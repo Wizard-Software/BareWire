@@ -1,1 +1,0 @@
-namespace BareWire.Saga.EntityFramework;

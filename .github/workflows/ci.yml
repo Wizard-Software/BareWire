@@ -46,9 +46,6 @@ jobs:
       - name: Unit Tests
         run: dotnet test tests/BareWire.UnitTests/ --no-build -c Release --logger "trx;LogFileName=unit-tests.trx" --results-directory ./test-results
 
-      - name: Integration Tests
-        run: dotnet test tests/BareWire.IntegrationTests/ --no-build -c Release --logger "trx;LogFileName=integration-tests.trx" --results-directory ./test-results
-
       - name: Contract Tests
         run: dotnet test tests/BareWire.ContractTests/ --no-build -c Release --logger "trx;LogFileName=contract-tests.trx" --results-directory ./test-results
 

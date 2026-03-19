@@ -4,6 +4,7 @@
     <InternalsVisibleTo Include="BareWire.UnitTests" />
     <InternalsVisibleTo Include="BareWire.IntegrationTests" />
     <InternalsVisibleTo Include="BareWire.Testing" />
+    <InternalsVisibleTo Include="BareWire.Saga" />
   </ItemGroup>
 
 </Project>

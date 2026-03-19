@@ -64,3 +64,9 @@ CLAUDE.md
 appsettings.*.json
 !appsettings.json
 !appsettings.Development.json
+
+# Serena
+.serena/
+
+# Legacy solution file (using .slnx)
+BareWire.sln

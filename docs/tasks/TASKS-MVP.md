@@ -271,47 +271,47 @@
 
 ### BareWire.Saga
 
-- [ ] **4.1. Zaimplementuj BareWireStateMachine<T> z fluent API** `[unit]`
+- [x] **4.1. Zaimplementuj BareWireStateMachine<T> z fluent API** `[unit]`
   Klasa bazowa: `Event<T>()`, `State()`, `Schedule<T>()`. Definicja przejść: `During(state, activities)`, `Initially(activities)`, `DuringAny(activities)`, `Finally(finalizer)`. Korelacja: `CorrelateBy<T>(event, selector)`, `CorrelateBy<T>(event, expression)`. Testy: definicja state machine, przejścia stanów, korelacja.
   -> [TDD.md sekcja 11.2](../TDD.md)
 
-- [ ] **4.2. Zaimplementuj IEventActivityBuilder z akcjami SAGA** `[unit]`
+- [x] **4.2. Zaimplementuj IEventActivityBuilder z akcjami SAGA** `[unit]`
   `TransitionTo(state)`, `Then(action)`, `Publish<T>(factory)`, `Send<T>(destination, factory)`, `ScheduleTimeout(schedule, delay)`, `CancelTimeout(schedule)`, `Finalize()`. Fluent chain. Integracja z outbox (publish/send buforowane). Testy: chain building, each activity type.
   -> [TDD.md sekcja 11.3](../TDD.md)
 
-- [ ] **4.3. Zaimplementuj StateMachineExecutor<T>** `[unit]`
+- [x] **4.3. Zaimplementuj StateMachineExecutor<T>** `[unit]`
   Execution engine: load state → match event → execute activities → persist state. Optimistic concurrency: retry na `ConcurrencyException`. Testy: state transitions, event mismatch (ignore), concurrent modification.
   -> [TDD.md sekcja 11.1](../TDD.md)
 
-- [ ] **4.4. Zaimplementuj SagaEventRouter i CorrelationProvider** `[unit]`
+- [x] **4.4. Zaimplementuj SagaEventRouter i CorrelationProvider** `[unit]`
   `SagaEventRouter`: routing eventów do instancji SAGA po korelacji. `CorrelationProvider`: `CorrelateById` (Guid z payloadu), `CorrelateByExpression` (dla queryable repo). SAGA z raw events: korelacja po polu z JSON payloadu. Testy: routing po CorrelationId, expression correlation, missing correlation → error.
   -> [TDD.md sekcja 11.2, 11.7](../TDD.md)
 
-- [ ] **4.5. Zaimplementuj strategie schedulingu timeoutów** `[unit]`
+- [x] **4.5. Zaimplementuj strategie schedulingu timeoutów** `[unit]`
   `IScheduleConfigurator` z `Delay` i `Strategy`. Strategie: `Auto` (wybiera najlepszą), `DelayRequeue` (TTL + DLX na dedykowaną delay queue — bez pluginu), `TransportNative` (ASB), `ExternalScheduler` (Quartz/Hangfire), `DelayTopic` (Kafka). Dla MVP: implementacja `DelayRequeue` dla RabbitMQ. Testy: Auto selection, delay requeue flow.
   -> [TDD.md sekcja 11.4](../TDD.md)
 
-- [ ] **4.6. Zaimplementuj RoutingSlipExecutor i ICompensableActivity** `[unit]`
+- [x] **4.6. Zaimplementuj RoutingSlipExecutor i ICompensableActivity** `[unit]`
   `ICompensableActivity<TArguments, TLog>`: `ExecuteAsync` (forward), `CompensateAsync` (rollback). `RoutingSlipExecutor`: execute chain of activities; on failure → compensate in reverse. `CompensationLog` persistence. Testy: happy path, failure + compensation, partial failure.
   -> [TDD.md sekcja 11.8](../TDD.md)
 
-- [ ] **4.7. Zaimplementuj InMemorySagaRepository<T>** `[unit]`
+- [x] **4.7. Zaimplementuj InMemorySagaRepository<T>** `[unit]`
   `ISagaRepository<T>` z `ConcurrentDictionary<Guid, TSaga>`. Optimistic concurrency per key (Version check). Do testów/dev (volatile). Testy: CRUD, concurrency conflict, delete.
   -> [TDD.md sekcja 11.5](../TDD.md)
 
 ### BareWire.Saga.EntityFramework
 
-- [ ] **4.8. Zaimplementuj EfCoreSagaRepository<T> z optimistic concurrency** `[integration]`
+- [x] **4.8. Zaimplementuj EfCoreSagaRepository<T> z optimistic concurrency** `[integration]`
   `ISagaRepository<T>` i `IQueryableSagaRepository<T>` z EF Core 10. Optimistic concurrency: `Version` property mapowany na `RowVersion` (SQL Server) lub `xmin` (PostgreSQL). `FindAsync`, `SaveAsync`, `UpdateAsync` z concurrency check. `FindSingleAsync` z expression predicate. Test: CRUD, concurrency conflict → `ConcurrencyException`.
   -> [TDD.md sekcja 11.5](../TDD.md)
 
-- [ ] **4.9. Utwórz SagaDbContext z migracjami EF Core** `[no-test]`
+- [x] **4.9. Utwórz SagaDbContext z migracjami EF Core** `[no-test]`
   `SagaDbContext` z konfigurowanym mapowaniem TSaga. Indeks na `CorrelationId`. Concurrency token na `Version`. Migracja initial create. Konfiguracja per-saga registration.
   -> [TDD.md sekcja 11.5](../TDD.md)
 
 ### Testy SAGA
 
-- [ ] **4.10. Dodaj testy integracyjne: SAGA E2E z RabbitMQ + EF Core** `[e2e]`
+- [x] **4.10. Dodaj testy integracyjne: SAGA E2E z RabbitMQ + EF Core** `[e2e]`
   Scenariusz OrderSaga: (1) OrderCreated → state: Processing, (2) PaymentReceived → state: Completed + publish OrderCompleted, (3) PaymentFailed → state: Compensating → Failed. Concurrency: 10 instancji, 100 eventów per instancja, < 5% conflicts. Timeout: Schedule → fire after delay. Kompensacja: RoutingSlip 3 activities → failure → compensate.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
