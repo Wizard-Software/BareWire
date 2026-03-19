@@ -5,6 +5,7 @@ using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
+using BareWire.Core.Observability;
 using BareWire.Core.Pipeline;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -40,7 +41,7 @@ public sealed class MessagePipelineTests
 
         var chain = new MiddlewareChain(middlewares ?? []);
         var dispatcher = new ConsumerDispatcher(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        var pipeline = new MessagePipeline(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance);
+        var pipeline = new MessagePipeline(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
 
         return (pipeline, chain, adapter, serviceProvider);
     }

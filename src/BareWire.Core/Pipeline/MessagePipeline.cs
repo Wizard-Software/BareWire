@@ -1,8 +1,10 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
@@ -20,17 +22,20 @@ internal sealed partial class MessagePipeline
     private readonly ConsumerDispatcher _dispatcher;
     private readonly IMessageDeserializer _deserializer;
     private readonly ILogger<MessagePipeline> _logger;
+    private readonly IBareWireInstrumentation _instrumentation;
 
     internal MessagePipeline(
         MiddlewareChain middlewareChain,
         ConsumerDispatcher dispatcher,
         IMessageDeserializer deserializer,
-        ILogger<MessagePipeline> logger)
+        ILogger<MessagePipeline> logger,
+        IBareWireInstrumentation instrumentation)
     {
         _middlewareChain = middlewareChain ?? throw new ArgumentNullException(nameof(middlewareChain));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
         _deserializer = deserializer ?? throw new ArgumentNullException(nameof(deserializer));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
     }
 
     // Processes an inbound message through the middleware chain and settles it with the transport.
@@ -46,6 +51,18 @@ internal sealed partial class MessagePipeline
         ArgumentNullException.ThrowIfNull(serviceProvider);
 
         Guid messageId = ParseOrHashMessageId(message.MessageId);
+
+        // Derive message type and endpoint from headers / routing key for metrics tags.
+        message.Headers.TryGetValue("BW-MessageType", out string? msgType);
+        string messageType = msgType ?? "unknown";
+        string endpoint = message.Headers.TryGetValue("BW-Endpoint", out string? ep) ? ep : "unknown";
+
+        int bodyLength = (int)Math.Min(message.Body.Length, int.MaxValue);
+
+        _instrumentation.RecordInflight(endpoint, messageType, +1, bodyLength);
+
+        Activity? activity = _instrumentation.StartConsumeActivity(messageType, endpoint, messageId, message.Headers);
+        Stopwatch sw = Stopwatch.StartNew();
 
         MessageContext context = new(
             messageId: messageId,
@@ -68,12 +85,21 @@ internal sealed partial class MessagePipeline
         catch (UnknownPayloadException ex)
         {
             LogUnknownPayload(_logger, ex, messageId);
+            _instrumentation.RecordFailure(endpoint, messageType, ex.GetType().Name);
             action = SettlementAction.Reject;
         }
         catch (Exception ex)
         {
             LogProcessingError(_logger, ex, messageId);
+            _instrumentation.RecordFailure(endpoint, messageType, ex.GetType().Name);
             action = SettlementAction.Nack;
+        }
+        finally
+        {
+            sw.Stop();
+            _instrumentation.RecordConsume(endpoint, messageType, sw.Elapsed.TotalMilliseconds, bodyLength);
+            _instrumentation.RecordInflight(endpoint, messageType, -1, -bodyLength);
+            activity?.Dispose();
         }
 
         await adapter.SettleAsync(action, message, ct).ConfigureAwait(false);

@@ -1,13 +1,16 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Core.Bus;
 using BareWire.Core.Configuration;
 using BareWire.Core.FlowControl;
+using BareWire.Core.Observability;
 using BareWire.Core.Pipeline;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -74,6 +77,11 @@ public static class ServiceCollectionExtensions
         // fail-fast validation in StartAsync via ConfigurationValidator.Validate(configurator).
         services.AddSingleton(configurator);
 
+        // Register NullInstrumentation as the default IBareWireInstrumentation fallback.
+        // AddBareWireObservability() (from BareWire.Observability) will replace this with
+        // BareWireInstrumentation when observability is enabled.
+        services.TryAddSingleton<IBareWireInstrumentation, NullInstrumentation>();
+
         // Flow controller — tracks credit/health per endpoint.
         services.AddSingleton(sp => new FlowController(
             sp.GetRequiredService<ILogger<FlowController>>()));
@@ -100,7 +108,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<MiddlewareChain>(),
             sp.GetRequiredService<ConsumerDispatcher>(),
             sp.GetRequiredService<IMessageDeserializer>(),
-            sp.GetRequiredService<ILogger<MessagePipeline>>()));
+            sp.GetRequiredService<ILogger<MessagePipeline>>(),
+            sp.GetRequiredService<IBareWireInstrumentation>()));
 
         // Publish flow control options — use defaults unless the caller has already registered
         // a custom instance before calling AddBareWire.
@@ -115,7 +124,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<MessagePipeline>(),
             sp.GetRequiredService<FlowController>(),
             sp.GetRequiredService<PublishFlowControlOptions>(),
-            sp.GetRequiredService<ILogger<BareWireBus>>()));
+            sp.GetRequiredService<ILogger<BareWireBus>>(),
+            sp.GetRequiredService<IBareWireInstrumentation>()));
 
         // BareWireBusControl — wraps BareWireBus and implements IBusControl / IBus.
         // Uses a factory because the constructor is internal.

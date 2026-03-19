@@ -7,6 +7,7 @@ using BareWire.Abstractions.Transport;
 using BareWire.Core.Bus;
 using BareWire.Core.Configuration;
 using BareWire.Core.FlowControl;
+using BareWire.Core.Observability;
 using BareWire.Core.Pipeline;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -43,7 +44,7 @@ public sealed class BareWireBusControlTests
 
         MiddlewareChain chain = new([]);
         ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance);
+        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         BareWireBus bus = new(
@@ -52,7 +53,8 @@ public sealed class BareWireBusControlTests
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
-            NullLogger<BareWireBus>.Instance);
+            NullLogger<BareWireBus>.Instance,
+            new NullInstrumentation());
 
         // Provide a configurator with InMemory transport so ConfigurationValidator passes.
         BusConfigurator configurator = new();

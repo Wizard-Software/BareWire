@@ -17,6 +17,7 @@
     <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Testing\BareWire.Testing.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Observability\BareWire.Observability.csproj" />
   </ItemGroup>
 
 </Project>

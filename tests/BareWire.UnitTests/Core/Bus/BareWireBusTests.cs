@@ -6,6 +6,7 @@ using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Core.Bus;
 using BareWire.Core.FlowControl;
+using BareWire.Core.Observability;
 using BareWire.Core.Pipeline;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -45,7 +46,7 @@ public sealed class BareWireBusTests
 
         MiddlewareChain chain = new([]);
         ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance);
+        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         PublishFlowControlOptions options = new()
@@ -60,7 +61,8 @@ public sealed class BareWireBusTests
             pipeline,
             flowController,
             options,
-            NullLogger<BareWireBus>.Instance);
+            NullLogger<BareWireBus>.Instance,
+            new NullInstrumentation());
 
         return (bus, adapter, serializer);
     }

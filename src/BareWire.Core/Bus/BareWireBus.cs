@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Core.FlowControl;
@@ -18,6 +20,7 @@ internal sealed partial class BareWireBus : IBus
     private readonly FlowController _flowController;
     private readonly PublishFlowControlOptions _publishFlowControl;
     private readonly ILogger<BareWireBus> _logger;
+    private readonly IBareWireInstrumentation _instrumentation;
 
     private readonly ConcurrentDictionary<Uri, ISendEndpoint> _sendEndpoints = new();
     private readonly Channel<OutboundMessage> _outgoingChannel;
@@ -33,7 +36,8 @@ internal sealed partial class BareWireBus : IBus
         MessagePipeline pipeline,
         FlowController flowController,
         PublishFlowControlOptions publishFlowControl,
-        ILogger<BareWireBus> logger)
+        ILogger<BareWireBus> logger,
+        IBareWireInstrumentation instrumentation)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
@@ -41,6 +45,7 @@ internal sealed partial class BareWireBus : IBus
         _flowController = flowController ?? throw new ArgumentNullException(nameof(flowController));
         _publishFlowControl = publishFlowControl ?? throw new ArgumentNullException(nameof(publishFlowControl));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
 
         BusId = Guid.NewGuid();
         Address = new Uri($"barewire://{adapter.TransportName.ToLowerInvariant()}/bus/{BusId:N}");
@@ -72,19 +77,35 @@ internal sealed partial class BareWireBus : IBus
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         string routingKey = typeof(T).FullName ?? typeof(T).Name;
-        OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
-            message,
-            _serializer,
-            routingKey,
-            headers: null,
-            cancellationToken);
+        string messageType = typeof(T).Name;
+        Guid messageId = Guid.NewGuid();
 
-        await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
-        Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
+        Activity? activity = _instrumentation.StartPublishActivity(messageType, routingKey, messageId);
+        try
+        {
+            Dictionary<string, string> headers = [];
+            _instrumentation.InjectTraceContext(activity, headers);
 
-        CheckPublishHealthAlert();
+            OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
+                message,
+                _serializer,
+                routingKey,
+                headers,
+                cancellationToken);
 
-        await _outgoingChannel.Writer.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+            await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
+            Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
+
+            _instrumentation.RecordPublishPending(routingKey, +1);
+            CheckPublishHealthAlert();
+
+            await _outgoingChannel.Writer.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+            _instrumentation.RecordPublish(routingKey, messageType, outbound.Body.Length);
+        }
+        finally
+        {
+            activity?.Dispose();
+        }
     }
 
     public async Task PublishRawAsync(
@@ -95,8 +116,11 @@ internal sealed partial class BareWireBus : IBus
         ArgumentNullException.ThrowIfNull(contentType);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        const string rawMessageType = "raw";
+        const string rawEndpoint = "";
+
         OutboundMessage outbound = new(
-            routingKey: string.Empty,
+            routingKey: rawEndpoint,
             headers: new Dictionary<string, string>(),
             body: payload,
             contentType: contentType);
@@ -104,7 +128,9 @@ internal sealed partial class BareWireBus : IBus
         await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
         Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
 
+        _instrumentation.RecordPublishPending(rawEndpoint, +1);
         await _outgoingChannel.Writer.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+        _instrumentation.RecordPublish(rawEndpoint, rawMessageType, outbound.Body.Length);
     }
 
     // ── ISendEndpointProvider ────────────────────────────────────────────────
@@ -271,7 +297,10 @@ internal sealed partial class BareWireBus : IBus
     {
         long batchTotalBytes = 0L;
         foreach (OutboundMessage msg in batch)
+        {
             batchTotalBytes += msg.Body.Length;
+            _instrumentation.RecordPublishPending(msg.RoutingKey, -1);
+        }
 
         Interlocked.Add(ref _pendingBytes, -batchTotalBytes);
 

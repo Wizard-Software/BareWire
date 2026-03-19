@@ -31,9 +31,9 @@
 | 3. Transport RabbitMQ | 10 | 2 | 7 | 1 | 0 |
 | 4. SAGA Engine | 10 | 7 | 1 | 1 | 1 |
 | 5. Outbox / Inbox | 8 | 4 | 1 | 1 | 2 |
-| 6. Observability | 7 | 3 | 4 | 0 | 0 |
+| 6. Observability | 7 | 6 | 1 | 0 | 0 |
 | 7. Kontrakty + Benchmarki + Samples | 8 | 2 | 0 | 1 | 5 |
-| **Razem** | **77** | **36** | **16** | **4** | **21** |
+| **Razem** | **77** | **39** | **13** | **4** | **21** |
 
 ---
 
@@ -324,39 +324,39 @@
 
 ### BareWire.Outbox
 
-- [ ] **5.1. Zaimplementuj InMemoryOutboxMiddleware** `[unit]`
+- [x] **5.1. Zaimplementuj InMemoryOutboxMiddleware** `[unit]`
   `IMessageMiddleware`: buforowanie `PublishAsync`/`SendAsync` w pamięci. Po sukcesie handlera: `FlushAsync()` → `SendBatch` do adaptera → ack original. Przy wyjątku: `Discard()` bufor → nack/abandon original. Testy: buffer + flush, discard on error, nested publish.
   -> [TDD.md sekcja 12.1](../TDD.md)
 
-- [ ] **5.2. Zaimplementuj OutboxDispatcher (background polling service)** `[unit]`
+- [x] **5.2. Zaimplementuj OutboxDispatcher (background polling service)** `[unit]`
   Background `IHostedService`: polling loop (konfigurowalny interval, domyślnie 1s). `SELECT` pending outbox messages (batch size konfigurowalny, domyślnie 100). Publish → update status = delivered. Idempotent: skip already delivered. Testy: polling, batch dispatch, idempotency.
   -> [TDD.md sekcja 12.2](../TDD.md)
 
-- [ ] **5.3. Zaimplementuj InboxFilter (deduplication)** `[unit]`
+- [x] **5.3. Zaimplementuj InboxFilter (deduplication)** `[unit]`
   `TryLock(MessageId)`: sprawdzenie czy wiadomość była już przetworzona. Already-processed → ack (idempotent skip). Lock timeout (konfigurowalny, domyślnie 30s). Testy: first process → lock, duplicate → skip, expired lock.
   -> [TDD.md sekcja 12.2](../TDD.md)
 
-- [ ] **5.4. Zaimplementuj konfigurację retention i cleanup** `[unit]`
+- [x] **5.4. Zaimplementuj konfigurację retention i cleanup** `[unit]`
   `IOutboxConfigurator`: `InboxRetention` (domyślnie 7 dni), `OutboxRetention` (domyślnie 7 dni), `PollingInterval`, `DispatchBatchSize`, `InboxLockTimeout`. Background cleanup job: usuwanie rekordów starszych niż retention. Testy: retention calculation, cleanup logic.
   -> [TDD.md sekcja 12.3](../TDD.md)
 
 ### BareWire.Outbox.EntityFramework
 
-- [ ] **5.5. Utwórz entity OutboxMessage i InboxMessage z migracjami EF Core** `[no-test]`
+- [x] **5.5. Utwórz entity OutboxMessage i InboxMessage z migracjami EF Core** `[no-test]`
   `OutboxMessage`: Id (PK auto), MessageId (Guid, indexed), Body (byte[]), ContentType, DestinationAddress, Headers (JSON), Status (Pending/Delivered), CreatedAt, DeliveredAt. `InboxMessage`: Id (PK auto), MessageId (Guid, unique indexed), ProcessedAt, ExpiresAt. Migracja initial create z indeksami.
   -> [TDD.md sekcja 12.4](../TDD.md)
 
-- [ ] **5.6. Zaimplementuj TransactionalOutboxMiddleware** `[integration]`
+- [x] **5.6. Zaimplementuj TransactionalOutboxMiddleware** `[integration]`
   `IMessageMiddleware`: inbox check (TryLock MessageId) → handler execution → business state + outbox messages w jednej transakcji EF Core `SaveChangesAsync()` → ack original. Rollback on error. Testy: exactly-once (business + outbox atomic), inbox dedup, rollback.
   -> [TDD.md sekcja 12.2](../TDD.md)
 
-- [ ] **5.7. Utwórz OutboxDbContext** `[no-test]`
+- [x] **5.7. Utwórz OutboxDbContext** `[no-test]`
   DbContext z DbSet<OutboxMessage>, DbSet<InboxMessage>. Konfiguracja mapowania, indeksów. Rejestracja w DI z konfiguracją connection string.
   -> [TDD.md sekcja 12.4](../TDD.md)
 
 ### Testy Outbox
 
-- [ ] **5.8. Dodaj testy integracyjne: transactional outbox z EF Core + RabbitMQ** `[e2e]`
+- [x] **5.8. Dodaj testy integracyjne: transactional outbox z EF Core + RabbitMQ** `[e2e]`
   Scenariusze: (1) Happy path: consume → business save + outbox → dispatcher delivers, (2) Inbox dedup: ten sam MessageId dwa razy → przetworzenie 1 raz, (3) Handler failure → rollback (brak outbox records), (4) Dispatcher retry: broker down → pending → broker up → delivered. (5) Retention cleanup: stare records usunięte.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
@@ -367,31 +367,31 @@
 > Faza 6 z planu implementacji. OpenTelemetry-first tracing + metrics + health checks.
 > Kryterium zakończenia: spany widoczne w Aspire Dashboard; metryki w OTel.
 
-- [ ] **6.1. Zaimplementuj BareWireActivitySource (OTel tracing)** `[unit]`
+- [x] **6.1. Zaimplementuj BareWireActivitySource (OTel tracing)** `[unit]`
   `ActivitySource("BareWire")`: spany publish (producer), consume (consumer), saga.transition, outbox.dispatch. Tags: `messaging.system`, `messaging.destination`, `messaging.message_id`, `messaging.correlation_id`. Kind: Producer/Consumer. Testy: span creation, tag values, parent-child relationship.
   -> [TDD.md sekcja 13](../TDD.md)
 
-- [ ] **6.2. Zaimplementuj BareWireMetrics (OTel counters i histogramy)** `[unit]`
+- [x] **6.2. Zaimplementuj BareWireMetrics (OTel counters i histogramy)** `[unit]`
   `Meter("BareWire")`: Counters: `barewire.messages.published`, `barewire.messages.consumed`, `barewire.messages.failed`, `barewire.messages.dead_lettered`. Histogramy: `barewire.message.duration` (processing time), `barewire.message.size` (payload bytes). Tags: endpoint, message_type. Testy: counter increment, histogram record.
   -> [TDD.md sekcja 13](../TDD.md)
 
-- [ ] **6.3. Zaimplementuj propagację trace context (traceparent header)** `[integration]`
+- [x] **6.3. Zaimplementuj propagację trace context (traceparent header)** `[integration]`
   Publish: inject `Activity.Current` → header `traceparent` w transport headers. Consume: extract `traceparent` z headers → create child span z propagowanym trace context. W3C TraceContext format. Test: publish → consume → verify trace_id propagation.
   -> [TDD.md sekcja 13](../TDD.md), [security-architecture.md](../architecture/security/security-architecture.md)
 
-- [ ] **6.4. Zaimplementuj BareWireEventCounterSource** `[unit]`
+- [x] **6.4. Zaimplementuj BareWireEventCounterSource** `[unit]`
   `EventSource("BareWire")` z `EventCounters`: inflight-messages, channel-utilization, publish-rate, consume-rate, alloc-rate. Konfigurowalny interval (domyślnie 5s). Low-overhead mode (< 1% narzutu). Testy: counter publishing, interval.
   -> [TDD.md sekcja 13](../TDD.md)
 
-- [ ] **6.5. Zaimplementuj BareWireHealthCheck** `[integration]`
+- [x] **6.5. Zaimplementuj BareWireHealthCheck** `[integration]`
   `IHealthCheck`: broker connection status, inflight load (> 90% → Degraded), outbox pending count (> threshold → Degraded), saga stuck detection (state unchanged > timeout → Degraded). Redacted connection strings w output (SEC-06). Test: healthy, degraded (high inflight), unhealthy (broker down).
   -> [TDD.md sekcja 13](../TDD.md), [security-architecture.md](../architecture/security/security-architecture.md)
 
-- [ ] **6.6. Dodaj integrację z Aspire Dashboard** `[integration]`
+- [x] **6.6. Dodaj integrację z Aspire Dashboard** `[integration]`
   `ConfigureObservability(Action<IObservabilityConfigurator>)`: `EnableOpenTelemetry` (default: true), `EnableEventCounters` (default: true). Konfiguracja OTel exporter (OTLP). Weryfikacja spanów i metryk w Aspire Dashboard. Test: spany publish/consume widoczne w dashboardzie.
   -> [TDD.md sekcja 13](../TDD.md)
 
-- [ ] **6.7. Dodaj testy integracyjne observability** `[integration]`
+- [x] **6.7. Dodaj testy integracyjne observability** `[integration]`
   Pokrycie: (1) spany publish → consume z poprawnym trace_id, (2) metryki: counter increment po publish/consume, (3) health check: healthy/degraded/unhealthy, (4) EventCounters: inflight tracking. In-process OTel collector w testach.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 

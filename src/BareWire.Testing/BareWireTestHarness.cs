@@ -6,6 +6,7 @@ using BareWire.Abstractions.Transport;
 using BareWire.Core.Bus;
 using BareWire.Core.Configuration;
 using BareWire.Core.FlowControl;
+using BareWire.Core.Observability;
 using BareWire.Core.Pipeline;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -80,7 +81,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             middlewareChain: middlewareChain,
             dispatcher: dispatcher,
             deserializer: deserializer,
-            logger: loggerFactory.CreateLogger<MessagePipeline>());
+            logger: loggerFactory.CreateLogger<MessagePipeline>(),
+            instrumentation: new NullInstrumentation());
 
         PublishFlowControlOptions publishFlowControl = new();
 
@@ -90,7 +92,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             pipeline: pipeline,
             flowController: flowController,
             publishFlowControl: publishFlowControl,
-            logger: loggerFactory.CreateLogger<BareWireBus>());
+            logger: loggerFactory.CreateLogger<BareWireBus>(),
+            instrumentation: new NullInstrumentation());
 
         BusConfigurator configurator = new() { HasInMemoryTransport = true };
         configure?.Invoke(configurator);
