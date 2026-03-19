@@ -133,12 +133,26 @@ public abstract class ConsumeContext : IPublishEndpoint, ISendEndpointProvider
 
     /// <summary>
     /// Sends a response message back to the originator of the current message.
-    /// Resolves the reply address from the message headers and delivers the response there.
+    /// When a <c>ReplyTo</c> header is present, the response is delivered directly to that address.
+    /// Falls back to <see cref="PublishAsync{T}"/> for backwards compatibility when no reply address is set.
     /// </summary>
     /// <typeparam name="T">The response message type. Must be a reference type.</typeparam>
     /// <param name="response">The response message to send.</param>
     /// <param name="cancellationToken">A token to cancel the send operation.</param>
     /// <returns>A <see cref="Task"/> that completes when the response has been accepted by the transport.</returns>
-    public abstract Task RespondAsync<T>(T response, CancellationToken cancellationToken = default)
-        where T : class;
+    public virtual async Task RespondAsync<T>(T response, CancellationToken cancellationToken = default)
+        where T : class
+    {
+        // If a ReplyTo header exists, send the response directly to that address (request-response pattern).
+        if (Headers.TryGetValue("ReplyTo", out string? replyTo) && !string.IsNullOrEmpty(replyTo))
+        {
+            ISendEndpoint endpoint = await GetSendEndpoint(new Uri(replyTo), cancellationToken)
+                .ConfigureAwait(false);
+            await endpoint.SendAsync(response, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Fallback: publish to all subscribers (backwards compatible when no ReplyTo is present).
+        await PublishAsync(response, cancellationToken).ConfigureAwait(false);
+    }
 }

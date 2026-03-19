@@ -1,0 +1,67 @@
+using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Topology;
+using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.RabbitMQ.Configuration;
+using RabbitMQ.Client;
+
+namespace BareWire.Transport.RabbitMQ;
+
+internal sealed class RabbitMqTransportOptions
+{
+    public string ConnectionString { get; set; } = string.Empty;
+
+    public bool AutomaticRecoveryEnabled { get; set; } = true;
+
+    public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
+
+    public string DefaultExchange { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional username override. When set, overrides any username embedded in <see cref="ConnectionString"/>.
+    /// </summary>
+    public string? UsernameOverride { get; set; }
+
+    /// <summary>
+    /// Optional password override. When set, overrides any password embedded in <see cref="ConnectionString"/>.
+    /// Never logged or included in diagnostic output.
+    /// </summary>
+    public string? PasswordOverride { get; set; }
+
+    /// <summary>
+    /// Fluent TLS configuration callback. When set, takes precedence over <see cref="SslOptions"/>.
+    /// </summary>
+    public Action<ITlsConfigurator>? ConfigureTls { get; set; }
+
+    /// <summary>
+    /// Raw <see cref="SslOption"/> for backward compatibility.
+    /// Prefer <see cref="ConfigureTls"/> for new code.
+    /// </summary>
+    public SslOption? SslOptions { get; set; }
+
+    public bool DeferEnabled { get; set; }
+
+    public int DeferDelayMs { get; set; } = 30_000;
+
+    /// <summary>
+    /// The accumulated topology declaration produced by <see cref="IRabbitMqConfigurator.ConfigureTopology"/>.
+    /// <see langword="null"/> when no topology was configured.
+    /// </summary>
+    public TopologyDeclaration? Topology { get; set; }
+
+    /// <summary>
+    /// The accumulated receive endpoint configurations produced by
+    /// <see cref="IRabbitMqConfigurator.ReceiveEndpoint"/>.
+    /// </summary>
+    public IReadOnlyList<RabbitMqEndpointConfiguration> EndpointConfigurations { get; set; } = [];
+
+    public void Validate()
+    {
+        if (string.IsNullOrEmpty(ConnectionString))
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(ConnectionString),
+                optionValue: ConnectionString,
+                expectedValue: "A non-empty RabbitMQ connection string (e.g. amqp://guest:guest@localhost:5672/)");
+        }
+    }
+}

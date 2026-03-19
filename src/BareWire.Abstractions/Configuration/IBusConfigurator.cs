@@ -11,15 +11,17 @@ public interface IBusConfigurator
 {
     /// <summary>
     /// Configures the bus to use RabbitMQ as its transport layer.
-    /// The <paramref name="configure"/> delegate receives a transport-specific configurator;
-    /// the actual type is defined in <c>BareWire.Transport.RabbitMQ</c> and passed at runtime.
+    /// The <paramref name="configure"/> delegate receives an <see cref="IRabbitMqConfigurator"/>
+    /// that provides a typed fluent API for host, topology, endpoint, and header-mapping settings.
     /// </summary>
     /// <param name="configure">
-    /// A delegate that receives the RabbitMQ configurator object and applies transport settings.
-    /// The parameter type is <see cref="object"/> to avoid a compile-time dependency on the
-    /// transport package from within <c>BareWire.Abstractions</c>.
+    /// A delegate that receives the <see cref="IRabbitMqConfigurator"/> and applies transport settings.
+    /// Must not be <see langword="null"/>.
     /// </param>
-    void UseRabbitMQ(Action<object> configure);
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
+    /// </exception>
+    void UseRabbitMQ(Action<IRabbitMqConfigurator> configure);
 
     /// <summary>
     /// Configures observability (tracing, metrics, logging) for the bus.

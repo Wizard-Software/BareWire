@@ -62,7 +62,4 @@ public sealed class RawConsumeContext : ConsumeContext
         }
     }
 
-    /// <inheritdoc/>
-    public override Task RespondAsync<TResponse>(TResponse response, CancellationToken cancellationToken = default)
-        => PublishAsync(response, cancellationToken);
 }

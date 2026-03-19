@@ -27,9 +27,8 @@ internal sealed class BusConfigurator : IBusConfigurator
 
     /// <summary>
     /// Gets the RabbitMQ configurator delegate, or <see langword="null"/> when RabbitMQ was not configured.
-    /// Placeholder for Phase 3 (RabbitMQ transport).
     /// </summary>
-    internal Action<object>? RabbitMqConfigurator { get; private set; }
+    internal Action<IRabbitMqConfigurator>? RabbitMqConfigurator { get; private set; }
 
     /// <summary>
     /// Gets the observability configurator delegate, or <see langword="null"/> when not configured.
@@ -47,7 +46,7 @@ internal sealed class BusConfigurator : IBusConfigurator
     // ── IBusConfigurator ───────────────────────────────────────────────────────
 
     /// <inheritdoc />
-    public void UseRabbitMQ(Action<object> configure)
+    public void UseRabbitMQ(Action<IRabbitMqConfigurator> configure)
     {
         ArgumentNullException.ThrowIfNull(configure);
         RabbitMqConfigurator = configure;

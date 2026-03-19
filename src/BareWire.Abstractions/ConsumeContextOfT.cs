@@ -41,8 +41,4 @@ public sealed class ConsumeContext<T> : ConsumeContext where T : class
     {
         Message = message ?? throw new ArgumentNullException(nameof(message));
     }
-
-    /// <inheritdoc/>
-    public override Task RespondAsync<TResponse>(TResponse response, CancellationToken cancellationToken = default)
-        => PublishAsync(response, cancellationToken);
 }

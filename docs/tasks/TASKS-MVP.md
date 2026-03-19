@@ -222,43 +222,43 @@
 > Faza 3 z planu implementacji. Działający adapter RabbitMQ z manualną topologią.
 > Kryterium zakończenia: testy integracyjne z prawdziwym RabbitMQ (Aspire) przechodzą.
 
-- [ ] **3.1. Zaimplementuj RabbitMqTransportAdapter (połączenie i lifecycle)** `[integration]`
+- [x] **3.1. Zaimplementuj RabbitMqTransportAdapter (połączenie i lifecycle)** `[integration]`
   `ITransportAdapter` z `RabbitMQ.Client` 7.x (async-native). `ConnectAsync` z connection string. `DisconnectAsync` z graceful drain. Automatic reconnect z exponential backoff. `TransportCapabilities`: PublisherConfirms, DlqNative, FlowControl. Test: connect/disconnect/reconnect.
   -> [TDD.md sekcja 8.2.1](../TDD.md), [internal-components.md](../architecture/architecture/internal-components.md)
 
-- [ ] **3.2. Zaimplementuj RabbitMqTopologyConfigurator i DeployTopologyAsync** `[integration]`
+- [x] **3.2. Zaimplementuj RabbitMqTopologyConfigurator i DeployTopologyAsync** `[integration]`
   `DeclareExchange` (name, type, durable, autoDelete), `DeclareQueue` (name, durable, DLX, TTL), `BindExchangeToQueue` (exchange, queue, routing key, arguments), `BindExchangeToExchange`. `DeployTopologyAsync` — topology-only deploy (bez uruchamiania konsumentów). Test: deploy exchange + queue + binding, idempotentność.
   -> [TDD.md sekcja 7](../TDD.md)
 
-- [ ] **3.3. Zaimplementuj send batch z publisher confirms** `[integration]`
+- [x] **3.3. Zaimplementuj send batch z publisher confirms** `[integration]`
   `SendBatchAsync(ReadOnlyMemory<OutboundMessage>)`: buforowanie + `basic.publish` z publisher confirms. Konfigurowalny linger time. `SendResult` z potwierdzeniem. Test: batch publish, confirm timeout, reconnect during publish.
   -> [TDD.md sekcja 8.2.1](../TDD.md)
 
-- [ ] **3.4. Zaimplementuj consume (IAsyncEnumerable z credit-based prefetch)** `[integration]`
+- [x] **3.4. Zaimplementuj consume (IAsyncEnumerable z credit-based prefetch)** `[integration]`
   `ConsumeAsync(endpoint, flowControl)` → `IAsyncEnumerable<InboundMessage>`. `basic.qos(prefetchCount)` mapowany na `FlowControlOptions.MaxInFlightMessages`. Asynchroniczny consumer z `IAsyncBasicConsumer`. Test: consume z prefetch, flow control activation.
   -> [TDD.md sekcja 8.2.1](../TDD.md), [ADR-004](../architecture/decisions/ADR-004-credit-based-flow-control.md)
 
-- [ ] **3.5. Zaimplementuj settlement (ack, nack, reject, requeue)** `[integration]`
+- [x] **3.5. Zaimplementuj settlement (ack, nack, reject, requeue)** `[integration]`
   `SettleAsync(SettlementAction, InboundMessage)`: Ack → `basic.ack`, Nack → `basic.nack`, Reject → `basic.reject(requeue=false)`, Requeue → `basic.nack(requeue=true)`. Atomic inflight release po settlement. Test: each settlement action, batch ack.
   -> [TDD.md sekcja 8.2.1](../TDD.md)
 
-- [ ] **3.6. Zaimplementuj RabbitMqHeaderMapper** `[unit]`
+- [x] **3.6. Zaimplementuj RabbitMqHeaderMapper** `[unit]`
   Domyślne mapowania: `message-id` → MessageId, `correlation-id` → CorrelationId, header `BW-MessageType` → MessageType, `content-type` → ContentType, `traceparent` → TraceContext. Custom mappings przez `IHeaderMappingConfigurator`: `MapCorrelationId`, `MapMessageType`, `MapHeader` z transformacją. `IgnoreUnmappedHeaders` (whitelist). Testy: domyślne mapowania, custom mappings, unmapped headers.
   -> [TDD.md sekcja 6.4](../TDD.md), [security-architecture.md](../architecture/security/security-architecture.md)
 
-- [ ] **3.7. Zaimplementuj konfigurację TLS / mTLS** `[integration]`
+- [x] **3.7. Zaimplementuj konfigurację TLS / mTLS** `[integration]`
   `UseTls(Action<ITlsConfigurator>)`: `CertificatePath`, `CertificatePassword`, `UseMutualAuthentication()`, `ServerCertificateValidation`. Konfiguracja `amqps://` URI. Test: połączenie z TLS (self-signed cert w kontenerze testowym).
   -> [security-architecture.md](../architecture/security/security-architecture.md)
 
-- [ ] **3.8. Zaimplementuj RabbitMqHostConfigurator (fluent API)** `[unit]`
+- [x] **3.8. Zaimplementuj RabbitMqHostConfigurator (fluent API)** `[unit]`
   `UseRabbitMQ(Action<IRabbitMqConfigurator>)`: `Host(uri, configure)`, `ConfigureTopology(configure)`, `ReceiveEndpoint(queue, configure)`. `IHostConfigurator`: `Username`, `Password`, `UseTls`. Walidacja: URI format, wymagany host. Testy: konfiguracja poprawna, walidacja błędnych wartości.
   -> [configuration.md](../architecture/api/configuration.md)
 
-- [ ] **3.9. Zaimplementuj IRequestClient z temporary response queue** `[integration]`
+- [x] **3.9. Zaimplementuj IRequestClient z temporary response queue** `[integration]`
   `CreateRequestClient<TRequest>()` → tworzy exclusive auto-delete queue dla odpowiedzi. `GetResponseAsync<TResponse>()` z timeout (`TaskCompletionSource` + `CancellationToken`). ReplyTo header z adresem temp queue. `RequestTimeoutException` po upływie timeout. Test: request-response E2E, timeout scenario.
   -> [public-api.md](../architecture/api/public-api.md), [TDD.md sekcja 5.5](../TDD.md)
 
-- [ ] **3.10. Dodaj testy integracyjne E2E z RabbitMQ** `[e2e]`
+- [x] **3.10. Dodaj testy integracyjne E2E z RabbitMQ** `[e2e]`
   Scenariusze: (1) Typowany publish/consume E2E, (2) Raw publish/consume z custom headers, (3) Topology deploy i ponowne deploy (idempotentność), (4) Retry + DLQ po wyczerpaniu prób, (5) Request-response z timeout, (6) Multiple consumers na jednym endpoint. Wszystkie z prawdziwym RabbitMQ przez Aspire.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
