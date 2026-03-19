@@ -1,0 +1,527 @@
+namespace BareWire.Abstractions
+{
+    public sealed class BusHandle : System.IAsyncDisposable
+    {
+        public BusHandle(System.Guid busId) { }
+        public System.Guid BusId { get; }
+        public System.Threading.Tasks.ValueTask DisposeAsync() { }
+    }
+    public sealed class BusHealthStatus : System.IEquatable<BareWire.Abstractions.BusHealthStatus>
+    {
+        public BusHealthStatus(BareWire.Abstractions.BusStatus Status, string Description, System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.EndpointHealthStatus> Endpoints) { }
+        public string Description { get; init; }
+        public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.EndpointHealthStatus> Endpoints { get; init; }
+        public BareWire.Abstractions.BusStatus Status { get; init; }
+    }
+    public enum BusStatus
+    {
+        Healthy = 0,
+        Degraded = 1,
+        Unhealthy = 2,
+    }
+    public abstract class ConsumeContext : BareWire.Abstractions.IPublishEndpoint, BareWire.Abstractions.ISendEndpointProvider
+    {
+        public System.Threading.CancellationToken CancellationToken { get; }
+        public string? ContentType { get; }
+        public System.Guid? ConversationId { get; }
+        public System.Guid? CorrelationId { get; }
+        public System.Uri? DestinationAddress { get; }
+        public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
+        public System.Guid MessageId { get; }
+        public System.Buffers.ReadOnlySequence<byte> RawBody { get; }
+        public System.DateTimeOffset? SentTime { get; }
+        public System.Uri? SourceAddress { get; }
+        public System.Threading.Tasks.Task<BareWire.Abstractions.ISendEndpoint> GetSendEndpoint(System.Uri address, System.Threading.CancellationToken cancellationToken = default) { }
+        public System.Threading.Tasks.Task PublishAsync<T>(T message, System.Threading.CancellationToken cancellationToken = default)
+            where T :  class { }
+        public System.Threading.Tasks.Task PublishRawAsync(System.ReadOnlyMemory<byte> payload, string contentType, System.Threading.CancellationToken cancellationToken = default) { }
+        public virtual System.Threading.Tasks.Task RespondAsync<T>(T response, System.Threading.CancellationToken cancellationToken = default)
+            where T :  class { }
+    }
+    public sealed class ConsumeContext<T> : BareWire.Abstractions.ConsumeContext
+        where T :  class
+    {
+        public T Message { get; }
+    }
+    public sealed class EndpointHealthStatus : System.IEquatable<BareWire.Abstractions.EndpointHealthStatus>
+    {
+        public EndpointHealthStatus(string EndpointName, BareWire.Abstractions.BusStatus Status, string? Description) { }
+        public string? Description { get; init; }
+        public string EndpointName { get; init; }
+        public BareWire.Abstractions.BusStatus Status { get; init; }
+    }
+    public enum ExchangeType
+    {
+        Direct = 0,
+        Fanout = 1,
+        Topic = 2,
+        Headers = 3,
+    }
+    public sealed class FlowControlOptions
+    {
+        public FlowControlOptions() { }
+        public System.Threading.Channels.BoundedChannelFullMode FullMode { get; set; }
+        public int InternalQueueCapacity { get; set; }
+        public long MaxInFlightBytes { get; set; }
+        public int MaxInFlightMessages { get; set; }
+    }
+    public interface IBus : BareWire.Abstractions.IPublishEndpoint, BareWire.Abstractions.ISendEndpointProvider, System.IAsyncDisposable, System.IDisposable
+    {
+        System.Uri Address { get; }
+        System.Guid BusId { get; }
+        System.IDisposable ConnectReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
+        BareWire.Abstractions.IRequestClient<T> CreateRequestClient<T>()
+            where T :  class;
+    }
+    public interface IBusControl : BareWire.Abstractions.IBus, BareWire.Abstractions.IPublishEndpoint, BareWire.Abstractions.ISendEndpointProvider, System.IAsyncDisposable, System.IDisposable
+    {
+        BareWire.Abstractions.BusHealthStatus CheckHealth();
+        System.Threading.Tasks.Task DeployTopologyAsync(System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<BareWire.Abstractions.BusHandle> StartAsync(System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task StopAsync(System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface IConsumer<T>
+        where T :  class
+    {
+        System.Threading.Tasks.Task ConsumeAsync(BareWire.Abstractions.ConsumeContext<T> context);
+    }
+    public interface IPublishEndpoint
+    {
+        System.Threading.Tasks.Task PublishAsync<T>(T message, System.Threading.CancellationToken cancellationToken = default)
+            where T :  class;
+        System.Threading.Tasks.Task PublishRawAsync(System.ReadOnlyMemory<byte> payload, string contentType, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface IRawConsumer
+    {
+        System.Threading.Tasks.Task ConsumeAsync(BareWire.Abstractions.RawConsumeContext context);
+    }
+    public interface IRequestClient<TRequest>
+        where TRequest :  class
+    {
+        System.Threading.Tasks.Task<BareWire.Abstractions.Response<TResponse>> GetResponseAsync<TResponse>(TRequest request, System.Threading.CancellationToken cancellationToken = default)
+            where TResponse :  class;
+    }
+    public interface ISendEndpoint
+    {
+        System.Uri Address { get; }
+        System.Threading.Tasks.Task SendAsync<T>(T message, System.Threading.CancellationToken cancellationToken = default)
+            where T :  class;
+        System.Threading.Tasks.Task SendRawAsync(System.ReadOnlyMemory<byte> payload, string contentType, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface ISendEndpointProvider
+    {
+        System.Threading.Tasks.Task<BareWire.Abstractions.ISendEndpoint> GetSendEndpoint(System.Uri address, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public sealed class PublishFlowControlOptions
+    {
+        public PublishFlowControlOptions() { }
+        public System.Threading.Channels.BoundedChannelFullMode FullMode { get; set; }
+        public long MaxPendingBytes { get; set; }
+        public int MaxPendingPublishes { get; set; }
+    }
+    public sealed class RawConsumeContext : BareWire.Abstractions.ConsumeContext
+    {
+        public T? TryDeserialize<T>()
+            where T :  class { }
+    }
+    [System.Flags]
+    public enum RawSerializerOptions
+    {
+        None = 0,
+        AddTransportHeaders = 1,
+        CopyHeaders = 2,
+        AnyMessageType = 4,
+        Default = 5,
+    }
+    public sealed class Response<T> : System.IEquatable<BareWire.Abstractions.Response<T>>
+        where T :  class
+    {
+        public Response(System.Guid MessageId, System.Collections.Generic.IReadOnlyDictionary<string, string> Headers, T Message) { }
+        public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; init; }
+        public T Message { get; init; }
+        public System.Guid MessageId { get; init; }
+    }
+    public enum SchedulingStrategy
+    {
+        Auto = 0,
+        TransportNative = 1,
+        DelayRequeue = 2,
+        ExternalScheduler = 3,
+        DelayTopic = 4,
+    }
+    public enum SettlementAction
+    {
+        Ack = 0,
+        Nack = 1,
+        Reject = 2,
+        Defer = 3,
+        Requeue = 4,
+    }
+    [System.Flags]
+    public enum TransportCapabilities
+    {
+        None = 0,
+        PublisherConfirms = 1,
+        ExactlyOnce = 2,
+        Transactions = 4,
+        NativeDeduplication = 8,
+        Sessions = 16,
+        OrderingKeys = 32,
+        NativeScheduling = 64,
+        BatchReceive = 128,
+        DlqNative = 256,
+        FlowControl = 512,
+    }
+}
+namespace BareWire.Abstractions.Configuration
+{
+    public interface IBusConfigurator
+    {
+        void AddMiddleware<T>()
+            where T :  class, BareWire.Abstractions.Pipeline.IMessageMiddleware;
+        void ConfigureObservability(System.Action<object> configure);
+        void UseRabbitMQ(System.Action<BareWire.Abstractions.Configuration.IRabbitMqConfigurator> configure);
+        void UseSerializer<T>()
+            where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
+    }
+    public interface IHostConfigurator
+    {
+        void Password(string password);
+        void UseTls(System.Action<BareWire.Abstractions.Configuration.ITlsConfigurator> configure);
+        void Username(string username);
+    }
+    public interface IRabbitMqConfigurator
+    {
+        void ConfigureHeaderMapping(System.Action<BareWire.Abstractions.Headers.IHeaderMappingConfigurator> configure);
+        void ConfigureTopology(System.Action<BareWire.Abstractions.Topology.ITopologyConfigurator> configure);
+        void Host(string uri, System.Action<BareWire.Abstractions.Configuration.IHostConfigurator>? configure = null);
+        void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
+    }
+    public interface IReceiveEndpointConfigurator
+    {
+        int ConcurrentMessageLimit { get; set; }
+        bool ConfigureConsumeTopology { get; set; }
+        string? DefaultContentType { get; set; }
+        int PrefetchCount { get; set; }
+        BareWire.Abstractions.RawSerializerOptions RawSerializerOptions { get; set; }
+        int RetryCount { get; set; }
+        System.TimeSpan RetryInterval { get; set; }
+        void Consumer<TConsumer, TMessage>()
+            where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
+            where TMessage :  class;
+        void RawConsumer<T>()
+            where T :  class, BareWire.Abstractions.IRawConsumer;
+        void StateMachineSaga<TSaga>()
+            where TSaga :  class;
+    }
+    public interface ITlsConfigurator
+    {
+        BareWire.Abstractions.Configuration.ITlsConfigurator WithCertificate(string path, string? password = null);
+        BareWire.Abstractions.Configuration.ITlsConfigurator WithMutualAuthentication();
+        BareWire.Abstractions.Configuration.ITlsConfigurator WithServerValidation(System.Net.Security.SslPolicyErrors acceptablePolicyErrors);
+    }
+}
+namespace BareWire.Abstractions.Exceptions
+{
+    public sealed class BareWireConfigurationException : BareWire.Abstractions.Exceptions.BareWireException
+    {
+        public BareWireConfigurationException(string optionName, string? optionValue = null, string? expectedValue = null, System.Exception? innerException = null) { }
+        public string? ExpectedValue { get; }
+        public string OptionName { get; }
+        public string? OptionValue { get; }
+    }
+    public class BareWireException : System.Exception
+    {
+        public BareWireException(string message) { }
+        public BareWireException(string message, System.Exception innerException) { }
+    }
+    public class BareWireSagaException : BareWire.Abstractions.Exceptions.BareWireException
+    {
+        public BareWireSagaException(string message, System.Type sagaType, System.Guid correlationId, string? currentState = null, System.Exception? innerException = null) { }
+        public System.Guid CorrelationId { get; }
+        public string? CurrentState { get; }
+        public System.Type SagaType { get; }
+    }
+    public sealed class BareWireSerializationException : BareWire.Abstractions.Exceptions.BareWireException
+    {
+        public const int MaxRawPayloadLength = 500;
+        public BareWireSerializationException(string message, string contentType, System.Type? targetType = null, string? rawPayload = null, System.Exception? innerException = null) { }
+        public string ContentType { get; }
+        public string? RawPayload { get; }
+        public System.Type? TargetType { get; }
+    }
+    public class BareWireTransportException : BareWire.Abstractions.Exceptions.BareWireException
+    {
+        public BareWireTransportException(string message, string transportName, System.Uri? endpointAddress, System.Exception? innerException = null) { }
+        public System.Uri? EndpointAddress { get; }
+        public string TransportName { get; }
+    }
+    public sealed class ConcurrencyException : BareWire.Abstractions.Exceptions.BareWireSagaException
+    {
+        public ConcurrencyException(System.Type sagaType, System.Guid correlationId, int expectedVersion, int actualVersion, string? currentState = null, System.Exception? innerException = null) { }
+        public int ActualVersion { get; }
+        public int ExpectedVersion { get; }
+    }
+    public sealed class RequestTimeoutException : BareWire.Abstractions.Exceptions.BareWireTransportException
+    {
+        public RequestTimeoutException(System.Type requestType, System.TimeSpan timeout, System.Uri? destinationAddress, string transportName = "Unknown", System.Exception? innerException = null) { }
+        public System.Uri? DestinationAddress { get; }
+        public System.Type RequestType { get; }
+        public System.TimeSpan Timeout { get; }
+    }
+    public sealed class TopologyDeploymentException : BareWire.Abstractions.Exceptions.BareWireTransportException
+    {
+        public TopologyDeploymentException(string topologyElement, string transportName = "Unknown", string? brokerError = null, System.Uri? endpointAddress = null, System.Exception? innerException = null) { }
+        public string? BrokerError { get; }
+        public string TopologyElement { get; }
+    }
+    public sealed class UnknownPayloadException : BareWire.Abstractions.Exceptions.BareWireException
+    {
+        public UnknownPayloadException(string endpointName, string? contentType = null, System.Exception? innerException = null) { }
+        public string? ContentType { get; }
+        public string EndpointName { get; }
+    }
+}
+namespace BareWire.Abstractions.Headers
+{
+    public interface IHeaderMappingConfigurator
+    {
+        void IgnoreUnmappedHeaders(bool ignore = true);
+        void MapCorrelationId(string headerName);
+        void MapHeader(string bareWireHeader, string transportHeader);
+        void MapMessageType(string headerName);
+    }
+}
+namespace BareWire.Abstractions.Observability
+{
+    public interface IBareWireInstrumentation
+    {
+        System.Diagnostics.Activity? ExtractTraceContext(System.Collections.Generic.IReadOnlyDictionary<string, string> headers, string operationName);
+        void InjectTraceContext(System.Diagnostics.Activity? activity, System.Collections.Generic.IDictionary<string, string> headers);
+        void RecordConsume(string endpoint, string messageType, double durationMs, int messageSize);
+        void RecordDeadLetter(string endpoint, string messageType);
+        void RecordFailure(string endpoint, string messageType, string errorType);
+        void RecordInflight(string endpoint, string messageType, int delta, int bytesDelta);
+        void RecordPublish(string endpoint, string messageType, int messageSize);
+        void RecordPublishPending(string endpoint, int delta);
+        void RecordPublishRejected(string endpoint, string messageType);
+        System.Diagnostics.Activity? StartConsumeActivity(string messageType, string endpoint, System.Guid messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers);
+        System.Diagnostics.Activity? StartPublishActivity(string messageType, string destination, System.Guid messageId);
+        System.Diagnostics.Activity? StartSagaTransitionActivity(string sagaType, string stateFrom, string stateTo, System.Guid correlationId);
+    }
+}
+namespace BareWire.Abstractions.Outbox
+{
+    public interface IOutboxConfigurator
+    {
+        System.TimeSpan CleanupInterval { get; set; }
+        int DispatchBatchSize { get; set; }
+        System.TimeSpan InboxLockTimeout { get; set; }
+        System.TimeSpan InboxRetention { get; set; }
+        System.TimeSpan OutboxRetention { get; set; }
+        System.TimeSpan PollingInterval { get; set; }
+    }
+}
+namespace BareWire.Abstractions.Pipeline
+{
+    public interface IMessageMiddleware
+    {
+        System.Threading.Tasks.Task InvokeAsync(BareWire.Abstractions.Pipeline.MessageContext context, BareWire.Abstractions.Pipeline.NextMiddleware nextMiddleware);
+    }
+    public sealed class MessageContext
+    {
+        public MessageContext(System.Guid messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.Buffers.ReadOnlySequence<byte> rawBody, System.IServiceProvider serviceProvider, System.Threading.CancellationToken cancellationToken = default) { }
+        public System.Threading.CancellationToken CancellationToken { get; }
+        public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
+        public System.Guid MessageId { get; }
+        public System.Buffers.ReadOnlySequence<byte> RawBody { get; }
+        public System.IServiceProvider ServiceProvider { get; }
+    }
+    public delegate System.Threading.Tasks.Task NextMiddleware(BareWire.Abstractions.Pipeline.MessageContext context);
+}
+namespace BareWire.Abstractions.Saga
+{
+    public abstract class BareWireStateMachine<TSaga>
+        where TSaga :  class, BareWire.Abstractions.Saga.ISagaState
+    {
+        protected BareWireStateMachine() { }
+        protected void CorrelateBy<T>(System.Func<T, System.Guid> correlationExpression)
+            where T :  class { }
+        protected void During(BareWire.Abstractions.Saga.StateHandle state, System.Action configure) { }
+        protected void During(string state, System.Action configure) { }
+        protected void DuringAny(System.Action configure) { }
+        protected BareWire.Abstractions.Saga.EventHandle<T> Event<T>()
+            where T :  class { }
+        protected void Finally(System.Action configure) { }
+        protected void Initially(System.Action configure) { }
+        protected BareWire.Abstractions.Saga.ScheduleHandle<T> Schedule<T>(System.Action<BareWire.Abstractions.Saga.IScheduleConfigurator> configure)
+            where T :  class { }
+        protected BareWire.Abstractions.Saga.StateHandle State(string name) { }
+        protected void When<T>(BareWire.Abstractions.Saga.EventHandle<T> eventHandle, System.Action<BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, T>> configure)
+            where T :  class { }
+    }
+    public sealed class EventHandle<T>
+        where T :  class
+    {
+        public EventHandle() { }
+        public string Name { get; }
+    }
+    public interface ICompensableActivity<TArguments, TLog>
+        where TArguments :  class
+        where TLog :  class
+    {
+        System.Threading.Tasks.Task CompensateAsync(TLog log, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<TLog> ExecuteAsync(TArguments arguments, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface IEventActivityBuilder<TSaga, TEvent>
+        where TSaga :  class, BareWire.Abstractions.Saga.ISagaState
+        where TEvent :  class
+    {
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> CancelTimeout<T>()
+            where T :  class;
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Finalize();
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Publish<T>(System.Func<TSaga, TEvent, T> factory)
+            where T :  class;
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> ScheduleTimeout<T>(System.Func<TSaga, TEvent, T> factory)
+            where T :  class;
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Send<T>(System.Uri destination, System.Func<TSaga, TEvent, T> factory)
+            where T :  class;
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Then(System.Func<TSaga, TEvent, System.Threading.Tasks.Task> action);
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> TransitionTo(string state);
+    }
+    public interface IQueryableSagaRepository<TSaga> : BareWire.Abstractions.Saga.ISagaRepository<TSaga>
+        where TSaga :  class, BareWire.Abstractions.Saga.ISagaState
+    {
+        System.Threading.Tasks.Task<TSaga?> FindSingleAsync(System.Linq.Expressions.Expression<System.Func<TSaga, bool>> predicate, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface ISagaRepository<TSaga>
+        where TSaga :  class, BareWire.Abstractions.Saga.ISagaState
+    {
+        System.Threading.Tasks.Task DeleteAsync(System.Guid correlationId, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<TSaga?> FindAsync(System.Guid correlationId, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task SaveAsync(TSaga saga, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task UpdateAsync(TSaga saga, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface ISagaState
+    {
+        System.Guid CorrelationId { get; set; }
+        string CurrentState { get; set; }
+        int Version { get; set; }
+    }
+    public interface IScheduleConfigurator
+    {
+        System.TimeSpan Delay { get; set; }
+        BareWire.Abstractions.SchedulingStrategy Strategy { get; set; }
+    }
+    public sealed class ScheduleHandle<T>
+        where T :  class
+    {
+        public System.TimeSpan Delay { get; }
+        public BareWire.Abstractions.SchedulingStrategy Strategy { get; }
+    }
+    public sealed class StateHandle
+    {
+        public string Name { get; }
+    }
+}
+namespace BareWire.Abstractions.Serialization
+{
+    public interface IDeserializerResolver
+    {
+        BareWire.Abstractions.Serialization.IMessageDeserializer Resolve(string? contentType);
+    }
+    public interface IMessageDeserializer
+    {
+        string ContentType { get; }
+        T? Deserialize<T>(System.Buffers.ReadOnlySequence<byte> data)
+            where T :  class;
+    }
+    public interface IMessageSerializer
+    {
+        string ContentType { get; }
+        void Serialize<T>(T message, System.Buffers.IBufferWriter<byte> output)
+            where T :  class;
+    }
+}
+namespace BareWire.Abstractions.Topology
+{
+    public sealed class ExchangeDeclaration : System.IEquatable<BareWire.Abstractions.Topology.ExchangeDeclaration>
+    {
+        public ExchangeDeclaration(string Name, BareWire.Abstractions.ExchangeType Type, bool Durable = true, bool AutoDelete = false) { }
+        public bool AutoDelete { get; init; }
+        public bool Durable { get; init; }
+        public string Name { get; init; }
+        public BareWire.Abstractions.ExchangeType Type { get; init; }
+    }
+    public sealed class ExchangeExchangeBinding : System.IEquatable<BareWire.Abstractions.Topology.ExchangeExchangeBinding>
+    {
+        public ExchangeExchangeBinding(string SourceExchangeName, string DestinationExchangeName, string RoutingKey) { }
+        public string DestinationExchangeName { get; init; }
+        public string RoutingKey { get; init; }
+        public string SourceExchangeName { get; init; }
+    }
+    public sealed class ExchangeQueueBinding : System.IEquatable<BareWire.Abstractions.Topology.ExchangeQueueBinding>
+    {
+        public ExchangeQueueBinding(string ExchangeName, string QueueName, string RoutingKey) { }
+        public string ExchangeName { get; init; }
+        public string QueueName { get; init; }
+        public string RoutingKey { get; init; }
+    }
+    public interface ITopologyConfigurator
+    {
+        void BindExchangeToExchange(string source, string destination, string routingKey);
+        void BindExchangeToQueue(string exchange, string queue, string routingKey);
+        void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
+        void DeclareQueue(string name, bool durable = true, bool autoDelete = false);
+    }
+    public sealed class QueueDeclaration : System.IEquatable<BareWire.Abstractions.Topology.QueueDeclaration>
+    {
+        public QueueDeclaration(string Name, bool Durable = true, bool Exclusive = false, bool AutoDelete = false) { }
+        public bool AutoDelete { get; init; }
+        public bool Durable { get; init; }
+        public bool Exclusive { get; init; }
+        public string Name { get; init; }
+    }
+    public sealed class TopologyDeclaration : System.IEquatable<BareWire.Abstractions.Topology.TopologyDeclaration>
+    {
+        public TopologyDeclaration() { }
+        public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Topology.ExchangeExchangeBinding> ExchangeExchangeBindings { get; init; }
+        public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Topology.ExchangeQueueBinding> ExchangeQueueBindings { get; init; }
+        public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Topology.ExchangeDeclaration> Exchanges { get; init; }
+        public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Topology.QueueDeclaration> Queues { get; init; }
+    }
+}
+namespace BareWire.Abstractions.Transport
+{
+    public interface ITransportAdapter
+    {
+        BareWire.Abstractions.TransportCapabilities Capabilities { get; }
+        string TransportName { get; }
+        System.Collections.Generic.IAsyncEnumerable<BareWire.Abstractions.Transport.InboundMessage> ConsumeAsync(string endpointName, BareWire.Abstractions.FlowControlOptions flowControl, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task DeployTopologyAsync(BareWire.Abstractions.Topology.TopologyDeclaration topology, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Transport.SendResult>> SendBatchAsync(System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Transport.OutboundMessage> messages, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task SettleAsync(BareWire.Abstractions.SettlementAction action, BareWire.Abstractions.Transport.InboundMessage message, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public sealed class InboundMessage
+    {
+        public InboundMessage(string messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.Buffers.ReadOnlySequence<byte> body, ulong deliveryTag) { }
+        public System.Buffers.ReadOnlySequence<byte> Body { get; }
+        public ulong DeliveryTag { get; }
+        public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
+        public string MessageId { get; }
+    }
+    public sealed class OutboundMessage
+    {
+        public OutboundMessage(string routingKey, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.ReadOnlyMemory<byte> body, string contentType) { }
+        public System.ReadOnlyMemory<byte> Body { get; }
+        public string ContentType { get; }
+        public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
+        public string RoutingKey { get; }
+    }
+    public readonly struct SendResult : System.IEquatable<BareWire.Abstractions.Transport.SendResult>
+    {
+        public SendResult(bool IsConfirmed, ulong DeliveryTag) { }
+        public ulong DeliveryTag { get; init; }
+        public bool IsConfirmed { get; init; }
+    }
+}

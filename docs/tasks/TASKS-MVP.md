@@ -33,7 +33,8 @@
 | 5. Outbox / Inbox | 8 | 4 | 1 | 1 | 2 |
 | 6. Observability | 7 | 6 | 1 | 0 | 0 |
 | 7. Kontrakty + Benchmarki + Samples | 8 | 2 | 0 | 1 | 5 |
-| **Razem** | **77** | **39** | **13** | **4** | **21** |
+| 8. Samples — scenariusze użycia | 11 | 0 | 0 | 0 | 11 |
+| **Razem** | **88** | **39** | **13** | **4** | **32** |
 
 ---
 
@@ -404,43 +405,115 @@
 
 ### Contract Tests
 
-- [ ] **7.1. Zaimplementuj PublicApiTests z PublicApiGenerator** `[unit]`
+- [x] **7.1. Zaimplementuj PublicApiTests z PublicApiGenerator** `[unit]`
   Snapshot publicznego API: `BareWire.Abstractions`, `BareWire.Core` (publiczne extension methods). Porównanie z `.approved.txt`. Fail na breaking change (usunięcie/zmiana sygnatury publicznej metody). Test: generate → compare → fail on diff.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
-- [ ] **7.2. Zaimplementuj ArchitectureRuleTests z NetArchTest** `[unit]`
+- [x] **7.2. Zaimplementuj ArchitectureRuleTests z NetArchTest** `[unit]`
   Reguły: Transport !→ Core, Observability !→ Core, Abstractions !→ {Core, Transport, Observability, Saga, Outbox}, Serialization !→ {Core, Transport}, Saga → {Abstractions, Core} only. Test per reguła z `Types.InAssembly().ShouldNot().HaveDependencyOn()`.
   -> [CONSTITUTION.md](../architecture/CONSTITUTION.md), [testing-spec.md](../architecture/testing/testing-spec.md)
 
-- [ ] **7.3. Wygeneruj .approved.txt dla wszystkich publicznych pakietów** `[no-test]`
+- [x] **7.3. Wygeneruj .approved.txt dla wszystkich publicznych pakietów** `[no-test]`
   `BareWire.Abstractions.approved.txt`, `BareWire.Core.approved.txt` (extension methods). Baseline dla przyszłych breaking change checks. Commit do repo.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
 ### Benchmarki
 
-- [ ] **7.4. Dodaj pełny benchmark suite** `[no-test]`
+- [x] **7.4. Dodaj pełny benchmark suite** `[no-test]`
   `PublishBenchmarks`: typowany in-memory, raw in-memory, typowany RabbitMQ. `ConsumeBenchmarks`: consume + ack in-memory, consume + ack RabbitMQ. `SerializationBenchmarks`: serialize/deserialize 100 B — 100 KB. `SagaBenchmarks`: state transition in-memory. Wszystkie z `[MemoryDiagnoser]` i `[EventPipeProfiler]`.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
-- [ ] **7.5. Zwaliduj performance targets vs baseline** `[no-test]`
+- [x] **7.5. Zwaliduj performance targets vs baseline** `[no-test]`
   Publish typowany: > 500K msgs/s, < 128 B/msg. Publish raw: > 1M msgs/s, 0 B/msg. Consume + ack: > 300K msgs/s, < 256 B/msg. SAGA transition: > 100K msgs/s, < 512 B/msg. JSON serialize 1 KB: < 1 μs, < 128 B. JSON deserialize 1 KB: < 1 μs, < 256 B.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
 
 ### Samples i CI
 
-- [ ] **7.6. Utwórz BareWire.Samples.RabbitMQ** `[no-test]`
+- [x] **7.6. Utwórz BareWire.Samples.RabbitMQ** `[no-test]`
   Przykładowa aplikacja ASP.NET Core: POST /orders → publish OrderCreated. Consumer → process → publish OrderProcessed. SAGA: OrderSaga z tranzycjami. Outbox: transactional outbox z EF Core. Config: RabbitMQ + Aspire + health checks + OTel.
   -> [usage/getting-started.md](../architecture/usage/getting-started.md)
 
-- [ ] **7.7. Rozszerz CI pipeline o contract check i benchmark gate** `[no-test]`
+- [x] **7.7. Rozszerz CI pipeline o contract check i benchmark gate** `[no-test]`
   GitHub Actions: contract test failure → block merge. Benchmark regresja > 10% alokacji → warning (nie block w MVP). Artifact: benchmark results jako CI artifact.
   -> [implementation-plan.md](../architecture/implementation-plan.md)
 
 ### Scenariusze E2E
 
-- [ ] **7.8. Dodaj obowiązkowe scenariusze E2E z testing-spec.md** `[e2e]`
+- [x] **7.8. Dodaj obowiązkowe scenariusze E2E z testing-spec.md** `[e2e]`
   E2E-1: steady-state throughput 10 min (< 256 B/msg, 0 GC Gen2). E2E-2: spike 10x → backpressure → recovery < 30s. E2E-3: retry storm + outbox/inbox (50% failures) → exactly-once. E2E-4: SAGA concurrency (1000 events → 10 instancji, < 5% conflicts). E2E-5: large payloads > 256 KB.
   -> [testing-spec.md](../architecture/testing/testing-spec.md)
+
+---
+
+## Funkcjonalność 8: Samples — scenariusze użycia
+
+> Kompletne przykłady użycia BareWire w rzeczywistych scenariuszach.
+> Każdy sample to osobny projekt ASP.NET Core z Aspire AppHost, prawdziwym RabbitMQ i PostgreSQL.
+> Kryterium zakończenia: każdy sample kompiluje się, uruchamia przez Aspire i działa end-to-end.
+
+### Infrastruktura Aspire
+
+- [x] **8.1. Utwórz BareWire.Samples.AppHost (Aspire orchestrator)** `[no-test]`
+  Aspire AppHost orkiestrujący wszystkie sample'e. Resources: RabbitMQ (kontener Docker), PostgreSQL (kontener Docker). Referencje do każdego sample'a z automatycznym discovery connection stringów (`RabbitMQ` i `PostgreSQL`). Dashboard Aspire z widocznością traces/metrics/logs. Wspólny `docker-compose.yml` jako fallback bez Aspire.
+  -> [testing-spec.md](../architecture/testing/testing-spec.md)
+
+- [x] **8.2. Utwórz BareWire.Samples.ServiceDefaults (wspólna konfiguracja)** `[no-test]`
+  Shared project z domyślną konfiguracją dla wszystkich sample'ów: OpenTelemetry (traces + metrics + OTLP exporter do Aspire Dashboard), health checks (`/health`, `/health/live`, `/health/ready`), `AddServiceDefaults()` extension method. Referencje do `BareWire.Observability`.
+  -> [configuration.md](../architecture/api/configuration.md)
+
+### Scenariusz: Podstawowy Publish / Consume
+
+- [x] **8.3. Utwórz BareWire.Samples.BasicPublishConsume** `[no-test]`
+  Najprostszy możliwy scenariusz. API: `POST /messages` → publish `MessageSent` do RabbitMQ. Consumer: `MessageConsumer` odbiera `MessageSent`, loguje i zapisuje do tabeli `ReceivedMessages` w PostgreSQL. API: `GET /messages` → lista odebranych wiadomości z bazy. Ręczna topologia (exchange fanout + queue). Konfiguracja: Aspire discovery dla RabbitMQ i PostgreSQL. EF Core + Npgsql. README z instrukcją uruchomienia.
+  -> [usage/getting-started.md](../architecture/usage/getting-started.md)
+
+### Scenariusz: Request-Response
+
+- [x] **8.4. Utwórz BareWire.Samples.RequestResponse** `[no-test]`
+  Wzorzec request-response z `IRequestClient<T>`. API: `POST /validate-order` → wysyła `ValidateOrder` request przez `IRequestClient<ValidateOrder>` → czeka na `OrderValidationResult` response (timeout 10s). Consumer: `OrderValidationConsumer` na osobnej kolejce — waliduje zamówienie, odpowiada `RespondAsync<OrderValidationResult>`. PostgreSQL: zapis historii walidacji. Demonstracja: `RequestTimeoutException` gdy consumer jest wyłączony. README z diagramem sekwencji.
+  -> [public-api.md](../architecture/api/public-api.md)
+
+### Scenariusz: Raw Message Interop
+
+- [x] **8.5. Utwórz BareWire.Samples.RawMessageInterop** `[no-test]`
+  Konsumpcja wiadomości z zewnętrznego systemu (raw JSON, bez koperty BareWire). Symulacja: osobny `BackgroundService` publikuje raw JSON do RabbitMQ (bezpośrednio `RabbitMQ.Client`, bez BareWire). Consumer: `IRawConsumer` odbiera surowy payload, deserializuje przez `TryDeserialize<T>()`, mapuje na domenowy model. Drugi consumer: typowany `IConsumer<T>` z automatycznym Content-Type routing. Custom `IHeaderMappingConfigurator`: mapowanie nagłówków zewnętrznego systemu (`X-Correlation-Id` → `CorrelationId`, `X-Message-Type` → `MessageType`). PostgreSQL: zapis przetworzonych wiadomości. README opisujący scenariusz migracji z legacy systemu.
+  -> [TDD.md sekcja 6](../TDD.md), [ADR-001](../architecture/decisions/ADR-001-raw-first-serialization.md)
+
+### Scenariusz: SAGA State Machine
+
+- [x] **8.6. Utwórz BareWire.Samples.SagaOrderFlow** `[no-test]`
+  Kompletny przepływ zamówienia z SAGA. `OrderSagaStateMachine`: Initial → `OrderCreated` → Processing → `PaymentReceived` → Shipping → `ShipmentDispatched` → Completed. Alternatywna ścieżka: Processing → `PaymentFailed` → Compensating → `CompensationCompleted` → Failed. Timeout: `Schedule<PaymentTimeout>` po 30s → automatyczne anulowanie. `RoutingSlip`: 3 aktywności kompensowalne (ReserveStock → ChargePayment → CreateShipment) z rollback. API: `POST /orders`, `GET /orders/{id}/status` (query saga state z PostgreSQL). PostgreSQL: `EfCoreSagaRepository<OrderSagaState>` z optimistic concurrency (`xmin`). Aspire Dashboard: widoczne trace'y przejść stanów. README z diagramem stanów.
+  -> [TDD.md sekcja 11](../TDD.md)
+
+### Scenariusz: Transactional Outbox / Inbox
+
+- [x] **8.7. Utwórz BareWire.Samples.TransactionalOutbox** `[no-test]`
+  Exactly-once delivery z transactional outbox. API: `POST /transfers` → tworzy `Transfer` w PostgreSQL + `TransferInitiated` w outbox — jedna transakcja EF Core `SaveChangesAsync()`. `OutboxDispatcher`: polling co 1s, batch dispatch do RabbitMQ. Consumer: `TransferConsumer` z `InboxFilter` (deduplication po `MessageId`). Demonstracja: (1) Zabicie RabbitMQ w trakcie → wiadomości czekają w outbox → po restarcie dostarczane. (2) Duplikat `MessageId` → inbox odrzuca. API: `GET /transfers` — lista transferów z bazy, `GET /outbox/pending` — podgląd pending messages. PostgreSQL: `OutboxDbContext` + biznesowy `TransferDbContext` (shared connection). Retention cleanup co 60s. README z diagramem exactly-once flow.
+  -> [TDD.md sekcja 12](../TDD.md)
+
+### Scenariusz: Retry + Dead Letter Queue
+
+- [x] **8.8. Utwórz BareWire.Samples.RetryAndDlq** `[no-test]`
+  Obsługa błędów z retry i DLQ. Consumer: `PaymentProcessor` rzuca `PaymentDeclinedException` w 70% przypadków (symulacja). `RetryMiddleware`: 3 próby, exponential backoff (1s, 2s, 4s). `DeadLetterMiddleware`: po wyczerpaniu retry → wiadomość trafia na `payments-dlq`. Drugi consumer: `DlqConsumer` na kolejce `payments-dlq` — loguje i zapisuje do tabeli `FailedPayments` w PostgreSQL. API: `POST /payments` → publish `ProcessPayment`, `GET /payments/failed` → lista z DLQ. Topology: exchange `payments` → queue `payments` z DLX do `payments-dlq`. README z opisem strategii retry.
+  -> [error-handling.md](../architecture/api/error-handling.md)
+
+### Scenariusz: Backpressure i Flow Control
+
+- [x] **8.9. Utwórz BareWire.Samples.BackpressureDemo** `[no-test]`
+  Demonstracja mechanizmów flow control. API: `POST /load-test/start` → uruchamia `BackgroundService` publikujący 10K msg/s. Consumer: `SlowConsumer` z opóźnieniem 100ms per wiadomość (symulacja wolnego przetwarzania). `FlowControlOptions`: `MaxInFlightMessages = 50`, `MaxInFlightBytes = 1MB`. `PublishFlowControlOptions`: `MaxPendingPublishes = 500`. Health endpoint: `GET /health` → pokazuje `Degraded` przy > 90% capacity. API: `GET /metrics` → aktualne metryki (inflight count, publish queue depth, consumer lag). Demonstracja: consumer nie nadąża → backpressure → publisher zwalnia → system się stabilizuje. README z opisem credit-based flow control (ADR-004, ADR-006).
+  -> [ADR-004](../architecture/decisions/ADR-004-credit-based-flow-control.md), [ADR-006](../architecture/decisions/ADR-006-publish-backpressure.md)
+
+### Scenariusz: Observability Dashboard
+
+- [x] **8.10. Utwórz BareWire.Samples.ObservabilityShowcase** `[no-test]`
+  Showcase pełnego stosu observability. Aplikacja z wszystkimi komponentami: publish, consume, SAGA, outbox. OpenTelemetry: traces z propagacją `traceparent` (publish → consume → saga transition → outbox dispatch — pełny distributed trace). Metrics: `barewire.messages.published`, `barewire.messages.consumed`, `barewire.message.duration` histogramy. EventCounters: `inflight-messages`, `publish-rate`, `consume-rate`. Health checks: bus health + inflight load + outbox pending + saga stuck detection. API: `POST /demo/run` → uruchamia scenariusz generujący ruch na wszystkich komponentach. Aspire Dashboard: pełna widoczność traces, metrics, logs. PostgreSQL: SAGA state + outbox. README z instrukcją czytania traces w Aspire Dashboard.
+  -> [TDD.md sekcja 13](../TDD.md)
+
+### Scenariusz: Multi-Consumer i Partycjonowanie
+
+- [x] **8.11. Utwórz BareWire.Samples.MultiConsumerPartitioning** `[no-test]`
+  Wiele consumerów na jednym endpoint + partycjonowanie. Topology: exchange `events` (topic) → queue `event-processing` z 3 bindingami (routing keys: `order.*`, `payment.*`, `shipment.*`). 3 consumery: `OrderEventConsumer`, `PaymentEventConsumer`, `ShipmentEventConsumer` na jednej kolejce z Content-Type routing. `PartitionerMiddleware`: partycjonowanie po `CorrelationId` — wiadomości z tym samym `CorrelationId` przetwarzane sekwencyjnie. `ConcurrentMessageLimit = 16`, `partitionCount = 64`. API: `POST /events/generate` → generuje burst 1000 eventów z 10 unikalnymi `CorrelationId`. PostgreSQL: zapis kolejności przetwarzania (weryfikacja sekwencyjności per partition). `GET /events/processing-log` → log przetwarzania z timestampami. README z opisem partycjonowania i topic routing.
+  -> [internal-components.md](../architecture/architecture/internal-components.md)
 
 ---
 
@@ -463,6 +536,7 @@
 | 14. Bezpieczeństwo | Tak | Funkcjonalność 3 (TLS), 6 (health redaction) |
 | 15. Serializacja | Tak | Funkcjonalność 2, zadania 2.1-2.5 |
 | 16. Strategia testowania | Tak | Funkcjonalność 7, zadania 7.1-7.8 |
+| Samples (wszystkie sekcje) | Tak | Funkcjonalność 8, zadania 8.1-8.11 |
 
 ### ADR → Zadania
 
@@ -489,12 +563,13 @@
 | BareWire.Outbox.EntityFramework | Tak | Funkcjonalność 5 (5.5-5.7) |
 | BareWire.Observability | Tak | Funkcjonalność 6 |
 | BareWire.Testing | Tak | Funkcjonalność 1 (1.16-1.17) |
+| BareWire.Samples.* | Tak | Funkcjonalność 8 (8.1-8.11) |
 
 ### Pokrycie testowe
 
 | Typ testu | Liczba | % całości |
 |-----------|--------|-----------|
-| Unit | 36 | 47% |
-| Integration | 16 | 21% |
+| Unit | 39 | 44% |
+| Integration | 13 | 15% |
 | E2E | 4 | 5% |
-| No-test | 21 | 27% |
+| No-test | 32 | 36% |

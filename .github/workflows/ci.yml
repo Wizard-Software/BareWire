@@ -49,9 +49,24 @@ jobs:
       - name: Contract Tests
         run: dotnet test tests/BareWire.ContractTests/ --no-build -c Release --logger "trx;LogFileName=contract-tests.trx" --results-directory ./test-results
 
+      - name: Run benchmarks (in-memory)
+        run: >
+          dotnet run --project tests/BareWire.Benchmarks/ -c Release --
+          --filter '*'
+          --exporters json csv markdown
+          --artifacts ./benchmark-results
+        continue-on-error: true
+
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results
           path: ./test-results/*.trx
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: ./benchmark-results/

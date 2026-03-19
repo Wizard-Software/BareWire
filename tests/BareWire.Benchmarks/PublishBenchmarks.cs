@@ -19,7 +19,7 @@ namespace BareWire.Benchmarks;
 /// Add [EventPipeProfiler] after BenchmarkDotNet ships a fix.
 /// </remarks>
 [MemoryDiagnoser(displayGenColumns: true)]
-public sealed class PublishBenchmarks
+public class PublishBenchmarks
 {
     private BareWireTestHarness _harness = null!;
     private ReadOnlyMemory<byte> _rawPayload;

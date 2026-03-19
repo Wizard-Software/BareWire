@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.1.2" />
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.RabbitMQ" />
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire.Samples.BasicPublishConsume\BareWire.Samples.BasicPublishConsume.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.RequestResponse\BareWire.Samples.RequestResponse.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.RawMessageInterop\BareWire.Samples.RawMessageInterop.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.SagaOrderFlow\BareWire.Samples.SagaOrderFlow.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.TransactionalOutbox\BareWire.Samples.TransactionalOutbox.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.RetryAndDlq\BareWire.Samples.RetryAndDlq.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.BackpressureDemo\BareWire.Samples.BackpressureDemo.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.ObservabilityShowcase\BareWire.Samples.ObservabilityShowcase.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.MultiConsumerPartitioning\BareWire.Samples.MultiConsumerPartitioning.csproj" />
+  </ItemGroup>
+</Project>

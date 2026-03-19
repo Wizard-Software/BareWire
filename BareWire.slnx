@@ -1,6 +1,17 @@
 <Solution>
   <Folder Name="/samples/">
     <Project Path="samples/BareWire.Samples.RabbitMQ/BareWire.Samples.RabbitMQ.csproj" />
+    <Project Path="samples/BareWire.Samples.AppHost/BareWire.Samples.AppHost.csproj" />
+    <Project Path="samples/BareWire.Samples.ServiceDefaults/BareWire.Samples.ServiceDefaults.csproj" />
+    <Project Path="samples/BareWire.Samples.BasicPublishConsume/BareWire.Samples.BasicPublishConsume.csproj" />
+    <Project Path="samples/BareWire.Samples.RequestResponse/BareWire.Samples.RequestResponse.csproj" />
+    <Project Path="samples/BareWire.Samples.RawMessageInterop/BareWire.Samples.RawMessageInterop.csproj" />
+    <Project Path="samples/BareWire.Samples.SagaOrderFlow/BareWire.Samples.SagaOrderFlow.csproj" />
+    <Project Path="samples/BareWire.Samples.TransactionalOutbox/BareWire.Samples.TransactionalOutbox.csproj" />
+    <Project Path="samples/BareWire.Samples.RetryAndDlq/BareWire.Samples.RetryAndDlq.csproj" />
+    <Project Path="samples/BareWire.Samples.BackpressureDemo/BareWire.Samples.BackpressureDemo.csproj" />
+    <Project Path="samples/BareWire.Samples.ObservabilityShowcase/BareWire.Samples.ObservabilityShowcase.csproj" />
+    <Project Path="samples/BareWire.Samples.MultiConsumerPartitioning/BareWire.Samples.MultiConsumerPartitioning.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/BareWire.Abstractions/BareWire.Abstractions.csproj" />

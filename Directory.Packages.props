@@ -23,9 +23,12 @@
     <PackageVersion Include="OpenTelemetry.Exporter.InMemory" Version="1.15.0" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.0" />
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.0" />
+    <!-- PostgreSQL (EF Core) -->
+    <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
     <!-- Aspire -->
     <PackageVersion Include="Aspire.Hosting" Version="13.1.2" />
     <PackageVersion Include="Aspire.Hosting.RabbitMQ" Version="13.1.2" />
+    <PackageVersion Include="Aspire.Hosting.PostgreSQL" Version="13.1.2" />
     <PackageVersion Include="Aspire.Hosting.Testing" Version="13.1.2" />
     <!-- Contract testing -->
     <PackageVersion Include="PublicApiGenerator" Version="11.5.4" />

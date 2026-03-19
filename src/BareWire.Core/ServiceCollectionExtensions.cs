@@ -67,8 +67,10 @@ public static class ServiceCollectionExtensions
     {
         // Register each middleware type as a Singleton so that MiddlewareChain's factory
         // can resolve them by concrete type via GetRequiredService(type).
+        // TryAddSingleton is used so that callers who pre-register a factory overload
+        // (e.g. AddPartitionerMiddleware) are not overwritten by a plain type-only registration.
         foreach (Type middlewareType in configurator.MiddlewareTypes)
-            services.AddSingleton(middlewareType);
+            services.TryAddSingleton(middlewareType);
     }
 
     private static void RegisterCoreServices(IServiceCollection services, BusConfigurator configurator)

@@ -1,0 +1,11 @@
+namespace BareWire.Core
+{
+    public static class BusConfiguratorExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddPartitionerMiddleware(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, BareWire.Abstractions.Configuration.IBusConfigurator busConfigurator, int partitionCount, System.Func<BareWire.Abstractions.Pipeline.MessageContext, System.Guid>? keySelector = null) { }
+    }
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWire(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator> configure) { }
+    }
+}

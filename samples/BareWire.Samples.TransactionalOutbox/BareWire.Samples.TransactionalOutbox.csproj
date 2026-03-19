@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Core\BareWire.Core.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Observability\BareWire.Observability.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Outbox.EntityFramework\BareWire.Outbox.EntityFramework.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.ServiceDefaults\BareWire.Samples.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+  </ItemGroup>
+
+</Project>
