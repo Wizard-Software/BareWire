@@ -152,7 +152,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         {
             await transferDb.Database.ExecuteSqlRawAsync(statement).ConfigureAwait(false);
         }
-        catch (Npgsql.PostgresException)
+        catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
         {
             // Table/index already exists — safe to ignore in development.
         }
@@ -164,7 +164,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         var outboxCreator = outboxDb.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
         await outboxCreator.CreateTablesAsync().ConfigureAwait(false);
     }
-    catch (Npgsql.PostgresException)
+    catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
     {
         // Tables already exist from a previous run — safe to ignore in development.
     }

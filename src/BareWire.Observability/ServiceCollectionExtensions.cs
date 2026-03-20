@@ -98,7 +98,7 @@ public static class ServiceCollectionExtensions
         // Reports bus + endpoint status only — no connection strings or secrets (SEC-06).
         // Guard against duplicate registration when AddBareWireObservability is called more than once
         // (e.g. via AddServiceDefaults + direct call).
-        if (!services.Any(d => d.ServiceType == typeof(BareWireHealthCheck)))
+        if (!services.Any(d => d.ImplementationType == typeof(BareWireHealthCheck)))
         {
             services.AddHealthChecks()
                 .AddCheck<BareWireHealthCheck>("barewire", tags: ["barewire", "messaging"]);

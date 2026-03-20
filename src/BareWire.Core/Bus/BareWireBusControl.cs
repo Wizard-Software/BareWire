@@ -211,8 +211,9 @@ internal sealed partial class BareWireBusControl : IBusControl
     public Task<ISendEndpoint> GetSendEndpoint(Uri address, CancellationToken cancellationToken = default)
         => _bus.GetSendEndpoint(address, cancellationToken);
 
-    public IRequestClient<T> CreateRequestClient<T>() where T : class
-        => _bus.CreateRequestClient<T>();
+    public ValueTask<IRequestClient<T>> CreateRequestClientAsync<T>(
+        CancellationToken cancellationToken = default) where T : class
+        => _bus.CreateRequestClientAsync<T>(cancellationToken);
 
     public IDisposable ConnectReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure)
         => _bus.ConnectReceiveEndpoint(queueName, configure);

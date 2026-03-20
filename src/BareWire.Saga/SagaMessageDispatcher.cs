@@ -15,7 +15,7 @@ namespace BareWire.Saga;
 /// </summary>
 /// <typeparam name="TStateMachine">The state machine type (the class deriving from <see cref="BareWireStateMachine{TSaga}"/>).</typeparam>
 /// <typeparam name="TSaga">The saga state type managed by the state machine.</typeparam>
-internal sealed class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessageDispatcher
+internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessageDispatcher
     where TStateMachine : BareWireStateMachine<TSaga>
     where TSaga : class, ISagaState, new()
 {
@@ -40,6 +40,7 @@ internal sealed class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessage
     private readonly StateMachineDefinition<TSaga> _definition;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly ILogger<SagaMessageDispatcher<TStateMachine, TSaga>> _logger;
 
     /// <inheritdoc />
     public Type StateMachineType => typeof(TStateMachine);
@@ -58,6 +59,7 @@ internal sealed class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessage
         _definition = definition;
         _scopeFactory = scopeFactory;
         _loggerFactory = loggerFactory;
+        _logger = loggerFactory.CreateLogger<SagaMessageDispatcher<TStateMachine, TSaga>>();
 
         // Collect all event types the saga knows about.
         // The Correlations dictionary keyset is the authoritative source: only event types
@@ -95,6 +97,7 @@ internal sealed class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessage
                 return true;
         }
 
+        LogNoEventMatched(messageId, typeof(TStateMachine).Name);
         return false;
     }
 
@@ -137,4 +140,9 @@ internal sealed class SagaMessageDispatcher<TStateMachine, TSaga> : ISagaMessage
             return result;
         return null;
     }
+
+    [LoggerMessage(
+        Level = LogLevel.Debug,
+        Message = "No saga event delegate matched message {MessageId} for saga '{SagaType}'.")]
+    private partial void LogNoEventMatched(string messageId, string sagaType);
 }

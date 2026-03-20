@@ -5,13 +5,14 @@ namespace BareWire.Core.FlowControl;
 internal sealed class CreditManager : IDisposable
 {
     private readonly FlowControlOptions _options;
-    private readonly SemaphoreSlim _creditAvailable = new(0);
+    private readonly SemaphoreSlim _creditAvailable;
     private int _inflightCount;
     private long _inflightBytes;
 
     internal CreditManager(FlowControlOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _creditAvailable = new SemaphoreSlim(0, options.MaxInFlightMessages);
     }
 
     internal int InflightCount => Volatile.Read(ref _inflightCount);
@@ -86,7 +87,16 @@ internal sealed class CreditManager : IDisposable
         }
 
         // Signal waiting consumers that a credit slot is available.
-        _creditAvailable.Release();
+        // Guard against SemaphoreFullException: if the semaphore is already at max count,
+        // no waiters need waking — swallow the exception rather than crashing the caller.
+        try
+        {
+            _creditAvailable.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // Max permits reached — no waiters to wake.
+        }
     }
 
     public void Dispose() => _creditAvailable.Dispose();

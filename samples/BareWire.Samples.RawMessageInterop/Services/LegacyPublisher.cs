@@ -165,14 +165,30 @@ internal sealed partial class LegacyPublisher(
     {
         if (_channel is not null)
         {
-            await _channel.CloseAsync().ConfigureAwait(false);
+            try
+            {
+                await _channel.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Best-effort cleanup — ignore close failures.
+            }
+
             _channel.Dispose();
             _channel = null;
         }
 
         if (_connection is not null)
         {
-            await _connection.CloseAsync().ConfigureAwait(false);
+            try
+            {
+                await _connection.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Best-effort cleanup — ignore close failures.
+            }
+
             _connection.Dispose();
             _connection = null;
         }

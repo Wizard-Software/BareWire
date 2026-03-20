@@ -121,10 +121,35 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 contentType: entry.ContentType);
         }
 
-        await _adapter.SendBatchAsync(messages, ct).ConfigureAwait(false);
-        await store.MarkDeliveredAsync(ids, ct).ConfigureAwait(false);
+        IReadOnlyList<SendResult> results = await _adapter.SendBatchAsync(messages, ct).ConfigureAwait(false);
 
-        LogDispatched(_logger, pending.Count);
+        // Only mark entries as delivered if the broker confirmed them.
+        List<long> confirmedIds = new(pending.Count);
+        int nackedCount = 0;
+
+        for (int i = 0; i < results.Count; i++)
+        {
+            if (results[i].IsConfirmed)
+            {
+                confirmedIds.Add(ids[i]);
+            }
+            else
+            {
+                nackedCount++;
+            }
+        }
+
+        if (confirmedIds.Count > 0)
+        {
+            await store.MarkDeliveredAsync([.. confirmedIds], ct).ConfigureAwait(false);
+        }
+
+        if (nackedCount > 0)
+        {
+            LogPartialSendFailure(_logger, nackedCount, pending.Count);
+        }
+
+        LogDispatched(_logger, confirmedIds.Count);
     }
 
     [LoggerMessage(
@@ -159,4 +184,9 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         Level = LogLevel.Error,
         Message = "Error during outbox dispatch batch. Will retry on next tick.")]
     private static partial void LogDispatchError(ILogger logger, Exception ex);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker and will be retried.")]
+    private static partial void LogPartialSendFailure(ILogger logger, int nackedCount, int totalCount);
 }

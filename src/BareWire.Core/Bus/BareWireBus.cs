@@ -153,11 +153,18 @@ internal sealed partial class BareWireBus : IBus
 
     // ── IBus ─────────────────────────────────────────────────────────────────
 
-    public IRequestClient<T> CreateRequestClient<T>() where T : class
-        => _requestClientFactory?.CreateRequestClient<T>()
-           ?? throw new NotSupportedException(
-               "Request client requires a transport adapter that supports temporary response queues. " +
-               "Register a transport that implements IRequestClientFactory (e.g. AddBareWireRabbitMq).");
+    /// <inheritdoc/>
+    public async ValueTask<IRequestClient<T>> CreateRequestClientAsync<T>(
+        CancellationToken cancellationToken = default) where T : class
+    {
+        if (_requestClientFactory is null)
+            throw new NotSupportedException(
+                "Request client requires a transport adapter that supports temporary response queues. " +
+                "Register a transport that implements IRequestClientFactory (e.g. AddBareWireRabbitMq).");
+
+        return await _requestClientFactory.CreateRequestClientAsync<T>(cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     public IDisposable ConnectReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure)
         => throw new NotSupportedException("Dynamic receive endpoints are not yet supported.");
@@ -384,16 +391,24 @@ internal sealed partial class BareWireBus : IBus
 
                 // Extract correlation-id from query string if present.
                 string query = Address.Query;
-                if (query.StartsWith("?correlation-id=", StringComparison.OrdinalIgnoreCase))
+                if (!string.IsNullOrEmpty(query))
                 {
-                    string value = query["?correlation-id=".Length..];
+                    // Remove leading '?' for parsing, then split into individual key=value pairs.
+                    string queryContent = query.StartsWith('?') ? query[1..] : query;
+                    foreach (string part in queryContent.Split('&', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        int eqIdx = part.IndexOf('=');
+                        if (eqIdx < 0)
+                            continue;
 
-                    // Handle possible additional query params (take value up to next &).
-                    int ampIdx = value.IndexOf('&');
-                    if (ampIdx >= 0)
-                        value = value[..ampIdx];
+                        string key = part[..eqIdx];
+                        string value = Uri.UnescapeDataString(part[(eqIdx + 1)..]);
 
-                    headers["correlation-id"] = Uri.UnescapeDataString(value);
+                        if (key.Equals("correlation-id", StringComparison.OrdinalIgnoreCase))
+                        {
+                            headers["correlation-id"] = value;
+                        }
+                    }
                 }
             }
 

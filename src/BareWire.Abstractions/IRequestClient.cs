@@ -3,7 +3,7 @@ namespace BareWire.Abstractions;
 /// <summary>
 /// Provides request/response messaging for a specific request type <typeparamref name="TRequest"/>.
 /// Sends a request message and waits for a correlated response, applying a configurable timeout.
-/// Obtain instances via <see cref="IBus.CreateRequestClient{T}"/>.
+/// Obtain instances via <see cref="IBus.CreateRequestClientAsync{T}(CancellationToken)"/>.
 /// </summary>
 /// <typeparam name="TRequest">
 /// The request message type. Must be a reference type (typically a <c>record</c>).

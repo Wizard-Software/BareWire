@@ -70,7 +70,7 @@ namespace BareWire.Abstractions
         System.Uri Address { get; }
         System.Guid BusId { get; }
         System.IDisposable ConnectReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
-        BareWire.Abstractions.IRequestClient<T> CreateRequestClient<T>()
+        System.Threading.Tasks.ValueTask<BareWire.Abstractions.IRequestClient<T>> CreateRequestClientAsync<T>(System.Threading.CancellationToken cancellationToken = default)
             where T :  class;
     }
     public interface IBusControl : BareWire.Abstractions.IBus, BareWire.Abstractions.IPublishEndpoint, BareWire.Abstractions.ISendEndpointProvider, System.IAsyncDisposable, System.IDisposable
@@ -97,7 +97,7 @@ namespace BareWire.Abstractions
     }
     public interface IRequestClientFactory
     {
-        BareWire.Abstractions.IRequestClient<T> CreateRequestClient<T>()
+        System.Threading.Tasks.ValueTask<BareWire.Abstractions.IRequestClient<T>> CreateRequestClientAsync<T>(System.Threading.CancellationToken cancellationToken = default)
             where T :  class;
     }
     public interface IRequestClient<TRequest>
@@ -530,11 +530,12 @@ namespace BareWire.Abstractions.Transport
     }
     public sealed class InboundMessage
     {
-        public InboundMessage(string messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.Buffers.ReadOnlySequence<byte> body, ulong deliveryTag) { }
+        public InboundMessage(string messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.Buffers.ReadOnlySequence<byte> body, ulong deliveryTag, byte[]? pooledBuffer = null) { }
         public System.Buffers.ReadOnlySequence<byte> Body { get; }
         public ulong DeliveryTag { get; }
         public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
         public string MessageId { get; }
+        public byte[]? PooledBuffer { get; }
     }
     public sealed class OutboundMessage
     {

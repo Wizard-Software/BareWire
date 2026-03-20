@@ -210,6 +210,12 @@ internal sealed class RabbitMqHeaderMapper
                 continue;
             }
 
+            if (bwKey.Equals("ReplyTo", StringComparison.Ordinal))
+            {
+                props.ReplyTo = value;
+                continue;
+            }
+
             // Check explicit custom mappings (BareWire → transport header name).
             // This must happen BEFORE the BW- skip guard so that user-defined BW-* headers
             // with an explicit mapping are still forwarded under their transport name.

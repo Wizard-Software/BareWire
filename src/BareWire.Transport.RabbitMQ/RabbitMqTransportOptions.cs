@@ -38,6 +38,13 @@ internal sealed class RabbitMqTransportOptions
     /// </summary>
     public SslOption? SslOptions { get; set; }
 
+    /// <summary>
+    /// Maximum time to wait when establishing a connection to the RabbitMQ broker.
+    /// Applied as a timeout on <see cref="System.Threading.SemaphoreSlim.WaitAsync(TimeSpan)"/>
+    /// in the request-client factory. Defaults to 30 seconds.
+    /// </summary>
+    public TimeSpan ConnectionTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     public bool DeferEnabled { get; set; }
 
     public int DeferDelayMs { get; set; } = 30_000;

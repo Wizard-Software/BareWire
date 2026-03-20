@@ -23,14 +23,21 @@ public interface IBus : IPublishEndpoint, ISendEndpointProvider, IDisposable, IA
     Uri Address { get; }
 
     /// <summary>
-    /// Creates a request client bound to <typeparamref name="T"/> for synchronous request/response messaging.
+    /// Creates a request client bound to <typeparamref name="T"/> for asynchronous request/response messaging.
     /// The returned client uses the bus's default timeout configuration.
     /// </summary>
     /// <typeparam name="T">
     /// The request message type. Must be a reference type (typically a <c>record</c>).
     /// </typeparam>
-    /// <returns>A new <see cref="IRequestClient{T}"/> scoped to this bus instance.</returns>
-    IRequestClient<T> CreateRequestClient<T>() where T : class;
+    /// <param name="cancellationToken">
+    /// A token to cancel connection establishment or response-queue declaration.
+    /// </param>
+    /// <returns>
+    /// A <see cref="ValueTask{TResult}"/> that resolves to a new <see cref="IRequestClient{T}"/>
+    /// scoped to this bus instance.
+    /// </returns>
+    ValueTask<IRequestClient<T>> CreateRequestClientAsync<T>(
+        CancellationToken cancellationToken = default) where T : class;
 
     /// <summary>
     /// Dynamically connects a receive endpoint to the bus at runtime without restarting.

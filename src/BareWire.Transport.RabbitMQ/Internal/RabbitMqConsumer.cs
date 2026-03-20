@@ -47,10 +47,19 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     {
         // CRITICAL: RabbitMQ.Client frees the body memory after this handler returns.
         // We MUST copy the bytes before writing to the channel so consumers receive stable data.
-        byte[] bodyCopy = body.ToArray();
-        ReadOnlySequence<byte> bodySequence = bodyCopy.Length == 0
-            ? ReadOnlySequence<byte>.Empty
-            : new ReadOnlySequence<byte>(bodyCopy);
+        // Rent from ArrayPool to avoid per-message heap allocation (ADR-003 zero-copy).
+        byte[]? pooledBuffer = null;
+        ReadOnlySequence<byte> bodySequence;
+        if (body.Length == 0)
+        {
+            bodySequence = ReadOnlySequence<byte>.Empty;
+        }
+        else
+        {
+            pooledBuffer = ArrayPool<byte>.Shared.Rent(body.Length);
+            body.Span.CopyTo(pooledBuffer);
+            bodySequence = new ReadOnlySequence<byte>(pooledBuffer, 0, body.Length);
+        }
 
         Dictionary<string, string> headers = _headerMapper.MapInbound(properties);
 
@@ -69,12 +78,19 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
             messageId: messageId,
             headers: headers,
             body: bodySequence,
-            deliveryTag: deliveryTag);
+            deliveryTag: deliveryTag,
+            pooledBuffer: pooledBuffer);
 
         // TryWrite returns false when the writer is completed (e.g. the consumer loop has ended).
         // In that case, nack-requeue the message so the broker can redeliver it to another consumer.
+        // The pooled buffer must also be returned here since ReceiveEndpointRunner will never see this message.
         if (!_inboundChannel.Writer.TryWrite(message))
         {
+            if (pooledBuffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(pooledBuffer);
+            }
+
             await Channel.BasicNackAsync(deliveryTag, multiple: false, requeue: true, cancellationToken)
                 .ConfigureAwait(false);
         }

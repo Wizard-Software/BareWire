@@ -146,7 +146,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         var creator = sagaDb.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
         await creator.CreateTablesAsync().ConfigureAwait(false);
     }
-    catch (Npgsql.PostgresException)
+    catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
     {
         // Tables already exist from a previous run — safe to ignore in development.
     }

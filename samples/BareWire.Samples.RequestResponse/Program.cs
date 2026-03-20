@@ -126,7 +126,7 @@ using (IServiceScope scope = app.Services.CreateScope())
         var creator = db.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
         await creator.CreateTablesAsync().ConfigureAwait(false);
     }
-    catch (Npgsql.PostgresException)
+    catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
     {
         // Tables already exist from a previous run — safe to ignore in development.
     }
@@ -144,7 +144,7 @@ app.MapPost("/validate-order", async (
     IBus bus,
     CancellationToken cancellationToken) =>
 {
-    IRequestClient<ValidateOrder> client = bus.CreateRequestClient<ValidateOrder>();
+    IRequestClient<ValidateOrder> client = await bus.CreateRequestClientAsync<ValidateOrder>(cancellationToken);
 
     Response<OrderValidationResult> response = await client
         .GetResponseAsync<OrderValidationResult>(

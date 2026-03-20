@@ -1,3 +1,7 @@
+// NSubstitute's Returns() for ValueTask-returning mocks triggers CA2012 as a false positive.
+// See: https://github.com/nsubstitute/NSubstitute/issues/597
+#pragma warning disable CA2012
+
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Serialization;
@@ -52,37 +56,38 @@ public sealed class BareWireBusCreateRequestClientTests
             factory);
     }
 
-    // ── CreateRequestClient ───────────────────────────────────────────────────
+    // ── CreateRequestClientAsync ──────────────────────────────────────────────
 
     [Fact]
-    public void CreateRequestClient_WhenFactoryRegistered_DelegatesToFactory()
+    public async Task CreateRequestClientAsync_WhenFactoryRegistered_DelegatesToFactory()
     {
         // Arrange
         IRequestClient<PingRequest> expectedClient = Substitute.For<IRequestClient<PingRequest>>();
         IRequestClientFactory factory = Substitute.For<IRequestClientFactory>();
-        factory.CreateRequestClient<PingRequest>().Returns(expectedClient);
+        factory.CreateRequestClientAsync<PingRequest>(Arg.Any<CancellationToken>())
+               .Returns(_ => new ValueTask<IRequestClient<PingRequest>>(expectedClient));
 
         BareWireBus bus = CreateBus(factory);
 
         // Act
-        IRequestClient<PingRequest> result = bus.CreateRequestClient<PingRequest>();
+        IRequestClient<PingRequest> result = await bus.CreateRequestClientAsync<PingRequest>();
 
         // Assert
         result.Should().BeSameAs(expectedClient);
-        factory.Received(1).CreateRequestClient<PingRequest>();
+        await factory.Received(1).CreateRequestClientAsync<PingRequest>(Arg.Any<CancellationToken>());
     }
 
     [Fact]
-    public void CreateRequestClient_WhenNoFactoryRegistered_ThrowsNotSupportedException()
+    public async Task CreateRequestClientAsync_WhenNoFactoryRegistered_ThrowsNotSupportedException()
     {
         // Arrange — no factory, null is passed
         BareWireBus bus = CreateBus(factory: null);
 
         // Act
-        Action act = () => bus.CreateRequestClient<PingRequest>();
+        Func<Task> act = async () => await bus.CreateRequestClientAsync<PingRequest>();
 
         // Assert
-        act.Should().Throw<NotSupportedException>()
-           .WithMessage("*IRequestClientFactory*");
+        await act.Should().ThrowAsync<NotSupportedException>()
+                 .WithMessage("*IRequestClientFactory*");
     }
 }

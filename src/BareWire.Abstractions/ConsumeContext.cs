@@ -161,7 +161,15 @@ public abstract class ConsumeContext : IPublishEndpoint, ISendEndpointProvider
             return;
         }
 
-        // Fallback: publish to all subscribers (backwards compatible when no ReplyTo is present).
+        // Fallback: publish to all subscribers when no ReplyTo header is present.
+        // WARNING: this means the response is broadcast to all subscribers rather than returned to
+        // the original caller. In a request-response scenario this almost certainly indicates a
+        // misconfigured consumer or a message that was not sent via IRequestClient<T>.
+        // No logger is available here (BareWire.Abstractions has no infrastructure dependencies),
+        // so a Trace warning is emitted to make the condition visible during debugging.
+        System.Diagnostics.Trace.TraceWarning(
+            $"[BareWire] RespondAsync called without a ReplyTo header on message {MessageId}. " +
+            "Falling back to PublishAsync — response will be broadcast to all subscribers.");
         await PublishAsync(response, cancellationToken).ConfigureAwait(false);
     }
 }

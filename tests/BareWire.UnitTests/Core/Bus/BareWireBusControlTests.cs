@@ -202,12 +202,12 @@ public sealed class BareWireBusControlTests
     }
 
     [Fact]
-    public void CreateRequestClient_ThrowsNotSupportedException()
+    public async Task CreateRequestClientAsync_ThrowsNotSupportedException()
     {
         var (control, _, _, _) = CreateControl();
 
-        Action act = () => control.CreateRequestClient<BusTestMessage>();
+        Func<Task> act = async () => await control.CreateRequestClientAsync<BusTestMessage>();
 
-        act.Should().Throw<NotSupportedException>();
+        await act.Should().ThrowAsync<NotSupportedException>();
     }
 }

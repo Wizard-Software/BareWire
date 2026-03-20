@@ -91,7 +91,10 @@ public sealed class OutboxDispatcherTests
             .Returns(ci =>
             {
                 capturedMessages = ci.Arg<IReadOnlyList<OutboundMessage>>();
-                return Task.FromResult<IReadOnlyList<SendResult>>(Array.Empty<SendResult>());
+                // Return confirmed results for each message so MarkDeliveredAsync is called.
+                var results = capturedMessages.Select((_, i) =>
+                    new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i)).ToArray();
+                return Task.FromResult<IReadOnlyList<SendResult>>(results);
             });
 
         _store
@@ -189,6 +192,16 @@ public sealed class OutboxDispatcherTests
                 }
 
                 return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                var msgs = ci.Arg<IReadOnlyList<OutboundMessage>>();
+                var results = msgs.Select((_, i) =>
+                    new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i)).ToArray();
+                return Task.FromResult<IReadOnlyList<SendResult>>(results);
             });
 
         IReadOnlyList<long>? markedIds = null;

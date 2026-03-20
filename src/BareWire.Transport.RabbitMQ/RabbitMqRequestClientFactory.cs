@@ -24,7 +24,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
 
     private IConnection? _connection;
-    private bool _disposed;
+    private int _disposed;
 
     internal RabbitMqRequestClientFactory(
         RabbitMqTransportOptions options,
@@ -45,14 +45,12 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     }
 
     /// <inheritdoc/>
-    public IRequestClient<T> CreateRequestClient<T>() where T : class
+    public async ValueTask<IRequestClient<T>> CreateRequestClientAsync<T>(
+        CancellationToken cancellationToken = default) where T : class
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        // Synchronously ensure the connection is open. The first call may block briefly
-        // while the AMQP connection is established; subsequent calls return immediately
-        // because the lock check is optimistic.
-        EnsureConnectedSync();
+        await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
 
         string routingKey = typeof(T).FullName ?? typeof(T).Name;
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
@@ -66,10 +64,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             routingKey: routingKey,
             timeout: DefaultRequestTimeout);
 
-        // InitializeAsync declares the exclusive auto-delete response queue and starts the
-        // consumer. We block here because IRequestClientFactory.CreateRequestClient is
-        // synchronous; the blocking is bounded (single network round-trip to the broker).
-        client.InitializeAsync(CancellationToken.None).GetAwaiter().GetResult();
+        await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
 
         LogRequestClientCreated(typeof(T).Name, routingKey);
         return client;
@@ -78,26 +73,30 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
-        {
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return;
-        }
 
-        _disposed = true;
-
-        if (_connection is not null)
+        await _connectionLock.WaitAsync().ConfigureAwait(false);
+        try
         {
-            try
+            if (_connection is not null)
             {
-                await _connection.CloseAsync().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                LogConnectionCloseError(ex);
-            }
+                try
+                {
+                    await _connection.CloseAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    LogConnectionCloseError(ex);
+                }
 
-            await _connection.DisposeAsync().ConfigureAwait(false);
-            _connection = null;
+                await _connection.DisposeAsync().ConfigureAwait(false);
+                _connection = null;
+            }
+        }
+        finally
+        {
+            _connectionLock.Release();
         }
 
         _connectionLock.Dispose();
@@ -105,24 +104,32 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
 
     // ── Connection management ─────────────────────────────────────────────────
 
-    private void EnsureConnectedSync()
+    private async ValueTask EnsureConnectedAsync(CancellationToken cancellationToken)
     {
-        if (_connection is not null && _connection.IsOpen)
-        {
+        // Fast path — volatile read avoids entering the lock when already connected.
+        IConnection? conn = Volatile.Read(ref _connection);
+        if (conn is not null && conn.IsOpen)
             return;
-        }
 
-        _connectionLock.Wait();
+        bool acquired = await _connectionLock.WaitAsync(_options.ConnectionTimeout, cancellationToken)
+            .ConfigureAwait(false);
+        if (!acquired)
+            throw new TimeoutException(
+                $"Timed out after {_options.ConnectionTimeout} waiting to acquire connection lock.");
+
         try
         {
-            // Double-check inside the lock.
-            if (_connection is not null && _connection.IsOpen)
-            {
+            // Double-check inside the lock to avoid duplicate connections from concurrent callers.
+            conn = Volatile.Read(ref _connection);
+            if (conn is not null && conn.IsOpen)
                 return;
-            }
 
-            _connection = CreateConnectionAsync(CancellationToken.None).GetAwaiter().GetResult();
-            LogConnectionEstablished(_connection.Endpoint.HostName, _connection.Endpoint.Port);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            Volatile.Write(ref _connection,
+                await CreateConnectionAsync(cancellationToken).ConfigureAwait(false));
+
+            LogConnectionEstablished(_connection!.Endpoint.HostName, _connection.Endpoint.Port);
         }
         finally
         {

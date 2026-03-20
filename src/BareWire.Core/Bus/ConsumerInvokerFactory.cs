@@ -43,10 +43,14 @@ internal static class ConsumerInvokerFactory
         CancellationToken cancellationToken);
 
     private static readonly MethodInfo CreateTypedMethod =
-        typeof(ConsumerInvokerFactory).GetMethod(nameof(CreateTyped), BindingFlags.NonPublic | BindingFlags.Static)!;
+        typeof(ConsumerInvokerFactory).GetMethod(nameof(CreateTyped), BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException(
+            $"Method '{nameof(CreateTyped)}' not found on {nameof(ConsumerInvokerFactory)}.");
 
     private static readonly MethodInfo CreateRawTypedMethod =
-        typeof(ConsumerInvokerFactory).GetMethod(nameof(CreateRawTyped), BindingFlags.NonPublic | BindingFlags.Static)!;
+        typeof(ConsumerInvokerFactory).GetMethod(nameof(CreateRawTyped), BindingFlags.NonPublic | BindingFlags.Static)
+        ?? throw new InvalidOperationException(
+            $"Method '{nameof(CreateRawTyped)}' not found on {nameof(ConsumerInvokerFactory)}.");
 
     internal static InvokerDelegate Create(Type consumerType, Type messageType)
     {

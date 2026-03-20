@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
@@ -93,74 +94,108 @@ internal sealed partial class ReceiveEndpointRunner
             _binding.EndpointName,
             _binding.Consumers.Count + _binding.RawConsumers.Count + _sagaDispatchers.Length);
 
-        await foreach (InboundMessage message in _adapter
-            .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken)
-            .ConfigureAwait(false))
+        try
         {
-            // Wait for credit (ADR-004: credit-based flow control).
-            while (creditManager.TryGrantCredits(1) == 0)
+            await foreach (InboundMessage message in _adapter
+                .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken)
+                .ConfigureAwait(false))
             {
-                await creditManager.WaitForCreditAsync(cancellationToken).ConfigureAwait(false);
-            }
+                // Wait for credit (ADR-004: credit-based flow control).
+                while (creditManager.TryGrantCredits(1) == 0)
+                {
+                    await creditManager.WaitForCreditAsync(cancellationToken).ConfigureAwait(false);
+                }
 
-            long bodyLength = message.Body.Length;
-            creditManager.TrackInflightBytes(bodyLength);
-
-            try
-            {
-                SettlementAction action = SettlementAction.Nack;
-                string messageType = "unknown";
-                long startTimestamp = Stopwatch.GetTimestamp();
-
-                // Start a consume activity for distributed tracing.
-                Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
-                Activity? activity = _instrumentation.StartConsumeActivity(
-                    messageType, _binding.EndpointName, msgId, message.Headers);
+                long bodyLength = message.Body.Length;
+                creditManager.TrackInflightBytes(bodyLength);
 
                 try
                 {
-                    bool dispatched = false;
+                    SettlementAction action = SettlementAction.Nack;
+                    string messageType = "unknown";
+                    long startTimestamp = Stopwatch.GetTimestamp();
 
-                    // Try typed consumers first — first match wins.
-                    foreach (ConsumerInvokerFactory.InvokerDelegate invoker in _invokers)
-                    {
-                        try
-                        {
-                            await invoker(
-                                _scopeFactory,
-                                message.Body,
-                                message.Headers,
-                                message.MessageId,
-                                _publishEndpoint,
-                                _sendEndpointProvider,
-                                _deserializer,
-                                _binding.EndpointName,
-                                cancellationToken).ConfigureAwait(false);
-                            dispatched = true;
-                            break; // First matching consumer wins.
-                        }
-                        catch (Abstractions.Exceptions.UnknownPayloadException)
-                        {
-                            // This invoker's message type doesn't match — try the next one.
-                            continue;
-                        }
-                        catch (Abstractions.Exceptions.BareWireSerializationException ex)
-                        {
-                            // Deserialization failed for this invoker — log and try the next one.
-                            LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
-                            continue;
-                        }
-                    }
+                    // Start a consume activity for distributed tracing.
+                    Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
+                    Activity? activity = _instrumentation.StartConsumeActivity(
+                        messageType, _binding.EndpointName, msgId, message.Headers);
 
-                    // If no typed consumer matched, try saga dispatchers.
-                    // Each dispatcher tries to deserialize the body as one of its registered event types.
-                    if (!dispatched && _sagaDispatchers.Length > 0)
+                    try
                     {
-                        foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
+                        bool dispatched = false;
+
+                        // Try typed consumers first — first match wins.
+                        for (int i = 0; i < _invokers.Length; i++)
                         {
+                            ConsumerInvokerFactory.InvokerDelegate invoker = _invokers[i];
                             try
                             {
-                                bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
+                                await invoker(
+                                    _scopeFactory,
+                                    message.Body,
+                                    message.Headers,
+                                    message.MessageId,
+                                    _publishEndpoint,
+                                    _sendEndpointProvider,
+                                    _deserializer,
+                                    _binding.EndpointName,
+                                    cancellationToken).ConfigureAwait(false);
+                                messageType = _binding.Consumers[i].MessageType.Name;
+                                dispatched = true;
+                                break; // First matching consumer wins.
+                            }
+                            catch (Abstractions.Exceptions.UnknownPayloadException)
+                            {
+                                // This invoker's message type doesn't match — try the next one.
+                                continue;
+                            }
+                            catch (Abstractions.Exceptions.BareWireSerializationException ex)
+                            {
+                                // Deserialization failed for this invoker — log and try the next one.
+                                LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
+                                continue;
+                            }
+                        }
+
+                        // If no typed consumer matched, try saga dispatchers.
+                        // Each dispatcher tries to deserialize the body as one of its registered event types.
+                        if (!dispatched && _sagaDispatchers.Length > 0)
+                        {
+                            foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
+                            {
+                                try
+                                {
+                                    bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
+                                        message.Body,
+                                        message.Headers,
+                                        message.MessageId,
+                                        _publishEndpoint,
+                                        _sendEndpointProvider,
+                                        _deserializer,
+                                        cancellationToken).ConfigureAwait(false);
+
+                                    if (sagaHandled)
+                                    {
+                                        messageType = sagaDispatcher.StateMachineType.Name;
+                                        dispatched = true;
+                                        break;
+                                    }
+                                }
+                                catch (Abstractions.Exceptions.BareWireSerializationException ex)
+                                {
+                                    LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
+                                }
+                            }
+                        }
+
+                        // If no typed consumer or saga matched, fall through to raw consumers.
+                        // Raw consumers accept any payload — all registered raw consumers are invoked.
+                        if (!dispatched && _rawInvokers.Length > 0)
+                        {
+                            foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
+                            {
+                                await rawInvoker(
+                                    _scopeFactory,
                                     message.Body,
                                     message.Headers,
                                     message.MessageId,
@@ -168,90 +203,86 @@ internal sealed partial class ReceiveEndpointRunner
                                     _sendEndpointProvider,
                                     _deserializer,
                                     cancellationToken).ConfigureAwait(false);
+                            }
 
-                                if (sagaHandled)
-                                {
-                                    dispatched = true;
-                                    break;
-                                }
-                            }
-                            catch (Abstractions.Exceptions.BareWireSerializationException ex)
-                            {
-                                LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
-                            }
+                            messageType = "raw";
+                            dispatched = true;
                         }
-                    }
 
-                    // If no typed consumer or saga matched, fall through to raw consumers.
-                    // Raw consumers accept any payload — all registered raw consumers are invoked.
-                    if (!dispatched && _rawInvokers.Length > 0)
-                    {
-                        foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
+                        if (!dispatched)
                         {
-                            await rawInvoker(
-                                _scopeFactory,
-                                message.Body,
-                                message.Headers,
-                                message.MessageId,
-                                _publishEndpoint,
-                                _sendEndpointProvider,
-                                _deserializer,
-                                cancellationToken).ConfigureAwait(false);
+                            LogNoConsumerMatched(_binding.EndpointName, message.MessageId);
                         }
-                        dispatched = true;
-                    }
 
-                    if (!dispatched)
+                        action = dispatched ? SettlementAction.Ack : SettlementAction.Reject;
+
+                        // Update activity tag now that messageType is resolved.
+                        activity?.SetTag("messaging.message.type", messageType);
+
+                        // Record successful consume metrics.
+                        if (dispatched)
+                        {
+                            double durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+                            _instrumentation.RecordConsume(
+                                _binding.EndpointName, messageType, durationMs, (int)bodyLength);
+                        }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                     {
-                        LogNoConsumerMatched(_binding.EndpointName, message.MessageId);
+                        action = SettlementAction.Requeue;
                     }
-
-                    action = dispatched ? SettlementAction.Ack : SettlementAction.Reject;
-
-                    // Record successful consume metrics.
-                    if (dispatched)
+                    catch (Exception ex)
                     {
-                        double durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
-                        _instrumentation.RecordConsume(
-                            _binding.EndpointName, messageType, durationMs, (int)bodyLength);
+                        LogConsumerError(_binding.EndpointName, message.MessageId, ex);
+                        _instrumentation.RecordFailure(
+                            _binding.EndpointName, messageType, ex.GetType().Name);
+                        activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                        action = SettlementAction.Nack;
                     }
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    action = SettlementAction.Requeue;
-                }
-                catch (Exception ex)
-                {
-                    LogConsumerError(_binding.EndpointName, message.MessageId, ex);
-                    _instrumentation.RecordFailure(
-                        _binding.EndpointName, messageType, ex.GetType().Name);
-                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-                    action = SettlementAction.Nack;
+                    finally
+                    {
+                        activity?.Dispose();
+                    }
+
+                    try
+                    {
+                        // Use CancellationToken.None for requeue during cancellation — the requeue
+                        // itself must not be cancelled, otherwise the message is silently lost.
+                        CancellationToken settleCt = action == SettlementAction.Requeue
+                            ? CancellationToken.None
+                            : cancellationToken;
+                        await _adapter.SettleAsync(action, message, settleCt).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
+                    }
                 }
                 finally
                 {
-                    activity?.Dispose();
-                }
+                    creditManager.ReleaseInflight(1, bodyLength);
 
-                try
-                {
-                    await _adapter.SettleAsync(action, message, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
+                    if (message.PooledBuffer is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(message.PooledBuffer);
+                    }
+
+                    BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
+                    if (healthStatus == BusStatus.Degraded)
+                    {
+                        LogFlowControlDegraded(_binding.EndpointName);
+                    }
                 }
             }
-            finally
-            {
-                creditManager.ReleaseInflight(1, bodyLength);
-
-                BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
-                if (healthStatus == BusStatus.Degraded)
-                {
-                    LogFlowControlDegraded(_binding.EndpointName);
-                }
-            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            LogConsumeLoopCancelled(_binding.EndpointName);
+        }
+        catch (Exception ex)
+        {
+            LogConsumeLoopFaulted(_binding.EndpointName, ex);
+            throw;
         }
     }
 
@@ -278,4 +309,12 @@ internal sealed partial class ReceiveEndpointRunner
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "No consumer matched message {MessageId} on endpoint '{EndpointName}' — message will be rejected.")]
     private partial void LogNoConsumerMatched(string endpointName, string messageId);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Consume loop cancelled for endpoint '{EndpointName}'.")]
+    private partial void LogConsumeLoopCancelled(string endpointName);
+
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Consume loop faulted for endpoint '{EndpointName}'. The endpoint has stopped consuming.")]
+    private partial void LogConsumeLoopFaulted(string endpointName, Exception ex);
 }

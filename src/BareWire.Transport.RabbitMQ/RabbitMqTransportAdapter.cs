@@ -246,6 +246,8 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IAsy
             {
                 LogConsumeChannelCloseError(endpointName, ex);
             }
+
+            _activeConsumerChannels.TryRemove(consumerChannelId, out _);
         }
     }
 

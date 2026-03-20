@@ -37,7 +37,7 @@ public static class ServiceCollectionExtensions
         configure(configurator);
         var options = configurator.Build();
 
-        services.AddSingleton(options);
+        services.TryAddSingleton(options);
 
         // Register the header mapper so both the transport adapter and request client share it.
         // When ConfigureHeaderMapping was called, the configurator flows through options.

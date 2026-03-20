@@ -156,10 +156,10 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
         // The runner is blocked — its inflight count should still be 1 (the pre-filled slot).
         creditManager.InflightCount.Should().Be(1);
 
-        // Cleanup: cancel so the runner exits (OperationCanceledException is expected here).
+        // Cleanup: cancel so the runner exits. After fix #1, cancellation is caught and
+        // RunAsync returns normally instead of throwing.
         await cts.CancelAsync();
-        Func<Task> waitForRun = () => runTask;
-        await waitForRun.Should().ThrowAsync<OperationCanceledException>();
+        await runTask;
     }
 
     [Fact]
@@ -191,9 +191,9 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
             Arg.Is<InboundMessage>(m => m.MessageId == "msg-1"),
             Arg.Any<CancellationToken>());
 
+        // Cancellation is caught by RunAsync — returns normally.
         await cts.CancelAsync();
-        Func<Task> waitForRun = () => runTask;
-        await waitForRun.Should().ThrowAsync<OperationCanceledException>();
+        await runTask;
     }
 
     [Fact]
@@ -279,12 +279,11 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
         // Allow the runner to reach WaitForCreditAsync.
         await Task.Delay(100, CancellationToken.None);
 
-        // Cancel the token — WaitForCreditAsync uses SemaphoreSlim.WaitAsync(cancellationToken)
-        // which will throw OperationCanceledException, propagating out of RunAsync.
+        // Cancel the token — WaitForCreditAsync throws OperationCanceledException,
+        // which is caught by RunAsync's outer try-catch (fix #1). RunAsync returns normally.
         await cts.CancelAsync();
 
-        // Assert — OperationCanceledException propagates out of RunAsync.
-        Func<Task> waitForRun = () => runTask;
-        await waitForRun.Should().ThrowAsync<OperationCanceledException>();
+        // Assert — RunAsync completes without throwing (cancellation is handled gracefully).
+        await runTask;
     }
 }
