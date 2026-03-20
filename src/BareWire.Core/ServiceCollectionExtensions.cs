@@ -2,6 +2,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
+using BareWire.Abstractions.Saga;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
@@ -144,7 +145,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IMessageDeserializer>(),
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<IBareWireInstrumentation>(),
-            sp.GetRequiredService<ILoggerFactory>()));
+            sp.GetRequiredService<ILoggerFactory>(),
+            [.. sp.GetService<IEnumerable<ISagaMessageDispatcher>>() ?? []]));
 
         // IBusControl and IBus both resolve to the same BareWireBusControl singleton.
         services.AddSingleton<IBusControl>(sp => sp.GetRequiredService<BareWireBusControl>());

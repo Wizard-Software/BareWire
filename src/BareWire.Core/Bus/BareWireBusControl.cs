@@ -24,6 +24,7 @@ internal sealed partial class BareWireBusControl : IBusControl
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly Abstractions.Observability.IBareWireInstrumentation _instrumentation;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly IReadOnlyList<ISagaMessageDispatcher> _sagaDispatchers;
 
     private readonly object _stateLock = new();
     private readonly List<Task> _consumeTasks = [];
@@ -41,7 +42,8 @@ internal sealed partial class BareWireBusControl : IBusControl
         IMessageDeserializer deserializer,
         IServiceScopeFactory scopeFactory,
         Abstractions.Observability.IBareWireInstrumentation instrumentation,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        IReadOnlyList<ISagaMessageDispatcher> sagaDispatchers)
     {
         _bus = bus ?? throw new ArgumentNullException(nameof(bus));
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
@@ -54,6 +56,7 @@ internal sealed partial class BareWireBusControl : IBusControl
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
+        _sagaDispatchers = sagaDispatchers ?? [];
     }
 
     // ── IBusControl ───────────────────────────────────────────────────────────
@@ -87,15 +90,8 @@ internal sealed partial class BareWireBusControl : IBusControl
         _consumeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         CancellationToken consumeToken = _consumeCts.Token;
 
-        // Resolve all registered saga message dispatchers once — shared across all endpoints.
+        // Saga dispatchers are injected via constructor — shared across all endpoints.
         // Each endpoint's ReceiveEndpointRunner filters to only the dispatchers relevant to it.
-        // Use GetService<IEnumerable<T>>() so that an empty list is returned when no dispatchers
-        // are registered, without throwing InvalidOperationException.
-        using IServiceScope dispatcherScope = _scopeFactory.CreateScope();
-        IReadOnlyList<ISagaMessageDispatcher> sagaDispatchers =
-            [.. dispatcherScope.ServiceProvider
-                .GetService<IEnumerable<ISagaMessageDispatcher>>() ?? []];
-
         foreach (EndpointBinding binding in _endpointBindings)
         {
             if (binding.Consumers.Count == 0
@@ -113,7 +109,7 @@ internal sealed partial class BareWireBusControl : IBusControl
                 _flowController,
                 _instrumentation,
                 _loggerFactory.CreateLogger<ReceiveEndpointRunner>(),
-                sagaDispatchers);
+                _sagaDispatchers);
 
             _consumeTasks.Add(Task.Run(() => runner.RunAsync(consumeToken), CancellationToken.None));
         }

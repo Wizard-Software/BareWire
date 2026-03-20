@@ -109,7 +109,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             deserializer: deserializer,
             scopeFactory: new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
             instrumentation: new NullInstrumentation(),
-            loggerFactory: loggerFactory);
+            loggerFactory: loggerFactory,
+            sagaDispatchers: []);
 
         await busControl.StartAsync(cancellationToken).ConfigureAwait(false);
 

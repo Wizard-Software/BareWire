@@ -71,7 +71,8 @@ public sealed class BareWireBusControlTests
             deserializer: deserializer,
             scopeFactory: scopeFactory,
             instrumentation: new NullInstrumentation(),
-            loggerFactory: NullLoggerFactory.Instance);
+            loggerFactory: NullLoggerFactory.Instance,
+            sagaDispatchers: []);
 
         return (control, bus, adapter, flowController);
     }
