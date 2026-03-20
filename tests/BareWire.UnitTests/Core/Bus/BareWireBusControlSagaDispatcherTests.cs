@@ -17,12 +17,6 @@ using NSubstitute;
 
 namespace BareWire.UnitTests.Core.Bus;
 
-/// <summary>
-/// Regression tests for the bug where <c>BareWireBusControl.StartAsync</c> resolved
-/// <see cref="ISagaMessageDispatcher"/> instances from a temporary <c>IServiceScope</c>
-/// that was disposed at the end of the method — leaving runners with dead dispatchers.
-/// After the fix, dispatchers are injected via the constructor and survive indefinitely.
-/// </summary>
 public sealed class BareWireBusControlSagaDispatcherTests
 {
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -109,8 +103,10 @@ public sealed class BareWireBusControlSagaDispatcherTests
         // Act — start the bus (previously this disposed the scope holding the dispatcher)
         await control.StartAsync(CancellationToken.None);
 
-        // Assert — the dispatcher is still usable after StartAsync returns;
-        // an ObjectDisposedException would be thrown here if the scope were disposed
+        // Assert — intent/documentation test: verifies the dispatcher is still callable
+        // after StartAsync. NSubstitute mocks don't simulate scope disposal, so this
+        // assertion is inherently vacuous. The true regression guard is
+        // StartAsync_SagaDispatchers_ResolvedFromRootProvider (CreateScope not called).
         Func<Task> useDispatcher = async () =>
             await dispatcher.TryDispatchAsync(
                 ReadOnlySequence<byte>.Empty,
