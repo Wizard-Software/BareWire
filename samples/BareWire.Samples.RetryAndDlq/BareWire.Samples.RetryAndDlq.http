@@ -1,0 +1,16 @@
+@host = http://localhost:5105
+
+### Submit a payment (70% failure rate — will retry 3x then dead-letter)
+POST {{host}}/payments
+Content-Type: application/json
+
+{
+  "amount": 99.99,
+  "currency": "PLN"
+}
+
+### Get all failed (dead-lettered) payments
+GET {{host}}/payments/failed
+
+### Health check
+GET {{host}}/health

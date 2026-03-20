@@ -37,6 +37,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
             .GetMethod(nameof(BuildEventDelegate), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     private readonly TryDispatchEventDelegate[] _eventDispatchers;
+    private readonly string[] _eventTypeNames;
     private readonly StateMachineDefinition<TSaga> _definition;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILoggerFactory _loggerFactory;
@@ -73,6 +74,10 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
                 .MakeGenericMethod(eventType)
                 .Invoke(null, null)!)
             .ToArray();
+
+        _eventTypeNames = eventTypes
+            .Select(t => t.Name)
+            .ToArray();
     }
 
     /// <inheritdoc />
@@ -85,6 +90,28 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
         IMessageDeserializer deserializer,
         CancellationToken cancellationToken = default)
     {
+        // When BW-MessageType header is present, dispatch only the matching event type
+        // to avoid ambiguous deserialization of raw JSON into the wrong record type.
+        if (headers.TryGetValue("BW-MessageType", out string? messageType)
+            && !string.IsNullOrEmpty(messageType))
+        {
+            for (int i = 0; i < _eventTypeNames.Length; i++)
+            {
+                if (string.Equals(_eventTypeNames[i], messageType, StringComparison.Ordinal))
+                {
+                    return await _eventDispatchers[i](
+                        _scopeFactory, _definition, _loggerFactory,
+                        body, headers, messageId,
+                        publishEndpoint, sendEndpointProvider,
+                        deserializer, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            // Header present but no matching event type — not for this saga.
+            return false;
+        }
+
+        // No header — fall back to trying all event types (legacy / interop).
         foreach (TryDispatchEventDelegate dispatch in _eventDispatchers)
         {
             bool handled = await dispatch(

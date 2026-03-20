@@ -19,7 +19,11 @@
 //              Processing ──PaymentTimeout──→ Compensating  (fired after 30s)
 //              Compensating ──CompensationCompleted──→ Failed (finalized)
 //
-//   GET /orders/{id}/status → queries saga repository for current state
+//   GET  /orders/{id}/status          → queries saga repository for current state
+//   POST /orders/{id}/simulate/pay    → publishes PaymentReceived  (Processing → Shipping)
+//   POST /orders/{id}/simulate/ship   → publishes ShipmentDispatched (Shipping → Completed)
+//   POST /orders/{id}/simulate/fail   → publishes PaymentFailed    (Processing → Compensating)
+//   POST /orders/{id}/simulate/compensate → publishes CompensationCompleted (Compensating → Failed)
 //
 // Prerequisites (runtime, NOT required to compile):
 //   - RabbitMQ broker (default: amqp://guest:guest@localhost:5672/)
@@ -216,6 +220,74 @@ app.MapGet("/orders/{id}/status", async (
 .ProducesProblem(StatusCodes.Status400BadRequest)
 .ProducesProblem(StatusCodes.Status404NotFound)
 .WithName("GetOrderStatus");
+
+// POST /orders/{id}/simulate/pay — simulate successful payment (Processing → Shipping).
+// Publishes PaymentReceived; the saga cancels the payment timeout and advances state.
+app.MapPost("/orders/{id}/simulate/pay", async (
+    string id,
+    IPublishEndpoint bus,
+    CancellationToken cancellationToken) =>
+{
+    string paymentId = Guid.NewGuid().ToString();
+
+    await bus.PublishAsync(
+        new PaymentReceived(id, paymentId),
+        cancellationToken).ConfigureAwait(false);
+
+    return Results.Ok(new { Event = "PaymentReceived", OrderId = id, PaymentId = paymentId });
+})
+.Produces<object>()
+.WithName("SimulatePayment");
+
+// POST /orders/{id}/simulate/ship — simulate shipment dispatch (Shipping → Completed).
+// Publishes ShipmentDispatched; the saga finalises the order as Completed.
+app.MapPost("/orders/{id}/simulate/ship", async (
+    string id,
+    IPublishEndpoint bus,
+    CancellationToken cancellationToken) =>
+{
+    string trackingNumber = $"TRACK-{Guid.NewGuid().ToString()[..8].ToUpperInvariant()}";
+
+    await bus.PublishAsync(
+        new ShipmentDispatched(id, trackingNumber),
+        cancellationToken).ConfigureAwait(false);
+
+    return Results.Ok(new { Event = "ShipmentDispatched", OrderId = id, TrackingNumber = trackingNumber });
+})
+.Produces<object>()
+.WithName("SimulateShipment");
+
+// POST /orders/{id}/simulate/fail — simulate payment failure (Processing → Compensating).
+// Publishes PaymentFailed; the saga cancels the timeout and begins compensation.
+app.MapPost("/orders/{id}/simulate/fail", async (
+    string id,
+    IPublishEndpoint bus,
+    CancellationToken cancellationToken) =>
+{
+    await bus.PublishAsync(
+        new PaymentFailed(id, "Simulated payment failure — insufficient funds."),
+        cancellationToken).ConfigureAwait(false);
+
+    return Results.Ok(new { Event = "PaymentFailed", OrderId = id });
+})
+.Produces<object>()
+.WithName("SimulatePaymentFailure");
+
+// POST /orders/{id}/simulate/compensate — simulate compensation completed (Compensating → Failed).
+// Publishes CompensationCompleted; the saga finalises the order as Failed.
+app.MapPost("/orders/{id}/simulate/compensate", async (
+    string id,
+    IPublishEndpoint bus,
+    CancellationToken cancellationToken) =>
+{
+    await bus.PublishAsync(
+        new CompensationCompleted(id),
+        cancellationToken).ConfigureAwait(false);
+
+    return Results.Ok(new { Event = "CompensationCompleted", OrderId = id });
+})
+.Produces<object>()
+.WithName("SimulateCompensation");
 
 app.Run();
 

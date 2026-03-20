@@ -109,7 +109,8 @@ internal sealed partial class BareWireBusControl : IBusControl
                 _flowController,
                 _instrumentation,
                 _loggerFactory.CreateLogger<ReceiveEndpointRunner>(),
-                _sagaDispatchers);
+                _sagaDispatchers,
+                _loggerFactory);
 
             _consumeTasks.Add(Task.Run(() => runner.RunAsync(consumeToken), CancellationToken.None));
         }

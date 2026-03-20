@@ -193,6 +193,8 @@ namespace BareWire.Abstractions.Configuration
         public required string EndpointName { get; init; }
         public int PrefetchCount { get; init; }
         public System.Collections.Generic.IReadOnlyList<System.Type> RawConsumers { get; init; }
+        public int RetryCount { get; init; }
+        public System.TimeSpan RetryInterval { get; init; }
         public System.Collections.Generic.IReadOnlyList<System.Type> SagaTypes { get; init; }
     }
     public interface IBusConfigurator
@@ -498,11 +500,12 @@ namespace BareWire.Abstractions.Topology
         void BindExchangeToExchange(string source, string destination, string routingKey);
         void BindExchangeToQueue(string exchange, string queue, string routingKey);
         void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
-        void DeclareQueue(string name, bool durable = true, bool autoDelete = false);
+        void DeclareQueue(string name, bool durable = true, bool autoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? arguments = null);
     }
     public sealed class QueueDeclaration : System.IEquatable<BareWire.Abstractions.Topology.QueueDeclaration>
     {
-        public QueueDeclaration(string Name, bool Durable = true, bool Exclusive = false, bool AutoDelete = false) { }
+        public QueueDeclaration(string Name, bool Durable = true, bool Exclusive = false, bool AutoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? Arguments = null) { }
+        public System.Collections.Generic.IReadOnlyDictionary<string, object>? Arguments { get; init; }
         public bool AutoDelete { get; init; }
         public bool Durable { get; init; }
         public bool Exclusive { get; init; }

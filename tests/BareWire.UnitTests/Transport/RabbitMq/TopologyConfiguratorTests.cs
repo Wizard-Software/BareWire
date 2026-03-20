@@ -119,6 +119,36 @@ public sealed class TopologyConfiguratorTests
         act.Should().Throw<ArgumentNullException>();
     }
 
+    [Fact]
+    public void DeclareQueue_WithArguments_IncludedInBuild()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+        Dictionary<string, object> arguments = new() { ["x-dead-letter-exchange"] = "dlx" };
+
+        // Act
+        sut.DeclareQueue("test-queue", arguments: arguments);
+        TopologyDeclaration result = sut.Build();
+
+        // Assert
+        result.Queues[0].Arguments.Should().NotBeNull();
+        result.Queues[0].Arguments!["x-dead-letter-exchange"].Should().Be("dlx");
+    }
+
+    [Fact]
+    public void DeclareQueue_WithoutArguments_ArgumentsIsNull()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        sut.DeclareQueue("test-queue");
+        TopologyDeclaration result = sut.Build();
+
+        // Assert
+        result.Queues[0].Arguments.Should().BeNull();
+    }
+
     // ── BindExchangeToQueue ───────────────────────────────────────────────────
 
     [Fact]

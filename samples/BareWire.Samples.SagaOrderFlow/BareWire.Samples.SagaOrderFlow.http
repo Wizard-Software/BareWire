@@ -1,0 +1,45 @@
+@host = http://localhost:5103
+@orderId = 690a13dc-fc38-4d40-972e-b9431390a129
+
+### 1. Create an order (starts the SAGA → Initial → Processing)
+POST {{host}}/orders
+Content-Type: application/json
+
+{
+  "amount": 599.99,
+  "shippingAddress": "ul. Marszalkowska 1, 00-001 Warszawa"
+}
+
+### 2. Check order status (should be "Processing")
+GET {{host}}/orders/{{orderId}}/status
+
+### === HAPPY PATH ===
+
+### 3a. Simulate payment received (Processing → Shipping)
+POST {{host}}/orders/{{orderId}}/simulate/pay
+
+### 4a. Check status (should be "Shipping" with paymentId)
+GET {{host}}/orders/{{orderId}}/status
+
+### 5a. Simulate shipment dispatched (Shipping → Completed)
+POST {{host}}/orders/{{orderId}}/simulate/ship
+
+### 6a. Check status (should be "Completed" with trackingNumber)
+GET {{host}}/orders/{{orderId}}/status
+
+### === FAILURE PATH ===
+
+### 3b. Simulate payment failure (Processing → Compensating)
+POST {{host}}/orders/{{orderId}}/simulate/fail
+
+### 4b. Check status (should be "Compensating" with failureReason)
+GET {{host}}/orders/{{orderId}}/status
+
+### 5b. Simulate compensation completed (Compensating → Failed)
+POST {{host}}/orders/{{orderId}}/simulate/compensate
+
+### 6b. Check status (should be "Failed")
+GET {{host}}/orders/{{orderId}}/status
+
+### Health check
+GET {{host}}/health

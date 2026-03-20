@@ -23,11 +23,12 @@ internal sealed class RabbitMqTopologyConfigurator : ITopologyConfigurator
     }
 
     /// <inheritdoc />
-    public void DeclareQueue(string name, bool durable = true, bool autoDelete = false)
+    public void DeclareQueue(string name, bool durable = true, bool autoDelete = false,
+        IReadOnlyDictionary<string, object>? arguments = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
 
-        _queues.Add(new QueueDeclaration(name, durable, Exclusive: false, autoDelete));
+        _queues.Add(new QueueDeclaration(name, durable, Exclusive: false, autoDelete, arguments));
     }
 
     /// <inheritdoc />

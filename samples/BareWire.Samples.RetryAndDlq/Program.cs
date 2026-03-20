@@ -17,20 +17,13 @@
 //                     └→ DlqConsumer (queue: "payments-dlq") → persists FailedPayment to PostgreSQL
 //
 // RabbitMQ DLX topology:
-//   Exchange "payments"     (direct, durable) ──→ Queue "payments"     (durable)
+//   Exchange "payments"     (topic, durable)  ──→ Queue "payments"     (durable)
 //   Exchange "payments.dlx" (fanout, durable) ──→ Queue "payments-dlq" (durable)
 //
-//   The "payments" queue must be declared with RabbitMQ queue arguments:
+//   The "payments" queue is declared with the RabbitMQ queue argument:
 //     x-dead-letter-exchange  = "payments.dlx"
-//   BareWire's ITopologyConfigurator.DeclareQueue does not yet support queue arguments
-//   (tracked: TODO in DelayRequeueScheduleProvider). Until the API is extended, provision
-//   the "payments" queue with these arguments via:
-//     - RabbitMQ Management UI (http://localhost:15672)
-//     - rabbitmqadmin CLI: rabbitmqadmin declare queue name=payments durable=true
-//         arguments='{"x-dead-letter-exchange":"payments.dlx"}'
-//     - Aspire AppHost provisioning script
-//   When running via Aspire AppHost with Docker, the docker-compose.yml in samples/ sets
-//   this up automatically through a RabbitMQ definitions file.
+//   This is passed directly via ITopologyConfigurator.DeclareQueue(arguments: ...)
+//   and applied by the transport adapter during topology deployment.
 //
 // Prerequisites (runtime, NOT required to compile):
 //   - RabbitMQ broker (default: amqp://guest:guest@localhost:5672/)
@@ -98,19 +91,15 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     // The broker resources are deployed by IBusControl.DeployTopologyAsync on startup.
     rmq.ConfigureTopology(t =>
     {
-        // Direct exchange for payment commands.
+        // Topic exchange for payment commands.
         // Messages published via IPublishEndpoint are routed here.
-        t.DeclareExchange("payments", ExchangeType.Direct, durable: true);
+        t.DeclareExchange("payments", ExchangeType.Topic, durable: true);
 
-        // Main processing queue.
-        // NOTE: For full DLX behaviour this queue must be provisioned with:
-        //   x-dead-letter-exchange = "payments.dlx"
-        // Use RabbitMQ Management UI, rabbitmqadmin, or the Aspire provisioning
-        // script — see the file header for details. BareWire will declare the queue
-        // without arguments here; if it was pre-created with arguments it will match
-        // the existing declaration and no error is raised (idempotent).
-        t.DeclareQueue("payments", durable: true);
-        t.BindExchangeToQueue("payments", "payments", routingKey: "");
+        // Main processing queue — declared with x-dead-letter-exchange so that RabbitMQ
+        // automatically routes rejected messages to "payments.dlx" after retry exhaustion.
+        t.DeclareQueue("payments", durable: true, arguments:
+            new Dictionary<string, object> { ["x-dead-letter-exchange"] = "payments.dlx" });
+        t.BindExchangeToQueue("payments", "payments", routingKey: "#");
 
         // Fanout DLX exchange — all dead-lettered payments fan out to "payments-dlq".
         t.DeclareExchange("payments.dlx", ExchangeType.Fanout, durable: true);

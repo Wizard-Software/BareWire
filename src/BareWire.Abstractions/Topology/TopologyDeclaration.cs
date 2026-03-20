@@ -48,7 +48,17 @@ public sealed record ExchangeDeclaration(string Name, ExchangeType Type, bool Du
 /// <param name="Durable">Whether the queue survives a broker restart.</param>
 /// <param name="Exclusive">Whether the queue is exclusive to the declaring connection.</param>
 /// <param name="AutoDelete">Whether the queue is deleted when the last consumer disconnects.</param>
-public sealed record QueueDeclaration(string Name, bool Durable = true, bool Exclusive = false, bool AutoDelete = false);
+/// <param name="Arguments">
+/// Optional broker-specific queue arguments, such as <c>x-dead-letter-exchange</c> to route
+/// rejected messages to a dead-letter exchange, or <c>x-message-ttl</c> to set a per-queue
+/// message time-to-live. Pass <see langword="null"/> when no arguments are required.
+/// </param>
+public sealed record QueueDeclaration(
+    string Name,
+    bool Durable = true,
+    bool Exclusive = false,
+    bool AutoDelete = false,
+    IReadOnlyDictionary<string, object>? Arguments = null);
 
 /// <summary>
 /// Describes a binding between an exchange and a queue.

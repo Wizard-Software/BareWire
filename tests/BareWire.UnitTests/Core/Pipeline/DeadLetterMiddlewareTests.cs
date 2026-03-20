@@ -42,7 +42,7 @@ public sealed class DeadLetterMiddlewareTests
     }
 
     [Fact]
-    public async Task InvokeAsync_ExceptionAfterRetry_RoutesToDeadLetter()
+    public async Task InvokeAsync_ExceptionAfterRetry_RoutesToDeadLetterThenRethrows()
     {
         // Arrange
         bool deadLetterCalled = false;
@@ -56,10 +56,11 @@ public sealed class DeadLetterMiddlewareTests
         var context = CreateContext();
 
         // Act — simulate exception after retry exhaustion
-        await sut.InvokeAsync(context, _ =>
+        Func<Task> act = () => sut.InvokeAsync(context, _ =>
             throw new InvalidOperationException("retries exhausted"));
 
-        // Assert
+        // Assert — callback fires, then exception propagates so ReceiveEndpointRunner can NACK
+        await act.Should().ThrowAsync<InvalidOperationException>();
         deadLetterCalled.Should().BeTrue();
     }
 
@@ -80,8 +81,9 @@ public sealed class DeadLetterMiddlewareTests
         var context = CreateContext();
         var expectedException = new InvalidOperationException("test error");
 
-        // Act
-        await sut.InvokeAsync(context, _ => throw expectedException);
+        // Act — DeadLetterMiddleware re-throws after invoking the callback
+        Func<Task> act = () => sut.InvokeAsync(context, _ => throw expectedException);
+        await act.Should().ThrowAsync<InvalidOperationException>();
 
         // Assert
         capturedContext.Should().BeSameAs(context);
@@ -89,20 +91,21 @@ public sealed class DeadLetterMiddlewareTests
     }
 
     [Fact]
-    public async Task InvokeAsync_DeadLetterRouted_MessageIsAcked()
+    public async Task InvokeAsync_ExceptionThrown_RethrowsAfterCallback()
     {
-        // Arrange — DeadLetterMiddleware does NOT re-throw, meaning the pipeline
-        // completes normally and the transport will Ack the message.
+        // Arrange — DeadLetterMiddleware re-throws so ReceiveEndpointRunner can NACK.
+        // The broker then routes to the DLX via x-dead-letter-exchange.
+        var thrownException = new InvalidOperationException("failure");
         var sut = new DeadLetterMiddleware(
             (_, _) => Task.CompletedTask,
             NullLogger<DeadLetterMiddleware>.Instance);
         var context = CreateContext();
 
-        // Act — should NOT throw, proving the message is "handled"
-        Func<Task> act = () => sut.InvokeAsync(context, _ =>
-            throw new InvalidOperationException("failure"));
+        // Act
+        Func<Task> act = () => sut.InvokeAsync(context, _ => throw thrownException);
 
-        // Assert
-        await act.Should().NotThrowAsync();
+        // Assert — exception propagates so the transport layer can NACK
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("failure");
     }
 }

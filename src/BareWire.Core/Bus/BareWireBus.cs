@@ -86,7 +86,11 @@ internal sealed partial class BareWireBus : IBus
         Activity? activity = _instrumentation.StartPublishActivity(messageType, routingKey, messageId);
         try
         {
-            Dictionary<string, string> headers = [];
+            Dictionary<string, string> headers = new()
+            {
+                ["BW-MessageType"] = messageType,
+                ["message-id"] = messageId.ToString(),
+            };
             _instrumentation.InjectTraceContext(activity, headers);
 
             OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(

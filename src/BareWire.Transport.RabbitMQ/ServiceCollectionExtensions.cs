@@ -69,6 +69,8 @@ public static class ServiceCollectionExtensions
                 Consumers = e.ConsumerRegistrations,
                 RawConsumers = e.RawConsumerTypes,
                 SagaTypes = e.SagaTypes,
+                RetryCount = e.RetryCount,
+                RetryInterval = e.RetryInterval,
             })
             .ToList();
         services.TryAddSingleton<IReadOnlyList<EndpointBinding>>(bindings);

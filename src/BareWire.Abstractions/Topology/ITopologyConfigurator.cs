@@ -36,7 +36,13 @@ public interface ITopologyConfigurator
     /// <see langword="true"/> if the queue should be deleted when the last consumer disconnects;
     /// otherwise <see langword="false"/>.
     /// </param>
-    void DeclareQueue(string name, bool durable = true, bool autoDelete = false);
+    /// <param name="arguments">
+    /// Optional broker-specific queue arguments, such as <c>x-dead-letter-exchange</c> to route
+    /// rejected messages to a dead-letter exchange, or <c>x-message-ttl</c> to set a per-queue
+    /// message time-to-live. Pass <see langword="null"/> or omit when no arguments are required.
+    /// </param>
+    void DeclareQueue(string name, bool durable = true, bool autoDelete = false,
+        IReadOnlyDictionary<string, object>? arguments = null);
 
     /// <summary>
     /// Creates a binding that routes messages from <paramref name="exchange"/> to <paramref name="queue"/>

@@ -21,4 +21,10 @@ public sealed class EndpointBinding
 
     /// <summary>Gets the saga state machine types registered on this endpoint.</summary>
     public IReadOnlyList<Type> SagaTypes { get; init; } = [];
+
+    /// <summary>Gets the number of retry attempts for failed message processing. Zero means no retry.</summary>
+    public int RetryCount { get; init; }
+
+    /// <summary>Gets the interval between retry attempts.</summary>
+    public TimeSpan RetryInterval { get; init; } = TimeSpan.Zero;
 }

@@ -37,8 +37,8 @@ internal sealed class DeadLetterMiddleware : IMessageMiddleware
 
             await _onDeadLetter(context, ex).ConfigureAwait(false);
 
-            // Do NOT re-throw: message is considered handled after DLQ routing.
-            // The pipeline will complete normally, causing the transport to Ack the message.
+            // Re-throw so ReceiveEndpointRunner can NACK — broker routes via x-dead-letter-exchange (DLX).
+            throw;
         }
     }
 }

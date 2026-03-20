@@ -369,7 +369,8 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IAsy
                         durable: queue.Durable,
                         exclusive: queue.Exclusive,
                         autoDelete: queue.AutoDelete,
-                        arguments: null,
+                        arguments: queue.Arguments?.ToDictionary(
+                            kvp => kvp.Key, kvp => (object?)kvp.Value),
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationInterruptedException ex)

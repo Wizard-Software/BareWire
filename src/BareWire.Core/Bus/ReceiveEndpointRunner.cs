@@ -2,10 +2,13 @@ using System.Diagnostics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Observability;
+using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Saga;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Core.FlowControl;
+using BareWire.Core.Pipeline;
+using BareWire.Core.Pipeline.Retry;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -30,6 +33,7 @@ internal sealed partial class ReceiveEndpointRunner
     private readonly ConsumerInvokerFactory.InvokerDelegate[] _invokers;
     private readonly ConsumerInvokerFactory.RawInvokerDelegate[] _rawInvokers;
     private readonly ISagaMessageDispatcher[] _sagaDispatchers;
+    private readonly MiddlewareChain _middlewareChain;
 
     internal ReceiveEndpointRunner(
         EndpointBinding binding,
@@ -41,7 +45,8 @@ internal sealed partial class ReceiveEndpointRunner
         FlowController flowController,
         IBareWireInstrumentation instrumentation,
         ILogger logger,
-        IReadOnlyList<ISagaMessageDispatcher>? sagaDispatchers = null)
+        IReadOnlyList<ISagaMessageDispatcher>? sagaDispatchers = null,
+        ILoggerFactory? loggerFactory = null)
     {
         _binding = binding;
         _adapter = adapter;
@@ -77,6 +82,29 @@ internal sealed partial class ReceiveEndpointRunner
         {
             _sagaDispatchers = [];
         }
+
+        // Build retry/DLQ middleware chain (task 8.12).
+        List<IMessageMiddleware> middlewares = [];
+
+        if (binding.RetryCount > 0 && loggerFactory is not null)
+        {
+            IntervalRetryPolicy retryPolicy = new(
+                maxRetries: binding.RetryCount,
+                interval: binding.RetryInterval,
+                handledExceptions: [],
+                ignoredExceptions: []);
+            middlewares.Add(new RetryMiddleware(retryPolicy, loggerFactory.CreateLogger<RetryMiddleware>()));
+        }
+
+        // DeadLetterMiddleware logs the error; re-throws so ReceiveEndpointRunner NACKs.
+        ILogger<DeadLetterMiddleware> dlqLogger = loggerFactory is not null
+            ? loggerFactory.CreateLogger<DeadLetterMiddleware>()
+            : Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance.CreateLogger<DeadLetterMiddleware>();
+        middlewares.Add(new DeadLetterMiddleware(
+            onDeadLetter: static (_, _) => Task.CompletedTask,
+            dlqLogger));
+
+        _middlewareChain = new MiddlewareChain(middlewares);
     }
 
     internal async Task RunAsync(CancellationToken cancellationToken)
@@ -123,90 +151,23 @@ internal sealed partial class ReceiveEndpointRunner
                     {
                         bool dispatched = false;
 
-                        // Try typed consumers first — first match wins.
-                        for (int i = 0; i < _invokers.Length; i++)
+                        // Build MessageContext for the middleware pipeline.
+                        using IServiceScope scope = _scopeFactory.CreateScope();
+                        MessageContext context = new(
+                            messageId: msgId,
+                            headers: message.Headers,
+                            rawBody: message.Body,
+                            serviceProvider: scope.ServiceProvider,
+                            cancellationToken: cancellationToken);
+
+                        // Terminator captures dispatch results from DispatchMessageAsync.
+                        NextMiddleware terminator = async ctx =>
                         {
-                            ConsumerInvokerFactory.InvokerDelegate invoker = _invokers[i];
-                            try
-                            {
-                                await invoker(
-                                    _scopeFactory,
-                                    message.Body,
-                                    message.Headers,
-                                    message.MessageId,
-                                    _publishEndpoint,
-                                    _sendEndpointProvider,
-                                    _deserializer,
-                                    _binding.EndpointName,
-                                    cancellationToken).ConfigureAwait(false);
-                                messageType = _binding.Consumers[i].MessageType.Name;
-                                dispatched = true;
-                                break; // First matching consumer wins.
-                            }
-                            catch (Abstractions.Exceptions.UnknownPayloadException)
-                            {
-                                // This invoker's message type doesn't match — try the next one.
-                                continue;
-                            }
-                            catch (Abstractions.Exceptions.BareWireSerializationException ex)
-                            {
-                                // Deserialization failed for this invoker — log and try the next one.
-                                LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
-                                continue;
-                            }
-                        }
+                            (dispatched, messageType) = await DispatchMessageAsync(ctx, cancellationToken)
+                                .ConfigureAwait(false);
+                        };
 
-                        // If no typed consumer matched, try saga dispatchers.
-                        // Each dispatcher tries to deserialize the body as one of its registered event types.
-                        if (!dispatched && _sagaDispatchers.Length > 0)
-                        {
-                            foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
-                            {
-                                try
-                                {
-                                    bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
-                                        message.Body,
-                                        message.Headers,
-                                        message.MessageId,
-                                        _publishEndpoint,
-                                        _sendEndpointProvider,
-                                        _deserializer,
-                                        cancellationToken).ConfigureAwait(false);
-
-                                    if (sagaHandled)
-                                    {
-                                        messageType = sagaDispatcher.StateMachineType.Name;
-                                        dispatched = true;
-                                        break;
-                                    }
-                                }
-                                catch (Abstractions.Exceptions.BareWireSerializationException ex)
-                                {
-                                    LogDeserializationFailed(_binding.EndpointName, message.MessageId, ex);
-                                }
-                            }
-                        }
-
-                        // If no typed consumer or saga matched, fall through to raw consumers.
-                        // Raw consumers accept any payload — all registered raw consumers are invoked.
-                        if (!dispatched && _rawInvokers.Length > 0)
-                        {
-                            foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
-                            {
-                                await rawInvoker(
-                                    _scopeFactory,
-                                    message.Body,
-                                    message.Headers,
-                                    message.MessageId,
-                                    _publishEndpoint,
-                                    _sendEndpointProvider,
-                                    _deserializer,
-                                    cancellationToken).ConfigureAwait(false);
-                            }
-
-                            messageType = "raw";
-                            dispatched = true;
-                        }
+                        await _middlewareChain.InvokeAsync(context, terminator).ConfigureAwait(false);
 
                         if (!dispatched)
                         {
@@ -285,6 +246,101 @@ internal sealed partial class ReceiveEndpointRunner
             LogConsumeLoopFaulted(_binding.EndpointName, ex);
             throw;
         }
+    }
+
+    private async Task<(bool Dispatched, string MessageType)> DispatchMessageAsync(
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        bool dispatched = false;
+        string messageType = "unknown";
+
+        // Try typed consumers first — first match wins.
+        for (int i = 0; i < _invokers.Length; i++)
+        {
+            ConsumerInvokerFactory.InvokerDelegate invoker = _invokers[i];
+            try
+            {
+                await invoker(
+                    _scopeFactory,
+                    context.RawBody,
+                    context.Headers,
+                    context.MessageId.ToString(),
+                    _publishEndpoint,
+                    _sendEndpointProvider,
+                    _deserializer,
+                    _binding.EndpointName,
+                    cancellationToken).ConfigureAwait(false);
+                messageType = _binding.Consumers[i].MessageType.Name;
+                dispatched = true;
+                break; // First matching consumer wins.
+            }
+            catch (Abstractions.Exceptions.UnknownPayloadException)
+            {
+                // This invoker's message type doesn't match — try the next one.
+                continue;
+            }
+            catch (Abstractions.Exceptions.BareWireSerializationException ex)
+            {
+                // Deserialization failed for this invoker — log and try the next one.
+                LogDeserializationFailed(_binding.EndpointName, context.MessageId.ToString(), ex);
+                continue;
+            }
+        }
+
+        // If no typed consumer matched, try saga dispatchers.
+        // Each dispatcher tries to deserialize the body as one of its registered event types.
+        if (!dispatched && _sagaDispatchers.Length > 0)
+        {
+            foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
+            {
+                try
+                {
+                    bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
+                        context.RawBody,
+                        context.Headers,
+                        context.MessageId.ToString(),
+                        _publishEndpoint,
+                        _sendEndpointProvider,
+                        _deserializer,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (sagaHandled)
+                    {
+                        messageType = sagaDispatcher.StateMachineType.Name;
+                        dispatched = true;
+                        break;
+                    }
+                }
+                catch (Abstractions.Exceptions.BareWireSerializationException ex)
+                {
+                    LogDeserializationFailed(_binding.EndpointName, context.MessageId.ToString(), ex);
+                }
+            }
+        }
+
+        // If no typed consumer or saga matched, fall through to raw consumers.
+        // Raw consumers accept any payload — all registered raw consumers are invoked.
+        if (!dispatched && _rawInvokers.Length > 0)
+        {
+            foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
+            {
+                await rawInvoker(
+                    _scopeFactory,
+                    context.RawBody,
+                    context.Headers,
+                    context.MessageId.ToString(),
+                    _publishEndpoint,
+                    _sendEndpointProvider,
+                    _deserializer,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            messageType = "raw";
+            dispatched = true;
+        }
+
+        return (dispatched, messageType);
     }
 
     [LoggerMessage(Level = LogLevel.Information,
