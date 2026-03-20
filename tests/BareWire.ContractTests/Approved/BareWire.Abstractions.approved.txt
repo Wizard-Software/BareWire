@@ -528,14 +528,14 @@ namespace BareWire.Abstractions.Transport
         System.Threading.Tasks.Task<System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Transport.SendResult>> SendBatchAsync(System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Transport.OutboundMessage> messages, System.Threading.CancellationToken cancellationToken = default);
         System.Threading.Tasks.Task SettleAsync(BareWire.Abstractions.SettlementAction action, BareWire.Abstractions.Transport.InboundMessage message, System.Threading.CancellationToken cancellationToken = default);
     }
-    public sealed class InboundMessage
+    public sealed class InboundMessage : System.IDisposable
     {
         public InboundMessage(string messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, System.Buffers.ReadOnlySequence<byte> body, ulong deliveryTag, byte[]? pooledBuffer = null) { }
         public System.Buffers.ReadOnlySequence<byte> Body { get; }
         public ulong DeliveryTag { get; }
         public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
         public string MessageId { get; }
-        public byte[]? PooledBuffer { get; }
+        public void Dispose() { }
     }
     public sealed class OutboundMessage
     {

@@ -401,7 +401,7 @@ internal sealed partial class BareWireBus : IBus
                         if (eqIdx < 0)
                             continue;
 
-                        string key = part[..eqIdx];
+                        string key = Uri.UnescapeDataString(part[..eqIdx]);
                         string value = Uri.UnescapeDataString(part[(eqIdx + 1)..]);
 
                         if (key.Equals("correlation-id", StringComparison.OrdinalIgnoreCase))

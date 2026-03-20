@@ -141,7 +141,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
         if (confirmedIds.Count > 0)
         {
-            await store.MarkDeliveredAsync([.. confirmedIds], ct).ConfigureAwait(false);
+            await store.MarkDeliveredAsync(confirmedIds, ct).ConfigureAwait(false);
         }
 
         if (nackedCount > 0)

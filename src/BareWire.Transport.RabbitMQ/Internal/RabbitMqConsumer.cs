@@ -86,10 +86,7 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         // The pooled buffer must also be returned here since ReceiveEndpointRunner will never see this message.
         if (!_inboundChannel.Writer.TryWrite(message))
         {
-            if (pooledBuffer is not null)
-            {
-                ArrayPool<byte>.Shared.Return(pooledBuffer);
-            }
+            message.Dispose();
 
             await Channel.BasicNackAsync(deliveryTag, multiple: false, requeue: true, cancellationToken)
                 .ConfigureAwait(false);

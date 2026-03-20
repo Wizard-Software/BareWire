@@ -261,6 +261,35 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
     }
 
     [Fact]
+    public async Task RunAsync_WithPooledBuffer_ReturnsBufferToPool()
+    {
+        // Arrange — message with a pooled buffer that should be returned after settlement.
+        var (runner, _, writer, adapter) = CreateRunner(maxInFlight: 2);
+
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        var message = new InboundMessage(
+            messageId: "msg-pool",
+            headers: new Dictionary<string, string>(),
+            body: new ReadOnlySequence<byte>(rentedBuffer.AsMemory(0, 64)),
+            deliveryTag: 1UL,
+            pooledBuffer: rentedBuffer);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        await writer.WriteAsync(message, cts.Token);
+        writer.Complete();
+
+        // Act — run to completion; the finally block must return the pooled buffer.
+        await runner.RunAsync(cts.Token);
+
+        // Assert — settlement completed (proving the finally block executed, returning the buffer).
+        await adapter.Received(1).SettleAsync(
+            Arg.Any<SettlementAction>(),
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-pool"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task RunAsync_WhenCancelledDuringCreditWait_ThrowsOperationCancelled()
     {
         // Arrange — MaxInFlightMessages=1, pre-fill the single slot so the runner blocks

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Threading;
 
 namespace BareWire.Abstractions.Transport;
 
@@ -7,8 +8,16 @@ namespace BareWire.Abstractions.Transport;
 /// Carries the zero-copy body as a <see cref="ReadOnlySequence{T}"/> of bytes along with
 /// transport-level metadata.
 /// </summary>
-public sealed class InboundMessage
+/// <remarks>
+/// Implements <see cref="IDisposable"/> to return the underlying <see cref="ArrayPool{T}"/>-rented
+/// buffer back to the pool when the message has been fully processed. The consumer pipeline owns the
+/// lifetime of this instance and must call <see cref="Dispose"/> after settlement.
+/// </remarks>
+public sealed class InboundMessage : IDisposable
 {
+    private byte[]? _pooledBuffer;
+    private int _disposed; // 0 = not disposed, 1 = disposed (Interlocked)
+
     /// <summary>
     /// Gets the unique identifier of the message assigned by the transport or originating publisher.
     /// </summary>
@@ -34,9 +43,9 @@ public sealed class InboundMessage
     /// <summary>
     /// Gets the <see cref="ArrayPool{T}"/>-rented buffer backing <see cref="Body"/>, or
     /// <see langword="null"/> when the body is empty or backed by non-pooled memory.
-    /// Must be returned to <see cref="ArrayPool{T}.Shared"/> after the message is settled.
+    /// Internal — visible only to BareWire.Core and test assemblies via InternalsVisibleTo.
     /// </summary>
-    public byte[]? PooledBuffer { get; }
+    internal byte[]? PooledBuffer => _pooledBuffer;
 
     /// <summary>
     /// Initializes a new instance of <see cref="InboundMessage"/> with all required transport metadata.
@@ -47,7 +56,8 @@ public sealed class InboundMessage
     /// <param name="deliveryTag">The transport-specific delivery tag for settlement.</param>
     /// <param name="pooledBuffer">
     /// Optional <see cref="ArrayPool{T}"/>-rented buffer backing <paramref name="body"/>.
-    /// When non-null, ownership transfers to the message pipeline — the transport must not return it.
+    /// When non-null, ownership transfers to this instance — the transport must not return it.
+    /// The buffer will be returned to <see cref="ArrayPool{T}.Shared"/> when <see cref="Dispose"/> is called.
     /// </param>
     /// <exception cref="ArgumentNullException">
     /// Thrown when <paramref name="messageId"/> or <paramref name="headers"/> is null.
@@ -63,6 +73,27 @@ public sealed class InboundMessage
         Headers = headers ?? throw new ArgumentNullException(nameof(headers));
         Body = body;
         DeliveryTag = deliveryTag;
-        PooledBuffer = pooledBuffer;
+        _pooledBuffer = pooledBuffer;
+    }
+
+    /// <summary>
+    /// Returns the <see cref="ArrayPool{T}"/>-rented buffer (if any) back to
+    /// <see cref="ArrayPool{T}.Shared"/>. Safe to call multiple times — subsequent calls are no-ops.
+    /// </summary>
+    /// <remarks>
+    /// After disposal, <see cref="Body"/> still refers to the returned memory segment.
+    /// Accessing <see cref="Body"/> after <see cref="Dispose"/> is undefined behaviour — the
+    /// caller must not read the body once the message has been settled and disposed.
+    /// </remarks>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        if (_pooledBuffer is not null)
+        {
+            ArrayPool<byte>.Shared.Return(_pooledBuffer);
+            _pooledBuffer = null;
+        }
     }
 }

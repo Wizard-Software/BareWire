@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Diagnostics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
@@ -114,11 +113,11 @@ internal sealed partial class ReceiveEndpointRunner
                     SettlementAction action = SettlementAction.Nack;
                     string messageType = "unknown";
                     long startTimestamp = Stopwatch.GetTimestamp();
-
-                    // Start a consume activity for distributed tracing.
                     Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
-                    Activity? activity = _instrumentation.StartConsumeActivity(
-                        messageType, _binding.EndpointName, msgId, message.Headers);
+
+                    // Activity is started AFTER messageType is resolved to avoid "unknown" leaking
+                    // to streaming exporters before dispatch completes.
+                    Activity? activity = null;
 
                     try
                     {
@@ -216,8 +215,9 @@ internal sealed partial class ReceiveEndpointRunner
 
                         action = dispatched ? SettlementAction.Ack : SettlementAction.Reject;
 
-                        // Update activity tag now that messageType is resolved.
-                        activity?.SetTag("messaging.message.type", messageType);
+                        // Start the activity now that messageType is fully resolved.
+                        activity = _instrumentation.StartConsumeActivity(
+                            messageType, _binding.EndpointName, msgId, message.Headers);
 
                         // Record successful consume metrics.
                         if (dispatched)
@@ -233,6 +233,10 @@ internal sealed partial class ReceiveEndpointRunner
                     }
                     catch (Exception ex)
                     {
+                        // Start an error activity if one hasn't been created yet — messageType may
+                        // still be "unknown" here if the exception occurred before dispatch completed.
+                        activity ??= _instrumentation.StartConsumeActivity(
+                            messageType, _binding.EndpointName, msgId, message.Headers);
                         LogConsumerError(_binding.EndpointName, message.MessageId, ex);
                         _instrumentation.RecordFailure(
                             _binding.EndpointName, messageType, ex.GetType().Name);
@@ -262,10 +266,7 @@ internal sealed partial class ReceiveEndpointRunner
                 {
                     creditManager.ReleaseInflight(1, bodyLength);
 
-                    if (message.PooledBuffer is not null)
-                    {
-                        ArrayPool<byte>.Shared.Return(message.PooledBuffer);
-                    }
+                    message.Dispose();
 
                     BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
                     if (healthStatus == BusStatus.Degraded)

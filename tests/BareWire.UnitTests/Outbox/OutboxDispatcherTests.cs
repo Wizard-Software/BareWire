@@ -230,6 +230,56 @@ public sealed class OutboxDispatcherTests
     }
 
     [Fact]
+    public async Task StartAsync_PartialConfirmation_OnlyConfirmedIdsMarkedDelivered()
+    {
+        // Arrange — 3 entries: entries[0] and entries[2] confirmed, entries[1] nacked.
+        var entries = new List<OutboxEntry> { CreateEntry(1), CreateEntry(2), CreateEntry(3) };
+        bool firstGetPending = true;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (firstGetPending)
+                {
+                    firstGetPending = false;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(entries);
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
+            {
+                new(IsConfirmed: true,  DeliveryTag: 0),
+                new(IsConfirmed: false, DeliveryTag: 1), // nacked
+                new(IsConfirmed: true,  DeliveryTag: 2),
+            }));
+
+        IReadOnlyList<long>? capturedIds = null;
+        _store
+            .MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                capturedIds = ci.Arg<IReadOnlyList<long>>();
+                return ValueTask.CompletedTask;
+            });
+
+        await using var sut = CreateSut();
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(50);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — only entries[0] (id=1) and entries[2] (id=3) were confirmed; entries[1] (id=2) was nacked.
+        capturedIds.Should().NotBeNull();
+        capturedIds!.Should().BeEquivalentTo([1L, 3L]);
+    }
+
+    [Fact]
     public async Task StopAsync_GracefulShutdown_TerminatesWithoutException()
     {
         // Arrange — polling loop runs indefinitely returning empty; stop must terminate cleanly.
