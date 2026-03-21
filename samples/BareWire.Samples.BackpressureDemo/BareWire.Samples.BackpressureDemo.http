@@ -1,0 +1,16 @@
+@host = http://localhost:5106
+
+### Start load test (default 1000 msg/s)
+POST {{host}}/load-test/start
+
+### Start load test with custom rate
+POST {{host}}/load-test/start?rate=5000
+
+### Stop load test
+POST {{host}}/load-test/stop
+
+### Get current metrics (publish rate, errors, backpressure)
+GET {{host}}/metrics
+
+### Health check
+GET {{host}}/health

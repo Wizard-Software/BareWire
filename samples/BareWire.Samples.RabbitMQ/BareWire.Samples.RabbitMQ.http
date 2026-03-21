@@ -1,0 +1,16 @@
+@host = http://localhost:5076
+
+### Create an order
+POST {{host}}/orders
+Content-Type: application/json
+
+{
+  "amount": 250.00,
+  "currency": "PLN"
+}
+
+### Get order status (replace {id} with the OrderId from POST response)
+GET {{host}}/orders/{{orderId}}
+
+### Health check
+GET {{host}}/health

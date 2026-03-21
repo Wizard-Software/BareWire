@@ -1,0 +1,15 @@
+@host = http://localhost:5100
+
+### Publish a message
+POST {{host}}/messages
+Content-Type: application/json
+
+{
+  "content": "Hello from BareWire!"
+}
+
+### Get all received messages
+GET {{host}}/messages
+
+### Health check
+GET {{host}}/health

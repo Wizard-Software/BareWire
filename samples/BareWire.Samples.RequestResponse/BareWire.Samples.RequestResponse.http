@@ -1,0 +1,16 @@
+@host = http://localhost:5101
+
+### Validate an order (request-response)
+POST {{host}}/validate-order
+Content-Type: application/json
+
+{
+  "orderId": "ORD-001",
+  "amount": 149.99
+}
+
+### Get all validation records
+GET {{host}}/validations
+
+### Health check
+GET {{host}}/health

@@ -1,0 +1,10 @@
+@host = http://localhost:5102
+
+### Simulate a legacy system publishing raw JSON
+POST {{host}}/legacy/simulate
+
+### Get all processed messages (from both raw and typed consumers)
+GET {{host}}/messages
+
+### Health check
+GET {{host}}/health

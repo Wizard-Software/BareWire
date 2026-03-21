@@ -1,0 +1,7 @@
+@host = http://localhost:5107
+
+### Run the observability demo (3-hop distributed trace)
+POST {{host}}/demo/run
+
+### Health check
+GET {{host}}/health

@@ -1,0 +1,10 @@
+@host = http://localhost:5108
+
+### Generate 1000 events across 10 correlation IDs
+POST {{host}}/events/generate
+
+### Get processing log (verify per-CorrelationId ordering)
+GET {{host}}/events/processing-log
+
+### Health check
+GET {{host}}/health

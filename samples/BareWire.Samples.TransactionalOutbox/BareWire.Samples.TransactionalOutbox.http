@@ -1,0 +1,20 @@
+@host = http://localhost:5104
+
+### Initiate a transfer (atomic outbox write)
+POST {{host}}/transfers
+Content-Type: application/json
+
+{
+  "fromAccount": "PL61109010140000071219812874",
+  "toAccount": "PL27114020040000300201355387",
+  "amount": 1500.00
+}
+
+### Get all transfers
+GET {{host}}/transfers
+
+### Check pending outbox messages
+GET {{host}}/outbox/pending
+
+### Health check
+GET {{host}}/health
