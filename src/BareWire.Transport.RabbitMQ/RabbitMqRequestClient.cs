@@ -164,17 +164,6 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
         try
         {
-            // Serialize the request using zero-copy ADR-003 pattern.
-            ReadOnlyMemory<byte> requestBody = SerializeRequest(request);
-
-            // Build AMQP properties: CorrelationId + ReplyTo.
-            var props = new BasicProperties
-            {
-                CorrelationId = correlationId,
-                ReplyTo = _responseQueueName,
-                ContentType = _serializer.ContentType,
-            };
-
             // Create a short-lived publish channel with publisher confirms.
             IChannel publishChannel = await _connection.CreateChannelAsync(
                 new CreateChannelOptions(
@@ -184,13 +173,10 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
             try
             {
-                await publishChannel.BasicPublishAsync<BasicProperties>(
-                    exchange: _targetExchange,
-                    routingKey: _routingKey,
-                    mandatory: false,
-                    basicProperties: props,
-                    body: requestBody,
-                    cancellationToken: cancellationToken).ConfigureAwait(false);
+                // ADR-003: serialize and publish in a single scope — pooled buffer stays alive
+                // through the await, then returns to ArrayPool. Zero heap allocation.
+                await SerializeAndPublishAsync(request, publishChannel, correlationId, cancellationToken)
+                    .ConfigureAwait(false);
             }
             finally
             {
@@ -331,22 +317,46 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         return Task.CompletedTask;
     }
 
-    // ADR-003: serialize into a pooled buffer, return only the written portion as ReadOnlyMemory<byte>.
-    // The caller uses this for a single publish then discards it; the array is returned to the pool
-    // after BasicPublishAsync completes (we pass ReadOnlyMemory<byte> to the publish API).
-    // NOTE: The underlying array lives until the publish completes because BasicPublishAsync
-    // makes a copy internally before the Task completes for publisher confirms.
-    private ReadOnlyMemory<byte> SerializeRequest(TRequest request)
+    // ADR-003: serialize into a pooled buffer and publish in a single scope so the rented buffer
+    // stays alive through the await. RabbitMQ.Client 7.x copies body bytes synchronously into its
+    // own frame buffer (Framing.SerializeToFrames) before the async I/O — so after BasicPublishAsync
+    // completes, the rented buffer is safe to return to the pool. Zero heap allocation per request.
+    private async ValueTask SerializeAndPublishAsync(
+        TRequest request,
+        IChannel publishChannel,
+        string correlationId,
+        CancellationToken cancellationToken)
     {
-        // Rent a buffer from the pool, grow if needed via the writer.
-        using var writer = new SimplePooledWriter(initialCapacity: 4096);
-        _serializer.Serialize(request, writer);
-        // Must copy written bytes to a new heap array here — we cannot return a slice of the rented buffer
-        // because RabbitMQ.Client 7.x copies the body internally, but we must keep the memory valid
-        // until after the await. Returning WrittenMemory here would give us a slice of the rented buffer
-        // which gets returned in Dispose(). Instead, we rent, copy, and return.
-        // This is a SINGLE allocation per request (not per byte / per message field) — acceptable per spec.
-        return writer.WrittenMemory.ToArray();
+        byte[] rentedBuffer;
+        int length;
+
+        using (var writer = new SimplePooledWriter(initialCapacity: 4096))
+        {
+            _serializer.Serialize(request, writer);
+            (rentedBuffer, length) = writer.DetachBuffer();
+        }
+
+        try
+        {
+            var props = new BasicProperties
+            {
+                CorrelationId = correlationId,
+                ReplyTo = _responseQueueName,
+                ContentType = _serializer.ContentType,
+            };
+
+            await publishChannel.BasicPublishAsync<BasicProperties>(
+                exchange: _targetExchange,
+                routingKey: _routingKey,
+                mandatory: false,
+                basicProperties: props,
+                body: new ReadOnlyMemory<byte>(rentedBuffer, 0, length),
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rentedBuffer);
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Information,
@@ -409,10 +419,27 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             return _buffer.AsSpan(_position);
         }
 
+        /// <summary>
+        /// Detaches the rented buffer, transferring ownership to the caller.
+        /// After this call, <see cref="Dispose"/> will not return the buffer to the pool.
+        /// The caller must return it via <see cref="ArrayPool{T}.Shared"/>.
+        /// </summary>
+        internal (byte[] Buffer, int Length) DetachBuffer()
+        {
+            byte[] buf = _buffer;
+            int len = _position;
+            _buffer = null!;
+            _position = 0;
+            return (buf, len);
+        }
+
         public void Dispose()
         {
-            ArrayPool<byte>.Shared.Return(_buffer);
-            _buffer = null!;
+            if (_buffer is not null)
+            {
+                ArrayPool<byte>.Shared.Return(_buffer);
+                _buffer = null!;
+            }
         }
 
         private void EnsureCapacity(int sizeHint)
