@@ -193,6 +193,9 @@ builder.Services.AddBareWireOutbox(
     {
         outbox.PollingInterval = TimeSpan.FromSeconds(1);
         outbox.DispatchBatchSize = 100;
+
+        // Automatically create Outbox/Inbox tables at host startup (development convenience).
+        outbox.AutoCreateSchema = true;
     });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,22 +210,10 @@ WebApplication app = builder.Build();
 using (IServiceScope scope = app.Services.CreateScope())
 {
     ShowcaseDbContext db = scope.ServiceProvider.GetRequiredService<ShowcaseDbContext>();
-    await db.Database.EnsureCreatedAsync().ConfigureAwait(false);
     try
     {
         var creator = db.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
         await creator.CreateTablesAsync().ConfigureAwait(false);
-    }
-    catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
-    {
-        // Tables already exist from a previous run — safe to ignore in development.
-    }
-
-    OutboxDbContext outboxDb = scope.ServiceProvider.GetRequiredService<OutboxDbContext>();
-    try
-    {
-        var outboxCreator = outboxDb.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
-        await outboxCreator.CreateTablesAsync().ConfigureAwait(false);
     }
     catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
     {

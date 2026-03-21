@@ -44,7 +44,7 @@ WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 // ─────────────────────────────────────────────────────────────────────────────
 
 string rabbitMqConnectionString =
-    builder.Configuration["BareWire:RabbitMQ:ConnectionString"]
+    builder.Configuration.GetConnectionString("rabbitmq")
     ?? "amqp://guest:guest@localhost:5672/";
 
 string dbConnectionString =
@@ -151,6 +151,9 @@ builder.Services.AddBareWireOutbox(
     {
         outbox.PollingInterval = TimeSpan.FromSeconds(1);
         outbox.DispatchBatchSize = 100;
+
+        // Automatically create Outbox/Inbox tables at host startup (development convenience).
+        outbox.AutoCreateSchema = true;
     });
 
 // ─────────────────────────────────────────────────────────────────────────────

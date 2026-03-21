@@ -126,6 +126,9 @@ builder.Services.AddBareWireOutbox(
 
         // Maximum number of outbox messages dispatched per polling cycle.
         outbox.DispatchBatchSize = 100;
+
+        // Automatically create Outbox/Inbox tables at host startup (development convenience).
+        outbox.AutoCreateSchema = true;
     });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,34 +138,15 @@ builder.Services.AddBareWireOutbox(
 WebApplication app = builder.Build();
 
 // Development only — use migrations in production.
-// EnsureCreatedAsync is a no-op when the database already has tables (even from other samples
-// sharing the same connection string). Use GenerateCreateScript + raw SQL for robustness.
+// CreateTablesAsync creates tables for this DbContext model only (unlike EnsureCreatedAsync
+// which is a no-op when any table already exists in a shared database).
 using (IServiceScope scope = app.Services.CreateScope())
 {
     TransferDbContext transferDb = scope.ServiceProvider.GetRequiredService<TransferDbContext>();
-    await transferDb.Database.EnsureCreatedAsync().ConfigureAwait(false);
-
-    // EnsureCreatedAsync is a no-op when ANY table exists in the DB (shared by multiple samples).
-    // Generate and execute the DDL manually to ensure Transfers table is created.
-    string createScript = transferDb.Database.GenerateCreateScript();
-    foreach (string statement in createScript.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-    {
-        if (string.IsNullOrWhiteSpace(statement)) continue;
-        try
-        {
-            await transferDb.Database.ExecuteSqlRawAsync(statement).ConfigureAwait(false);
-        }
-        catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
-        {
-            // Table/index already exists — safe to ignore in development.
-        }
-    }
-
-    OutboxDbContext outboxDb = scope.ServiceProvider.GetRequiredService<OutboxDbContext>();
     try
     {
-        var outboxCreator = outboxDb.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
-        await outboxCreator.CreateTablesAsync().ConfigureAwait(false);
+        var creator = transferDb.Database.GetInfrastructure().GetRequiredService<IRelationalDatabaseCreator>();
+        await creator.CreateTablesAsync().ConfigureAwait(false);
     }
     catch (Npgsql.PostgresException ex) when (ex.SqlState == "42P07")
     {
