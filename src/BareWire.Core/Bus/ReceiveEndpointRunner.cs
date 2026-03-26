@@ -23,6 +23,7 @@ internal sealed partial class ReceiveEndpointRunner
 {
     private readonly EndpointBinding _binding;
     private readonly ITransportAdapter _adapter;
+    private readonly IConsumerChannelManager? _channelManager;
     private readonly IMessageDeserializer _deserializer;
     private readonly IPublishEndpoint _publishEndpoint;
     private readonly ISendEndpointProvider _sendEndpointProvider;
@@ -50,6 +51,7 @@ internal sealed partial class ReceiveEndpointRunner
     {
         _binding = binding;
         _adapter = adapter;
+        _channelManager = adapter as IConsumerChannelManager;
         _deserializer = deserializer;
         _publishEndpoint = publishEndpoint;
         _sendEndpointProvider = sendEndpointProvider;
@@ -124,12 +126,23 @@ internal sealed partial class ReceiveEndpointRunner
             _binding.EndpointName,
             _binding.Consumers.Count + _binding.RawConsumers.Count + _sagaDispatchers.Length);
 
+        // Captures the BW-ConsumerChannelId from the first message in the stream.
+        // Used to release the consumer channel via IConsumerChannelManager after all
+        // in-flight settlements are complete (normal cleanup path post-ConsumeAsync).
+        string? consumerChannelId = null;
+
         try
         {
             await foreach (InboundMessage message in _adapter
                 .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken)
                 .ConfigureAwait(false))
             {
+                // Capture the channel ID from the first message — all messages on the same
+                // ConsumeAsync stream share the same BW-ConsumerChannelId.
+                consumerChannelId ??= message.Headers.TryGetValue("BW-ConsumerChannelId", out string? channelId)
+                    ? channelId
+                    : null;
+
                 // Wait for credit (ADR-004: credit-based flow control).
                 while (creditManager.TryGrantCredits(1) == 0)
                 {
@@ -248,6 +261,19 @@ internal sealed partial class ReceiveEndpointRunner
         {
             LogConsumeLoopFaulted(_binding.EndpointName, ex);
             throw;
+        }
+        finally
+        {
+            // Release the consumer channel so the broker can reclaim it.
+            // CancellationToken.None is intentional — by the time we get here the original
+            // cancellationToken is likely already cancelled (shutdown scenario), but the
+            // close handshake with the broker must still complete cleanly.
+            if (_channelManager is not null && consumerChannelId is not null)
+            {
+                await _channelManager
+                    .ReleaseConsumerChannelAsync(consumerChannelId, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
         }
     }
 

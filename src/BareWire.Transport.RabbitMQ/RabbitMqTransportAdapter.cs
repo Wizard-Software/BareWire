@@ -15,7 +15,7 @@ using BwExchangeType = BareWire.Abstractions.ExchangeType;
 
 namespace BareWire.Transport.RabbitMQ;
 
-internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IAsyncDisposable
+internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IAsyncDisposable
 {
     private readonly RabbitMqTransportOptions _options;
     private readonly ILogger<RabbitMqTransportAdapter> _logger;
@@ -230,9 +230,12 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IAsy
         finally
         {
             // Stop the broker from pushing new messages to this consumer, but keep the channel
-            // open so the caller can still settle (ACK/NACK) messages via SettleAsync.
-            // The channel is cleaned up when:
-            //   - The adapter is disposed (DisposeAsync closes all channels via the connection).
+            // open so the caller can still settle (ACK/NACK) in-flight messages via SettleAsync.
+            // The channel lifecycle after this point:
+            //   - Normal path: the consumer pipeline calls IConsumerChannelManager.ReleaseConsumerChannelAsync
+            //     once all settlements are complete, which removes and closes the channel.
+            //   - Fallback: DisposeAsync closes any channels that were not explicitly released
+            //     (e.g. if the adapter is torn down before the pipeline calls Release).
             inboundChannel.Writer.TryComplete();
 
             try
@@ -463,6 +466,30 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IAsy
         }
 
         return null;
+    }
+
+    /// <inheritdoc />
+    public async Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default)
+    {
+        if (!_activeConsumerChannels.TryRemove(channelId, out IChannel? channel))
+        {
+            // Already released or never registered — no-op (idempotent).
+            return;
+        }
+
+        try
+        {
+            if (channel.IsOpen)
+            {
+                await channel.CloseAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogConsumeChannelCloseError(channelId, ex);
+        }
+
+        await channel.DisposeAsync().ConfigureAwait(false);
     }
 
     private static string ToRabbitMqExchangeType(BwExchangeType exchangeType) =>

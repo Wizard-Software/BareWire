@@ -20,7 +20,7 @@ namespace BareWire.Testing;
 /// Disposal completes all channel writers, which causes any active <see cref="ConsumeAsync"/>
 /// enumerators to terminate gracefully.
 /// </remarks>
-internal sealed class InMemoryTransportAdapter : ITransportAdapter, IAsyncDisposable
+internal sealed class InMemoryTransportAdapter : ITransportAdapter, IConsumerChannelManager, IAsyncDisposable
 {
     private const int DefaultChannelCapacity = 1_000;
 
@@ -124,6 +124,13 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IAsyncDispos
         CancellationToken cancellationToken = default)
     {
         // In-memory transport has no external broker — topology declarations are silently accepted.
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default)
+    {
+        // In-memory transport has no broker channels to release — no-op.
         return Task.CompletedTask;
     }
 
