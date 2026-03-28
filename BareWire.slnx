@@ -32,5 +32,6 @@
     <Project Path="tests/BareWire.ContractTests/BareWire.ContractTests.csproj" />
     <Project Path="tests/BareWire.IntegrationTests/BareWire.IntegrationTests.csproj" />
     <Project Path="tests/BareWire.UnitTests/BareWire.UnitTests.csproj" />
+    <Project Path="tests/BareWire.E2ETests/BareWire.E2ETests.csproj" />
   </Folder>
 </Solution>
