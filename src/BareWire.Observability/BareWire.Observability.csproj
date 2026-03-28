@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>OpenTelemetry integration for BareWire with traces, metrics, and health checks.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
   </ItemGroup>

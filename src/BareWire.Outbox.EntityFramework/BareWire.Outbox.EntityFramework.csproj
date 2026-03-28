@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>Entity Framework Core provider for BareWire Outbox with SQL Server, PostgreSQL, and SQLite support.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\BareWire.Outbox\BareWire.Outbox.csproj" />

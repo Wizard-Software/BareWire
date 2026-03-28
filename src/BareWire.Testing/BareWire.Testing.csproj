@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>In-memory test harness for BareWire with deterministic message delivery and assertion helpers.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="NSubstitute" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />

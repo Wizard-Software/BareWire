@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>Transactional outbox and inbox pattern for BareWire ensuring exactly-once message delivery.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\BareWire\BareWire.csproj" />

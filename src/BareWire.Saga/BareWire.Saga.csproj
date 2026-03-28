@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>SAGA state machine for BareWire with deterministic scheduling and correlation support.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\BareWire\BareWire.csproj" />

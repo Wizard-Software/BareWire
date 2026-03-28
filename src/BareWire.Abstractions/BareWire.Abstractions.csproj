@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>Core interfaces and contracts for BareWire messaging library. Zero dependencies.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="BareWire" />
     <InternalsVisibleTo Include="BareWire.Transport.RabbitMQ" />

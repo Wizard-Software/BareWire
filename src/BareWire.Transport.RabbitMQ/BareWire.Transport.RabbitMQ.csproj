@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <Description>RabbitMQ transport provider for BareWire with manual topology control and connection pooling.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
   </ItemGroup>

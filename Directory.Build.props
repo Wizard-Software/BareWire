@@ -11,9 +11,25 @@
     <AnalysisLevel>10.0-recommended</AnalysisLevel>
   </PropertyGroup>
 
-  <!-- Documentation only for src/ projects -->
+  <!-- src/ projects: documentation, packaging, NuGet metadata -->
   <PropertyGroup Condition="$(MSBuildProjectDirectory.Contains('$([System.IO.Path]::DirectorySeparatorChar)src$([System.IO.Path]::DirectorySeparatorChar)'))">
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>true</IsPackable>
+    <Authors>Artur Sawicki</Authors>
+    <Company>asawicki</Company>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/asawicki/BareWire</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/asawicki/BareWire</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>messaging;rabbitmq;barewire;async;dotnet;high-performance</PackageTags>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Copyright>Copyright (c) Artur Sawicki</Copyright>
   </PropertyGroup>
+
+  <ItemGroup Condition="$(MSBuildProjectDirectory.Contains('$([System.IO.Path]::DirectorySeparatorChar)src$([System.IO.Path]::DirectorySeparatorChar)'))">
+    <None Include="$(MSBuildThisFileDirectory)build/icon.png" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>
