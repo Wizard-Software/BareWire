@@ -88,7 +88,7 @@ public sealed class OrderSagaStateMachine : BareWireStateMachine<OrderSagaState>
                     saga.UpdatedAt = DateTimeOffset.UtcNow;
                     return Task.CompletedTask;
                 })
-                .ScheduleTimeout<PaymentTimeout>((saga, evt) => new PaymentTimeout(evt.OrderId))
+                .ScheduleTimeout<PaymentTimeout>((saga, evt) => new PaymentTimeout(evt.OrderId), paymentTimeoutSchedule)
                 .TransitionTo(processing.Name));
         });
 

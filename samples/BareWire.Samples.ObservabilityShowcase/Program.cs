@@ -100,6 +100,13 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     rmq.Host(rabbitMqConnectionString);
     rmq.DefaultExchange("demo.events");
 
+    // Map message types to AMQP routing keys that match the topic exchange binding patterns.
+    // Without these mappings, PublishAsync<T> would use typeof(T).FullName as the routing key,
+    // which does not match patterns like "order.*" / "payment.*" / "shipment.*".
+    rmq.MapRoutingKey<DemoOrderCreated>("order.created");
+    rmq.MapRoutingKey<DemoPaymentProcessed>("payment.processed");
+    rmq.MapRoutingKey<DemoShipmentDispatched>("shipment.dispatched");
+
     // ADR-002: Manual topology — declare all exchanges, queues, and bindings explicitly.
     // Topic exchange routes messages by routing key pattern to the appropriate queues.
     rmq.ConfigureTopology(t =>
@@ -119,9 +126,10 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
         t.DeclareQueue("demo-shipments", durable: true);
         t.BindExchangeToQueue("demo.events", "demo-shipments", routingKey: "shipment.*");
 
-        // Queue for the saga — receives all events via catch-all "#" routing key.
+        // Queue for the saga — receives only order.* and payment.* events (handled by DemoSagaStateMachine).
         t.DeclareQueue("demo-saga", durable: true);
-        t.BindExchangeToQueue("demo.events", "demo-saga", routingKey: "#");
+        t.BindExchangeToQueue("demo.events", "demo-saga", routingKey: "order.*");
+        t.BindExchangeToQueue("demo.events", "demo-saga", routingKey: "payment.*");
     });
 
     // Endpoint: DemoOrderConsumer processes DemoOrderCreated and publishes DemoPaymentProcessed.

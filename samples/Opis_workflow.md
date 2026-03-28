@@ -243,7 +243,7 @@ GET http://localhost:5102/messages
 
 ### Cel
 
-Kompleksowy przykład end-to-end łączący wiele funkcjonalności BareWire: transport RabbitMQ, SAGA state machine, transactional outbox, observability.
+Kompleksowy przykład end-to-end łączący wiele funkcjonalności BareWire: transport RabbitMQ, transactional outbox, observability, publish-side back-pressure.
 
 ### Demonstrowane funkcjonalności
 
@@ -256,13 +256,11 @@ Kompleksowy przykład end-to-end łączący wiele funkcjonalności BareWire: tra
 ### Architektura przepływu
 
 ```
-POST /orders → OrderCreated (exchange: order.events, fanout)
-    ├→ OrderConsumer (queue: "orders") → przetwarza zamówienie → OrderProcessed
-    └→ OrderSagaStateMachine (queue: "order-saga"):
-           Initial ──OrderCreated──→ Processing
-           Processing ──PaymentReceived──→ Completed
-           Processing ──PaymentFailed──→ Failed
+POST /orders → OrderCreated (exchange: rmq-sample.order.events, fanout)
+    └→ OrderConsumer (queue: "orders") → przetwarza zamówienie → OrderProcessed
 ```
+
+> **Uwaga:** Ten sample używa osobnego exchange `rmq-sample.order.events`, oddzielonego od exchange `order.events` używanego przez SagaOrderFlow (sekcja 5). Dzięki temu oba sample'e mogą działać równolegle bez cross-contamination wiadomości.
 
 ### Workflow krok po kroku
 
@@ -287,10 +285,9 @@ Content-Type: application/json
 
 Co się dzieje w tle:
 1. Generowany jest unikalny `orderId` (GUID).
-2. `OrderCreated` publikowane na exchange `order.events` (fanout).
+2. `OrderCreated` publikowane na exchange `rmq-sample.order.events` (fanout).
 3. **OrderConsumer** na kolejce `orders` odbiera zdarzenie i przetwarza zamówienie.
-4. **OrderSagaStateMachine** na kolejce `order-saga` tworzy nową instancję sagi i przechodzi ze stanu `Initial` do `Processing`.
-5. Saga czeka na zdarzenie `PaymentReceived` lub `PaymentFailed`.
+4. OrderConsumer wysyła `OrderProcessed` na exchange `order-processed.events`.
 
 **Krok 2: Sprawdź status zamówienia**
 

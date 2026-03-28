@@ -10,7 +10,7 @@ namespace BareWire.Samples.RabbitMQ.Consumers;
 /// <see cref="IConsumeContext.GetSendEndpoint"/> once the order has been handled.
 /// </summary>
 /// <remarks>
-/// Sending to a separate exchange (rather than publishing to the default <c>order.events</c>
+/// Sending to a separate exchange (rather than publishing to the default <c>rmq-sample.order.events</c>
 /// exchange) prevents an infinite message loop: <c>order-processed.events</c> is not bound
 /// to the <c>orders</c> queue, so <see cref="OrderProcessed"/> messages never re-enter this consumer.
 /// <para>

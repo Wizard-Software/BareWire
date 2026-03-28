@@ -22,8 +22,11 @@
 //       └→ TransactionalOutboxMiddleware: inbox dedup check (exactly-once)
 //       └→ INSERT NotificationLog (Type="Audit")
 //
-//   POST /payments/duplicate?paymentId=...
+//   POST /payments/duplicate?paymentId=...&messageId=...&amount=...
 //       └→ Re-publishes with the same MessageId → both consumers reject (duplicate)
+//
+//   POST /payments/redeliver?paymentId=...&messageId=...&amount=...
+//       └→ Simulates broker redelivery → inbox prevents double processing
 //
 // Prerequisites (runtime, NOT required to compile):
 //   - RabbitMQ broker (default: amqp://guest:guest@localhost:5672/)
@@ -206,13 +209,15 @@ app.MapPost("/payments", async (
         PaymentId = paymentId,
         MessageId = messageId,
         Note = "PaymentReceived published. Both Email and Audit consumers will process it exactly once. " +
-               "Use MessageId with /duplicate or /redeliver to test inbox deduplication."
+               $"Use /duplicate?paymentId={paymentId}&messageId={messageId}&amount={request.Amount} " +
+               $"or /redeliver?paymentId={paymentId}&messageId={messageId}&amount={request.Amount} " +
+               "to test inbox deduplication."
     });
 })
 .Produces(StatusCodes.Status202Accepted)
 .WithName("PublishPayment");
 
-// POST /payments/duplicate?paymentId=...&messageId=... — re-publish with the original MessageId.
+// POST /payments/duplicate?paymentId=...&messageId=...&amount=... — re-publish with the original MessageId.
 // The inbox rejects processing for both consumers because entries already exist
 // for this (MessageId, ConsumerType) composite key.
 app.MapPost("/payments/duplicate", async (
@@ -241,7 +246,7 @@ app.MapPost("/payments/duplicate", async (
 .Produces(StatusCodes.Status200OK)
 .WithName("PublishDuplicate");
 
-// POST /payments/redeliver?paymentId=...&messageId=... — simulates a broker redelivery scenario.
+// POST /payments/redeliver?paymentId=...&messageId=...&amount=... — simulates a broker redelivery scenario.
 // In production, RabbitMQ might redeliver a message after a consumer crash or nack.
 // The inbox prevents the handler from running a second time for the same (MessageId, ConsumerType).
 app.MapPost("/payments/redeliver", async (

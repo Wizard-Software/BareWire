@@ -10,7 +10,7 @@
 //   - Minimal API endpoint POST /orders that publishes OrderCreated.
 //
 // Architecture:
-//   POST /orders → OrderCreated → exchange:order.events (fanout) → queue:orders
+//   POST /orders → OrderCreated → exchange:rmq-sample.order.events (fanout) → queue:orders
 //       └→ OrderConsumer → OrderProcessed → exchange:order-processed.events (fanout)
 //   (SAGA state machine is in the separate BareWire.Samples.SagaOrderFlow sample.)
 //
@@ -71,24 +71,24 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 {
     // Connection to the RabbitMQ broker.
     rmq.Host(rabbitMqConnectionString);
-    rmq.DefaultExchange("order.events");
+    rmq.DefaultExchange("rmq-sample.order.events");
 
     // ADR-002: Manual topology — declare all exchanges, queues, and bindings explicitly.
     // The broker resources are deployed by IBusControl.DeployTopologyAsync on startup.
     rmq.ConfigureTopology(t =>
     {
         // Two separate exchanges prevent a publish cycle:
-        //   "order.events"           — receives OrderCreated from the HTTP endpoint (DefaultExchange).
-        //   "order-processed.events" — receives OrderProcessed from OrderConsumer via GetSendEndpoint.
-        // Only "order.events" is bound to the "orders" queue; "order-processed.events" is intentionally
+        //   "rmq-sample.order.events" — receives OrderCreated from the HTTP endpoint (DefaultExchange).
+        //   "order-processed.events"  — receives OrderProcessed from OrderConsumer via GetSendEndpoint.
+        // Only "rmq-sample.order.events" is bound to the "orders" queue; "order-processed.events" is intentionally
         // left unbound here so that OrderProcessed messages do not loop back through OrderConsumer.
         // The "order-saga" queue is managed by BareWire.Samples.SagaOrderFlow — not this sample.
-        t.DeclareExchange("order.events", ExchangeType.Fanout, durable: true);
+        t.DeclareExchange("rmq-sample.order.events", ExchangeType.Fanout, durable: true);
         t.DeclareExchange("order-processed.events", ExchangeType.Fanout, durable: true);
 
         // Queue for OrderConsumer (processes OrderCreated → sends OrderProcessed).
         t.DeclareQueue("orders", durable: true);
-        t.BindExchangeToQueue("order.events", "orders", routingKey: "#");
+        t.BindExchangeToQueue("rmq-sample.order.events", "orders", routingKey: "#");
         // NOTE: "order-processed.events" is NOT bound to "orders" — that is what breaks the cycle.
     });
 
@@ -164,7 +164,7 @@ WebApplication app = builder.Build();
 app.MapHealthChecks("/health");
 
 // POST /orders — accepts an order submission and publishes OrderCreated to the bus.
-// All connected consumers and the saga receive the event via the "order.events" exchange.
+// OrderConsumer receives the event via the "rmq-sample.order.events" exchange.
 app.MapPost("/orders", async (
     OrderRequest request,
     IPublishEndpoint bus,
