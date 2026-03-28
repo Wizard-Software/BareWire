@@ -9,6 +9,12 @@ namespace BareWire.Serialization.Json;
 
 internal sealed class BareWireEnvelopeSerializer : IMessageSerializer, IMessageDeserializer
 {
+    private static readonly JsonWriterOptions s_writerOptions = new() { SkipValidation = true };
+
+    // Thread-local pooling — same rationale as SystemTextJsonSerializer.
+    [ThreadStatic]
+    private static Utf8JsonWriter? t_writer;
+
     public string ContentType => "application/vnd.barewire+json";
 
     public void Serialize<T>(T message, IBufferWriter<byte> output) where T : class
@@ -16,21 +22,27 @@ internal sealed class BareWireEnvelopeSerializer : IMessageSerializer, IMessageD
         ArgumentNullException.ThrowIfNull(message);
         ArgumentNullException.ThrowIfNull(output);
 
+        Utf8JsonWriter writer = t_writer ??= new Utf8JsonWriter(Stream.Null, s_writerOptions);
+        writer.Reset(output);
         try
         {
-            JsonElement body = JsonSerializer.SerializeToElement(message, BareWireJsonSerializerOptions.Default);
+            // Write envelope fields directly to avoid intermediate JsonElement allocation.
+            // Property names use camelCase to match BareWireJsonSerializerOptions.Default.
+            // Null values are omitted to match DefaultIgnoreCondition.WhenWritingNull.
+            writer.WriteStartObject();
+            writer.WriteString("messageId"u8, Guid.NewGuid());
 
-            var envelope = new BareWireEnvelope(
-                MessageId: Guid.NewGuid(),
-                CorrelationId: null,
-                ConversationId: null,
-                MessageType: [$"urn:message:{typeof(T).Namespace}:{typeof(T).Name}"],
-                SentTime: DateTimeOffset.UtcNow,
-                Headers: null,
-                Body: body);
+            writer.WriteStartArray("messageType"u8);
+            writer.WriteStringValue($"urn:message:{typeof(T).Namespace}:{typeof(T).Name}");
+            writer.WriteEndArray();
 
-            using var writer = new Utf8JsonWriter(output, new JsonWriterOptions { SkipValidation = true });
-            JsonSerializer.Serialize(writer, envelope, BareWireJsonSerializerOptions.Default);
+            writer.WriteString("sentTime"u8, DateTimeOffset.UtcNow);
+
+            writer.WritePropertyName("body"u8);
+            JsonSerializer.Serialize(writer, message, BareWireJsonSerializerOptions.Default);
+
+            writer.WriteEndObject();
+            writer.Flush();
         }
         catch (JsonException ex)
         {
@@ -39,6 +51,10 @@ internal sealed class BareWireEnvelopeSerializer : IMessageSerializer, IMessageD
                 ContentType,
                 targetType: typeof(T),
                 innerException: ex);
+        }
+        finally
+        {
+            writer.Reset(Stream.Null);
         }
     }
 

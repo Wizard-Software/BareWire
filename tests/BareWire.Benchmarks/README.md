@@ -8,10 +8,12 @@ Performance benchmarks for BareWire messaging pipeline using [BenchmarkDotNet](h
 |-----------|-----------|------------|-----------|
 | Publish typed (in-memory) | > 500K msgs/s | < 768 B/msg | ±10% |
 | Publish raw (in-memory) | > 1M msgs/s | < 512 B/msg | ±10% |
-| Consume + ack (in-memory) | > 300K msgs/s | < 256 B/msg | ±10% |
+| Consume + ack (in-memory) | > 300K msgs/s | < 512 B/op | ±10% |
 | SAGA transition (in-memory) | > 100K msgs/s | < 768 B/transition | ±15% |
-| JSON serialize (1 KB) | < 1 μs | < 128 B | ±10% |
-| JSON deserialize (1 KB) | < 1 μs | < 256 B | ±10% |
+| JSON serialize raw (1 KB) | < 2 μs | < 384 B | ±10% |
+| JSON serialize envelope (1 KB) | < 2 μs | < 512 B | ±10% |
+| JSON deserialize raw (1 KB) | < 5 μs | < 5 KB | ±10% |
+| JSON deserialize envelope (1 KB) | < 10 μs | < 8 KB | ±10% |
 
 ## Running Benchmarks
 

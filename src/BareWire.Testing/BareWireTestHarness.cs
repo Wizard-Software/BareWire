@@ -1,18 +1,19 @@
 using System.Buffers;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
+using BareWire.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Bus;
 using BareWire.Configuration;
 using BareWire.FlowControl;
 using BareWire;
 using BareWire.Pipeline;
+using BareWire.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
-using NSubstitute;
-
 namespace BareWire.Testing;
 
 /// <summary>
@@ -31,11 +32,13 @@ public sealed class BareWireTestHarness : IAsyncDisposable
 {
     private readonly InMemoryTransportAdapter _adapter;
     private readonly BareWireBusControl _busControl;
+    private readonly IRoutingKeyResolver _routingKeyResolver;
 
-    private BareWireTestHarness(InMemoryTransportAdapter adapter, BareWireBusControl busControl)
+    private BareWireTestHarness(InMemoryTransportAdapter adapter, BareWireBusControl busControl, IRoutingKeyResolver routingKeyResolver)
     {
         _adapter = adapter;
         _busControl = busControl;
+        _routingKeyResolver = routingKeyResolver;
     }
 
     /// <summary>
@@ -50,10 +53,15 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     /// An optional callback that receives an <see cref="IBusConfigurator"/> to apply
     /// custom configuration. Currently a placeholder — full DI-based wiring is completed in Phase 1.15.
     /// </param>
+    /// <param name="routingKeyResolver">
+    /// An optional <see cref="IRoutingKeyResolver"/> to override the default fallback resolver.
+    /// When <see langword="null"/>, a resolver with empty mappings (falls back to <c>typeof(T).FullName</c>) is used.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the startup sequence.</param>
     /// <returns>A started <see cref="BareWireTestHarness"/> ready for use in tests.</returns>
     public static async Task<BareWireTestHarness> CreateAsync(
         Action<IBusConfigurator>? configure = null,
+        IRoutingKeyResolver? routingKeyResolver = null,
         CancellationToken cancellationToken = default)
     {
         InMemoryTransportAdapter adapter = new();
@@ -62,29 +70,22 @@ public sealed class BareWireTestHarness : IAsyncDisposable
         // with a message that round-trips through the in-memory transport without real serialization.
         IMessageSerializer serializer = new NoOpMessageSerializer();
         IMessageDeserializer deserializer = new NoOpMessageDeserializer();
+        IDeserializerResolver deserializerResolver = new SingleDeserializerResolver(deserializer);
 
         // Use NullLoggerFactory so the harness produces no log output by default.
         ILoggerFactory loggerFactory = NullLoggerFactory.Instance;
 
-        // ConsumerDispatcher requires IServiceScopeFactory. In the test harness there are
-        // no registered consumers, so a no-op mock is sufficient.
-        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
-
         FlowController flowController = new(loggerFactory.CreateLogger<FlowController>());
         MiddlewareChain middlewareChain = new([]);
 
-        ConsumerDispatcher dispatcher = new(
-            scopeFactory: scopeFactory,
-            logger: loggerFactory.CreateLogger<ConsumerDispatcher>());
-
         MessagePipeline pipeline = new(
             middlewareChain: middlewareChain,
-            dispatcher: dispatcher,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: loggerFactory.CreateLogger<MessagePipeline>(),
             instrumentation: new NullInstrumentation());
 
         PublishFlowControlOptions publishFlowControl = new();
+        IRoutingKeyResolver resolver = routingKeyResolver ?? new RoutingKeyResolver();
 
         BareWireBus bus = new(
             adapter: adapter,
@@ -93,7 +94,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             flowController: flowController,
             publishFlowControl: publishFlowControl,
             logger: loggerFactory.CreateLogger<BareWireBus>(),
-            instrumentation: new NullInstrumentation());
+            instrumentation: new NullInstrumentation(),
+            routingKeyResolver: resolver);
 
         BusConfigurator configurator = new() { HasInMemoryTransport = true };
         configure?.Invoke(configurator);
@@ -106,7 +108,7 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             logger: loggerFactory.CreateLogger<BareWireBusControl>(),
             topology: null,
             endpointBindings: [],
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             scopeFactory: new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
             instrumentation: new NullInstrumentation(),
             loggerFactory: loggerFactory,
@@ -114,7 +116,7 @@ public sealed class BareWireTestHarness : IAsyncDisposable
 
         await busControl.StartAsync(cancellationToken).ConfigureAwait(false);
 
-        return new BareWireTestHarness(adapter, busControl);
+        return new BareWireTestHarness(adapter, busControl, resolver);
     }
 
     /// <summary>
@@ -154,7 +156,7 @@ public sealed class BareWireTestHarness : IAsyncDisposable
 
     private Task<OutboundMessage> WaitForMessageAsync<T>(TimeSpan timeout) where T : class
     {
-        string expectedRoutingKey = typeof(T).FullName ?? typeof(T).Name;
+        string expectedRoutingKey = _routingKeyResolver.Resolve<T>();
 
         TaskCompletionSource<OutboundMessage> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         CancellationTokenSource timeoutCts = new();

@@ -194,6 +194,7 @@ namespace BareWire.Abstractions.Configuration
     {
         public EndpointBinding() { }
         public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Configuration.ConsumerRegistration> Consumers { get; init; }
+        public System.Type? DeserializerOverrideType { get; init; }
         public required string EndpointName { get; init; }
         public bool HasDeadLetterExchange { get; init; }
         public int PrefetchCount { get; init; }
@@ -201,6 +202,7 @@ namespace BareWire.Abstractions.Configuration
         public int RetryCount { get; init; }
         public System.TimeSpan RetryInterval { get; init; }
         public System.Collections.Generic.IReadOnlyList<System.Type> SagaTypes { get; init; }
+        public System.Type? SerializerOverrideType { get; init; }
     }
     public interface IBusConfigurator
     {
@@ -223,6 +225,8 @@ namespace BareWire.Abstractions.Configuration
         void ConfigureTopology(System.Action<BareWire.Abstractions.Topology.ITopologyConfigurator> configure);
         void DefaultExchange(string exchangeName);
         void Host(string uri, System.Action<BareWire.Abstractions.Configuration.IHostConfigurator>? configure = null);
+        void MapRoutingKey<T>(string routingKey)
+            where T :  class;
         void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
     }
     public interface IReceiveEndpointConfigurator
@@ -241,6 +245,10 @@ namespace BareWire.Abstractions.Configuration
             where T :  class, BareWire.Abstractions.IRawConsumer;
         void StateMachineSaga<TSaga>()
             where TSaga :  class;
+        void UseDeserializer<TDeserializer>()
+            where TDeserializer :  class, BareWire.Abstractions.Serialization.IMessageDeserializer;
+        void UseSerializer<TSerializer>()
+            where TSerializer :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
     }
     public interface ITlsConfigurator
     {
@@ -364,11 +372,24 @@ namespace BareWire.Abstractions.Pipeline
         public System.Threading.CancellationToken CancellationToken { get; }
         public string EndpointName { get; }
         public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
+        public System.Collections.Generic.IDictionary<string, object?> Items { get; }
         public System.Guid MessageId { get; }
         public System.Buffers.ReadOnlySequence<byte> RawBody { get; }
         public System.IServiceProvider ServiceProvider { get; }
     }
     public delegate System.Threading.Tasks.Task NextMiddleware(BareWire.Abstractions.Pipeline.MessageContext context);
+    public static class WellKnownItemKeys
+    {
+        public const string InboxFiltered = "inbox:filtered";
+    }
+}
+namespace BareWire.Abstractions.Routing
+{
+    public interface IRoutingKeyResolver
+    {
+        string Resolve<T>()
+            where T :  class;
+    }
 }
 namespace BareWire.Abstractions.Saga
 {
@@ -415,6 +436,8 @@ namespace BareWire.Abstractions.Saga
             where T :  class;
         BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> ScheduleTimeout<T>(System.Func<TSaga, TEvent, T> factory)
             where T :  class;
+        BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> ScheduleTimeout<T>(System.Func<TSaga, TEvent, T> factory, BareWire.Abstractions.Saga.ScheduleHandle<T> schedule)
+            where T :  class;
         BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Send<T>(System.Uri destination, System.Func<TSaga, TEvent, T> factory)
             where T :  class;
         BareWire.Abstractions.Saga.IEventActivityBuilder<TSaga, TEvent> Then(System.Func<TSaga, TEvent, System.Threading.Tasks.Task> action);
@@ -428,7 +451,7 @@ namespace BareWire.Abstractions.Saga
     public interface ISagaMessageDispatcher
     {
         System.Type StateMachineType { get; }
-        System.Threading.Tasks.Task<bool> TryDispatchAsync(System.Buffers.ReadOnlySequence<byte> body, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, string messageId, BareWire.Abstractions.IPublishEndpoint publishEndpoint, BareWire.Abstractions.ISendEndpointProvider sendEndpointProvider, BareWire.Abstractions.Serialization.IMessageDeserializer deserializer, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<bool> TryDispatchAsync(System.Buffers.ReadOnlySequence<byte> body, System.Collections.Generic.IReadOnlyDictionary<string, string> headers, string messageId, string endpointName, BareWire.Abstractions.IPublishEndpoint publishEndpoint, BareWire.Abstractions.ISendEndpointProvider sendEndpointProvider, BareWire.Abstractions.Serialization.IDeserializerResolver deserializerResolver, System.Threading.CancellationToken cancellationToken = default);
     }
     public interface ISagaRepository<TSaga>
         where TSaga :  class, BareWire.Abstractions.Saga.ISagaState

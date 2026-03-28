@@ -2,6 +2,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Saga;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
@@ -10,6 +11,8 @@ using BareWire.Bus;
 using BareWire.Configuration;
 using BareWire.FlowControl;
 using BareWire.Pipeline;
+using BareWire.Routing;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -89,11 +92,6 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(sp => new FlowController(
             sp.GetRequiredService<ILogger<FlowController>>()));
 
-        // Consumer dispatcher — creates scoped DI lifetimes per message dispatch.
-        services.AddSingleton(sp => new ConsumerDispatcher(
-            sp.GetRequiredService<IServiceScopeFactory>(),
-            sp.GetRequiredService<ILogger<ConsumerDispatcher>>()));
-
         // Middleware chain — built from all registered middleware types resolved from DI.
         // Capture the middleware type list from the configurator for use in the factory lambda.
         IReadOnlyList<Type> middlewareTypes = configurator.MiddlewareTypes;
@@ -109,10 +107,15 @@ public static class ServiceCollectionExtensions
         // Message pipeline — orchestrates inbound and outbound message lifecycle.
         services.AddSingleton(sp => new MessagePipeline(
             sp.GetRequiredService<MiddlewareChain>(),
-            sp.GetRequiredService<ConsumerDispatcher>(),
-            sp.GetRequiredService<IMessageDeserializer>(),
+            sp.GetService<IDeserializerResolver>()
+                ?? new SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
             sp.GetRequiredService<ILogger<MessagePipeline>>(),
             sp.GetRequiredService<IBareWireInstrumentation>()));
+
+        // Default routing key resolver — returns typeof(T).FullName for all types.
+        // Transport packages (e.g. AddBareWireRabbitMq) replace this with a resolver
+        // that includes explicit routing key mappings configured via MapRoutingKey<T>.
+        services.TryAddSingleton<IRoutingKeyResolver>(new RoutingKeyResolver());
 
         // Publish flow control options — use defaults unless the caller has already registered
         // a custom instance before calling AddBareWire.
@@ -129,6 +132,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<PublishFlowControlOptions>(),
             sp.GetRequiredService<ILogger<BareWireBus>>(),
             sp.GetRequiredService<IBareWireInstrumentation>(),
+            sp.GetRequiredService<IRoutingKeyResolver>(),
             sp.GetService<IRequestClientFactory>()));
 
         // BareWireBusControl — wraps BareWireBus and implements IBusControl / IBus.
@@ -141,7 +145,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ILogger<BareWireBusControl>>(),
             sp.GetService<TopologyDeclaration>(),
             sp.GetService<IReadOnlyList<EndpointBinding>>() ?? [],
-            sp.GetRequiredService<IMessageDeserializer>(),
+            sp.GetService<IDeserializerResolver>()
+                ?? new SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<IBareWireInstrumentation>(),
             sp.GetRequiredService<ILoggerFactory>(),

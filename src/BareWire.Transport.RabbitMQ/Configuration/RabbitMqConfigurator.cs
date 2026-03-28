@@ -13,6 +13,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     private RabbitMqTopologyConfigurator? _topologyConfigurator;
     private RabbitMqHeaderMappingConfigurator? _headerMappingConfigurator;
     private readonly List<RabbitMqEndpointConfiguration> _endpoints = [];
+    private readonly Dictionary<Type, string> _routingKeyMappings = [];
 
     public void Host(string uri, Action<IHostConfigurator>? configure = null)
     {
@@ -56,6 +57,12 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         configure(_headerMappingConfigurator);
     }
 
+    public void MapRoutingKey<T>(string routingKey) where T : class
+    {
+        ArgumentException.ThrowIfNullOrEmpty(routingKey);
+        _routingKeyMappings[typeof(T)] = routingKey;
+    }
+
     internal RabbitMqTransportOptions Build()
     {
         ValidateUri(_hostUri);
@@ -97,6 +104,11 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         if (_headerMappingConfigurator is not null)
         {
             options.HeaderMappingConfigurator = _headerMappingConfigurator;
+        }
+
+        if (_routingKeyMappings.Count > 0)
+        {
+            options.RoutingKeyMappings = new Dictionary<Type, string>(_routingKeyMappings);
         }
 
         return options;

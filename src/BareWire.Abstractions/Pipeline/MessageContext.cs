@@ -40,6 +40,27 @@ public sealed class MessageContext
     /// <summary>The name of the receive endpoint processing this message.</summary>
     public string EndpointName { get; }
 
+    private string? _messageIdString;
+    private Dictionary<string, object?>? _items;
+
+    /// <summary>
+    /// Gets the string representation of <see cref="MessageId"/>, cached to avoid repeated allocations.
+    /// </summary>
+    internal string MessageIdString => _messageIdString ??= MessageId.ToString();
+
+    /// <summary>
+    /// Mutable bag for middleware to communicate out-of-band data to the pipeline host.
+    /// Keys follow the convention "component:key" (e.g., "inbox:filtered").
+    /// Lazy-initialized — zero allocation when unused.
+    /// </summary>
+    public IDictionary<string, object?> Items => _items ??= new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Returns <see langword="true"/> when at least one item has been written to <see cref="Items"/>,
+    /// without triggering a lazy allocation.
+    /// </summary>
+    internal bool HasItems => _items is not null;
+
     /// <summary>
     /// Initializes a new instance of <see cref="MessageContext"/>.
     /// </summary>

@@ -39,12 +39,11 @@ public sealed class BareWireBusControlTests
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
         serializer.ContentType.Returns("application/json");
 
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
         IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
 
         MiddlewareChain chain = new([]);
-        ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         BareWireBus bus = new(
@@ -68,7 +67,7 @@ public sealed class BareWireBusControlTests
             NullLogger<BareWireBusControl>.Instance,
             topology: null,
             endpointBindings: [],
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             scopeFactory: scopeFactory,
             instrumentation: new NullInstrumentation(),
             loggerFactory: NullLoggerFactory.Instance,

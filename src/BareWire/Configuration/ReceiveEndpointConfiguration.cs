@@ -29,6 +29,9 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
     internal IReadOnlyList<Type> RawConsumerTypes => _rawConsumerTypes;
     internal IReadOnlyList<Type> SagaTypes => _sagaTypes;
 
+    internal Type? SerializerOverrideType { get; private set; }
+    internal Type? DeserializerOverrideType { get; private set; }
+
     internal bool HasAnyConsumer =>
         _consumerTypes.Count > 0 || _rawConsumerTypes.Count > 0 || _sagaTypes.Count > 0;
 
@@ -73,5 +76,17 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
     public void StateMachineSaga<TSaga>() where TSaga : class
     {
         _sagaTypes.Add(typeof(TSaga));
+    }
+
+    /// <inheritdoc />
+    public void UseSerializer<TSerializer>() where TSerializer : class, IMessageSerializer
+    {
+        SerializerOverrideType = typeof(TSerializer);
+    }
+
+    /// <inheritdoc />
+    public void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer
+    {
+        DeserializerOverrideType = typeof(TDeserializer);
     }
 }

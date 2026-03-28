@@ -6,6 +6,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Serialization;
+using static BareWire.Abstractions.Pipeline.WellKnownItemKeys;
 using BareWire.Abstractions.Transport;
 using BareWire.Bus;
 using BareWire.FlowControl;
@@ -48,6 +49,31 @@ public sealed class TrackingRawConsumer : IRawConsumer
     public Task ConsumeAsync(RawConsumeContext context)
     {
         _executionLog.Add(_label);
+        return Task.CompletedTask;
+    }
+}
+
+// Two record types with compatible JSON structure — used to reproduce BW-MessageType routing bug.
+// Must be public so ConsumerInvokerFactory can build delegates over these types.
+public sealed record TestOrderEvent(string? OrderId, string CorrelationId);
+public sealed record TestPaymentEvent(string? PaymentId, string CorrelationId);
+
+// Tracking consumers for multi-consumer header-based dispatch tests.
+// Must be public so ConsumerInvokerFactory and GetRequiredService<T>() can resolve them.
+public sealed class TrackingOrderConsumer(List<string> log) : IConsumer<TestOrderEvent>
+{
+    public Task ConsumeAsync(ConsumeContext<TestOrderEvent> context)
+    {
+        log.Add("OrderConsumer");
+        return Task.CompletedTask;
+    }
+}
+
+public sealed class TrackingPaymentConsumer(List<string> log) : IConsumer<TestPaymentEvent>
+{
+    public Task ConsumeAsync(ConsumeContext<TestPaymentEvent> context)
+    {
+        log.Add("PaymentConsumer");
         return Task.CompletedTask;
     }
 }
@@ -97,6 +123,8 @@ public sealed class ReceiveEndpointRunnerTests
 
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         ThrowingRawConsumer consumer = new();
 
@@ -128,7 +156,7 @@ public sealed class ReceiveEndpointRunnerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             Substitute.For<IPublishEndpoint>(),
             Substitute.For<ISendEndpointProvider>(),
             scopeFactory,
@@ -185,6 +213,8 @@ public sealed class ReceiveEndpointRunnerTests
 
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         ThrowingRawConsumer consumer = new();
 
@@ -214,7 +244,7 @@ public sealed class ReceiveEndpointRunnerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             Substitute.For<IPublishEndpoint>(),
             Substitute.For<ISendEndpointProvider>(),
             scopeFactory,
@@ -252,6 +282,8 @@ public sealed class ReceiveEndpointRunnerTests
 
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         ThrowingRawConsumer consumer = new();
 
@@ -284,7 +316,7 @@ public sealed class ReceiveEndpointRunnerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             Substitute.For<IPublishEndpoint>(),
             Substitute.For<ISendEndpointProvider>(),
             scopeFactory,
@@ -466,6 +498,8 @@ public sealed class ReceiveEndpointRunnerTests
 
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         TrackingRawConsumer consumer = new(executionLog, "consumer");
 
@@ -505,7 +539,7 @@ public sealed class ReceiveEndpointRunnerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             Substitute.For<IPublishEndpoint>(),
             Substitute.For<ISendEndpointProvider>(),
             scopeFactory,
@@ -515,6 +549,376 @@ public sealed class ReceiveEndpointRunnerTests
             loggerFactory: NullLoggerFactory.Instance);
 
         return (runner, channel.Writer, adapter, executionLog);
+    }
+
+    /// <summary>
+    /// Creates a runner with two typed consumers (Order + Payment) to test header-based routing.
+    /// The mock deserializer is set up to return valid instances for both message types so
+    /// the fallback (deserialization-based routing) path also works correctly.
+    /// </summary>
+    private static (
+        ReceiveEndpointRunner Runner,
+        List<string> ExecutionLog,
+        ChannelWriter<InboundMessage> MessageWriter,
+        ITransportAdapter Adapter)
+        CreateRunnerWithTwoTypedConsumers()
+    {
+        List<string> log = [];
+        TrackingOrderConsumer orderConsumer = new(log);
+        TrackingPaymentConsumer paymentConsumer = new(log);
+
+        Channel<InboundMessage> channel = Channel.CreateBounded<InboundMessage>(
+            new BoundedChannelOptions(64) { SingleWriter = false, SingleReader = true });
+
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
+        adapter.TransportName.Returns("test");
+        adapter.ConsumeAsync(
+                Arg.Any<string>(),
+                Arg.Any<FlowControlOptions>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo => ReadChannelAsync(channel.Reader, callInfo.ArgAt<CancellationToken>(2)));
+        adapter.SettleAsync(
+                Arg.Any<SettlementAction>(),
+                Arg.Any<InboundMessage>(),
+                Arg.Any<CancellationToken>())
+               .Returns(Task.CompletedTask);
+
+        // Set up deserializer to return valid instances for both message types.
+        // ConsumerInvokerFactory calls deserializer.Deserialize<T>(body) — returning null
+        // causes UnknownPayloadException which is the "no match" signal in fallback routing.
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<TestOrderEvent>(Arg.Any<ReadOnlySequence<byte>>())
+                    .Returns(new TestOrderEvent("order-1", "corr-1"));
+        deserializer.Deserialize<TestPaymentEvent>(Arg.Any<ReadOnlySequence<byte>>())
+                    .Returns(new TestPaymentEvent("pay-1", "corr-1"));
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IServiceScope scope = Substitute.For<IServiceScope>();
+        IServiceProvider provider = Substitute.For<IServiceProvider>();
+
+        scopeFactory.CreateScope().Returns(scope);
+        scope.ServiceProvider.Returns(provider);
+        provider.GetService(typeof(TrackingOrderConsumer)).Returns(orderConsumer);
+        provider.GetService(typeof(TrackingPaymentConsumer)).Returns(paymentConsumer);
+        provider.GetService(typeof(IEnumerable<IMessageMiddleware>))
+            .Returns(Array.Empty<IMessageMiddleware>());
+
+        FlowController flowController = new(NullLogger<FlowController>.Instance);
+
+        EndpointBinding binding = new()
+        {
+            EndpointName = EndpointName,
+            PrefetchCount = 4,
+            Consumers =
+            [
+                new ConsumerRegistration(typeof(TrackingOrderConsumer), typeof(TestOrderEvent)),
+                new ConsumerRegistration(typeof(TrackingPaymentConsumer), typeof(TestPaymentEvent)),
+            ],
+            RawConsumers = [],
+        };
+
+        ReceiveEndpointRunner runner = new(
+            binding,
+            adapter,
+            deserializerResolver,
+            Substitute.For<IPublishEndpoint>(),
+            Substitute.For<ISendEndpointProvider>(),
+            scopeFactory,
+            flowController,
+            new NullInstrumentation(),
+            NullLogger<ReceiveEndpointRunner>.Instance,
+            loggerFactory: NullLoggerFactory.Instance);
+
+        return (runner, log, channel.Writer, adapter);
+    }
+
+    private static InboundMessage MakeMessageWithHeaders(
+        Dictionary<string, string> headers,
+        string id = "msg-1")
+    {
+        byte[] body = """{"CorrelationId":"corr-1"}"""u8.ToArray();
+        return new InboundMessage(
+            messageId: id,
+            headers: headers,
+            body: new ReadOnlySequence<byte>(body),
+            deliveryTag: 1UL);
+    }
+
+    // ── Multi-consumer header-based dispatch tests (task 10.18) ──────────────
+
+    [Fact]
+    public async Task DispatchMessageAsync_WithBwMessageTypeHeader_RoutesToMatchingConsumer()
+    {
+        // Arrange — two consumers; header targets the second one (PaymentConsumer).
+        var (runner, log, writer, _) = CreateRunnerWithTwoTypedConsumers();
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        Dictionary<string, string> headers = new()
+        {
+            ["BW-MessageType"] = nameof(TestPaymentEvent),
+        };
+        await writer.WriteAsync(MakeMessageWithHeaders(headers, "msg-payment"), cts.Token);
+        writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — PaymentConsumer was dispatched.
+        log.Should().Contain("PaymentConsumer");
+    }
+
+    [Fact]
+    public async Task DispatchMessageAsync_WithBwMessageTypeHeader_FirstConsumerNotInvoked()
+    {
+        // Arrange — two consumers; header targets the second one (PaymentConsumer).
+        // Before the fix, the first registered consumer (OrderConsumer) would always win.
+        var (runner, log, writer, _) = CreateRunnerWithTwoTypedConsumers();
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        Dictionary<string, string> headers = new()
+        {
+            ["BW-MessageType"] = nameof(TestPaymentEvent),
+        };
+        await writer.WriteAsync(MakeMessageWithHeaders(headers, "msg-payment-skip-order"), cts.Token);
+        writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — OrderConsumer must NOT have been invoked.
+        log.Should().NotContain("OrderConsumer");
+    }
+
+    [Fact]
+    public async Task DispatchMessageAsync_WithoutBwMessageTypeHeader_FallsBackToDeserializationRouting()
+    {
+        // Arrange — two consumers, no BW-MessageType header; fallback tries all invokers in order.
+        // The mock deserializer returns a valid TestOrderEvent, so the first invoker wins.
+        var (runner, log, writer, _) = CreateRunnerWithTwoTypedConsumers();
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        // No BW-MessageType header — triggers fallback (deserialization-based) routing.
+        await writer.WriteAsync(MakeMessageWithHeaders([], "msg-no-header"), cts.Token);
+        writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — fallback routing dispatched the first consumer whose deserializer returned non-null.
+        log.Should().NotBeEmpty("at least one consumer should be dispatched via fallback routing");
+    }
+
+    [Fact]
+    public async Task DispatchMessageAsync_WithUnknownBwMessageType_NoConsumerMatched()
+    {
+        // Arrange — two consumers; header contains a type name that matches neither.
+        var (runner, log, writer, adapter) = CreateRunnerWithTwoTypedConsumers();
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        Dictionary<string, string> headers = new()
+        {
+            ["BW-MessageType"] = "UnknownEventType",
+        };
+        await writer.WriteAsync(MakeMessageWithHeaders(headers, "msg-unknown"), cts.Token);
+        writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — neither consumer invoked; message rejected (no match → Reject).
+        log.Should().BeEmpty("no consumer should handle an unknown BW-MessageType");
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Reject,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-unknown"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task DispatchMessageAsync_WithBwMessageTypeHeader_SingleConsumer_Works()
+    {
+        // Arrange — only OrderConsumer registered; header matches it.
+        List<string> log = [];
+        TrackingOrderConsumer orderConsumer = new(log);
+
+        Channel<InboundMessage> channel = Channel.CreateBounded<InboundMessage>(
+            new BoundedChannelOptions(64) { SingleWriter = false, SingleReader = true });
+
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
+        adapter.TransportName.Returns("test");
+        adapter.ConsumeAsync(
+                Arg.Any<string>(),
+                Arg.Any<FlowControlOptions>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo => ReadChannelAsync(channel.Reader, callInfo.ArgAt<CancellationToken>(2)));
+        adapter.SettleAsync(
+                Arg.Any<SettlementAction>(),
+                Arg.Any<InboundMessage>(),
+                Arg.Any<CancellationToken>())
+               .Returns(Task.CompletedTask);
+
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<TestOrderEvent>(Arg.Any<ReadOnlySequence<byte>>())
+                    .Returns(new TestOrderEvent("order-42", "corr-42"));
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IServiceScope scope = Substitute.For<IServiceScope>();
+        IServiceProvider provider = Substitute.For<IServiceProvider>();
+        scopeFactory.CreateScope().Returns(scope);
+        scope.ServiceProvider.Returns(provider);
+        provider.GetService(typeof(TrackingOrderConsumer)).Returns(orderConsumer);
+        provider.GetService(typeof(IEnumerable<IMessageMiddleware>))
+            .Returns(Array.Empty<IMessageMiddleware>());
+
+        FlowController flowController = new(NullLogger<FlowController>.Instance);
+
+        EndpointBinding binding = new()
+        {
+            EndpointName = EndpointName,
+            PrefetchCount = 4,
+            Consumers = [new ConsumerRegistration(typeof(TrackingOrderConsumer), typeof(TestOrderEvent))],
+            RawConsumers = [],
+        };
+
+        ReceiveEndpointRunner runner = new(
+            binding,
+            adapter,
+            deserializerResolver,
+            Substitute.For<IPublishEndpoint>(),
+            Substitute.For<ISendEndpointProvider>(),
+            scopeFactory,
+            flowController,
+            new NullInstrumentation(),
+            NullLogger<ReceiveEndpointRunner>.Instance,
+            loggerFactory: NullLoggerFactory.Instance);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        Dictionary<string, string> headers = new()
+        {
+            ["BW-MessageType"] = nameof(TestOrderEvent),
+        };
+        await channel.Writer.WriteAsync(MakeMessageWithHeaders(headers, "msg-single"), cts.Token);
+        channel.Writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — single consumer dispatched via header-based routing.
+        log.Should().ContainSingle()
+            .Which.Should().Be("OrderConsumer");
+    }
+
+    [Fact]
+    public async Task InboxFilteredMessage_WhenMiddlewareSetsFlag_AcksWithoutWarning()
+    {
+        // Arrange — register a DI middleware that sets the inbox:filtered flag and does NOT call next.
+        // This simulates TransactionalOutboxMiddleware detecting a duplicate message.
+        ILogger logger = Substitute.For<ILogger>();
+        logger.IsEnabled(Arg.Any<LogLevel>()).Returns(true);
+
+        Channel<InboundMessage> channel = Channel.CreateBounded<InboundMessage>(
+            new BoundedChannelOptions(64) { SingleWriter = false, SingleReader = true });
+
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
+        adapter.TransportName.Returns("test");
+        adapter.ConsumeAsync(
+                Arg.Any<string>(),
+                Arg.Any<FlowControlOptions>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo => ReadChannelAsync(channel.Reader, callInfo.ArgAt<CancellationToken>(2)));
+        adapter.SettleAsync(
+                Arg.Any<SettlementAction>(),
+                Arg.Any<InboundMessage>(),
+                Arg.Any<CancellationToken>())
+               .Returns(Task.CompletedTask);
+
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        // Inbox-filtering middleware: sets Items["inbox:filtered"] = true, does NOT call next.
+        IMessageMiddleware inboxFilteringMiddleware = Substitute.For<IMessageMiddleware>();
+        inboxFilteringMiddleware
+            .InvokeAsync(Arg.Any<MessageContext>(), Arg.Any<NextMiddleware>())
+            .Returns(callInfo =>
+            {
+                MessageContext ctx = callInfo.Arg<MessageContext>();
+                ctx.Items[WellKnownItemKeys.InboxFiltered] = true;
+                // Deliberately does not call next — simulates duplicate detection.
+                return Task.CompletedTask;
+            });
+
+        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IServiceScope scope = Substitute.For<IServiceScope>();
+        IServiceProvider provider = Substitute.For<IServiceProvider>();
+
+        scopeFactory.CreateScope().Returns(scope);
+        scope.ServiceProvider.Returns(provider);
+        provider.GetService(typeof(IEnumerable<IMessageMiddleware>))
+            .Returns(new IMessageMiddleware[] { inboxFilteringMiddleware });
+
+        FlowController flowController = new(NullLogger<FlowController>.Instance);
+
+        EndpointBinding binding = new()
+        {
+            EndpointName = EndpointName,
+            PrefetchCount = 4,
+            Consumers = [],
+            RawConsumers = [],
+            RetryCount = 0,
+            RetryInterval = TimeSpan.Zero,
+        };
+
+        ReceiveEndpointRunner runner = new(
+            binding,
+            adapter,
+            deserializerResolver,
+            Substitute.For<IPublishEndpoint>(),
+            Substitute.For<ISendEndpointProvider>(),
+            scopeFactory,
+            flowController,
+            new NullInstrumentation(),
+            logger,
+            loggerFactory: NullLoggerFactory.Instance);
+
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+
+        await channel.Writer.WriteAsync(MakeMessage("msg-inbox-filtered"), cts.Token);
+        channel.Writer.Complete();
+
+        // Act
+        await runner.RunAsync(cts.Token);
+
+        // Assert — inbox-filtered messages must be ACKed, not rejected.
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Ack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-inbox-filtered"),
+            Arg.Any<CancellationToken>());
+
+        await adapter.DidNotReceive().SettleAsync(
+            SettlementAction.Reject,
+            Arg.Any<InboundMessage>(),
+            Arg.Any<CancellationToken>());
+
+        // Assert — the "No consumer matched" warning must NOT be emitted.
+        IEnumerable<NSubstitute.Core.ICall> noConsumerWarnings = logger.ReceivedCalls()
+            .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log)
+                && c.GetArguments()[0] is LogLevel level
+                && level == LogLevel.Warning
+                && c.GetArguments()[2]?.ToString()?.Contains("No consumer matched") == true);
+        noConsumerWarnings.Should().BeEmpty(
+            "inbox-filtered messages must not trigger 'No consumer matched' warning");
     }
 
     /// <summary>

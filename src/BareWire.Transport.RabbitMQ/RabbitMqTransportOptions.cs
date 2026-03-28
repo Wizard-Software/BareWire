@@ -67,6 +67,12 @@ internal sealed class RabbitMqTransportOptions
     /// </summary>
     public RabbitMqHeaderMappingConfigurator? HeaderMappingConfigurator { get; set; }
 
+    /// <summary>
+    /// Explicit routing key mappings produced by <see cref="IRabbitMqConfigurator.MapRoutingKey{T}"/>.
+    /// <see langword="null"/> when no custom routing key mappings were configured.
+    /// </summary>
+    public IReadOnlyDictionary<Type, string>? RoutingKeyMappings { get; set; }
+
     public void Validate()
     {
         if (string.IsNullOrEmpty(ConnectionString))

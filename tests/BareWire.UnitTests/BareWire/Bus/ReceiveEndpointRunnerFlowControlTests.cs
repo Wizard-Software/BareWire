@@ -43,7 +43,7 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
         ITransportAdapter Adapter)
         CreateRunner(
             int maxInFlight = 1,
-            IMessageDeserializer? deserializer = null)
+            IDeserializerResolver? deserializerResolver = null)
     {
         // Build a bounded channel that the mock transport will read from.
         Channel<InboundMessage> channel = Channel.CreateBounded<InboundMessage>(
@@ -62,8 +62,8 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
                 Arg.Any<CancellationToken>())
                .Returns(Task.CompletedTask);
 
-        // Set up the deserializer to return a non-null message so the consumer is dispatched.
-        IMessageDeserializer resolvedDeserializer = deserializer ?? CreateDeserializer();
+        // Set up the deserializer resolver to return a non-null message so the consumer is dispatched.
+        IDeserializerResolver resolvedDeserializerResolver = deserializerResolver ?? CreateDeserializerResolver();
 
         // Wire DI so the runner's invoker can resolve RunnerTestConsumer from the scope.
         IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
@@ -94,7 +94,7 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            resolvedDeserializer,
+            resolvedDeserializerResolver,
             publishEndpoint,
             sendEndpointProvider,
             scopeFactory,
@@ -105,13 +105,15 @@ public sealed class ReceiveEndpointRunnerFlowControlTests
         return (runner, creditManager, channel.Writer, adapter);
     }
 
-    private static IMessageDeserializer CreateDeserializer()
+    private static IDeserializerResolver CreateDeserializerResolver()
     {
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
         deserializer.Deserialize<RunnerTestMessage>(Arg.Any<ReadOnlySequence<byte>>())
                     .Returns(new RunnerTestMessage("test"));
-        return deserializer;
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+        return resolver;
     }
 
     private static InboundMessage MakeMessage(string id = "msg-1", int bodyBytes = 10)

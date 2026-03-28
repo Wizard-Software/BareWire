@@ -40,12 +40,10 @@ public sealed class PublishBackpressureTests
         serializer.When(s => s.Serialize(Arg.Any<BusTestMessage>(), Arg.Any<IBufferWriter<byte>>()))
                   .Do(_ => { });
 
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
-        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         MiddlewareChain chain = new([]);
-        ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         PublishFlowControlOptions options = new()

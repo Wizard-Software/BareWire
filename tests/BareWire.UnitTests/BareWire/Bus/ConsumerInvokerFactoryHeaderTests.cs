@@ -80,13 +80,15 @@ public sealed class ConsumerInvokerFactoryHeaderTests
         return (scopeFactory, consumer);
     }
 
-    private static IMessageDeserializer BuildDeserializer()
+    private static IDeserializerResolver BuildDeserializerResolver()
     {
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
         deserializer.Deserialize<HeaderTestMessage>(Arg.Any<ReadOnlySequence<byte>>())
                     .Returns(new HeaderTestMessage("test"));
-        return deserializer;
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+        return resolver;
     }
 
     // ── Typed consumer — correlation-id header ────────────────────────────────
@@ -105,7 +107,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.Create(typeof(HeaderTestConsumer), typeof(HeaderTestMessage));
 
         var (scopeFactory, consumer) = BuildScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -132,7 +134,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.Create(typeof(HeaderTestConsumer), typeof(HeaderTestMessage));
 
         var (scopeFactory, consumer) = BuildScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -155,7 +157,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.Create(typeof(HeaderTestConsumer), typeof(HeaderTestMessage));
 
         var (scopeFactory, consumer) = BuildScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -182,7 +184,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.Create(typeof(HeaderTestConsumer), typeof(HeaderTestMessage));
 
         var (scopeFactory, consumer) = BuildScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -211,7 +213,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.CreateRaw(typeof(RawHeaderTestConsumer));
 
         var (scopeFactory, consumer) = BuildRawScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -234,7 +236,7 @@ public sealed class ConsumerInvokerFactoryHeaderTests
             ConsumerInvokerFactory.CreateRaw(typeof(RawHeaderTestConsumer));
 
         var (scopeFactory, consumer) = BuildRawScopeFactory();
-        IMessageDeserializer deserializer = BuildDeserializer();
+        IDeserializerResolver deserializer = BuildDeserializerResolver();
         IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
         ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
 
@@ -245,5 +247,65 @@ public sealed class ConsumerInvokerFactoryHeaderTests
         // Assert
         consumer.LastContext.Should().NotBeNull();
         consumer.LastContext!.CorrelationId.Should().BeNull();
+    }
+
+    // ── Null content-type — resolver called with null ─────────────────────────
+
+    [Fact]
+    public async Task Create_WhenContentTypeHeaderAbsent_ResolvesDeserializerWithNull()
+    {
+        // Arrange — headers contain no "content-type" key
+        var headers = new Dictionary<string, string>();
+
+        ConsumerInvokerFactory.InvokerDelegate invoker =
+            ConsumerInvokerFactory.Create(typeof(HeaderTestConsumer), typeof(HeaderTestMessage));
+
+        var (scopeFactory, _) = BuildScopeFactory();
+
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<HeaderTestMessage>(Arg.Any<ReadOnlySequence<byte>>())
+                    .Returns(new HeaderTestMessage("test"));
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
+        ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
+
+        // Act
+        await invoker(scopeFactory, ReadOnlySequence<byte>.Empty, headers,
+            Guid.NewGuid().ToString(), pub, send, resolver, "ep", CancellationToken.None);
+
+        // Assert — resolver must have been called exactly once with null (no content-type in headers)
+        resolver.Received(1).Resolve(null);
+    }
+
+    [Fact]
+    public async Task CreateRaw_WhenContentTypeHeaderAbsent_ResolvesDeserializerWithNull()
+    {
+        // Arrange — headers contain no "content-type" key
+        var headers = new Dictionary<string, string>();
+
+        ConsumerInvokerFactory.RawInvokerDelegate rawInvoker =
+            ConsumerInvokerFactory.CreateRaw(typeof(RawHeaderTestConsumer));
+
+        var (scopeFactory, _) = BuildRawScopeFactory();
+
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        IPublishEndpoint pub = Substitute.For<IPublishEndpoint>();
+        ISendEndpointProvider send = Substitute.For<ISendEndpointProvider>();
+
+        // Act
+        await rawInvoker(scopeFactory, ReadOnlySequence<byte>.Empty, headers,
+            Guid.NewGuid().ToString(), pub, send, resolver, CancellationToken.None);
+
+        // Assert — resolver must have been called exactly once with null (no content-type in headers)
+        resolver.Received(1).Resolve(null);
     }
 }

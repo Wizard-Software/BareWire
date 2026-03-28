@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
@@ -39,6 +40,11 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton(options);
 
+        // Register routing key resolver with explicit mappings from MapRoutingKey<T>.
+        // Uses Replace to always override the default resolver from AddBareWire().
+        var routingKeyResolver = new Internal.RoutingKeyResolver(options.RoutingKeyMappings);
+        services.Replace(ServiceDescriptor.Singleton<IRoutingKeyResolver>(routingKeyResolver));
+
         // Register the header mapper so both the transport adapter and request client share it.
         // When ConfigureHeaderMapping was called, the configurator flows through options.
         var headerMapper = new RabbitMqHeaderMapper(options.HeaderMappingConfigurator);
@@ -52,6 +58,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<RabbitMqTransportOptions>(),
             sp.GetRequiredService<IMessageSerializer>(),
             sp.GetRequiredService<IMessageDeserializer>(),
+            sp.GetRequiredService<IRoutingKeyResolver>(),
             sp.GetRequiredService<ILoggerFactory>()));
 
         // Register topology so the core bus can deploy it on startup.
@@ -74,6 +81,8 @@ public static class ServiceCollectionExtensions
                 HasDeadLetterExchange = options.Topology?.Queues
                     .FirstOrDefault(q => q.Name == e.QueueName)
                     ?.Arguments?.ContainsKey("x-dead-letter-exchange") ?? false,
+                SerializerOverrideType = e.SerializerOverrideType,
+                DeserializerOverrideType = e.DeserializerOverrideType,
             })
             .ToList();
         services.TryAddSingleton<IReadOnlyList<EndpointBinding>>(bindings);

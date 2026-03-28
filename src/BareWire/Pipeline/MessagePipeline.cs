@@ -18,22 +18,22 @@ namespace BareWire.Pipeline;
 // outbound: serialize via pooled writer → OutboundMessage (ready for the bounded publish channel)
 internal sealed partial class MessagePipeline
 {
+    private static readonly IReadOnlyDictionary<string, string> s_emptyHeaders =
+        new Dictionary<string, string>();
+
     private readonly MiddlewareChain _middlewareChain;
-    private readonly ConsumerDispatcher _dispatcher;
-    private readonly IMessageDeserializer _deserializer;
+    private readonly IDeserializerResolver _deserializerResolver;
     private readonly ILogger<MessagePipeline> _logger;
     private readonly IBareWireInstrumentation _instrumentation;
 
     internal MessagePipeline(
         MiddlewareChain middlewareChain,
-        ConsumerDispatcher dispatcher,
-        IMessageDeserializer deserializer,
+        IDeserializerResolver deserializerResolver,
         ILogger<MessagePipeline> logger,
         IBareWireInstrumentation instrumentation)
     {
         _middlewareChain = middlewareChain ?? throw new ArgumentNullException(nameof(middlewareChain));
-        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
-        _deserializer = deserializer ?? throw new ArgumentNullException(nameof(deserializer));
+        _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
     }
@@ -130,7 +130,7 @@ internal sealed partial class MessagePipeline
 
         return new OutboundMessage(
             routingKey: routingKey,
-            headers: headers ?? new Dictionary<string, string>(),
+            headers: headers ?? s_emptyHeaders,
             body: body,
             contentType: serializer.ContentType);
     }

@@ -32,15 +32,12 @@ public sealed class BareWireBusCreateRequestClientTests
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
         serializer.ContentType.Returns("application/json");
 
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
-        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         MiddlewareChain chain = new([]);
-        ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
         MessagePipeline pipeline = new(
             chain,
-            dispatcher,
-            deserializer,
+            deserializerResolver,
             NullLogger<MessagePipeline>.Instance,
             new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
@@ -53,7 +50,8 @@ public sealed class BareWireBusCreateRequestClientTests
             new PublishFlowControlOptions(),
             NullLogger<BareWireBus>.Instance,
             new NullInstrumentation(),
-            factory);
+            routingKeyResolver: null,
+            requestClientFactory: factory);
     }
 
     // ── CreateRequestClientAsync ──────────────────────────────────────────────

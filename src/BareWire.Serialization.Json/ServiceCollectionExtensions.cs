@@ -47,6 +47,9 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<IMessageSerializer, SystemTextJsonSerializer>();
         services.TryAddSingleton<IMessageDeserializer, SystemTextJsonRawDeserializer>();
 
+        services.TryAddSingleton<IDeserializerResolver>(sp =>
+            new ContentTypeDeserializerRouter(sp.GetRequiredService<IMessageDeserializer>()));
+
         return services;
     }
 }

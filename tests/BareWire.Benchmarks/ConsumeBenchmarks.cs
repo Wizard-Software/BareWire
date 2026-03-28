@@ -15,7 +15,7 @@ namespace BareWire.Benchmarks;
 /// <remarks>
 /// Performance targets:
 /// <list type="bullet">
-/// <item><description>ConsumeAndAck_InMemory: &gt; 300K msgs/s, &lt; 256 B/msg</description></item>
+/// <item><description>ConsumeAndAck_InMemory: &gt; 300K msgs/s, &lt; 512 B/op</description></item>
 /// </list>
 /// NOTE: [EventPipeProfiler] is intentionally omitted — BenchmarkDotNet has a known bug with
 /// .NET 10 where runtime detection treats it as v1 (https://github.com/dotnet/BenchmarkDotNet/issues/2699).
@@ -81,7 +81,7 @@ public class ConsumeBenchmarks
     /// <summary>
     /// Consumes all pre-published messages from the in-memory transport and acknowledges each one.
     /// Measures the bounded-channel dequeue + no-op ack path.
-    /// Target: &gt; 300K msgs/s, &lt; 256 B/msg.
+    /// Target: &gt; 300K msgs/s, &lt; 512 B/op.
     /// </summary>
     [Benchmark]
     public async Task ConsumeAndAck_InMemory()

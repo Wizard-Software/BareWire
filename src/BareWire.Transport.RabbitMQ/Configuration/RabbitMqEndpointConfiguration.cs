@@ -24,6 +24,9 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     internal IReadOnlyList<Type> RawConsumerTypes => _rawConsumerTypes;
     internal IReadOnlyList<Type> SagaTypes => _sagaTypes;
 
+    internal Type? SerializerOverrideType { get; private set; }
+    internal Type? DeserializerOverrideType { get; private set; }
+
     // ── IReceiveEndpointConfigurator ───────────────────────────────────────────
 
     public int PrefetchCount { get; set; } = 16;
@@ -56,5 +59,17 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     public void StateMachineSaga<TSaga>() where TSaga : class
     {
         _sagaTypes.Add(typeof(TSaga));
+    }
+
+    /// <inheritdoc />
+    public void UseSerializer<TSerializer>() where TSerializer : class, IMessageSerializer
+    {
+        SerializerOverrideType = typeof(TSerializer);
+    }
+
+    /// <inheritdoc />
+    public void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer
+    {
+        DeserializerOverrideType = typeof(TDeserializer);
     }
 }

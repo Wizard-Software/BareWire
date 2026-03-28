@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Transport.RabbitMQ;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -28,8 +29,9 @@ public sealed class RabbitMqRequestClientFactoryTests
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
         serializer.ContentType.Returns("application/json");
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IRoutingKeyResolver routingKeyResolver = Substitute.For<IRoutingKeyResolver>();
         return new RabbitMqRequestClientFactory(
-            options, serializer, deserializer, NullLoggerFactory.Instance);
+            options, serializer, deserializer, routingKeyResolver, NullLoggerFactory.Instance);
     }
 
     // ── Dispose tests ─────────────────────────────────────────────────────────

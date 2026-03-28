@@ -1,4 +1,5 @@
 using BareWire.Abstractions;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Transport.RabbitMQ.Configuration;
 using Microsoft.Extensions.Logging;
@@ -19,6 +20,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     private readonly RabbitMqTransportOptions _options;
     private readonly IMessageSerializer _serializer;
     private readonly IMessageDeserializer _deserializer;
+    private readonly IRoutingKeyResolver _routingKeyResolver;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RabbitMqRequestClientFactory> _logger;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
@@ -30,16 +32,19 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         RabbitMqTransportOptions options,
         IMessageSerializer serializer,
         IMessageDeserializer deserializer,
+        IRoutingKeyResolver routingKeyResolver,
         ILoggerFactory loggerFactory)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(serializer);
         ArgumentNullException.ThrowIfNull(deserializer);
+        ArgumentNullException.ThrowIfNull(routingKeyResolver);
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
         _options = options;
         _serializer = serializer;
         _deserializer = deserializer;
+        _routingKeyResolver = routingKeyResolver;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<RabbitMqRequestClientFactory>();
     }
@@ -52,7 +57,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
 
         await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
 
-        string routingKey = typeof(T).FullName ?? typeof(T).Name;
+        string routingKey = _routingKeyResolver.Resolve<T>();
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
 
         var client = new RabbitMqRequestClient<T>(

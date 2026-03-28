@@ -35,4 +35,10 @@ public sealed class EndpointBinding
     /// broker-side configuration made outside the application.
     /// </summary>
     public bool HasDeadLetterExchange { get; init; }
+
+    /// <summary>Gets the optional per-endpoint serializer type override. Null means use global.</summary>
+    public Type? SerializerOverrideType { get; init; }
+
+    /// <summary>Gets the optional per-endpoint deserializer type override. Null means use global.</summary>
+    public Type? DeserializerOverrideType { get; init; }
 }

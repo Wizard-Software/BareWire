@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Threading.Channels;
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Bus;
@@ -22,7 +23,10 @@ public sealed class BareWireBusTests
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static (BareWireBus Bus, ITransportAdapter Adapter, IMessageSerializer Serializer)
-        CreateBus(int maxPendingPublishes = 1_000, BoundedChannelFullMode fullMode = BoundedChannelFullMode.Wait)
+        CreateBus(
+            int maxPendingPublishes = 1_000,
+            BoundedChannelFullMode fullMode = BoundedChannelFullMode.Wait,
+            IRoutingKeyResolver? routingKeyResolver = null)
     {
         ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
         adapter.TransportName.Returns("test");
@@ -41,12 +45,10 @@ public sealed class BareWireBusTests
         serializer.When(s => s.Serialize(Arg.Any<BusTestMessage>(), Arg.Any<IBufferWriter<byte>>()))
                   .Do(_ => { /* no-op */ });
 
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
-        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         MiddlewareChain chain = new([]);
-        ConsumerDispatcher dispatcher = new(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         PublishFlowControlOptions options = new()
@@ -62,7 +64,8 @@ public sealed class BareWireBusTests
             flowController,
             options,
             NullLogger<BareWireBus>.Instance,
-            new NullInstrumentation());
+            new NullInstrumentation(),
+            routingKeyResolver: routingKeyResolver);
 
         return (bus, adapter, serializer);
     }
@@ -436,5 +439,41 @@ public sealed class BareWireBusTests
         await adapter.Received().SendBatchAsync(
             Arg.Any<IReadOnlyList<OutboundMessage>>(),
             Arg.Any<CancellationToken>());
+    }
+
+    // ── PublishAsync with IRoutingKeyResolver ─────────────────────────────────
+
+    [Fact]
+    public async Task PublishAsync_WithRoutingKeyMapping_UsesResolvedKey()
+    {
+        // Arrange — capture outbound messages.
+        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
+
+        IRoutingKeyResolver resolver = Substitute.For<IRoutingKeyResolver>();
+        resolver.Resolve<BusTestMessage>().Returns("order.created");
+
+        var (bus, adapter, _) = CreateBus(routingKeyResolver: resolver);
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo =>
+               {
+                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
+                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                   return Task.FromResult<IReadOnlyList<SendResult>>(
+                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+               });
+        bus.StartPublishing();
+
+        // Act
+        await bus.PublishAsync(new BusTestMessage("hello"), CancellationToken.None);
+        await Task.Delay(50);
+
+        // Assert — the outbound message must carry the mapped routing key.
+        capturedBatches.Should().HaveCount(1);
+        OutboundMessage sent = capturedBatches[0][0];
+        sent.RoutingKey.Should().Be("order.created");
+
+        await bus.DisposeAsync();
     }
 }

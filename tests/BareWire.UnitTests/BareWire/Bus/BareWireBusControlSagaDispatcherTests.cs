@@ -43,13 +43,11 @@ public sealed class BareWireBusControlSagaDispatcherTests
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
         serializer.ContentType.Returns("application/json");
 
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
-
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
         IServiceScopeFactory resolvedScopeFactory = scopeFactory ?? Substitute.For<IServiceScopeFactory>();
 
         MiddlewareChain chain = new([]);
-        ConsumerDispatcher consumerDispatcher = new(resolvedScopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        MessagePipeline pipeline = new(chain, consumerDispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
         FlowController flowController = new(NullLogger<FlowController>.Instance);
 
         BareWireBus bus = new(
@@ -72,7 +70,7 @@ public sealed class BareWireBusControlSagaDispatcherTests
             NullLogger<BareWireBusControl>.Instance,
             topology: null,
             endpointBindings: endpointBindings ?? [],
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             scopeFactory: resolvedScopeFactory,
             instrumentation: new NullInstrumentation(),
             loggerFactory: NullLoggerFactory.Instance,
@@ -92,9 +90,10 @@ public sealed class BareWireBusControlSagaDispatcherTests
                 Arg.Any<ReadOnlySequence<byte>>(),
                 Arg.Any<IReadOnlyDictionary<string, string>>(),
                 Arg.Any<string>(),
+                Arg.Any<string>(),
                 Arg.Any<IPublishEndpoint>(),
                 Arg.Any<ISendEndpointProvider>(),
-                Arg.Any<IMessageDeserializer>(),
+                Arg.Any<IDeserializerResolver>(),
                 Arg.Any<CancellationToken>())
             .Returns(Task.FromResult(true));
 
@@ -112,9 +111,10 @@ public sealed class BareWireBusControlSagaDispatcherTests
                 ReadOnlySequence<byte>.Empty,
                 new Dictionary<string, string>(),
                 "msg-id-1",
+                "test-endpoint",
                 Substitute.For<IPublishEndpoint>(),
                 Substitute.For<ISendEndpointProvider>(),
-                Substitute.For<IMessageDeserializer>(),
+                Substitute.For<IDeserializerResolver>(),
                 CancellationToken.None);
 
         await useDispatcher.Should().NotThrowAsync<ObjectDisposedException>();

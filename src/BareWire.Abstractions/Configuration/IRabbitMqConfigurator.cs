@@ -89,4 +89,19 @@ public interface IRabbitMqConfigurator
     /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
     /// </exception>
     void ConfigureHeaderMapping(Action<IHeaderMappingConfigurator> configure);
+
+    /// <summary>
+    /// Maps a message type to an explicit AMQP routing key used by <c>PublishAsync&lt;T&gt;</c>.
+    /// Required when using topic exchanges with pattern-based bindings (e.g. <c>order.*</c>),
+    /// because the default routing key (<c>typeof(T).FullName</c>) does not match such patterns.
+    /// </summary>
+    /// <typeparam name="T">The message type to map.</typeparam>
+    /// <param name="routingKey">
+    /// The routing key to use when publishing messages of type <typeparamref name="T"/>.
+    /// Must not be <see langword="null"/> or empty.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="routingKey"/> is <see langword="null"/> or empty.
+    /// </exception>
+    void MapRoutingKey<T>(string routingKey) where T : class;
 }

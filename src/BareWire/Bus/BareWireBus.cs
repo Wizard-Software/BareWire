@@ -4,16 +4,21 @@ using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Observability;
+using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.FlowControl;
 using BareWire.Pipeline;
+using BareWire.Routing;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Bus;
 
 internal sealed partial class BareWireBus : IBus
 {
+    private static readonly IReadOnlyDictionary<string, string> s_emptyHeaders =
+        new Dictionary<string, string>();
+
     private readonly ITransportAdapter _adapter;
     private readonly IMessageSerializer _serializer;
     private readonly MessagePipeline _pipeline;
@@ -21,6 +26,7 @@ internal sealed partial class BareWireBus : IBus
     private readonly PublishFlowControlOptions _publishFlowControl;
     private readonly ILogger<BareWireBus> _logger;
     private readonly IBareWireInstrumentation _instrumentation;
+    private readonly IRoutingKeyResolver _routingKeyResolver;
     private readonly IRequestClientFactory? _requestClientFactory;
 
     private readonly ConcurrentDictionary<Uri, ISendEndpoint> _sendEndpoints = new();
@@ -39,6 +45,7 @@ internal sealed partial class BareWireBus : IBus
         PublishFlowControlOptions publishFlowControl,
         ILogger<BareWireBus> logger,
         IBareWireInstrumentation instrumentation,
+        IRoutingKeyResolver? routingKeyResolver = null,
         IRequestClientFactory? requestClientFactory = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
@@ -48,6 +55,7 @@ internal sealed partial class BareWireBus : IBus
         _publishFlowControl = publishFlowControl ?? throw new ArgumentNullException(nameof(publishFlowControl));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
+        _routingKeyResolver = routingKeyResolver ?? new RoutingKeyResolver();
         _requestClientFactory = requestClientFactory;
 
         BusId = Guid.NewGuid();
@@ -84,7 +92,7 @@ internal sealed partial class BareWireBus : IBus
         ArgumentNullException.ThrowIfNull(message);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        string routingKey = typeof(T).FullName ?? typeof(T).Name;
+        string routingKey = _routingKeyResolver.Resolve<T>();
         string messageType = typeof(T).Name;
 
         // If the caller supplied a "message-id" header, honour it to support inbox deduplication
@@ -146,7 +154,7 @@ internal sealed partial class BareWireBus : IBus
 
         OutboundMessage outbound = new(
             routingKey: rawEndpoint,
-            headers: new Dictionary<string, string>(),
+            headers: s_emptyHeaders,
             body: payload,
             contentType: contentType);
 
@@ -459,7 +467,7 @@ internal sealed partial class BareWireBus : IBus
 
             OutboundMessage outbound = new(
                 routingKey: Address.AbsolutePath.TrimStart('/'),
-                headers: new Dictionary<string, string>(),
+                headers: s_emptyHeaders,
                 body: payload,
                 contentType: contentType);
 

@@ -70,6 +70,8 @@ public sealed class ReceiveEndpointRunnerRawConsumerTests
         // Returning null from Deserialize causes the typed invoker to throw UnknownPayloadException.
         deserializer.Deserialize<RunnerTestMessage>(Arg.Any<ReadOnlySequence<byte>>())
                     .Returns((RunnerTestMessage?)null);
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         RawDispatchTestConsumer rawConsumer = new();
 
@@ -111,7 +113,7 @@ public sealed class ReceiveEndpointRunnerRawConsumerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             publishEndpoint,
             sendEndpointProvider,
             scopeFactory,
@@ -225,6 +227,8 @@ public sealed class ReceiveEndpointRunnerRawConsumerTests
 
         IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
         deserializer.ContentType.Returns("application/json");
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
 
         IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
         IServiceScope scope = Substitute.For<IServiceScope>();
@@ -247,7 +251,7 @@ public sealed class ReceiveEndpointRunnerRawConsumerTests
         ReceiveEndpointRunner runner = new(
             binding,
             adapter,
-            deserializer,
+            deserializerResolver,
             Substitute.For<IPublishEndpoint>(),
             Substitute.For<ISendEndpointProvider>(),
             scopeFactory,

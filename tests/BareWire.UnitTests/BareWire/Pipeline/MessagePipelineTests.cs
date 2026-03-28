@@ -15,6 +15,8 @@ namespace BareWire.UnitTests.Core.Pipeline;
 
 public sealed class MessagePipelineTests
 {
+    private sealed record TestMessage(string Value);
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static InboundMessage CreateInboundMessage(string messageId = "test-id")
@@ -36,12 +38,10 @@ public sealed class MessagePipelineTests
                .Returns(Task.CompletedTask);
 
         IServiceProvider serviceProvider = Substitute.For<IServiceProvider>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
-        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         var chain = new MiddlewareChain(middlewares ?? []);
-        var dispatcher = new ConsumerDispatcher(scopeFactory, NullLogger<ConsumerDispatcher>.Instance);
-        var pipeline = new MessagePipeline(chain, dispatcher, deserializer, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+        var pipeline = new MessagePipeline(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
 
         return (pipeline, chain, adapter, serviceProvider);
     }

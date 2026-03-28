@@ -79,4 +79,18 @@ public interface IReceiveEndpointConfigurator
     /// </summary>
     /// <typeparam name="TSaga">The saga state machine type. Must be a reference type.</typeparam>
     void StateMachineSaga<TSaga>() where TSaga : class;
+
+    /// <summary>
+    /// Overrides the serializer for this endpoint. The serializer type is resolved from DI.
+    /// When not set, the global bus-level serializer is used.
+    /// </summary>
+    /// <typeparam name="TSerializer">The serializer type to use for this endpoint.</typeparam>
+    void UseSerializer<TSerializer>() where TSerializer : class, IMessageSerializer;
+
+    /// <summary>
+    /// Overrides the deserializer for this endpoint. The deserializer type is resolved from DI.
+    /// When not set, the global bus-level deserializer resolver is used.
+    /// </summary>
+    /// <typeparam name="TDeserializer">The deserializer type to use for this endpoint.</typeparam>
+    void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer;
 }

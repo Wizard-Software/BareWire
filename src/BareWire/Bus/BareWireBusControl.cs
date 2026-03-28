@@ -6,6 +6,7 @@ using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
 using BareWire.Configuration;
 using BareWire.FlowControl;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -20,7 +21,7 @@ internal sealed partial class BareWireBusControl : IBusControl
     private readonly ILogger<BareWireBusControl> _logger;
     private readonly TopologyDeclaration? _topology;
     private readonly IReadOnlyList<EndpointBinding> _endpointBindings;
-    private readonly IMessageDeserializer _deserializer;
+    private readonly IDeserializerResolver _deserializerResolver;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly Abstractions.Observability.IBareWireInstrumentation _instrumentation;
     private readonly ILoggerFactory _loggerFactory;
@@ -39,7 +40,7 @@ internal sealed partial class BareWireBusControl : IBusControl
         ILogger<BareWireBusControl> logger,
         TopologyDeclaration? topology,
         IReadOnlyList<EndpointBinding> endpointBindings,
-        IMessageDeserializer deserializer,
+        IDeserializerResolver deserializerResolver,
         IServiceScopeFactory scopeFactory,
         Abstractions.Observability.IBareWireInstrumentation instrumentation,
         ILoggerFactory loggerFactory,
@@ -52,7 +53,7 @@ internal sealed partial class BareWireBusControl : IBusControl
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _topology = topology;
         _endpointBindings = endpointBindings ?? [];
-        _deserializer = deserializer ?? throw new ArgumentNullException(nameof(deserializer));
+        _deserializerResolver = deserializerResolver ?? throw new ArgumentNullException(nameof(deserializerResolver));
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
@@ -99,10 +100,20 @@ internal sealed partial class BareWireBusControl : IBusControl
                 && binding.SagaTypes.Count == 0)
                 continue;
 
+            // Resolve per-endpoint deserializer override if configured (task 11.8).
+            IDeserializerResolver endpointResolver = _deserializerResolver;
+            if (binding.DeserializerOverrideType is not null)
+            {
+                await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
+                IMessageDeserializer perEndpointDeserializer =
+                    (IMessageDeserializer)scope.ServiceProvider.GetRequiredService(binding.DeserializerOverrideType);
+                endpointResolver = new SingleDeserializerResolver(perEndpointDeserializer);
+            }
+
             var runner = new ReceiveEndpointRunner(
                 binding,
                 _adapter,
-                _deserializer,
+                endpointResolver,
                 _bus, // IPublishEndpoint
                 _bus, // ISendEndpointProvider
                 _scopeFactory,
