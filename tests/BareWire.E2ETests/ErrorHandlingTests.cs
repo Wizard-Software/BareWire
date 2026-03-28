@@ -23,9 +23,10 @@ public sealed class ErrorHandlingTests(SamplesAppFixture fixture) : IClassFixtur
         // Arrange
         using var client = fixture.CreateHttpClient("retry-and-dlq");
 
-        // Act — send multiple payments (70% failure rate in sample PaymentProcessor).
+        // Act — send 20 payments (70% failure rate × 4 attempts = ~24% DLQ rate per msg).
+        // With 20 messages P(zero in DLQ) = 0.76^20 ≈ 0.3%, virtually eliminating flakiness.
         // Request format: { Amount, Currency }
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < 20; i++)
         {
             var response = await client.PostAsJsonAsync("/payments", new
             {
@@ -35,11 +36,12 @@ public sealed class ErrorHandlingTests(SamplesAppFixture fixture) : IClassFixtur
             response.StatusCode.Should().Be(HttpStatusCode.Accepted);
         }
 
-        // Assert — poll until at least one failed payment appears in DLQ
+        // Assert — poll until at least one failed payment appears in DLQ.
+        // Longer timeout: 20 msgs × up to 4 attempts × 1s retry interval under load.
         var failedPayments = await client.PollUntilAsync<JsonElement[]>(
             "/payments/failed",
             items => items.Length > 0,
-            PollTimeout);
+            TimeSpan.FromSeconds(90));
 
         failedPayments.Should().NotBeEmpty("at least one payment should fail and reach DLQ");
     }
