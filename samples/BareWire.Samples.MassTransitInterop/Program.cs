@@ -1,0 +1,202 @@
+// BareWire.Samples.MassTransitInterop — demonstrates coexistence of BareWire and a MassTransit
+// producer on a shared RabbitMQ broker, with transparent envelope unwrapping.
+//
+// What this sample shows:
+//   - ADR-001  Raw-first: /barewire/publish sends plain JSON; no envelope by default.
+//   - ADR-002  Manual topology: exchanges, queues, and bindings declared explicitly.
+//   - ADR-005  MassTransit naming: IBus, IConsumer<T>, ConsumeContext<T>.
+//   - MassTransit interop: AddMassTransitEnvelopeDeserializer() registers a content-type-aware
+//     deserializer for application/vnd.masstransit+json. BareWire's ContentTypeDeserializerRouter
+//     unwraps the envelope transparently — MassTransitOrderConsumer receives a plain OrderCreated
+//     record, identical to what BareWireOrderConsumer receives from raw JSON.
+//   - MassTransitSimulator: BackgroundService using bare RabbitMQ.Client (no BareWire) to
+//     simulate a MassTransit producer publishing enveloped messages every 5 seconds.
+//   - ServiceDefaults: OpenTelemetry observability + health checks.
+//
+// Architecture:
+//   MassTransitSimulator (RabbitMQ.Client) → mt-orders (direct exchange)
+//       └→ mt-orders-queue → MassTransitOrderConsumer (IConsumer<OrderCreated>)
+//            Content-Type: application/vnd.masstransit+json
+//            → ContentTypeDeserializerRouter → MassTransitEnvelopeDeserializer → OrderCreated
+//
+//   IBus.PublishAsync<OrderCreated>() → barewire-orders (direct exchange)
+//       └→ barewire-orders-queue → BareWireOrderConsumer (IConsumer<OrderCreated>)
+//            Content-Type: application/json
+//            → ContentTypeDeserializerRouter → SystemTextJsonRawDeserializer → OrderCreated
+//
+// Prerequisites (runtime, NOT required to compile):
+//   - RabbitMQ broker (default: amqp://guest:guest@localhost:5672/)
+//   When running via Aspire AppHost, the broker is provisioned automatically.
+
+using BareWire.Abstractions;
+using BareWire.Abstractions.Configuration;
+using BareWire;
+using BareWire.Transport.RabbitMQ;
+using BareWire.Serialization.Json;
+using BareWire.Interop.MassTransit;
+using BareWire.Samples.MassTransitInterop.Consumers;
+using BareWire.Samples.MassTransitInterop.Messages;
+using BareWire.Samples.MassTransitInterop.Services;
+using BareWire.Samples.ServiceDefaults;
+
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Shared defaults: OpenTelemetry observability + health checks
+// ─────────────────────────────────────────────────────────────────────────────
+
+builder.AddServiceDefaults();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+string rabbitMqConnectionString =
+    builder.Configuration.GetConnectionString("rabbitmq")
+    ?? "amqp://guest:guest@localhost:5672/";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. BareWire serialization — ADR-001 raw-first + MassTransit envelope interop
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ADR-001: Raw-first — registers SystemTextJsonSerializer (IMessageSerializer)
+// and SystemTextJsonRawDeserializer (IMessageDeserializer) as singletons.
+// No envelope wrapper added by default.
+builder.Services.AddBareWireJsonSerializer();
+
+// MassTransit interop — registers MassTransitEnvelopeDeserializer and wires it into
+// ContentTypeDeserializerRouter for application/vnd.masstransit+json.
+// IMPORTANT: must be called AFTER AddBareWireJsonSerializer() — requires the router
+// to be registered first; calling before throws InvalidOperationException.
+builder.Services.AddMassTransitEnvelopeDeserializer();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. Consumers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Register consumers in DI (resolved per-message by ConsumerDispatcher).
+builder.Services.AddTransient<MassTransitOrderConsumer>();
+builder.Services.AddTransient<BareWireOrderConsumer>();
+
+// In-memory store for tracking processed orders (used by GET /orders/processed for E2E testing).
+builder.Services.AddSingleton<ProcessedOrderStore>();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. BareWire messaging — transport, topology, receive endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
+{
+    // Connection to the RabbitMQ broker.
+    rmq.Host(rabbitMqConnectionString);
+    rmq.DefaultExchange("barewire-orders");
+
+    // ADR-002: Manual topology — declare all exchanges, queues, and bindings explicitly.
+    // The broker resources are deployed by IBusControl.DeployTopologyAsync on startup.
+    rmq.ConfigureTopology(t =>
+    {
+        // Direct exchange for MassTransit-format messages (published by MassTransitSimulator).
+        t.DeclareExchange("mt-orders", ExchangeType.Direct, durable: true);
+        t.DeclareQueue("mt-orders-queue", durable: true);
+        t.BindExchangeToQueue("mt-orders", "mt-orders-queue", routingKey: "");
+
+        // Fanout exchange for raw JSON messages (published by IBus.PublishAsync).
+        // Fanout ignores routing keys — IBus.PublishAsync resolves the routing key from the
+        // message type name, so Direct would require a matching binding key.
+        t.DeclareExchange("barewire-orders", ExchangeType.Fanout, durable: true);
+        t.DeclareQueue("barewire-orders-queue", durable: true);
+        t.BindExchangeToQueue("barewire-orders", "barewire-orders-queue", routingKey: "");
+    });
+
+    // Endpoint 1: MassTransitOrderConsumer — receives enveloped messages from MassTransitSimulator.
+    // ContentTypeDeserializerRouter detects application/vnd.masstransit+json and unwraps the
+    // envelope before the consumer is invoked.
+    rmq.ReceiveEndpoint("mt-orders-queue", e =>
+    {
+        e.PrefetchCount = 8;
+        e.ConcurrentMessageLimit = 4;
+        e.RetryCount = 3;
+        e.RetryInterval = TimeSpan.FromSeconds(5);
+        e.Consumer<MassTransitOrderConsumer, OrderCreated>();
+    });
+
+    // Endpoint 2: BareWireOrderConsumer — receives raw JSON published by IBus.PublishAsync.
+    // SystemTextJsonRawDeserializer handles application/json directly.
+    rmq.ReceiveEndpoint("barewire-orders-queue", e =>
+    {
+        e.PrefetchCount = 8;
+        e.ConcurrentMessageLimit = 4;
+        e.RetryCount = 3;
+        e.RetryInterval = TimeSpan.FromSeconds(5);
+        e.Consumer<BareWireOrderConsumer, OrderCreated>();
+    });
+};
+
+builder.Services.AddBareWireRabbitMq(configureRabbitMq);
+builder.Services.AddBareWire(cfg =>
+{
+    cfg.UseRabbitMQ(configureRabbitMq);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. MassTransit simulator — simulates an external MassTransit producer
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Register as singleton so the HTTP endpoint can resolve and trigger it on demand,
+// then register as a hosted service backed by the same instance.
+builder.Services.AddSingleton<MassTransitSimulator>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<MassTransitSimulator>());
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Build the application
+// ─────────────────────────────────────────────────────────────────────────────
+
+WebApplication app = builder.Build();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. HTTP endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Health check endpoints: /health, /health/live, /health/ready.
+app.MapServiceDefaults();
+
+// POST /masstransit/simulate — triggers an immediate one-off publish from MassTransitSimulator.
+// Publishes a MassTransit-envelope message to mt-orders exchange; MassTransitOrderConsumer
+// will receive and log the unwrapped OrderCreated record.
+app.MapPost("/masstransit/simulate", async (
+    MassTransitSimulator simulator,
+    CancellationToken cancellationToken) =>
+{
+    await simulator.PublishOnceAsync(cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted(value: new { Message = "MassTransit envelope published to mt-orders exchange." });
+})
+.Produces(StatusCodes.Status202Accepted)
+.WithName("SimulateMassTransitPublish");
+
+// POST /barewire/publish — publishes a raw JSON OrderCreated via IBus.PublishAsync.
+// BareWireOrderConsumer will receive and log the plain OrderCreated record (ADR-001 raw-first).
+app.MapPost("/barewire/publish", async (
+    IBus bus,
+    CancellationToken cancellationToken) =>
+{
+    OrderCreated order = new(
+        OrderId: Guid.NewGuid().ToString(),
+        Amount: 99.99m,
+        Currency: "PLN");
+
+    await bus.PublishAsync(order, cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted(value: new { Message = "Raw JSON OrderCreated published to barewire-orders exchange.", order.OrderId });
+})
+.Produces(StatusCodes.Status202Accepted)
+.WithName("PublishBareWireOrder");
+
+// GET /orders/processed — returns all orders processed by both consumers (MassTransit + BareWire).
+// Used by E2E tests to verify that messages were consumed and deserialized correctly.
+app.MapGet("/orders/processed", (ProcessedOrderStore store) =>
+    Results.Ok(store.GetAll()))
+    .Produces<IReadOnlyList<ProcessedOrder>>(StatusCodes.Status200OK)
+    .WithName("GetProcessedOrders");
+
+app.Run();

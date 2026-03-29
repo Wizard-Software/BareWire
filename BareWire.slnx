@@ -13,10 +13,12 @@
     <Project Path="samples/BareWire.Samples.ObservabilityShowcase/BareWire.Samples.ObservabilityShowcase.csproj" />
     <Project Path="samples/BareWire.Samples.MultiConsumerPartitioning/BareWire.Samples.MultiConsumerPartitioning.csproj" />
     <Project Path="samples/BareWire.Samples.InboxDeduplication/BareWire.Samples.InboxDeduplication.csproj" />
+    <Project Path="samples/BareWire.Samples.MassTransitInterop/BareWire.Samples.MassTransitInterop.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/BareWire.Abstractions/BareWire.Abstractions.csproj" />
     <Project Path="src/BareWire/BareWire.csproj" />
+    <Project Path="src/BareWire.Interop.MassTransit/BareWire.Interop.MassTransit.csproj" />
     <Project Path="src/BareWire.Observability/BareWire.Observability.csproj" />
     <Project Path="src/BareWire.Outbox.EntityFramework/BareWire.Outbox.EntityFramework.csproj" />
     <Project Path="src/BareWire.Outbox/BareWire.Outbox.csproj" />

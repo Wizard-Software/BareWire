@@ -39,6 +39,7 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             "observability-showcase",
             "multi-consumer-partitioning",
             "inbox-deduplication",
+            "masstransit-interop",
         ];
 
         foreach (string resource in sampleResources)

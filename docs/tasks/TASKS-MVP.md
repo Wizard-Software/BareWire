@@ -37,7 +37,8 @@
 | 9. Refaktoryzacja | 1 | 0 | 0 | 0 | 1 |
 | 10. Bugi wykryte w E2E testach samples | 18 | 1 | 2 | 1 | 14 |
 | 11. Ulepszenia architektury (code review) | 8 | 5 | 0 | 0 | 3 |
-| **Razem** | **118** | **47** | **17** | **4** | **50** |
+| 12. Interop MassTransit | 7 | 4 | 0 | 0 | 3 |
+| **Razem** | **125** | **51** | **17** | **4** | **53** |
 
 ---
 
@@ -755,6 +756,49 @@
 
 ---
 
+## Funkcjonalność 12: Interop MassTransit
+
+> Pakiet integracyjny do odbierania wiadomości w formacie koperty MassTransit.
+> Kryterium zakończenia: deserializacja koperty MassTransit działa z auto-routingiem po Content-Type.
+
+### Projekt i DTO
+
+- [x] **12.1. Utwórz projekt BareWire.Interop.MassTransit** `[no-test]`
+  Nowy projekt `src/BareWire.Interop.MassTransit` z `ProjectReference` do `Abstractions` + `Serialization.Json`. `PackageReference`: `Microsoft.Extensions.DependencyInjection.Abstractions`. `InternalsVisibleTo`: `BareWire.UnitTests`, `BareWire.IntegrationTests`. Dodać do `BareWire.slnx` (folder `/src/`) i `BareWire.UnitTests.csproj`.
+  -> [extension-points.md](../architecture/architecture/extension-points.md)
+
+- [x] **12.2. Zaimplementuj MassTransitEnvelope DTO** `[no-test]`
+  `internal sealed record MassTransitEnvelope` z polami: `MessageId`, `CorrelationId`, `ConversationId`, `InitiatorId`, `SourceAddress`, `DestinationAddress`, `MessageType`, `SentTime`, `ExpirationTime`, `Headers`, `Message` (`JsonElement`). Wszystkie pola nullable — permisywne parsowanie obcych kopert. Nieznane pola (`host`, `faultAddress`, `requestId`, `responseAddress`) ignorowane przez `System.Text.Json` (domyślne zachowanie).
+  -> [migration-guide.md](../architecture/appendix/migration-guide.md)
+
+### Deserializer i DI
+
+- [x] **12.3. Zaimplementuj MassTransitEnvelopeDeserializer** `[unit]`
+  `internal sealed class` implementująca `IMessageDeserializer`. `ContentType`: `application/vnd.masstransit+json`. Deserializacja: `Utf8JsonReader` na `ReadOnlySequence<byte>` → `MassTransitEnvelope` → `envelope.Message.Deserialize<T>(BareWireJsonSerializerOptions.Default)`. Wzorzec identyczny jak `BareWireEnvelopeSerializer.Deserialize<T>()`. Zero-copy (ADR-003). `JsonException` → `BareWireSerializationException` z `ExtractRawPayload`.
+  -> [extension-points.md](../architecture/architecture/extension-points.md), [ADR-003](../architecture/decisions/ADR-003-zero-copy-pipeline.md)
+
+- [x] **12.4. Zaimplementuj ServiceCollectionExtensions.AddMassTransitEnvelopeDeserializer()** `[unit]`
+  Metoda rozszerzenia rejestrująca `MassTransitEnvelopeDeserializer` w DI i zastępująca `IDeserializerResolver` routerem uwzględniającym deserializer MassTransit. Kolejność wywołań: `AddBareWireJsonSerializer()` → `AddMassTransitEnvelopeDeserializer()`. Test DI: resolve `IDeserializerResolver`, routing `application/vnd.masstransit+json` → MassTransit deserializer.
+  -> [configuration.md](../architecture/api/configuration.md)
+
+### Testy
+
+- [x] **12.5. Dodaj testy jednostkowe MassTransitEnvelopeDeserializer** `[unit]`
+  ~9 testów: valid envelope, empty payload, invalid JSON, all metadata fields, missing optional fields, nested message, null message field, content-type assertion, multi-segment sequence. Reuse: `SimpleMessage`, `NestedMessage`, `InnerData` z istniejących testów.
+  -> [testing-spec.md](../architecture/testing/testing-spec.md)
+
+- [x] **12.6. Dodaj test routera dla Content-Type MassTransit** `[unit]`
+  W istniejącym `ContentTypeDeserializerRouterTests` dodać test: `Resolve_VndMasstransitJson_ReturnsMassTransitDeserializer`.
+  -> [testing-spec.md](../architecture/testing/testing-spec.md)
+
+### Sample
+
+- [x] **12.7. Utwórz BareWire.Samples.MassTransitInterop** `[no-test]`
+  Sample demonstrująca koegzystencję BareWire z MassTransit. Scenariusz: dwa endpointy — jeden odbiera wiadomości w formacie koperty MassTransit (`application/vnd.masstransit+json`), drugi odbiera raw JSON z BareWire. API: `POST /masstransit/simulate` → publikuje wiadomość w formacie koperty MT na kolejkę, `POST /barewire/publish` → publikuje raw JSON. Consumer loguje otrzymane wiadomości z metadata (`messageId`, `correlationId`). README z opisem scenariusza i konfiguracji. Dodać do `BareWire.slnx` (folder `/samples/`) i `BareWire.Samples.AppHost`.
+  -> [migration-guide.md](../architecture/appendix/migration-guide.md)
+
+---
+
 ## Macierz pokrycia
 
 ### TDD → Zadania
@@ -801,13 +845,14 @@
 | BareWire.Outbox.EntityFramework | Tak | Funkcjonalność 5 (5.5-5.7) |
 | BareWire.Observability | Tak | Funkcjonalność 6 |
 | BareWire.Testing | Tak | Funkcjonalność 1 (1.16-1.17) |
+| BareWire.Interop.MassTransit | Tak | Funkcjonalność 12 |
 | BareWire.Samples.* | Tak | Funkcjonalność 8 (8.1-8.11) |
 
 ### Pokrycie testowe
 
 | Typ testu | Liczba | % całości |
 |-----------|--------|-----------|
-| Unit | 39 | 44% |
-| Integration | 13 | 15% |
-| E2E | 4 | 5% |
-| No-test | 32 | 36% |
+| Unit | 51 | 41% |
+| Integration | 17 | 14% |
+| E2E | 4 | 3% |
+| No-test | 53 | 42% |

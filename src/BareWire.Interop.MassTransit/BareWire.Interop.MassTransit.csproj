@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>MassTransit envelope interop deserializer for BareWire messaging library.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+    <ProjectReference Include="..\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BareWire.UnitTests" />
+    <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+  </ItemGroup>
+
+</Project>

@@ -46,6 +46,7 @@ public sealed class ArchitectureRuleTests
             "BareWire.Outbox",
             "BareWire.Serialization.Json",
             "BareWire.Testing",
+            "BareWire.Interop.MassTransit",
         ];
 
         foreach (var dep in forbidden)
@@ -276,6 +277,38 @@ public sealed class ArchitectureRuleTests
 
         result.IsSuccessful.Should().BeTrue(
             result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 11: Interop.MassTransit must NOT depend on Core, Transport, Observability, Saga, Outbox, or Testing
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Rule11_InteropMassTransit_ShouldNotDependOn_CoreTransportOrObservability()
+    {
+        var assembly = Assembly.Load("BareWire.Interop.MassTransit");
+
+        AssertNoDependencyOnCore(assembly);
+
+        string[] forbidden =
+        [
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Observability",
+            "BareWire.Saga",
+            "BareWire.Outbox",
+            "BareWire.Testing",
+        ];
+
+        foreach (var dep in forbidden)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(dep)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+        }
     }
 
     // -------------------------------------------------------------------------

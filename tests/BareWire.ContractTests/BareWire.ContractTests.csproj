@@ -19,6 +19,7 @@
     <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Outbox.EntityFramework\BareWire.Outbox.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Observability\BareWire.Observability.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Interop.MassTransit\BareWire.Interop.MassTransit.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Testing\BareWire.Testing.csproj" />
   </ItemGroup>
 

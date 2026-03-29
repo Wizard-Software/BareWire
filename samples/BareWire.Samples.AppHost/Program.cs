@@ -77,4 +77,8 @@ builder.AddProject<Projects.BareWire_Samples_RabbitMQ>("rabbitmq-sample")
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+builder.AddProject<Projects.BareWire_Samples_MassTransitInterop>("masstransit-interop")
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

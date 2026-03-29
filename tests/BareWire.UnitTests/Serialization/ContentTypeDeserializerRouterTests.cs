@@ -1,6 +1,7 @@
 using System.Buffers;
 using AwesomeAssertions;
 using BareWire.Abstractions.Serialization;
+using BareWire.Interop.MassTransit;
 using BareWire.Serialization.Json;
 using NSubstitute;
 
@@ -10,6 +11,7 @@ public sealed class ContentTypeDeserializerRouterTests
 {
     private readonly SystemTextJsonRawDeserializer _rawDeserializer = new();
     private readonly BareWireEnvelopeSerializer _envelopeDeserializer = new();
+    private readonly MassTransitEnvelopeDeserializer _mtDeserializer = new();
 
     [Fact]
     public void Resolve_ApplicationJson_ReturnsRawDeserializer()
@@ -79,5 +81,17 @@ public sealed class ContentTypeDeserializerRouterTests
         var result = sut.Resolve("APPLICATION/JSON");
 
         result.Should().BeSameAs(_rawDeserializer);
+    }
+
+    [Fact]
+    public void Resolve_VndMasstransitJson_ReturnsMassTransitDeserializer()
+    {
+        var sut = new ContentTypeDeserializerRouter(
+            _rawDeserializer,
+            [_envelopeDeserializer, _mtDeserializer]);
+
+        var result = sut.Resolve("application/vnd.masstransit+json");
+
+        result.Should().BeSameAs(_mtDeserializer);
     }
 }

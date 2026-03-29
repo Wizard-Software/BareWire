@@ -19,5 +19,6 @@
     <ProjectReference Include="..\BareWire.Samples.MultiConsumerPartitioning\BareWire.Samples.MultiConsumerPartitioning.csproj" />
     <ProjectReference Include="..\BareWire.Samples.InboxDeduplication\BareWire.Samples.InboxDeduplication.csproj" />
     <ProjectReference Include="..\BareWire.Samples.RabbitMQ\BareWire.Samples.RabbitMQ.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.MassTransitInterop\BareWire.Samples.MassTransitInterop.csproj" />
   </ItemGroup>
 </Project>
