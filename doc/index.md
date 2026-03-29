@@ -11,10 +11,13 @@ Welcome to the BareWire documentation. BareWire is a high-performance async mess
 5. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
 6. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
 7. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
-8. [Transactional Outbox](outbox.md) — exactly-once delivery, inbox deduplication
-9. [Observability](observability.md) — OpenTelemetry, metrics, health checks
-10. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
-11. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
+8. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
+9. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
+10. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
+11. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
+12. [Observability](observability.md) — OpenTelemetry, metrics, health checks
+13. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
+14. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
 
 ## Allocation Characteristics
 
@@ -45,3 +48,4 @@ dotnet run --project samples/BareWire.Samples.AppHost/
 | `InboxDeduplication` | Inbox deduplication across multiple consumers (Email + Audit) |
 | `ObservabilityShowcase` | 3-hop distributed tracing (order → payment → shipment) with OTel |
 | `MultiConsumerPartitioning` | Per-correlation ordering with 64-partition partitioner |
+| `MassTransitInterop` | Coexistence of BareWire and MassTransit producers on shared RabbitMQ |

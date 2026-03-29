@@ -60,25 +60,9 @@ app.MapPost("/transfers", async (
 
 ## Inbox Deduplication
 
-The `TransactionalOutboxMiddleware` automatically deduplicates messages on the consumer side. The composite inbox key is `(MessageId, EndpointName)` — the same `MessageId` can be processed by different consumers on different endpoints (e.g. `EmailConsumer` and `AuditConsumer`), but the same consumer on the same endpoint will never process it twice.
+The `TransactionalOutboxMiddleware` automatically deduplicates messages on the consumer side using a two-phase lock mechanism. The composite inbox key is `(MessageId, ConsumerType)` — the same message can be processed by different consumers independently, but the same consumer will never process it twice.
 
-### Two-Phase Mechanism
-
-1. **Lock** — on first receipt the inbox creates an entry with `ReceivedAt` and `ExpiresAt` (lock lifetime). If an entry already exists and has not expired, the message is rejected as a duplicate.
-2. **Mark processed** — after successful processing (after `TransactionScope.Complete()`) the middleware sets `ProcessedAt` to the current time. Entries with `ProcessedAt != null` never allow reprocessing, even after `ExpiresAt` has elapsed.
-
-This means that even if a lock expires before processing completes (e.g. a long-running consumer), the message is permanently protected against duplicates once marked as processed.
-
-### Preserving MessageId on Re-Publish
-
-For inbox deduplication to work when re-publishing the same logical message, use the `PublishAsync` overload with the `"message-id"` header:
-
-```csharp
-var headers = new Dictionary<string, string> { ["message-id"] = originalMessageId.ToString() };
-await bus.PublishAsync(message, headers, ct);
-```
-
-> See: [Publishing with Custom Headers](publishing-and-consuming.md#publishing-with-custom-headers)
+> See: [Inbox Deduplication](inbox.md) for full details on configuration, composite keys, and multi-consumer patterns
 
 ## Resilience
 
