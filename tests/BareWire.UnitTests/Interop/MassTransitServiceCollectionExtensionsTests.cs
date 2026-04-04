@@ -57,4 +57,47 @@ public sealed class MassTransitServiceCollectionExtensionsTests
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*AddBareWireJsonSerializer*");
     }
+
+    [Fact]
+    public void AddMassTransitEnvelopeSerializer_RegistersSerializer()
+    {
+        var services = new ServiceCollection();
+        services.AddBareWireJsonSerializer();
+        services.AddMassTransitEnvelopeSerializer();
+
+        using var provider = services.BuildServiceProvider();
+        var serializer = provider.GetRequiredService<MassTransitEnvelopeSerializer>();
+
+        serializer.Should().NotBeNull();
+    }
+
+    [Fact]
+    public void AddMassTransitEnvelopeSerializer_DoesNotReplaceDefaultSerializer()
+    {
+        var services = new ServiceCollection();
+        services.AddBareWireJsonSerializer();
+        services.AddMassTransitEnvelopeSerializer();
+
+        using var provider = services.BuildServiceProvider();
+        var defaultSerializer = provider.GetRequiredService<IMessageSerializer>();
+
+        defaultSerializer.ContentType.Should().Be("application/json");
+    }
+
+    [Fact]
+    public void AddMassTransitEnvelopeSerializer_NullServices_ThrowsArgumentNull()
+    {
+        Assert.Throws<ArgumentNullException>(() => ((IServiceCollection)null!).AddMassTransitEnvelopeSerializer());
+    }
+
+    [Fact]
+    public void AddMassTransitEnvelopeSerializer_WithoutJsonSerializer_ThrowsInvalidOperation()
+    {
+        var services = new ServiceCollection();
+
+        Action act = () => services.AddMassTransitEnvelopeSerializer();
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*AddBareWireJsonSerializer*");
+    }
 }

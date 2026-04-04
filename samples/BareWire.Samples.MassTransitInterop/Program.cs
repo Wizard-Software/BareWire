@@ -1,14 +1,20 @@
 // BareWire.Samples.MassTransitInterop — demonstrates coexistence of BareWire and a MassTransit
-// producer on a shared RabbitMQ broker, with transparent envelope unwrapping.
+// producer on a shared RabbitMQ broker, with transparent envelope unwrapping and per-endpoint
+// serializer override for publishing in MassTransit envelope format.
 //
 // What this sample shows:
 //   - ADR-001  Raw-first: /barewire/publish sends plain JSON; no envelope by default.
 //   - ADR-002  Manual topology: exchanges, queues, and bindings declared explicitly.
 //   - ADR-005  MassTransit naming: IBus, IConsumer<T>, ConsumeContext<T>.
-//   - MassTransit interop: AddMassTransitEnvelopeDeserializer() registers a content-type-aware
-//     deserializer for application/vnd.masstransit+json. BareWire's ContentTypeDeserializerRouter
-//     unwraps the envelope transparently — MassTransitOrderConsumer receives a plain OrderCreated
-//     record, identical to what BareWireOrderConsumer receives from raw JSON.
+//   - MassTransit interop (receive): AddMassTransitEnvelopeDeserializer() registers a
+//     content-type-aware deserializer for application/vnd.masstransit+json. BareWire's
+//     ContentTypeDeserializerRouter unwraps the envelope transparently — MassTransitOrderConsumer
+//     receives a plain OrderCreated record, identical to what BareWireOrderConsumer receives.
+//   - MassTransit interop (publish): AddMassTransitEnvelopeSerializer() registers
+//     MassTransitEnvelopeSerializer in DI for per-endpoint use. UseSerializer<T>() on a receive
+//     endpoint overrides the serializer for that endpoint only — published messages from consumers
+//     on that endpoint are wrapped in a MassTransit envelope. The default raw JSON serializer
+//     (ADR-001) is not affected.
 //   - MassTransitSimulator: BackgroundService using bare RabbitMQ.Client (no BareWire) to
 //     simulate a MassTransit producer publishing enveloped messages every 5 seconds.
 //   - ServiceDefaults: OpenTelemetry observability + health checks.
@@ -23,6 +29,12 @@
 //       └→ barewire-orders-queue → BareWireOrderConsumer (IConsumer<OrderCreated>)
 //            Content-Type: application/json
 //            → ContentTypeDeserializerRouter → SystemTextJsonRawDeserializer → OrderCreated
+//
+//   IBus.PublishAsync<OrderCreated>() [UseSerializer<MassTransitEnvelopeSerializer>()]
+//       → mt-envelope-publish (direct exchange)
+//       └→ mt-envelope-publish-queue → MassTransitOrderConsumer (IConsumer<OrderCreated>)
+//            Content-Type: application/vnd.masstransit+json (per-endpoint override)
+//            → ContentTypeDeserializerRouter → MassTransitEnvelopeDeserializer → OrderCreated
 //
 // Prerequisites (runtime, NOT required to compile):
 //   - RabbitMQ broker (default: amqp://guest:guest@localhost:5672/)
@@ -70,6 +82,11 @@ builder.Services.AddBareWireJsonSerializer();
 // to be registered first; calling before throws InvalidOperationException.
 builder.Services.AddMassTransitEnvelopeDeserializer();
 
+// Registers MassTransitEnvelopeSerializer in DI for per-endpoint use.
+// Does NOT replace the default raw JSON serializer (ADR-001 raw-first).
+// Activate per endpoint via e.UseSerializer<MassTransitEnvelopeSerializer>().
+builder.Services.AddMassTransitEnvelopeSerializer();
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Consumers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +123,12 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
         t.DeclareExchange("barewire-orders", ExchangeType.Fanout, durable: true);
         t.DeclareQueue("barewire-orders-queue", durable: true);
         t.BindExchangeToQueue("barewire-orders", "barewire-orders-queue", routingKey: "");
+
+        // Exchange + queue for messages published by BareWire in MassTransit envelope format
+        // (per-endpoint serializer override via UseSerializer<MassTransitEnvelopeSerializer>()).
+        t.DeclareExchange("mt-envelope-publish", ExchangeType.Direct, durable: true);
+        t.DeclareQueue("mt-envelope-publish-queue", durable: true);
+        t.BindExchangeToQueue("mt-envelope-publish", "mt-envelope-publish-queue", routingKey: "");
     });
 
     // Endpoint 1: MassTransitOrderConsumer — receives enveloped messages from MassTransitSimulator.
@@ -129,6 +152,19 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
         e.RetryCount = 3;
         e.RetryInterval = TimeSpan.FromSeconds(5);
         e.Consumer<BareWireOrderConsumer, OrderCreated>();
+    });
+
+    // Endpoint 3: receives messages published by BareWire in MassTransit envelope format.
+    // UseSerializer overrides the serializer for this endpoint only — published messages
+    // from consumers on this endpoint will use MassTransit envelope format.
+    rmq.ReceiveEndpoint("mt-envelope-publish-queue", e =>
+    {
+        e.PrefetchCount = 8;
+        e.ConcurrentMessageLimit = 4;
+        e.RetryCount = 3;
+        e.RetryInterval = TimeSpan.FromSeconds(5);
+        e.UseSerializer<MassTransitEnvelopeSerializer>();
+        e.Consumer<MassTransitOrderConsumer, OrderCreated>();
     });
 };
 
@@ -191,6 +227,24 @@ app.MapPost("/barewire/publish", async (
 })
 .Produces(StatusCodes.Status202Accepted)
 .WithName("PublishBareWireOrder");
+
+// POST /masstransit/publish-envelope — publishes an OrderCreated via IBus using MassTransit
+// envelope serialization (per-endpoint override via UseSerializer<MassTransitEnvelopeSerializer>()).
+app.MapPost("/masstransit/publish-envelope", async (
+    IBus bus,
+    CancellationToken cancellationToken) =>
+{
+    OrderCreated order = new(
+        OrderId: Guid.NewGuid().ToString(),
+        Amount: 149.99m,
+        Currency: "EUR");
+
+    await bus.PublishAsync(order, cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted(value: new { Message = "MT envelope OrderCreated published.", order.OrderId });
+})
+.Produces(StatusCodes.Status202Accepted)
+.WithName("PublishMassTransitEnvelope");
 
 // GET /orders/processed — returns all orders processed by both consumers (MassTransit + BareWire).
 // Used by E2E tests to verify that messages were consumed and deserialized correctly.

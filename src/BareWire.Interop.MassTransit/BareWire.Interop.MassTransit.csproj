@@ -16,6 +16,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="BareWire.UnitTests" />
     <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+    <InternalsVisibleTo Include="BareWire.Samples.MassTransitInterop" />
   </ItemGroup>
 
 </Project>

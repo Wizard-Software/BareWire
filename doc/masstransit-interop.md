@@ -1,6 +1,6 @@
 # MassTransit Interop
 
-BareWire can consume messages published by MassTransit without requiring MassTransit as a runtime dependency. The `BareWire.Interop.MassTransit` package adds a content-type-aware deserializer that unwraps MassTransit's envelope format transparently.
+BareWire can both consume and publish messages in MassTransit's envelope format without requiring MassTransit as a runtime dependency. The `BareWire.Interop.MassTransit` package provides a content-type-aware deserializer for consuming MassTransit messages and a per-endpoint serializer for publishing in MassTransit-compatible format.
 
 ## Installation
 
@@ -10,14 +10,17 @@ dotnet add package BareWire.Interop.MassTransit
 
 ## Configuration
 
-Register the MassTransit envelope deserializer **after** the base JSON serializer:
+Register the MassTransit interop components **after** the base JSON serializer:
 
 ```csharp
 builder.Services.AddBareWireJsonSerializer();
-builder.Services.AddMassTransitEnvelopeDeserializer();
+builder.Services.AddMassTransitEnvelopeDeserializer(); // consume from MassTransit
+builder.Services.AddMassTransitEnvelopeSerializer();   // publish to MassTransit (per-endpoint)
 ```
 
-The order matters — `AddMassTransitEnvelopeDeserializer()` throws `InvalidOperationException` if called before `AddBareWireJsonSerializer()`.
+The order matters — both methods throw `InvalidOperationException` if called before `AddBareWireJsonSerializer()`.
+
+`AddMassTransitEnvelopeSerializer()` registers the serializer in DI but does **not** replace the default raw JSON serializer. To activate it, use `UseSerializer<MassTransitEnvelopeSerializer>()` on the endpoints that need to publish in MassTransit format (see [Publishing to MassTransit](#publishing-to-masstransit) below).
 
 ## How It Works
 
@@ -84,6 +87,64 @@ The envelope deserializer is intentionally permissive:
 - Unknown fields (`host`, `faultAddress`, `requestId`) are silently ignored
 - `null` or missing `message` field returns `null` (not an exception)
 - Malformed JSON throws `BareWireSerializationException` with a raw payload excerpt for debugging
+
+## Publishing to MassTransit
+
+To publish messages that MassTransit consumers can understand, activate the `MassTransitEnvelopeSerializer` on the endpoint that communicates with MassTransit:
+
+```csharp
+rmq.ReceiveEndpoint("to-masstransit", e =>
+{
+    e.UseSerializer<MassTransitEnvelopeSerializer>();
+    e.Consumer<OutboundConsumer, OrderCreated>();
+});
+```
+
+Messages published from this endpoint are wrapped in a MassTransit-compatible envelope:
+
+```json
+{
+  "messageId": "550e8400-e29b-41d4-a716-446655440000",
+  "messageType": ["urn:message:MyNamespace:OrderCreated"],
+  "sentTime": "2026-04-04T12:00:00Z",
+  "message": { "orderId": "abc-123", "amount": 99.99, "currency": "PLN" }
+}
+```
+
+Other endpoints continue using the default raw JSON serializer — `UseSerializer<T>()` only affects the endpoint it is called on.
+
+### Bidirectional Interop
+
+For a single endpoint that both receives and publishes in MassTransit format, combine both overrides:
+
+```csharp
+rmq.ReceiveEndpoint("masstransit-bridge", e =>
+{
+    e.UseSerializer<MassTransitEnvelopeSerializer>();
+    e.UseDeserializer<MassTransitEnvelopeDeserializer>();
+    e.Consumer<BridgeConsumer, OrderCreated>();
+});
+```
+
+### Mixed Endpoints
+
+A single application can have endpoints with different serialization formats:
+
+```csharp
+// Internal: raw JSON (default)
+rmq.ReceiveEndpoint("internal-events", e =>
+{
+    e.Consumer<InternalConsumer, InternalEvent>();
+});
+
+// MassTransit bridge: envelope format
+rmq.ReceiveEndpoint("masstransit-bridge", e =>
+{
+    e.UseSerializer<MassTransitEnvelopeSerializer>();
+    e.UseDeserializer<MassTransitEnvelopeDeserializer>();
+    e.Consumer<BridgeConsumer, OrderCreated>();
+});
+```
 
 ## Simulating a MassTransit Producer
 

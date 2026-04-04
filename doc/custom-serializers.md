@@ -84,7 +84,9 @@ Per-endpoint `UseDeserializer<T>()` bypasses the router entirely and uses the sp
 |---|---|
 | All endpoints use the same format | Global `AddBareWireJsonSerializer()` — no overrides |
 | One endpoint receives a different format | `e.UseDeserializer<T>()` on that endpoint |
+| One endpoint publishes in a different format | `e.UseSerializer<T>()` on that endpoint |
 | Multiple formats on the same endpoint | Global `ContentTypeDeserializerRouter` (register additional deserializers) |
+| Publishing to MassTransit from one endpoint | `AddMassTransitEnvelopeSerializer()` + `e.UseSerializer<MassTransitEnvelopeSerializer>()` |
 | External system with custom wire format | `e.UseDeserializer<T>()` with a custom `IMessageDeserializer` |
 
-> See: [MassTransit Interop](masstransit-interop.md) for an example of content-type routing with multiple deserializers
+> See: [MassTransit Interop](masstransit-interop.md) for bidirectional interop with MassTransit (consume + publish)
