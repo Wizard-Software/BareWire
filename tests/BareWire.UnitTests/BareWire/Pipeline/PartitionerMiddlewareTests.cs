@@ -271,6 +271,108 @@ public sealed class PartitionerMiddlewareTests
     }
 
     // -----------------------------------------------------------------------
+    // DefaultKeySelector_NonGuidCorrelationId_HashesToSamePartition
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task InvokeAsync_NonGuidCorrelationId_SameValueRoutesToSamePartition()
+    {
+        // Arrange — two messages with the same non-Guid CorrelationId should be serialised
+        // (same partition key), proving the hash-based fallback works.
+        const string correlationId = "order-123";
+
+        MessageContext ctx1 = CreateContext(headers: new Dictionary<string, string>
+        {
+            ["CorrelationId"] = correlationId
+        });
+        MessageContext ctx2 = CreateContext(headers: new Dictionary<string, string>
+        {
+            ["CorrelationId"] = correlationId
+        });
+
+        await using var middleware = new PartitionerMiddleware(partitionCount: 1);
+
+        var executionOrder = new List<string>();
+        var firstEntered = new SemaphoreSlim(0, 1);
+        var firstCanExit = new SemaphoreSlim(0, 1);
+
+        async Task SlowNext1(MessageContext _)
+        {
+            executionOrder.Add("first-start");
+            firstEntered.Release();
+            await firstCanExit.WaitAsync().ConfigureAwait(false);
+            executionOrder.Add("first-end");
+        }
+
+        Task SlowNext2(MessageContext _)
+        {
+            executionOrder.Add("second");
+            return Task.CompletedTask;
+        }
+
+        // Act
+        Task first = Task.Run(() => middleware.InvokeAsync(ctx1, SlowNext1));
+        await firstEntered.WaitAsync();
+        Task second = Task.Run(() => middleware.InvokeAsync(ctx2, SlowNext2));
+        await Task.Delay(50);
+        firstCanExit.Release();
+        await Task.WhenAll(first, second);
+
+        // Assert — must be sequential, proving both messages got the same partition key.
+        executionOrder.Should().Equal("first-start", "first-end", "second");
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NonGuidCorrelationId_DifferentValuesCanRunConcurrently()
+    {
+        // Arrange — two messages with different non-Guid CorrelationIds should land on
+        // different partitions (with enough partitions), proving distinct hash values.
+        const string corrId1 = "order-aaa";
+        const string corrId2 = "order-bbb";
+
+        MessageContext ctx1 = CreateContext(headers: new Dictionary<string, string>
+        {
+            ["CorrelationId"] = corrId1
+        });
+        MessageContext ctx2 = CreateContext(headers: new Dictionary<string, string>
+        {
+            ["CorrelationId"] = corrId2
+        });
+
+        // Use 16 partitions to make hash collision unlikely.
+        await using var middleware = new PartitionerMiddleware(partitionCount: 16);
+
+        var firstEntered = new SemaphoreSlim(0, 1);
+        var secondEntered = new SemaphoreSlim(0, 1);
+        var firstCanExit = new SemaphoreSlim(0, 1);
+
+        async Task SlowNext1(MessageContext _)
+        {
+            firstEntered.Release();
+            await firstCanExit.WaitAsync().ConfigureAwait(false);
+        }
+
+        async Task SlowNext2(MessageContext _)
+        {
+            secondEntered.Release();
+            await Task.Yield();
+        }
+
+        // Act
+        Task first = Task.Run(() => middleware.InvokeAsync(ctx1, SlowNext1));
+        await firstEntered.WaitAsync();
+        Task second = Task.Run(() => middleware.InvokeAsync(ctx2, SlowNext2));
+
+        bool secondStarted = await secondEntered.WaitAsync(millisecondsTimeout: 2000);
+
+        firstCanExit.Release();
+        await Task.WhenAll(first, second);
+
+        // Assert
+        secondStarted.Should().BeTrue("messages with different non-Guid CorrelationIds must be processed concurrently");
+    }
+
+    // -----------------------------------------------------------------------
     // InvokeAsync_ExceptionInNext_ReleasesLock
     // -----------------------------------------------------------------------
 

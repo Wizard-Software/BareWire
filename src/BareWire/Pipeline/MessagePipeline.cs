@@ -1,7 +1,5 @@
 using System.Buffers;
 using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Observability;
@@ -139,17 +137,7 @@ internal sealed partial class MessagePipeline
     // If the string is a valid Guid format it is parsed directly.
     // Otherwise a deterministic Guid is derived from the first 16 bytes of the SHA256 hash of the ID string,
     // ensuring we never throw FormatException and always produce a stable, collision-resistant identifier.
-    private static Guid ParseOrHashMessageId(string messageId)
-    {
-        if (Guid.TryParse(messageId, out Guid parsed))
-            return parsed;
-
-        byte[] idBytes = Encoding.UTF8.GetBytes(messageId);
-        byte[] hash = SHA256.HashData(idBytes);
-
-        // Use the first 16 bytes of the hash as the Guid bytes.
-        return new Guid(hash.AsSpan(0, 16));
-    }
+    private static Guid ParseOrHashMessageId(string messageId) => GuidHelper.ParseOrHash(messageId);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Unknown payload received for message {MessageId}. Rejecting.")]
     private static partial void LogUnknownPayload(ILogger logger, Exception ex, Guid messageId);

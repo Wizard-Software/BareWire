@@ -65,11 +65,8 @@ internal sealed class PartitionerMiddleware : IMessageMiddleware, IAsyncDisposab
 
     private static Guid DefaultKeySelector(MessageContext context)
     {
-        if (context.Headers.TryGetValue("CorrelationId", out string? value)
-            && Guid.TryParse(value, out Guid correlationId))
-        {
-            return correlationId;
-        }
+        if (context.Headers.TryGetValue("CorrelationId", out string? value))
+            return GuidHelper.ParseOrHash(value);
 
         return context.MessageId;
     }
