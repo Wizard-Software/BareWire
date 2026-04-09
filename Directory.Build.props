@@ -16,10 +16,10 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IsPackable>true</IsPackable>
     <Authors>Artur Sawicki</Authors>
-    <Company>asawicki</Company>
+    <Company>Wizard-Software</Company>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/asawicki/BareWire</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/asawicki/BareWire</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/Wizard-Software/BareWire</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Wizard-Software/BareWire</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>messaging;rabbitmq;barewire;async;dotnet;high-performance</PackageTags>
     <PackageIcon>icon.png</PackageIcon>
