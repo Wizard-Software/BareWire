@@ -221,13 +221,13 @@ public sealed class AuditMiddleware : IMessageMiddleware
 
 The framework sets `EndpointName` automatically from `EndpointBinding.EndpointName` — no configuration required.
 
-## Routing do wybranego exchange'a
+## Routing to a Specific Exchange
 
-Domyślnie każda wiadomość opublikowana przez `bus.PublishAsync<T>(...)` trafia na
-`DefaultExchange` skonfigurowany w `UseRabbitMQ`. Gdy różne typy wiadomości mają
-trafiać na różne exchange'e bez konieczności ręcznego przekazywania nagłówka
-`BW-Exchange` przy każdym wywołaniu, użyj `MapExchange<T>(...)` symetrycznie do
-istniejącego `MapRoutingKey<T>(...)`:
+By default, every message published via `bus.PublishAsync<T>(...)` lands on the
+`DefaultExchange` configured in `UseRabbitMQ`. When different message types need
+to land on different exchanges without passing a `BW-Exchange` header on every
+call, use `MapExchange<T>(...)` symmetrically to the existing
+`MapRoutingKey<T>(...)`:
 
 ```csharp
 services.AddBareWireRabbitMq(cfg =>
@@ -243,30 +243,30 @@ services.AddBareWireRabbitMq(cfg =>
 
     cfg.DefaultExchange("default.direct");
 
-    // Mapowanie typ → exchange. Wymaga, aby exchange był zadeklarowany powyżej;
-    // w przeciwnym razie Build() rzuca BareWireConfigurationException (fail-fast
-    // zgodnie z ADR-002: manual topology).
+    // Type → exchange mapping. The exchange must be declared above; otherwise
+    // Build() throws BareWireConfigurationException (fail-fast per ADR-002:
+    // manual topology).
     cfg.MapExchange<PaymentRequested>("payments.topic");
     cfg.MapExchange<OrderCreated>("orders.fanout");
 });
 ```
 
-### Kolejność rozwiązywania docelowego exchange'a (precedence)
+### Exchange Resolution Precedence
 
-Gdy `bus.PublishAsync<T>(...)` wysyła wiadomość, docelowy exchange jest wyznaczany
-w następującej kolejności — od najwyższego priorytetu do najniższego:
+When `bus.PublishAsync<T>(...)` sends a message, the target exchange is resolved
+in the following order — from highest to lowest priority:
 
-| # | Źródło | Kiedy wygrywa |
+| # | Source | When it wins |
 |---|---|---|
-| a | Nagłówek `BW-Exchange` jawnie podany przez wołającego w `PublishAsync(msg, headers, ct)` | Zawsze, gdy jest obecny — także dla pustej wartości (ścieżka `queue:` URI korzysta z pustego nagłówka). |
-| b | Mapowanie typ→exchange z `MapExchange<T>(...)` | Gdy (a) nie wystąpiło — BareWire wstrzykuje `BW-Exchange` do nagłówków. |
-| c | Globalny `DefaultExchange(...)` | Gdy ani (a), ani (b) nie wystąpiły — transport adapter sięga do `RabbitMqTransportOptions.DefaultExchange`. |
-| d | Brak (a), (b) i (c) | `BareWireConfigurationException` przy wysyłce — konfiguracja jest niepełna. |
+| a | Explicit `BW-Exchange` header supplied by the caller in `PublishAsync(msg, headers, ct)` | Always, when present — including an empty value (the `queue:` URI scheme relies on an empty header). |
+| b | Type → exchange mapping from `MapExchange<T>(...)` | When (a) is absent — BareWire injects `BW-Exchange` into the outbound headers. |
+| c | Global `DefaultExchange(...)` | When neither (a) nor (b) applied — the transport adapter falls back to `RabbitMqTransportOptions.DefaultExchange`. |
+| d | None of the above | `BareWireConfigurationException` at publish time — configuration is incomplete. |
 
-Dzięki temu samo wywołanie `bus.PublishAsync(new PaymentRequested(...), ct)`
-trafia na `payments.topic` bez dodatkowego kodu w miejscu publikacji, a wołający,
-który *musi* wymusić inny exchange (np. bridge do MassTransit), może jednorazowo
-podać `BW-Exchange` w słowniku nagłówków.
+This lets `bus.PublishAsync(new PaymentRequested(...), ct)` land on
+`payments.topic` without any extra code at the call site, while a caller that
+*must* force a different exchange (e.g. a MassTransit bridge) can supply
+`BW-Exchange` in the headers dictionary on a per-call basis.
 
 ## Raw Publishing
 
