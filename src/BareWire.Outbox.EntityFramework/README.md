@@ -30,7 +30,7 @@ Requires EF Core migrations for outbox/inbox tables. See the documentation for m
 
 ## Documentation
 
-Full documentation: [BareWire on GitHub](https://github.com/asawicki/BareWire)
+Full documentation: [barewire.wizardsoftware.pl](https://barewire.wizardsoftware.pl)
 
 ## License
 

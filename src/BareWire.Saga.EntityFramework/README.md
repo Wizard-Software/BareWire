@@ -30,7 +30,7 @@ Requires EF Core migrations for saga state tables. See the documentation for mig
 
 ## Documentation
 
-Full documentation: [BareWire on GitHub](https://github.com/asawicki/BareWire)
+Full documentation: [barewire.wizardsoftware.pl](https://barewire.wizardsoftware.pl)
 
 ## License
 

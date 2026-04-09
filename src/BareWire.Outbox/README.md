@@ -30,7 +30,7 @@ builder.AddBareWire(wire =>
 
 ## Documentation
 
-Full documentation: [BareWire on GitHub](https://github.com/asawicki/BareWire)
+Full documentation: [barewire.wizardsoftware.pl](https://barewire.wizardsoftware.pl)
 
 ## License
 
