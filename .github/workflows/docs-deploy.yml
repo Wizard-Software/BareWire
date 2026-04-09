@@ -1,0 +1,57 @@
+name: docs-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'src/**'
+      - '.github/workflows/docs-deploy.yml'
+  workflow_dispatch:
+
+# Allow the workflow to deploy to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One concurrent Pages deployment at a time; do not cancel an in-progress deploy
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install DocFX
+        run: dotnet tool update -g docfx
+
+      - name: Restore dependencies
+        run: dotnet restore BareWire.slnx
+
+      - name: Build documentation site
+        run: docfx docs/docfx.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,17 @@
+###############################################################################
+# DocFX build outputs and generated API metadata
+###############################################################################
+
+# Static site output
+_site/
+
+# Generated API reference YAML (keep only the hand-written index.md)
+api/*.yml
+api/.manifest
+
+# DocFX logs
+log.txt
+*.log
+
+# Intermediate build artifacts
+obj/
