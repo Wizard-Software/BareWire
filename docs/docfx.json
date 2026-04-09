@@ -49,8 +49,8 @@
       "_appName": "BareWire",
       "_appTitle": "BareWire",
       "_enableSearch": true,
-      "_appLogoPath": "images/logo.png",
-      "_appFaviconPath": "images/favicon.png",
+      "_appLogoPath": "images/logo.svg",
+      "_appFaviconPath": "images/logo.svg",
       "_appFooter": "<span>Built with <a href=\"https://dotnet.github.io/docfx\">DocFX</a> · © 2026 <a href=\"https://github.com/Wizard-Software\">Wizard-Software</a></span>",
       "_gitContribute": {
         "repo": "https://github.com/Wizard-Software/BareWire",

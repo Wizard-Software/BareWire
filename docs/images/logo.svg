@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="BareWire">
+  <defs>
+    <linearGradient id="bw-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4c8bf5"/>
+      <stop offset="100%" stop-color="#9b6bff"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" ry="56" fill="url(#bw-grad)"/>
+  <g fill="#ffffff">
+    <rect x="64" y="116" width="128" height="24" rx="12" ry="12"/>
+    <circle cx="64" cy="128" r="26"/>
+    <circle cx="192" cy="128" r="26"/>
+    <circle cx="64" cy="128" r="10" fill="url(#bw-grad)"/>
+    <circle cx="192" cy="128" r="10" fill="url(#bw-grad)"/>
+  </g>
+</svg>

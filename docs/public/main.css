@@ -1,38 +1,78 @@
 /* BareWire custom overrides for DocFX modern template */
 
+/* Navbar brand logo — constrain so 256x256 PNG doesn't blow up the navbar */
+.navbar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+}
+
+.navbar-brand img,
+.navbar .navbar-brand img {
+  height: 28px;
+  width: 28px;
+  max-height: 28px;
+  max-width: 28px;
+  object-fit: contain;
+  border-radius: 6px;
+}
+
 :root {
   --bw-accent: #4c8bf5;
+  --bw-accent-2: #9b6bff;
   --bw-accent-hover: #6ba0ff;
-  --bw-surface: rgba(255, 255, 255, 0.03);
-  --bw-border: rgba(255, 255, 255, 0.08);
+  --bw-surface: rgba(255, 255, 255, 0.045);
+  --bw-surface-strong: rgba(255, 255, 255, 0.07);
+  --bw-border: rgba(255, 255, 255, 0.12);
+  --bw-border-strong: rgba(255, 255, 255, 0.18);
+  --bw-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 10px 28px rgba(0, 0, 0, 0.28);
 }
 
 /* Hero section */
 .hero {
-  padding: 3rem 0 4rem 0;
-  border-bottom: 1px solid var(--bw-border);
+  position: relative;
+  padding: 4rem 0 4.5rem 0;
   margin-bottom: 2.5rem;
+  border-bottom: 1px solid var(--bw-border);
+  overflow: hidden;
+}
+
+.hero::before {
+  content: "";
+  position: absolute;
+  inset: -20% -10% auto auto;
+  width: 620px;
+  height: 620px;
+  background: radial-gradient(closest-side, rgba(76, 139, 245, 0.22), rgba(155, 107, 255, 0.08) 55%, transparent 75%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hero > * {
+  position: relative;
+  z-index: 1;
 }
 
 .hero .display-2 {
-  background: linear-gradient(135deg, var(--bw-accent) 0%, #9b6bff 100%);
+  background: linear-gradient(135deg, var(--bw-accent) 0%, var(--bw-accent-2) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
   letter-spacing: -0.03em;
+  margin-bottom: 1rem;
 }
 
 .hero .lead {
   font-size: 1.25rem;
-  opacity: 0.85;
-  max-width: 38rem;
+  opacity: 0.88;
+  max-width: 44rem;
+  line-height: 1.55;
 }
 
-.hero-logo {
-  max-width: 260px;
-  width: 100%;
-  height: auto;
-  filter: drop-shadow(0 8px 32px rgba(76, 139, 245, 0.25));
+.hero-cta {
+  margin-top: 1.75rem;
 }
 
 /* Feature cards */
@@ -43,25 +83,38 @@
 .feature-card {
   background: var(--bw-surface);
   border: 1px solid var(--bw-border);
-  border-radius: 12px;
-  padding: 1.5rem;
+  border-radius: 14px;
+  padding: 1.75rem;
   height: 100%;
-  transition: border-color 0.2s ease, transform 0.2s ease;
+  box-shadow: var(--bw-shadow);
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .feature-card:hover {
   border-color: var(--bw-accent);
-  transform: translateY(-2px);
+  transform: translateY(-3px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 14px 36px rgba(76, 139, 245, 0.22);
 }
 
 .feature-card h3 {
   margin-top: 0;
+  margin-bottom: 0.6rem;
   color: var(--bw-accent);
-  font-size: 1.15rem;
+  font-size: 1.2rem;
+  letter-spacing: -0.005em;
+}
+
+.feature-card p {
+  margin-bottom: 0;
+  opacity: 0.85;
+  line-height: 1.55;
 }
 
 .feature-card code {
   font-size: 0.85em;
+  padding: 0.08em 0.35em;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 /* Stats row */
@@ -71,22 +124,106 @@
 }
 
 .stat {
-  padding: 1.25rem 0.5rem;
+  background: var(--bw-surface);
+  border: 1px solid var(--bw-border);
+  border-radius: 14px;
+  padding: 1.6rem 1rem 1.4rem;
+  height: 100%;
+  box-shadow: var(--bw-shadow);
+  transition: border-color 0.2s ease, transform 0.2s ease;
 }
 
-.stat .display-5 {
+.stat:hover {
+  border-color: var(--bw-accent);
+  transform: translateY(-2px);
+}
+
+.stat .stat-value {
   display: block;
-  color: var(--bw-accent);
-  font-weight: 700;
+  background: linear-gradient(135deg, var(--bw-accent) 0%, var(--bw-accent-2) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 800;
+  font-size: clamp(1.9rem, 3.6vw, 2.6rem);
   line-height: 1.1;
-  margin-bottom: 0.25rem;
+  margin-bottom: 0.45rem;
+  letter-spacing: -0.02em;
 }
 
 .stat span {
-  font-size: 0.85rem;
-  opacity: 0.7;
+  font-size: 0.78rem;
+  opacity: 0.78;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+}
+
+/* Core concept cards (clickable) */
+.concept-row {
+  margin: 2rem 0 3rem 0;
+}
+
+.concept-row > [class^="col-"] {
+  display: flex;
+  margin-bottom: 1.25rem;
+}
+
+.concept-card {
+  display: block;
+  width: 100%;
+  background: var(--bw-surface);
+  border: 1px solid var(--bw-border);
+  border-radius: 14px;
+  padding: 1.4rem 1.5rem;
+  color: inherit;
+  text-decoration: none;
+  box-shadow: var(--bw-shadow);
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.concept-card:hover,
+.concept-card:focus {
+  border-color: var(--bw-accent);
+  background: var(--bw-surface-strong);
+  transform: translateY(-2px);
+  text-decoration: none;
+  color: inherit;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 14px 32px rgba(76, 139, 245, 0.22);
+}
+
+.concept-card h3 {
+  margin: 0 0 0.4rem 0;
+  font-size: 1.05rem;
+  color: var(--bw-accent);
+  letter-spacing: -0.005em;
+}
+
+.concept-card h3::after {
+  content: " →";
+  opacity: 0;
+  margin-left: 0.15rem;
+  transition: opacity 0.2s ease, margin-left 0.2s ease;
+}
+
+.concept-card:hover h3::after,
+.concept-card:focus h3::after {
+  opacity: 1;
+  margin-left: 0.35rem;
+}
+
+.concept-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  opacity: 0.78;
+  line-height: 1.5;
+}
+
+/* About line */
+.about-line {
+  text-align: center;
+  opacity: 0.65;
+  font-size: 0.9rem;
+  margin: 2rem 0 3rem;
 }
 
 /* Primary button accent override */
@@ -116,9 +253,33 @@
 /* Responsive tweaks */
 @media (max-width: 991.98px) {
   .hero {
-    padding: 2rem 0 2.5rem 0;
+    padding: 2.5rem 0 3rem 0;
   }
   .hero .display-2 {
-    font-size: 3rem;
+    font-size: 2.75rem;
+  }
+  .hero .lead {
+    font-size: 1.1rem;
+  }
+  .hero::before {
+    width: 420px;
+    height: 420px;
+    inset: -25% -30% auto auto;
+  }
+  .feature-card,
+  .concept-card {
+    padding: 1.35rem;
+  }
+  .stat {
+    padding: 1.25rem 0.5rem 1.1rem;
+  }
+  .stat .stat-value {
+    font-size: 1.75rem;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .stats-row > .col-6 {
+    margin-bottom: 1rem;
   }
 }
