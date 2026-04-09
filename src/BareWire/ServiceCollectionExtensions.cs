@@ -118,6 +118,11 @@ public static class ServiceCollectionExtensions
         // that includes explicit routing key mappings configured via MapRoutingKey<T>.
         services.TryAddSingleton<IRoutingKeyResolver>(new RoutingKeyResolver());
 
+        // Default exchange resolver — returns null for all types (no mappings).
+        // Transport packages (e.g. AddBareWireRabbitMq) replace this with a resolver
+        // that includes explicit exchange mappings configured via MapExchange<T>.
+        services.TryAddSingleton<IExchangeResolver>(new ExchangeResolver());
+
         // Publish flow control options — use defaults unless the caller has already registered
         // a custom instance before calling AddBareWire.
         // Use conditional registration to respect any user-supplied options.
@@ -170,7 +175,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ILogger<BareWireBus>>(),
             sp.GetRequiredService<IBareWireInstrumentation>(),
             sp.GetRequiredService<IRoutingKeyResolver>(),
-            sp.GetService<IRequestClientFactory>()));
+            sp.GetService<IRequestClientFactory>(),
+            sp.GetRequiredService<IExchangeResolver>()));
 
         // BareWireBusControl — wraps BareWireBus and implements IBusControl / IBus.
         // Uses a factory because the constructor is internal.

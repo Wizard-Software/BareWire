@@ -45,6 +45,11 @@ public static class ServiceCollectionExtensions
         var routingKeyResolver = new Internal.RoutingKeyResolver(options.RoutingKeyMappings);
         services.Replace(ServiceDescriptor.Singleton<IRoutingKeyResolver>(routingKeyResolver));
 
+        // Register exchange resolver with explicit mappings from MapExchange<T>.
+        // Uses Replace to always override the default resolver from AddBareWire().
+        var exchangeResolver = new Internal.ExchangeResolver(options.ExchangeMappings);
+        services.Replace(ServiceDescriptor.Singleton<IExchangeResolver>(exchangeResolver));
+
         // Register the header mapper so both the transport adapter and request client share it.
         // When ConfigureHeaderMapping was called, the configurator flows through options.
         var headerMapper = new RabbitMqHeaderMapper(options.HeaderMappingConfigurator);

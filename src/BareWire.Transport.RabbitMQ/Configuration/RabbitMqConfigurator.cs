@@ -14,6 +14,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     private RabbitMqHeaderMappingConfigurator? _headerMappingConfigurator;
     private readonly List<RabbitMqEndpointConfiguration> _endpoints = [];
     private readonly Dictionary<Type, string> _routingKeyMappings = [];
+    private readonly Dictionary<Type, string> _exchangeMappings = [];
 
     public void Host(string uri, Action<IHostConfigurator>? configure = null)
     {
@@ -61,6 +62,12 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     {
         ArgumentException.ThrowIfNullOrEmpty(routingKey);
         _routingKeyMappings[typeof(T)] = routingKey;
+    }
+
+    public void MapExchange<T>(string exchangeName) where T : class
+    {
+        ArgumentException.ThrowIfNullOrEmpty(exchangeName);
+        _exchangeMappings[typeof(T)] = exchangeName;
     }
 
     internal RabbitMqTransportOptions Build()
@@ -111,7 +118,47 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
             options.RoutingKeyMappings = new Dictionary<Type, string>(_routingKeyMappings);
         }
 
+        if (_exchangeMappings.Count > 0)
+        {
+            ValidateExchangeMappings(options.Topology);
+            options.ExchangeMappings = new Dictionary<Type, string>(_exchangeMappings);
+        }
+
         return options;
+    }
+
+    private void ValidateExchangeMappings(TopologyDeclaration? topology)
+    {
+        if (topology is null)
+        {
+            throw new BareWireConfigurationException(
+                optionName: "MapExchange",
+                optionValue: null,
+                expectedValue: "ConfigureTopology must be called before MapExchange<T>. " +
+                               "Declare all exchanges via ConfigureTopology before mapping message types to them.");
+        }
+
+        HashSet<string> declaredExchanges = [..topology.Exchanges.Select(e => e.Name)];
+
+        List<string>? missing = null;
+        foreach (string exchangeName in _exchangeMappings.Values)
+        {
+            if (!declaredExchanges.Contains(exchangeName))
+            {
+                missing ??= [];
+                missing.Add(exchangeName);
+            }
+        }
+
+        if (missing is not null)
+        {
+            string missingList = string.Join(", ", missing.Distinct());
+            throw new BareWireConfigurationException(
+                optionName: "MapExchange",
+                optionValue: missingList,
+                expectedValue: "All exchanges referenced in MapExchange<T> must be declared via ConfigureTopology. " +
+                               $"Missing exchanges: {missingList}.");
+        }
     }
 
     private static void ValidateUri(string? uri)

@@ -73,6 +73,12 @@ internal sealed class RabbitMqTransportOptions
     /// </summary>
     public IReadOnlyDictionary<Type, string>? RoutingKeyMappings { get; set; }
 
+    /// <summary>
+    /// Explicit type→exchange mappings produced by <see cref="IRabbitMqConfigurator.MapExchange{T}"/>.
+    /// <see langword="null"/> when no explicit exchange mappings were configured.
+    /// </summary>
+    public IReadOnlyDictionary<Type, string>? ExchangeMappings { get; set; }
+
     public void Validate()
     {
         if (string.IsNullOrEmpty(ConnectionString))

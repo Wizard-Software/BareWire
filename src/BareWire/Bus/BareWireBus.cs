@@ -28,6 +28,7 @@ internal sealed partial class BareWireBus : IBus
     private readonly ILogger<BareWireBus> _logger;
     private readonly IBareWireInstrumentation _instrumentation;
     private readonly IRoutingKeyResolver _routingKeyResolver;
+    private readonly IExchangeResolver _exchangeResolver;
     private readonly IRequestClientFactory? _requestClientFactory;
 
     private readonly ConcurrentDictionary<Uri, ISendEndpoint> _sendEndpoints = new();
@@ -47,7 +48,8 @@ internal sealed partial class BareWireBus : IBus
         ILogger<BareWireBus> logger,
         IBareWireInstrumentation instrumentation,
         IRoutingKeyResolver? routingKeyResolver = null,
-        IRequestClientFactory? requestClientFactory = null)
+        IRequestClientFactory? requestClientFactory = null,
+        IExchangeResolver? exchangeResolver = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
@@ -57,6 +59,7 @@ internal sealed partial class BareWireBus : IBus
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
         _routingKeyResolver = routingKeyResolver ?? new RoutingKeyResolver();
+        _exchangeResolver = exchangeResolver ?? new ExchangeResolver();
         _requestClientFactory = requestClientFactory;
 
         BusId = Guid.NewGuid();
@@ -119,6 +122,15 @@ internal sealed partial class BareWireBus : IBus
             mergedHeaders["BW-MessageType"] = messageType;
             mergedHeaders["message-id"] = messageId.ToString();
             _instrumentation.InjectTraceContext(activity, mergedHeaders);
+
+            // Inject BW-Exchange from the type→exchange mapping only when the caller has not already
+            // provided an explicit BW-Exchange header (precedence: caller header > mapping > DefaultExchange).
+            if (!mergedHeaders.ContainsKey("BW-Exchange"))
+            {
+                string? mappedExchange = _exchangeResolver.Resolve<T>();
+                if (mappedExchange is not null)
+                    mergedHeaders["BW-Exchange"] = mappedExchange;
+            }
 
             IMessageSerializer serializer = _serializerResolver.Resolve<T>();
         OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(

@@ -221,6 +221,53 @@ public sealed class AuditMiddleware : IMessageMiddleware
 
 The framework sets `EndpointName` automatically from `EndpointBinding.EndpointName` — no configuration required.
 
+## Routing do wybranego exchange'a
+
+Domyślnie każda wiadomość opublikowana przez `bus.PublishAsync<T>(...)` trafia na
+`DefaultExchange` skonfigurowany w `UseRabbitMQ`. Gdy różne typy wiadomości mają
+trafiać na różne exchange'e bez konieczności ręcznego przekazywania nagłówka
+`BW-Exchange` przy każdym wywołaniu, użyj `MapExchange<T>(...)` symetrycznie do
+istniejącego `MapRoutingKey<T>(...)`:
+
+```csharp
+services.AddBareWireRabbitMq(cfg =>
+{
+    cfg.Host("amqp://guest:guest@localhost:5672/");
+
+    cfg.ConfigureTopology(t =>
+    {
+        t.DeclareExchange("payments.topic", ExchangeType.Topic);
+        t.DeclareExchange("orders.fanout",  ExchangeType.Fanout);
+        t.DeclareExchange("default.direct", ExchangeType.Direct);
+    });
+
+    cfg.DefaultExchange("default.direct");
+
+    // Mapowanie typ → exchange. Wymaga, aby exchange był zadeklarowany powyżej;
+    // w przeciwnym razie Build() rzuca BareWireConfigurationException (fail-fast
+    // zgodnie z ADR-002: manual topology).
+    cfg.MapExchange<PaymentRequested>("payments.topic");
+    cfg.MapExchange<OrderCreated>("orders.fanout");
+});
+```
+
+### Kolejność rozwiązywania docelowego exchange'a (precedence)
+
+Gdy `bus.PublishAsync<T>(...)` wysyła wiadomość, docelowy exchange jest wyznaczany
+w następującej kolejności — od najwyższego priorytetu do najniższego:
+
+| # | Źródło | Kiedy wygrywa |
+|---|---|---|
+| a | Nagłówek `BW-Exchange` jawnie podany przez wołającego w `PublishAsync(msg, headers, ct)` | Zawsze, gdy jest obecny — także dla pustej wartości (ścieżka `queue:` URI korzysta z pustego nagłówka). |
+| b | Mapowanie typ→exchange z `MapExchange<T>(...)` | Gdy (a) nie wystąpiło — BareWire wstrzykuje `BW-Exchange` do nagłówków. |
+| c | Globalny `DefaultExchange(...)` | Gdy ani (a), ani (b) nie wystąpiły — transport adapter sięga do `RabbitMqTransportOptions.DefaultExchange`. |
+| d | Brak (a), (b) i (c) | `BareWireConfigurationException` przy wysyłce — konfiguracja jest niepełna. |
+
+Dzięki temu samo wywołanie `bus.PublishAsync(new PaymentRequested(...), ct)`
+trafia na `payments.topic` bez dodatkowego kodu w miejscu publikacji, a wołający,
+który *musi* wymusić inny exchange (np. bridge do MassTransit), może jednorazowo
+podać `BW-Exchange` w słowniku nagłówków.
+
 ## Raw Publishing
 
 Publish raw byte payloads when you need full control over the wire format:

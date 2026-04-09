@@ -90,9 +90,23 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             {
                 OutboundMessage outbound = messages[i];
 
-                string exchange = outbound.Headers.TryGetValue("BW-Exchange", out string? headerExchange)
-                    ? headerExchange
+                bool hasExchangeHeader = outbound.Headers.TryGetValue("BW-Exchange", out string? headerExchange);
+                string exchange = hasExchangeHeader
+                    ? headerExchange!
                     : _options.DefaultExchange;
+
+                // Fail-fast: throw only when the caller did NOT supply a BW-Exchange header AND no
+                // DefaultExchange is configured. If the header is present (even as ""), honour it —
+                // BareWireSendEndpoint uses BW-Exchange="" for the queue: scheme (AMQP default exchange).
+                if (!hasExchangeHeader && string.IsNullOrEmpty(_options.DefaultExchange))
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: "Exchange",
+                        optionValue: exchange,
+                        expectedValue: "No exchange resolved for the outbound message. " +
+                                       "Configure a DefaultExchange, call MapExchange<T>(), " +
+                                       "or pass the BW-Exchange header on each publish call per ADR-002.");
+                }
 
                 ulong deliveryTag = (ulong)Interlocked.Increment(ref _deliveryTagCounter);
 

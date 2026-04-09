@@ -42,6 +42,12 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     }
 
     /// <summary>
+    /// Gets the underlying <see cref="InMemoryTransportAdapter"/> for direct inspection of
+    /// outbound messages including headers (e.g. <c>BW-Exchange</c>).
+    /// </summary>
+    internal InMemoryTransportAdapter Adapter => _adapter;
+
+    /// <summary>
     /// Gets the running <see cref="IBus"/> backed by the in-memory transport.
     /// </summary>
     public IBus Bus => _busControl;
@@ -57,11 +63,16 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     /// An optional <see cref="IRoutingKeyResolver"/> to override the default fallback resolver.
     /// When <see langword="null"/>, a resolver with empty mappings (falls back to <c>typeof(T).FullName</c>) is used.
     /// </param>
+    /// <param name="exchangeResolver">
+    /// An optional <see cref="IExchangeResolver"/> to override the default no-op resolver.
+    /// When <see langword="null"/>, a resolver with empty mappings (returns <see langword="null"/> for all types) is used.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the startup sequence.</param>
     /// <returns>A started <see cref="BareWireTestHarness"/> ready for use in tests.</returns>
     public static async Task<BareWireTestHarness> CreateAsync(
         Action<IBusConfigurator>? configure = null,
         IRoutingKeyResolver? routingKeyResolver = null,
+        IExchangeResolver? exchangeResolver = null,
         CancellationToken cancellationToken = default)
     {
         InMemoryTransportAdapter adapter = new();
@@ -86,6 +97,7 @@ public sealed class BareWireTestHarness : IAsyncDisposable
 
         PublishFlowControlOptions publishFlowControl = new();
         IRoutingKeyResolver resolver = routingKeyResolver ?? new RoutingKeyResolver();
+        IExchangeResolver exchResolver = exchangeResolver ?? new ExchangeResolver();
 
         ISerializerResolver serializerResolver = new DefaultSerializerResolver(serializer);
         BareWireBus bus = new(
@@ -96,7 +108,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
             publishFlowControl: publishFlowControl,
             logger: loggerFactory.CreateLogger<BareWireBus>(),
             instrumentation: new NullInstrumentation(),
-            routingKeyResolver: resolver);
+            routingKeyResolver: resolver,
+            exchangeResolver: exchResolver);
 
         BusConfigurator configurator = new() { HasInMemoryTransport = true };
         configure?.Invoke(configurator);

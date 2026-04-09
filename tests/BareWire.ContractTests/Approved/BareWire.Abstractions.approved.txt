@@ -228,6 +228,8 @@ namespace BareWire.Abstractions.Configuration
         void ConfigureTopology(System.Action<BareWire.Abstractions.Topology.ITopologyConfigurator> configure);
         void DefaultExchange(string exchangeName);
         void Host(string uri, System.Action<BareWire.Abstractions.Configuration.IHostConfigurator>? configure = null);
+        void MapExchange<T>(string exchangeName)
+            where T :  class;
         void MapRoutingKey<T>(string routingKey)
             where T :  class;
         void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
@@ -388,6 +390,11 @@ namespace BareWire.Abstractions.Pipeline
 }
 namespace BareWire.Abstractions.Routing
 {
+    public interface IExchangeResolver
+    {
+        string? Resolve<T>()
+            where T :  class;
+    }
     public interface IRoutingKeyResolver
     {
         string Resolve<T>()

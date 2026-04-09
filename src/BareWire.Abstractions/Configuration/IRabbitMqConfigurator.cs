@@ -104,4 +104,38 @@ public interface IRabbitMqConfigurator
     /// Thrown when <paramref name="routingKey"/> is <see langword="null"/> or empty.
     /// </exception>
     void MapRoutingKey<T>(string routingKey) where T : class;
+
+    /// <summary>
+    /// Maps a message type to a specific AMQP exchange used by <c>PublishAsync&lt;T&gt;</c>.
+    /// Use this when different message types should be published to different exchanges.
+    /// The specified exchange must be declared via <see cref="ConfigureTopology"/>; validation
+    /// is performed at bus startup and throws <see cref="Exceptions.BareWireConfigurationException"/>
+    /// when the exchange is missing from the declared topology.
+    /// </summary>
+    /// <remarks>
+    /// This mapping participates in the following precedence order (highest to lowest):
+    /// <list type="number">
+    ///   <item><description>Explicit <c>BW-Exchange</c> header passed by the caller to <c>PublishAsync</c>.</description></item>
+    ///   <item><description>Type→exchange mapping registered via this method.</description></item>
+    ///   <item><description>Global <c>DefaultExchange</c> configured on the transport.</description></item>
+    ///   <item><description>No exchange resolved → <see cref="Exceptions.BareWireConfigurationException"/> at publish time.</description></item>
+    /// </list>
+    /// Calling this method multiple times for the same <typeparamref name="T"/> is allowed; the last
+    /// call wins. Note that <see cref="DefaultExchange"/> is not validated against declared topology
+    /// (this asymmetry is intentional and out of scope for this release).
+    /// </remarks>
+    /// <typeparam name="T">The message type to map. Must be a reference type.</typeparam>
+    /// <param name="exchangeName">
+    /// The exchange name to use when publishing messages of type <typeparamref name="T"/>.
+    /// Must not be <see langword="null"/> or empty. Must match an exchange declared via
+    /// <see cref="ConfigureTopology"/>.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="exchangeName"/> is <see langword="null"/> or empty.
+    /// </exception>
+    /// <exception cref="Exceptions.BareWireConfigurationException">
+    /// Thrown at bus startup (during <c>Build()</c>) when <paramref name="exchangeName"/> does not
+    /// correspond to an exchange declared via <see cref="ConfigureTopology"/>.
+    /// </exception>
+    void MapExchange<T>(string exchangeName) where T : class;
 }
