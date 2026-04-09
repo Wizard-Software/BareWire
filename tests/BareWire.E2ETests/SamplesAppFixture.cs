@@ -10,6 +10,7 @@ public sealed class SamplesAppFixture : IAsyncLifetime
 {
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(120);
     private DistributedApplication? _app;
+    private string? _rabbitMqConnectionString;
 
     public async ValueTask InitializeAsync()
     {
@@ -25,6 +26,8 @@ public sealed class SamplesAppFixture : IAsyncLifetime
         // Wait for infrastructure to be healthy.
         await notifier.WaitForResourceHealthyAsync("rabbitmq", cts.Token);
         await notifier.WaitForResourceHealthyAsync("barewiredb", cts.Token);
+
+        _rabbitMqConnectionString = await _app.GetConnectionStringAsync("rabbitmq", cts.Token);
 
         // Wait for each sample project to be running.
         string[] sampleResources =
@@ -52,6 +55,12 @@ public sealed class SamplesAppFixture : IAsyncLifetime
     {
         return _app?.CreateHttpClient(resourceName)
             ?? throw new InvalidOperationException($"App not started, cannot create client for '{resourceName}'");
+    }
+
+    public string GetRabbitMqConnectionString()
+    {
+        return _rabbitMqConnectionString
+            ?? throw new InvalidOperationException("RabbitMQ connection string not available — fixture not initialized.");
     }
 
     public async ValueTask DisposeAsync()

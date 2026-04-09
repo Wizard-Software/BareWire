@@ -8,6 +8,7 @@ using BareWire.Configuration;
 using BareWire.FlowControl;
 using BareWire;
 using BareWire.Pipeline;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -47,7 +48,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -265,7 +266,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -309,7 +310,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -353,7 +354,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -394,7 +395,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -438,7 +439,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -482,7 +483,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -526,7 +527,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -570,7 +571,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -615,7 +616,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),
@@ -662,7 +663,7 @@ public sealed class BareWireBusControlTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),

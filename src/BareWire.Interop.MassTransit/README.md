@@ -12,6 +12,7 @@ dotnet add package BareWire.Interop.MassTransit
 
 - **Deserializer** — transparently unwraps `application/vnd.masstransit+json` envelopes; consumers receive a plain message object regardless of the source format
 - **Serializer** — publishes messages wrapped in a MassTransit-compatible envelope; activatable per receive endpoint via `UseSerializer<MassTransitEnvelopeSerializer>()` without replacing the default raw JSON serializer
+- **Publish-only bridge (no receive endpoint)** — use `IBusConfigurator.MapSerializer<TMessage, MassTransitEnvelopeSerializer>()` to forward specific message types in MassTransit envelope format without declaring any receive endpoint
 - Extracts envelope metadata: `MessageId`, `CorrelationId`, `ConversationId`, `SentTime`, headers
 - Permissive parsing — unknown envelope fields are silently ignored
 - Zero MassTransit runtime dependency
@@ -45,6 +46,23 @@ rmq.ReceiveEndpoint("mt-envelope-queue", e =>
     e.Consumer<MyConsumer, MyMessage>();
 });
 ```
+
+## Publish-only bridge (no receive endpoint)
+
+When your application only publishes to MassTransit (no receive endpoints), use `MapSerializer<TMessage, MassTransitEnvelopeSerializer>()` on the bus configurator:
+
+```csharp
+services.AddBareWireJsonSerializer();
+services.AddMassTransitEnvelopeSerializer();
+
+services.AddBareWire(bus =>
+{
+    bus.MapSerializer<OrderCreated, MassTransitEnvelopeSerializer>();
+    // Other types continue using the default raw JSON serializer.
+});
+```
+
+See [doc/masstransit-interop.md](../../../doc/masstransit-interop.md) for full documentation and the publish-only bridge scenario.
 
 ## Dependencies
 

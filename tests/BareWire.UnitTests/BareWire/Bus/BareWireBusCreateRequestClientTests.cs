@@ -10,6 +10,7 @@ using BareWire.Bus;
 using BareWire.FlowControl;
 using BareWire;
 using BareWire.Pipeline;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -44,7 +45,7 @@ public sealed class BareWireBusCreateRequestClientTests
 
         return new BareWireBus(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             new PublishFlowControlOptions(),

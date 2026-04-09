@@ -87,9 +87,10 @@ public sealed class BareWireTestHarness : IAsyncDisposable
         PublishFlowControlOptions publishFlowControl = new();
         IRoutingKeyResolver resolver = routingKeyResolver ?? new RoutingKeyResolver();
 
+        ISerializerResolver serializerResolver = new DefaultSerializerResolver(serializer);
         BareWireBus bus = new(
             adapter: adapter,
-            serializer: serializer,
+            serializerResolver: serializerResolver,
             pipeline: pipeline,
             flowController: flowController,
             publishFlowControl: publishFlowControl,

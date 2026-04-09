@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Routing;
@@ -123,10 +124,46 @@ public static class ServiceCollectionExtensions
         if (!services.Any(d => d.ServiceType == typeof(PublishFlowControlOptions)))
             services.AddSingleton(new PublishFlowControlOptions());
 
+        // For each serializer type referenced in per-type mappings, register it as a Singleton
+        // (idempotent — if AddMassTransitEnvelopeSerializer() was already called, TryAdd is a no-op).
+        foreach (Type serializerType in configurator.SerializerMappings.Values)
+            services.TryAddSingleton(serializerType);
+
+        // Serializer resolver — built once at startup from per-type mappings collected by BusConfigurator.
+        // If no mappings were registered, uses DefaultSerializerResolver (zero overhead, backward-compat).
+        // If mappings exist, resolves each mapped serializer type from DI once and builds an immutable dict.
+        services.TryAddSingleton<ISerializerResolver>(sp =>
+        {
+            IMessageSerializer defaultSerializer = sp.GetRequiredService<IMessageSerializer>();
+
+            if (configurator.SerializerMappings.Count == 0)
+                return new DefaultSerializerResolver(defaultSerializer);
+
+            Dictionary<Type, IMessageSerializer> resolved = new(configurator.SerializerMappings.Count);
+            foreach ((Type messageType, Type serializerType) in configurator.SerializerMappings)
+            {
+                object? instance = sp.GetService(serializerType);
+                if (instance is null)
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: "MapSerializer",
+                        optionValue: serializerType.FullName,
+                        expectedValue: $"Serializer type '{serializerType.Name}' mapped via " +
+                                       $"MapSerializer<,>() is not registered in the DI container. " +
+                                       $"Register it via services.AddSingleton<{serializerType.Name}>() " +
+                                       $"or use a dedicated helper (e.g. AddMassTransitEnvelopeSerializer()).");
+                }
+
+                resolved[messageType] = (IMessageSerializer)instance;
+            }
+
+            return new TypeMappedSerializerResolver(defaultSerializer, resolved);
+        });
+
         // BareWireBus — the core bus implementation. Uses a factory because the constructor is internal.
         services.AddSingleton(sp => new BareWireBus(
             sp.GetRequiredService<ITransportAdapter>(),
-            sp.GetRequiredService<IMessageSerializer>(),
+            sp.GetRequiredService<ISerializerResolver>(),
             sp.GetRequiredService<MessagePipeline>(),
             sp.GetRequiredService<FlowController>(),
             sp.GetRequiredService<PublishFlowControlOptions>(),

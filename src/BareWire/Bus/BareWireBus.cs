@@ -10,6 +10,7 @@ using BareWire.Abstractions.Transport;
 using BareWire.FlowControl;
 using BareWire.Pipeline;
 using BareWire.Routing;
+using BareWire.Serialization;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Bus;
@@ -20,7 +21,7 @@ internal sealed partial class BareWireBus : IBus
         new Dictionary<string, string>();
 
     private readonly ITransportAdapter _adapter;
-    private readonly IMessageSerializer _serializer;
+    private readonly ISerializerResolver _serializerResolver;
     private readonly MessagePipeline _pipeline;
     private readonly FlowController _flowController;
     private readonly PublishFlowControlOptions _publishFlowControl;
@@ -39,7 +40,7 @@ internal sealed partial class BareWireBus : IBus
 
     internal BareWireBus(
         ITransportAdapter adapter,
-        IMessageSerializer serializer,
+        ISerializerResolver serializerResolver,
         MessagePipeline pipeline,
         FlowController flowController,
         PublishFlowControlOptions publishFlowControl,
@@ -49,7 +50,7 @@ internal sealed partial class BareWireBus : IBus
         IRequestClientFactory? requestClientFactory = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
-        _serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
+        _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         _flowController = flowController ?? throw new ArgumentNullException(nameof(flowController));
         _publishFlowControl = publishFlowControl ?? throw new ArgumentNullException(nameof(publishFlowControl));
@@ -119,9 +120,10 @@ internal sealed partial class BareWireBus : IBus
             mergedHeaders["message-id"] = messageId.ToString();
             _instrumentation.InjectTraceContext(activity, mergedHeaders);
 
-            OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
+            IMessageSerializer serializer = _serializerResolver.Resolve<T>();
+        OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
                 message,
-                _serializer,
+                serializer,
                 routingKey,
                 mergedHeaders,
                 cancellationToken);
@@ -175,8 +177,8 @@ internal sealed partial class BareWireBus : IBus
 
         ISendEndpoint endpoint = _sendEndpoints.GetOrAdd(
             address,
-            static (uri, state) => new BareWireSendEndpoint(uri, state._serializer, state._outgoingChannel.Writer),
-            (_serializer, _outgoingChannel));
+            static (uri, state) => new BareWireSendEndpoint(uri, state._serializerResolver, state._outgoingChannel.Writer),
+            (_serializerResolver, _outgoingChannel));
 
         return Task.FromResult(endpoint);
     }
@@ -391,16 +393,16 @@ internal sealed partial class BareWireBus : IBus
 
     private sealed class BareWireSendEndpoint : ISendEndpoint
     {
-        private readonly IMessageSerializer _serializer;
+        private readonly ISerializerResolver _serializerResolver;
         private readonly ChannelWriter<OutboundMessage> _channelWriter;
 
         internal BareWireSendEndpoint(
             Uri address,
-            IMessageSerializer serializer,
+            ISerializerResolver serializerResolver,
             ChannelWriter<OutboundMessage> channelWriter)
         {
             Address = address ?? throw new ArgumentNullException(nameof(address));
-            _serializer = serializer ?? throw new ArgumentNullException(nameof(serializer));
+            _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _channelWriter = channelWriter ?? throw new ArgumentNullException(nameof(channelWriter));
         }
 
@@ -448,9 +450,10 @@ internal sealed partial class BareWireBus : IBus
                 routingKey = string.Empty;
             }
 
+            IMessageSerializer serializer = _serializerResolver.Resolve<T>();
             OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
                 message,
-                _serializer,
+                serializer,
                 routingKey,
                 headers: headers,
                 cancellationToken);

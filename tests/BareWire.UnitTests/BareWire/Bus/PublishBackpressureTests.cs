@@ -8,6 +8,7 @@ using BareWire.Bus;
 using BareWire.FlowControl;
 using BareWire;
 using BareWire.Pipeline;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -55,7 +56,7 @@ public sealed class PublishBackpressureTests
 
         BareWireBus bus = new(
             adapter,
-            serializer,
+            new DefaultSerializerResolver(serializer),
             pipeline,
             flowController,
             options,

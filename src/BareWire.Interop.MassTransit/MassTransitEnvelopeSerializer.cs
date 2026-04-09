@@ -7,7 +7,24 @@ using BareWire.Serialization.Json;
 
 namespace BareWire.Interop.MassTransit;
 
-internal sealed class MassTransitEnvelopeSerializer : IMessageSerializer
+/// <summary>
+/// Serializes messages wrapped in a MassTransit-compatible JSON envelope
+/// (<c>application/vnd.masstransit+json</c>), enabling BareWire to publish messages
+/// that MassTransit consumers can transparently consume.
+/// </summary>
+/// <remarks>
+/// This class is <see langword="public"/> solely so that it can be referenced by name in
+/// <c>IBusConfigurator.MapSerializer&lt;TMessage, MassTransitEnvelopeSerializer&gt;()</c>
+/// for publish-only bridge scenarios where no receive endpoint is required.
+/// The default bus behavior remains raw-first per ADR-001 — mapping a type to this serializer
+/// is an explicit opt-in that does not affect other message types.
+/// <para>
+/// This class is stateless and thread-safe. Use <c>services.AddMassTransitEnvelopeSerializer()</c>
+/// to register it in the DI container as a Singleton (recommended) before calling
+/// <c>MapSerializer&lt;TMessage, MassTransitEnvelopeSerializer&gt;()</c>.
+/// </para>
+/// </remarks>
+public sealed class MassTransitEnvelopeSerializer : IMessageSerializer
 {
     private static readonly JsonWriterOptions s_writerOptions = new() { SkipValidation = true };
 

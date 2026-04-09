@@ -129,6 +129,10 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
         t.DeclareExchange("mt-envelope-publish", ExchangeType.Direct, durable: true);
         t.DeclareQueue("mt-envelope-publish-queue", durable: true);
         t.BindExchangeToQueue("mt-envelope-publish", "mt-envelope-publish-queue", routingKey: "");
+
+        // Exchange for the publish-only bridge demo (no receive endpoint — bus.MapSerializer<T,S>() only).
+        // Fanout so any downstream MassTransit consumer bound to this exchange can receive the envelope.
+        t.DeclareExchange("mt-bridge-orders", ExchangeType.Fanout, durable: true);
     });
 
     // Endpoint 1: MassTransitOrderConsumer — receives enveloped messages from MassTransitSimulator.
@@ -172,6 +176,14 @@ builder.Services.AddBareWireRabbitMq(configureRabbitMq);
 builder.Services.AddBareWire(cfg =>
 {
     cfg.UseRabbitMQ(configureRabbitMq);
+
+    // Publish-only bridge: BridgeOrderCreated published via IBus.PublishAsync will be serialized
+    // as application/vnd.masstransit+json. A dedicated message type (not OrderCreated) is used so
+    // the mapping does not affect the raw-JSON /barewire/publish demo. The publish call must also
+    // target the mt-bridge-orders exchange explicitly via the BW-Exchange header — see the
+    // /masstransit/bridge-publish endpoint below.
+    // No ReceiveEndpoint is declared for mt-bridge-orders — this is a one-way outbound bridge.
+    cfg.MapSerializer<BridgeOrderCreated, MassTransitEnvelopeSerializer>();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -245,6 +257,43 @@ app.MapPost("/masstransit/publish-envelope", async (
 })
 .Produces(StatusCodes.Status202Accepted)
 .WithName("PublishMassTransitEnvelope");
+
+// POST /masstransit/bridge-publish — publish-only bridge demo.
+// Demonstrates IBus.MapSerializer<OrderCreated, MassTransitEnvelopeSerializer>() without any
+// ReceiveEndpoint. The message is serialized as application/vnd.masstransit+json and published to
+// the mt-bridge-orders fanout exchange. No BareWire consumer subscribes to that exchange — this
+// is a one-way outbound bridge for scenarios where BareWire forwards events to a MassTransit cluster.
+//
+// Contrast with /masstransit/publish-envelope (above), which uses a per-endpoint UseSerializer<T>()
+// override that requires a ReceiveEndpoint for the consumer that triggers the publish.
+app.MapPost("/masstransit/bridge-publish", async (
+    IBus bus,
+    CancellationToken cancellationToken) =>
+{
+    BridgeOrderCreated order = new(
+        OrderId: Guid.NewGuid().ToString(),
+        Amount: 75.00m,
+        Currency: "USD");
+
+    // MapSerializer<BridgeOrderCreated, MassTransitEnvelopeSerializer>() (registered in AddBareWire
+    // above) causes this publish to use the MassTransit envelope format. The BW-Exchange header
+    // overrides the DefaultExchange so the message lands on mt-bridge-orders instead of the
+    // raw-JSON barewire-orders exchange.
+    var headers = new Dictionary<string, string>
+    {
+        ["BW-Exchange"] = "mt-bridge-orders",
+    };
+
+    await bus.PublishAsync(order, headers, cancellationToken).ConfigureAwait(false);
+
+    return Results.Accepted(value: new
+    {
+        Message = "BridgeOrderCreated published via publish-only bridge (application/vnd.masstransit+json) to mt-bridge-orders exchange.",
+        order.OrderId,
+    });
+})
+.Produces(StatusCodes.Status202Accepted)
+.WithName("BridgePublishOrder");
 
 // GET /orders/processed — returns all orders processed by both consumers (MassTransit + BareWire).
 // Used by E2E tests to verify that messages were consumed and deserialized correctly.

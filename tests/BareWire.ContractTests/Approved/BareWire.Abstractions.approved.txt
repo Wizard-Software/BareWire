@@ -209,6 +209,9 @@ namespace BareWire.Abstractions.Configuration
         void AddMiddleware<T>()
             where T :  class, BareWire.Abstractions.Pipeline.IMessageMiddleware;
         void ConfigureObservability(System.Action<object> configure);
+        void MapSerializer<TMessage, TSerializer>()
+            where TMessage :  class
+            where TSerializer :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
         void UseRabbitMQ(System.Action<BareWire.Abstractions.Configuration.IRabbitMqConfigurator> configure);
         void UseSerializer<T>()
             where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
@@ -499,6 +502,11 @@ namespace BareWire.Abstractions.Serialization
     {
         string ContentType { get; }
         void Serialize<T>(T message, System.Buffers.IBufferWriter<byte> output)
+            where T :  class;
+    }
+    public interface ISerializerResolver
+    {
+        BareWire.Abstractions.Serialization.IMessageSerializer Resolve<T>()
             where T :  class;
     }
 }

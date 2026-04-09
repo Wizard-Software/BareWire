@@ -146,6 +146,47 @@ rmq.ReceiveEndpoint("masstransit-bridge", e =>
 });
 ```
 
+## Publish-only bridge (no receive endpoint)
+
+The scenarios above require at least one `ReceiveEndpoint` to activate the per-endpoint serializer override. When your application only **publishes** to a MassTransit-compatible exchange and does not consume any MassTransit queues, you can use `IBusConfigurator.MapSerializer<TMessage, TSerializer>()` instead — no receive endpoint required.
+
+This is the recommended pattern when BareWire acts as a bridge that forwards events to an existing MassTransit cluster without subscribing to any queues.
+
+```csharp
+// Register serializers first (order matters).
+services.AddBareWireJsonSerializer();
+services.AddMassTransitEnvelopeSerializer(); // registers MassTransitEnvelopeSerializer in DI
+
+services.AddBareWireRabbitMq(rmq =>
+{
+    rmq.Host("amqp://guest:guest@localhost:5672/");
+    rmq.ConfigureTopology(topo => topo.Exchange("mt-orders").Fanout().Durable());
+    rmq.DefaultExchange("mt-orders");
+    // No ReceiveEndpoint — publish-only bridge
+});
+
+services.AddBareWire(bus =>
+{
+    bus.MapSerializer<OrderCreated, MassTransitEnvelopeSerializer>();
+    // All other message types continue using the default raw JSON serializer (ADR-001).
+});
+
+// Usage:
+await bus.PublishAsync(new OrderCreated(...), ct);
+// → Content-Type: application/vnd.masstransit+json
+
+await bus.PublishAsync(new PaymentRequested(...), ct);
+// → Content-Type: application/json (default, unaffected)
+```
+
+The mapping is bus-global and transport-agnostic: it applies to both `IBus.PublishAsync<T>()` and `ISendEndpoint.SendAsync<T>()`, regardless of which transport is configured.
+
+Unmapped types always fall back to the default `IMessageSerializer` — the raw-first guarantee from ADR-001 is preserved.
+
+### Security and thread-safety note
+
+`MassTransitEnvelopeSerializer` is stateless and thread-safe (uses `[ThreadStatic]` pooled writers with no shared mutable state). It is safe to register as a Singleton and call from any number of threads concurrently. The `ISerializerResolver` built by `AddBareWire` is also immutable after construction — the per-type mapping dictionary is built once at startup and never modified.
+
 ## Simulating a MassTransit Producer
 
 For testing, you can publish MassTransit-format messages using the bare `RabbitMQ.Client` without installing MassTransit:

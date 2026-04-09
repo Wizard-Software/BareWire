@@ -8,6 +8,7 @@
     <PackageReference Include="Aspire.Hosting.Testing" />
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
+    <PackageReference Include="RabbitMQ.Client" />
   </ItemGroup>
 
   <ItemGroup>

@@ -14,11 +14,13 @@ internal sealed class BusConfigurator : IBusConfigurator
 {
     private readonly List<Type> _middlewareTypes = [];
     private readonly List<ReceiveEndpointConfiguration> _receiveEndpoints = [];
+    private readonly Dictionary<Type, Type> _serializerMappings = [];
 
     // ── Collected configuration ────────────────────────────────────────────────
 
     internal IReadOnlyList<Type> MiddlewareTypes => _middlewareTypes;
     internal IReadOnlyList<ReceiveEndpointConfiguration> ReceiveEndpoints => _receiveEndpoints;
+    internal IReadOnlyDictionary<Type, Type> SerializerMappings => _serializerMappings;
 
     /// <summary>
     /// Gets the registered serializer type, or <see langword="null"/> when no serializer was configured.
@@ -69,6 +71,14 @@ internal sealed class BusConfigurator : IBusConfigurator
     public void UseSerializer<T>() where T : class, IMessageSerializer
     {
         SerializerType = typeof(T);
+    }
+
+    /// <inheritdoc />
+    public void MapSerializer<TMessage, TSerializer>()
+        where TMessage : class
+        where TSerializer : class, IMessageSerializer
+    {
+        _serializerMappings[typeof(TMessage)] = typeof(TSerializer);
     }
 
     // ── Endpoint configuration ─────────────────────────────────────────────────
