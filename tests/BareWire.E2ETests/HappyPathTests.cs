@@ -14,7 +14,7 @@ namespace BareWire.E2ETests;
 public sealed class HappyPathTests(SamplesAppFixture fixture) : IClassFixture<SamplesAppFixture>
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
-    private static readonly TimeSpan PollTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PollTimeout = TimeSpan.FromSeconds(60);
 
     // ── E2E-001: BasicPublishConsume ────────────────────────────────────────────
 

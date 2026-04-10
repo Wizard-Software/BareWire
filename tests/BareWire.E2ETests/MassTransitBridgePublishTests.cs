@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using AwesomeAssertions;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Exceptions;
 using Xunit;
 
 namespace BareWire.E2ETests;
@@ -43,21 +44,10 @@ public sealed class MassTransitBridgePublishTests(SamplesAppFixture fixture) : I
         };
 
         await using IConnection connection = await factory.CreateConnectionAsync(cts.Token);
-        await using IChannel channel = await connection.CreateChannelAsync(cancellationToken: cts.Token);
 
         string observerQueue = $"e2e-bridge-observer-{Guid.NewGuid():N}";
-        await channel.QueueDeclareAsync(
-            queue: observerQueue,
-            durable: false,
-            exclusive: true,
-            autoDelete: true,
-            arguments: null,
-            cancellationToken: cts.Token);
-        await channel.QueueBindAsync(
-            queue: observerQueue,
-            exchange: BridgeExchange,
-            routingKey: string.Empty,
-            cancellationToken: cts.Token);
+        await using IChannel channel = await SetupObserverQueueAsync(
+            connection, observerQueue, BridgeExchange, cts.Token);
 
         // Act — trigger the publish-only bridge endpoint.
         using HttpClient client = fixture.CreateHttpClient("masstransit-interop");
@@ -113,21 +103,10 @@ public sealed class MassTransitBridgePublishTests(SamplesAppFixture fixture) : I
         };
 
         await using IConnection connection = await factory.CreateConnectionAsync(cts.Token);
-        await using IChannel channel = await connection.CreateChannelAsync(cancellationToken: cts.Token);
 
         string observerQueue = $"e2e-raw-observer-{Guid.NewGuid():N}";
-        await channel.QueueDeclareAsync(
-            queue: observerQueue,
-            durable: false,
-            exclusive: true,
-            autoDelete: true,
-            arguments: null,
-            cancellationToken: cts.Token);
-        await channel.QueueBindAsync(
-            queue: observerQueue,
-            exchange: "barewire-orders",
-            routingKey: string.Empty,
-            cancellationToken: cts.Token);
+        await using IChannel channel = await SetupObserverQueueAsync(
+            connection, observerQueue, "barewire-orders", cts.Token);
 
         // Act
         using HttpClient client = fixture.CreateHttpClient("masstransit-interop");
@@ -149,6 +128,59 @@ public sealed class MassTransitBridgePublishTests(SamplesAppFixture fixture) : I
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a new channel, declares a transient exclusive queue, and binds it to
+    /// <paramref name="exchangeName"/>. Retries the whole sequence on AMQP 404
+    /// (exchange not yet declared by the sample) with exponential back-off, because
+    /// AMQP closes the channel on a 404 reply so a fresh channel is required each time.
+    /// </summary>
+    private static async Task<IChannel> SetupObserverQueueAsync(
+        IConnection connection,
+        string queueName,
+        string exchangeName,
+        CancellationToken cancellationToken)
+    {
+        const int maxRetries = 10;
+        TimeSpan delay = TimeSpan.FromMilliseconds(250);
+        TimeSpan maxDelay = TimeSpan.FromSeconds(5);
+
+        for (int attempt = 0; attempt < maxRetries; attempt++)
+        {
+            IChannel channel = await connection.CreateChannelAsync(cancellationToken: cancellationToken);
+            try
+            {
+                await channel.QueueDeclareAsync(
+                    queue: queueName,
+                    durable: false,
+                    exclusive: true,
+                    autoDelete: true,
+                    arguments: null,
+                    cancellationToken: cancellationToken);
+                await channel.QueueBindAsync(
+                    queue: queueName,
+                    exchange: exchangeName,
+                    routingKey: string.Empty,
+                    cancellationToken: cancellationToken);
+                return channel;
+            }
+            catch (OperationInterruptedException ex)
+                when (ex.ShutdownReason?.ReplyCode == 404)
+            {
+                await channel.DisposeAsync();
+                if (attempt == maxRetries - 1)
+                {
+                    throw;
+                }
+
+                await Task.Delay(delay, cancellationToken);
+                delay = TimeSpan.FromMilliseconds(
+                    Math.Min(delay.TotalMilliseconds * 2, maxDelay.TotalMilliseconds));
+            }
+        }
+
+        throw new InvalidOperationException("Unreachable");
+    }
 
     private static async Task<BasicGetResult?> PollForMessageAsync(
         IChannel channel,
