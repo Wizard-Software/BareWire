@@ -45,6 +45,25 @@ public interface ITopologyConfigurator
         IReadOnlyDictionary<string, object>? arguments = null);
 
     /// <summary>
+    /// Declares a queue on the broker using a fluent configurator for queue arguments.
+    /// The declaration is idempotent — if the queue already exists with compatible attributes,
+    /// no error is raised.
+    /// </summary>
+    /// <param name="name">The queue name.</param>
+    /// <param name="durable">
+    /// <see langword="true"/> if the queue should survive a broker restart; otherwise <see langword="false"/>.
+    /// </param>
+    /// <param name="autoDelete">
+    /// <see langword="true"/> if the queue should be deleted when the last consumer disconnects;
+    /// otherwise <see langword="false"/>.
+    /// </param>
+    /// <param name="configure">
+    /// Callback to configure queue arguments via <see cref="IQueueConfigurator"/>.
+    /// </param>
+    void DeclareQueue(string name, bool durable, bool autoDelete,
+        Action<IQueueConfigurator> configure);
+
+    /// <summary>
     /// Creates a binding that routes messages from <paramref name="exchange"/> to <paramref name="queue"/>
     /// when the message routing key matches <paramref name="routingKey"/>.
     /// </summary>

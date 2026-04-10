@@ -55,6 +55,26 @@ rmq.ReceiveEndpoint("my-queue", e =>
 });
 ```
 
+## Topology Configuration
+
+Use `ConfigureTopology` to declare exchanges, queues, and bindings. Queue arguments can be configured using the fluent `IQueueConfigurator` API:
+
+```csharp
+rmq.ConfigureTopology(topology =>
+{
+    topology.DeclareExchange("orders", ExchangeType.Topic, durable: true);
+    topology.DeclareQueue("orders", durable: true, autoDelete: false, configure: q =>
+    {
+        q.SetQueueType(QueueType.Quorum)
+         .DeadLetterExchange("orders.dlx")
+         .MessageTtl(TimeSpan.FromDays(7));
+    });
+    topology.BindExchangeToQueue("orders", "orders", routingKey: "#");
+});
+```
+
+> See: [Topology](topology.md) for full details and all available `IQueueConfigurator` methods.
+
 ## Flow Control Options
 
 BareWire provides both consume-side and publish-side flow control. Register options via DI:

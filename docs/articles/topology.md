@@ -56,16 +56,83 @@ await bus.PublishAsync(new DemoOrderCreated(...), routingKey: "order.created", c
 
 > See: `samples/BareWire.Samples.ObservabilityShowcase/Program.cs`
 
-## Dead Letter Exchanges
+## Queue Configuration (IQueueConfigurator)
 
-For retry exhaustion handling, configure RabbitMQ native DLX:
+`IQueueConfigurator` provides a typed, fluent API for common RabbitMQ queue arguments. It eliminates error-prone string keys like `"x-dead-letter-exchange"` or `"x-message-ttl"`.
+
+Use the `DeclareQueue` overload that accepts `Action<IQueueConfigurator>`:
 
 ```csharp
-// Main queue with DLX routing
-topology.DeclareExchange("payments", ExchangeType.Direct, durable: true);
+// Fluent API (recommended)
+topology.DeclareQueue("order-processing", durable: true, autoDelete: false, configure: q =>
+{
+    q.DeadLetterExchange("orders.events.dlx")
+     .DeadLetterRoutingKey("orders.dead")
+     .MessageTtl(TimeSpan.FromHours(24))
+     .SetQueueType(QueueType.Quorum);
+});
+
+// MaxLength with overflow strategy
+topology.DeclareQueue("bounded-queue", durable: true, autoDelete: false, configure: q =>
+{
+    q.MaxLength(10_000)
+     .Overflow(OverflowStrategy.RejectPublish)
+     .DeadLetterExchange("bounded.dlx");
+});
+
+// Escape hatch for uncommon arguments
+topology.DeclareQueue("priority-queue", durable: true, autoDelete: false, configure: q =>
+{
+    q.SetQueueType(QueueType.Classic)
+     .Argument("x-max-priority", 10);
+});
+```
+
+The raw dictionary overload remains available as an alternative:
+
+```csharp
 topology.DeclareQueue("payments", durable: true, arguments: new Dictionary<string, object>
 {
     ["x-dead-letter-exchange"] = "payments.dlx"
+});
+```
+
+### Available Methods
+
+| Method | RabbitMQ Argument | Description |
+|--------|-------------------|-------------|
+| `DeadLetterExchange(string)` | `x-dead-letter-exchange` | Routes rejected/expired messages to a DLX |
+| `DeadLetterRoutingKey(string)` | `x-dead-letter-routing-key` | Overrides routing key for dead-lettered messages |
+| `MessageTtl(TimeSpan)` | `x-message-ttl` | Per-queue message time-to-live (auto-converted to ms) |
+| `MaxLength(long)` | `x-max-length` | Maximum message count in the queue |
+| `MaxLengthBytes(long)` | `x-max-length-bytes` | Maximum total bytes in the queue |
+| `SetQueueType(QueueType)` | `x-queue-type` | Classic, Quorum, or Stream |
+| `Overflow(OverflowStrategy)` | `x-overflow` | What happens when max length is reached |
+| `Argument(string, object)` | Any | Escape hatch for any queue argument |
+
+### RabbitMQ Defaults Reference
+
+| Argument | Default (when not set) |
+|----------|----------------------|
+| `x-queue-type` | `classic` |
+| `x-overflow` | `drop-head` |
+| `x-message-ttl` | No expiry |
+| `x-max-length` | Unlimited |
+| `x-dead-letter-exchange` | Messages discarded on reject/expire |
+
+> **Warning:** Without a dead-letter exchange configured, rejected or expired messages are permanently discarded. For production queues, always configure a DLX to avoid silent message loss.
+
+## Dead Letter Exchanges
+
+For retry exhaustion handling, configure RabbitMQ native DLX. The recommended approach uses `IQueueConfigurator`:
+
+```csharp
+// Main queue with DLX routing (fluent API)
+topology.DeclareExchange("payments", ExchangeType.Direct, durable: true);
+topology.DeclareQueue("payments", durable: true, autoDelete: false, configure: q =>
+{
+    q.DeadLetterExchange("payments.dlx")
+     .SetQueueType(QueueType.Quorum);
 });
 topology.BindExchangeToQueue("payments", "payments");
 
@@ -73,6 +140,19 @@ topology.BindExchangeToQueue("payments", "payments");
 topology.DeclareExchange("payments.dlx", ExchangeType.Fanout, durable: true);
 topology.DeclareQueue("payments-dlq", durable: true);
 topology.BindExchangeToQueue("payments.dlx", "payments-dlq");
+```
+
+### Typical Production Configuration
+
+```csharp
+topology.DeclareQueue("orders", durable: true, autoDelete: false, configure: q =>
+{
+    q.SetQueueType(QueueType.Quorum)           // HA replication
+     .DeadLetterExchange("orders.dlx")          // capture failed messages
+     .MessageTtl(TimeSpan.FromDays(7))          // auto-expire after 7 days
+     .MaxLength(1_000_000)                       // bound queue size
+     .Overflow(OverflowStrategy.RejectPublish); // backpressure to publishers
+});
 ```
 
 > See: `samples/BareWire.Samples.RetryAndDlq/Program.cs`

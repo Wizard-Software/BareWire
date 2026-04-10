@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Topology;
+using BareWire.Transport.RabbitMQ.Topology;
 
 namespace BareWire.Transport.RabbitMQ;
 
@@ -29,6 +30,19 @@ internal sealed class RabbitMqTopologyConfigurator : ITopologyConfigurator
         ArgumentException.ThrowIfNullOrEmpty(name);
 
         _queues.Add(new QueueDeclaration(name, durable, Exclusive: false, autoDelete, arguments));
+    }
+
+    /// <inheritdoc />
+    public void DeclareQueue(string name, bool durable, bool autoDelete,
+        Action<IQueueConfigurator> configure)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var configurator = new QueueConfigurator();
+        configure(configurator);
+
+        _queues.Add(new QueueDeclaration(name, durable, Exclusive: false, autoDelete, configurator.Build()));
     }
 
     /// <inheritdoc />

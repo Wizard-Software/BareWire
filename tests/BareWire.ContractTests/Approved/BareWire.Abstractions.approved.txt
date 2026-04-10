@@ -541,12 +541,30 @@ namespace BareWire.Abstractions.Topology
         public string QueueName { get; init; }
         public string RoutingKey { get; init; }
     }
+    public interface IQueueConfigurator
+    {
+        BareWire.Abstractions.Topology.IQueueConfigurator Argument(string key, object value);
+        BareWire.Abstractions.Topology.IQueueConfigurator DeadLetterExchange(string exchangeName);
+        BareWire.Abstractions.Topology.IQueueConfigurator DeadLetterRoutingKey(string routingKey);
+        BareWire.Abstractions.Topology.IQueueConfigurator MaxLength(long maxMessages);
+        BareWire.Abstractions.Topology.IQueueConfigurator MaxLengthBytes(long maxBytes);
+        BareWire.Abstractions.Topology.IQueueConfigurator MessageTtl(System.TimeSpan ttl);
+        BareWire.Abstractions.Topology.IQueueConfigurator Overflow(BareWire.Abstractions.Topology.OverflowStrategy strategy);
+        BareWire.Abstractions.Topology.IQueueConfigurator SetQueueType(BareWire.Abstractions.Topology.QueueType type);
+    }
     public interface ITopologyConfigurator
     {
         void BindExchangeToExchange(string source, string destination, string routingKey);
         void BindExchangeToQueue(string exchange, string queue, string routingKey);
         void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
+        void DeclareQueue(string name, bool durable, bool autoDelete, System.Action<BareWire.Abstractions.Topology.IQueueConfigurator> configure);
         void DeclareQueue(string name, bool durable = true, bool autoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? arguments = null);
+    }
+    public enum OverflowStrategy
+    {
+        DropHead = 0,
+        RejectPublish = 1,
+        RejectPublishDlx = 2,
     }
     public sealed class QueueDeclaration : System.IEquatable<BareWire.Abstractions.Topology.QueueDeclaration>
     {
@@ -556,6 +574,12 @@ namespace BareWire.Abstractions.Topology
         public bool Durable { get; init; }
         public bool Exclusive { get; init; }
         public string Name { get; init; }
+    }
+    public enum QueueType
+    {
+        Classic = 0,
+        Quorum = 1,
+        Stream = 2,
     }
     public sealed class TopologyDeclaration : System.IEquatable<BareWire.Abstractions.Topology.TopologyDeclaration>
     {

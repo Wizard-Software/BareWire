@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Topology;
@@ -244,5 +245,80 @@ public sealed class TopologyConfiguratorTests
         declaration.Queues.Should().BeEmpty();
         declaration.ExchangeQueueBindings.Should().BeEmpty();
         declaration.ExchangeExchangeBindings.Should().BeEmpty();
+    }
+
+    // ── DeclareQueue (fluent overload) ───────────────────────────────────────
+
+    [Fact]
+    public void DeclareQueue_WithFluentConfigure_ProducesCorrectArguments()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        sut.DeclareQueue("order-queue", durable: true, autoDelete: false, configure: q =>
+        {
+            q.DeadLetterExchange("orders.dlx")
+             .MessageTtl(TimeSpan.FromHours(24))
+             .SetQueueType(QueueType.Quorum);
+        });
+        TopologyDeclaration result = sut.Build();
+
+        // Assert
+        result.Queues.Should().HaveCount(1);
+        result.Queues[0].Name.Should().Be("order-queue");
+        result.Queues[0].Durable.Should().BeTrue();
+        result.Queues[0].Arguments.Should().NotBeNull();
+        result.Queues[0].Arguments!["x-dead-letter-exchange"].Should().Be("orders.dlx");
+        result.Queues[0].Arguments!["x-message-ttl"].Should().Be(86400000L);
+        result.Queues[0].Arguments!["x-queue-type"].Should().Be("quorum");
+    }
+
+    [Fact]
+    public void DeclareQueue_WithFluentConfigure_NullAction_ThrowsArgumentNullException()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        Action act = () => sut.DeclareQueue("test-queue", durable: true, autoDelete: false,
+            configure: null!);
+
+        // Assert
+        act.Should().Throw<ArgumentNullException>();
+    }
+
+    [Fact]
+    public void DeclareQueue_FluentAndDictionary_ProduceIdenticalDeclarations()
+    {
+        // Arrange
+        var fluentConfigurator = CreateConfigurator();
+        var dictConfigurator = CreateConfigurator();
+        var arguments = new ReadOnlyDictionary<string, object>(
+            new Dictionary<string, object>
+            {
+                ["x-dead-letter-exchange"] = "dlx",
+                ["x-message-ttl"] = 60000L,
+            });
+
+        // Act
+        fluentConfigurator.DeclareQueue("test-q", durable: true, autoDelete: false, configure: q =>
+        {
+            q.DeadLetterExchange("dlx")
+             .MessageTtl(TimeSpan.FromMinutes(1));
+        });
+
+        dictConfigurator.DeclareQueue("test-q", durable: true, arguments: arguments);
+
+        TopologyDeclaration fluentResult = fluentConfigurator.Build();
+        TopologyDeclaration dictResult = dictConfigurator.Build();
+
+        // Assert
+        fluentResult.Queues[0].Name.Should().Be(dictResult.Queues[0].Name);
+        fluentResult.Queues[0].Durable.Should().Be(dictResult.Queues[0].Durable);
+        fluentResult.Queues[0].Arguments!["x-dead-letter-exchange"]
+            .Should().Be(dictResult.Queues[0].Arguments!["x-dead-letter-exchange"]);
+        fluentResult.Queues[0].Arguments!["x-message-ttl"]
+            .Should().Be(dictResult.Queues[0].Arguments!["x-message-ttl"]);
     }
 }
