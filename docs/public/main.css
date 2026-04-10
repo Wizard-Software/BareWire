@@ -279,7 +279,77 @@
 }
 
 @media (max-width: 575.98px) {
+  .hero {
+    padding: 2rem 0 2.25rem 0;
+    margin-bottom: 1.5rem;
+  }
+  .hero .display-2 {
+    font-size: 2rem;
+  }
+  .hero .lead {
+    font-size: 1rem;
+  }
+  .hero::before {
+    width: 280px;
+    height: 280px;
+    inset: -30% -20% auto auto;
+  }
+  .hero-cta {
+    margin-top: 1.25rem;
+  }
+  .hero-cta .btn-lg {
+    font-size: 0.95rem;
+    padding: 0.5rem 1rem;
+  }
+  .feature-row {
+    margin: 1.25rem 0 2rem 0;
+  }
+  .feature-card {
+    padding: 1.15rem 1.25rem;
+    border-radius: 10px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 4px 12px rgba(0, 0, 0, 0.18);
+  }
+  .feature-card h3 {
+    font-size: 1.05rem;
+    margin-bottom: 0.4rem;
+  }
+  .feature-card p {
+    font-size: 0.9rem;
+    line-height: 1.45;
+  }
+  .concept-row {
+    margin: 1.25rem 0 2rem 0;
+  }
+  .concept-row > [class^="col-"] {
+    margin-bottom: 0.75rem;
+  }
+  .concept-card {
+    padding: 1rem 1.15rem;
+    border-radius: 10px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 4px 12px rgba(0, 0, 0, 0.18);
+  }
+  .concept-card h3 {
+    font-size: 0.95rem;
+    margin-bottom: 0.25rem;
+  }
+  .concept-card p {
+    font-size: 0.82rem;
+  }
+  .stats-row {
+    margin: 1rem 0 2rem 0;
+  }
   .stats-row > .col-6 {
     margin-bottom: 1rem;
+  }
+  .stat {
+    padding: 1.1rem 0.5rem 0.9rem;
+    border-radius: 10px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 4px 12px rgba(0, 0, 0, 0.18);
+  }
+  .stat .stat-value {
+    font-size: 1.5rem;
+  }
+  .about-line {
+    margin: 1.25rem 0 2rem;
   }
 }
