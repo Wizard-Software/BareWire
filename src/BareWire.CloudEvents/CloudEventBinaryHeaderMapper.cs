@@ -40,7 +40,9 @@ internal static class CloudEventBinaryHeaderMapper
     {
         ArgumentNullException.ThrowIfNull(attributes);
 
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        // D6: wstępny rozmiar słownika eliminuje garbage z resize bucket-array;
+        // 8 slotów obejmuje 4 obowiązkowe + 4 opcjonalne standardowe bez resize.
+        var headers = new Dictionary<string, string>(8, StringComparer.OrdinalIgnoreCase)
         {
             [HeaderId] = attributes.Id,
             [HeaderSource] = attributes.Source.OriginalString,
@@ -55,7 +57,21 @@ internal static class CloudEventBinaryHeaderMapper
 
         if (attributes.Time is { } time)
         {
-            headers[HeaderTime] = time.ToString("O", CultureInfo.InvariantCulture);
+            // D1/D5: formatowanie bez pośredniego string z ToString("O").
+            // stackalloc char[35] — format "O" dla DateTimeOffset ma maks. 33 znaki
+            // (np. "9999-12-31T23:59:59.9999999+00:00"), margines 2 znaków wyklucza cichy
+            // fallback przy wartościach granicznych (D5 z planu 13.5).
+            Span<char> buffer = stackalloc char[35];
+            if (time.TryFormat(buffer, out int written, "O", CultureInfo.InvariantCulture))
+            {
+                headers[HeaderTime] = new string(buffer[..written]);
+            }
+            else
+            {
+                // Ścieżka awaryjna — TryFormat("O") nie powinna zwrócić false dla żadnej
+                // prawidłowej wartości DateTimeOffset, ale zachowujemy fallback jako defensive programming.
+                headers[HeaderTime] = time.ToString("O", CultureInfo.InvariantCulture);
+            }
         }
 
         if (!string.IsNullOrEmpty(attributes.DataContentType))
@@ -68,10 +84,15 @@ internal static class CloudEventBinaryHeaderMapper
             headers[HeaderDataSchema] = dataSchema.OriginalString;
         }
 
+        // D6: guard przed pętlą extensions eliminuje alokację zboxowanego enumeratora
+        // interfejsu IReadOnlyDictionary (~32-40 B) w ścieżce mandatory-only (brak extensions).
         // Extension keys are already ce-* per ICloudEventAttributes contract — emit verbatim.
-        foreach (KeyValuePair<string, string> kv in attributes.Extensions)
+        if (attributes.Extensions.Count > 0)
         {
-            headers[kv.Key] = kv.Value;
+            foreach (KeyValuePair<string, string> kv in attributes.Extensions)
+            {
+                headers[kv.Key] = kv.Value;
+            }
         }
 
         return headers;
