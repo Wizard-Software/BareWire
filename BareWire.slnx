@@ -18,6 +18,7 @@
   <Folder Name="/src/">
     <Project Path="src/BareWire.Abstractions/BareWire.Abstractions.csproj" />
     <Project Path="src/BareWire/BareWire.csproj" />
+    <Project Path="src/BareWire.CloudEvents/BareWire.CloudEvents.csproj" />
     <Project Path="src/BareWire.Interop.MassTransit/BareWire.Interop.MassTransit.csproj" />
     <Project Path="src/BareWire.Observability/BareWire.Observability.csproj" />
     <Project Path="src/BareWire.Outbox.EntityFramework/BareWire.Outbox.EntityFramework.csproj" />
