@@ -29,6 +29,7 @@ using BareWire.CloudEvents;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Samples.CloudEventsInterop.Consumers;
 using BareWire.Samples.CloudEventsInterop.Messages;
+using BareWire.Samples.CloudEventsInterop.Services;
 using BareWire.Samples.ServiceDefaults;
 using BareWire.Serialization.Json;
 
@@ -71,6 +72,10 @@ builder.Services.AddCloudEventsEnvelope();
 builder.Services.AddTransient<BinaryAwareConsumer>();
 builder.Services.AddTransient<StructuredConsumer>();
 builder.Services.AddTransient<RawConsumer>();
+
+// Wątkowo-bezpieczny rejestr potwierdzeń odbioru (singleton) — zasilany przez trzy konsumenty,
+// odczytywany przez GET /shipments/processed (weryfikacja E2E).
+builder.Services.AddSingleton<ShipmentReceiptStore>();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Topologia RabbitMQ — jeden broadcast exchange + 3 kolejki czytające
@@ -208,5 +213,14 @@ app.MapPost("/barewire/publish", async (
 })
 .Produces(StatusCodes.Status202Accepted)
 .WithName("PublishRaw");
+
+// GET /shipments/processed
+// Zwraca wszystkie potwierdzenia odbioru zarejestrowane przez trzy konsumenty
+// (BinaryAware / Structured / Raw). Używane przez testy E2E do weryfikacji, że fanout
+// rozgłosił wiadomość i że metadane CE są widoczne zgodnie z trybem publikacji.
+app.MapGet("/shipments/processed", (ShipmentReceiptStore receipts) =>
+    Results.Ok(receipts.GetAll()))
+    .Produces<IReadOnlyList<ShipmentReceipt>>(StatusCodes.Status200OK)
+    .WithName("GetProcessedShipments");
 
 app.Run();

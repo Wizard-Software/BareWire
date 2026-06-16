@@ -43,6 +43,7 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             "multi-consumer-partitioning",
             "inbox-deduplication",
             "masstransit-interop",
+            "cloudevents-interop",
         ];
 
         foreach (string resource in sampleResources)

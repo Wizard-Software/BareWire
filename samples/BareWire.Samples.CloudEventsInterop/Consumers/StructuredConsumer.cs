@@ -12,6 +12,7 @@
 using BareWire.Abstractions;
 using BareWire.CloudEvents;
 using BareWire.Samples.CloudEventsInterop.Messages;
+using BareWire.Samples.CloudEventsInterop.Services;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Samples.CloudEventsInterop.Consumers;
@@ -22,7 +23,9 @@ namespace BareWire.Samples.CloudEventsInterop.Consumers;
 /// <c>data</c> przed przekazaniem wiadomości do konsumenta — <see cref="ConsumeContext{T}.Message"/>
 /// zawiera gotowy obiekt <see cref="ShipmentDispatched"/>.
 /// </summary>
-public sealed partial class StructuredConsumer(ILogger<StructuredConsumer> logger)
+public sealed partial class StructuredConsumer(
+    ILogger<StructuredConsumer> logger,
+    ShipmentReceiptStore receipts)
     : IConsumer<ShipmentDispatched>
 {
     /// <inheritdoc />
@@ -37,6 +40,16 @@ public sealed partial class StructuredConsumer(ILogger<StructuredConsumer> logge
         bool hasCeHeaders = context.GetCloudEvent() is not null;
 
         LogStructuredMessage(logger, msg.ShipmentId, msg.Destination, msg.Carrier, hasCeHeaders);
+
+        // Rejestr E2E: atrybuty CE są w kopercie JSON, nie w nagłówkach ce-* — Ce* pozostają null.
+        receipts.Add(new ShipmentReceipt(
+            msg.ShipmentId,
+            "Structured",
+            HasCloudEventAttributes: hasCeHeaders,
+            CeId: null,
+            CeSource: null,
+            CeType: null,
+            DateTimeOffset.UtcNow));
 
         return Task.CompletedTask;
     }

@@ -10,6 +10,7 @@
 using BareWire.Abstractions;
 using BareWire.CloudEvents;
 using BareWire.Samples.CloudEventsInterop.Messages;
+using BareWire.Samples.CloudEventsInterop.Services;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Samples.CloudEventsInterop.Consumers;
@@ -19,7 +20,9 @@ namespace BareWire.Samples.CloudEventsInterop.Consumers;
 /// Potwierdza kontrakt ADR-001: <c>PublishAsync</c> nie dodaje nagłówków <c>ce-*</c>
 /// ani koperty — <see cref="CloudEventContextExtensions.GetCloudEvent"/> zwraca <see langword="null"/>.
 /// </summary>
-public sealed partial class RawConsumer(ILogger<RawConsumer> logger)
+public sealed partial class RawConsumer(
+    ILogger<RawConsumer> logger,
+    ShipmentReceiptStore receipts)
     : IConsumer<ShipmentDispatched>
 {
     /// <inheritdoc />
@@ -31,6 +34,16 @@ public sealed partial class RawConsumer(ILogger<RawConsumer> logger)
         bool hasCeMetadata = context.GetCloudEvent() is not null;
 
         LogRawMessage(logger, msg.ShipmentId, msg.Destination, msg.Carrier, hasCeMetadata);
+
+        // Rejestr E2E: czysty raw JSON bez metadanych CE — Ce* pozostają null.
+        receipts.Add(new ShipmentReceipt(
+            msg.ShipmentId,
+            "Raw",
+            HasCloudEventAttributes: hasCeMetadata,
+            CeId: null,
+            CeSource: null,
+            CeType: null,
+            DateTimeOffset.UtcNow));
 
         return Task.CompletedTask;
     }

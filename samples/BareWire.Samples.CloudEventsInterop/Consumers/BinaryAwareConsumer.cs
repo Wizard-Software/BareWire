@@ -9,6 +9,7 @@
 using BareWire.Abstractions;
 using BareWire.CloudEvents;
 using BareWire.Samples.CloudEventsInterop.Messages;
+using BareWire.Samples.CloudEventsInterop.Services;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Samples.CloudEventsInterop.Consumers;
@@ -19,7 +20,9 @@ namespace BareWire.Samples.CloudEventsInterop.Consumers;
 /// zwraca niepuste atrybuty tylko dla wiadomości opublikowanych przez
 /// <c>PublishCloudEventAsync</c> (tryb binary).
 /// </summary>
-public sealed partial class BinaryAwareConsumer(ILogger<BinaryAwareConsumer> logger)
+public sealed partial class BinaryAwareConsumer(
+    ILogger<BinaryAwareConsumer> logger,
+    ShipmentReceiptStore receipts)
     : IConsumer<ShipmentDispatched>
 {
     /// <inheritdoc />
@@ -40,12 +43,32 @@ public sealed partial class BinaryAwareConsumer(ILogger<BinaryAwareConsumer> log
                 validated.Source,
                 validated.Type,
                 context.Message.ShipmentId);
+
+            // Rejestr E2E: atrybuty CE odczytane z nagłówków ce-* (tryb binarny).
+            receipts.Add(new ShipmentReceipt(
+                context.Message.ShipmentId,
+                "BinaryAware",
+                HasCloudEventAttributes: true,
+                CeId: validated.Id,
+                CeSource: validated.Source.ToString(),
+                CeType: validated.Type,
+                DateTimeOffset.UtcNow));
         }
         else
         {
             // Brak nagłówków ce-* — wiadomość opublikowana w trybie structured lub raw
             // i dostarczona przez fanout do tej kolejki.
             LogNoCeHeaders(logger, context.Message.ShipmentId);
+
+            // Rejestr E2E: brak metadanych CE — wiadomość innego trybu dostarczona przez fanout.
+            receipts.Add(new ShipmentReceipt(
+                context.Message.ShipmentId,
+                "BinaryAware",
+                HasCloudEventAttributes: false,
+                CeId: null,
+                CeSource: null,
+                CeType: null,
+                DateTimeOffset.UtcNow));
         }
 
         return Task.CompletedTask;
