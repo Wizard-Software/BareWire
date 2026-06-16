@@ -41,6 +41,7 @@ public sealed class ArchitectureRuleTests
         [
             .. CoreNamespaces,
             "BareWire.Transport.RabbitMQ",
+            "BareWire.Transport.Kafka",
             "BareWire.Observability",
             "BareWire.Saga",
             "BareWire.Outbox",
@@ -135,6 +136,34 @@ public sealed class ArchitectureRuleTests
 
         resultObservability.IsSuccessful.Should().BeTrue(
             resultObservability.FailingTypeNames is { Count: > 0 } oNames ? oNames[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 4b: Transport.Kafka must NOT depend on Core, Observability, or other Transports
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void KafkaTransport_ShouldNotDependOn_CoreOrObservability()
+    {
+        var assembly = GetAssembly("BareWire.Transport.Kafka");
+
+        AssertNoDependencyOnCore(assembly);
+
+        var resultObservability = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Observability")
+            .GetResult();
+
+        resultObservability.IsSuccessful.Should().BeTrue(
+            resultObservability.FailingTypeNames is { Count: > 0 } oNames ? oNames[0] : null);
+
+        var resultRabbitMq = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.RabbitMQ")
+            .GetResult();
+
+        resultRabbitMq.IsSuccessful.Should().BeTrue(
+            resultRabbitMq.FailingTypeNames is { Count: > 0 } rNames ? rNames[0] : null);
     }
 
     // -------------------------------------------------------------------------
