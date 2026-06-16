@@ -8,10 +8,13 @@
     <PackageReference Include="NSubstitute" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <PackageReference Include="CloudNative.CloudEvents" />
+    <PackageReference Include="CloudNative.CloudEvents.SystemTextJson" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.CloudEvents\BareWire.CloudEvents.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Interop.MassTransit\BareWire.Interop.MassTransit.csproj" />
     <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
