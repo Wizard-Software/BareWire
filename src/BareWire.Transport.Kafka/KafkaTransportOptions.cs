@@ -9,9 +9,13 @@ namespace BareWire.Transport.Kafka;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Scope note (R1.1):</b> This class covers producer-side configuration only.
+/// <b>Scope note (R1.1/R1.2):</b> Producer-side configuration was added in R1.1.
+/// Consumer-side configuration (<see cref="GroupId"/>, <see cref="AutoOffsetReset"/>,
+/// <see cref="ConsumerPartitionAssignmentStrategy"/>, <see cref="EnableAutoCommit"/>,
+/// <see cref="EnableAutoOffsetStore"/>, <see cref="SessionTimeoutMs"/>,
+/// <see cref="MaxPollIntervalMs"/>) was added in R1.2.
 /// SASL/SSL (<c>SecurityProtocol</c>, SCRAM, OAUTHBEARER) are deferred to a dedicated security task
-/// (R1.x). The producer defaults to <c>SecurityProtocol=Plaintext</c> — <b>do not use against a
+/// (R1.x). The adapter defaults to <c>SecurityProtocol=Plaintext</c> — <b>do not use against a
 /// production broker until the secure-config layer is in place.</b>
 /// </para>
 /// <para>
@@ -23,6 +27,8 @@ namespace BareWire.Transport.Kafka;
 /// </remarks>
 internal sealed class KafkaTransportOptions
 {
+    // ── Producer options ──────────────────────────────────────────────────────
+
     /// <summary>
     /// Gets or sets the bootstrap server(s) used to establish the initial Kafka connection.
     /// Format: <c>host1:port1,host2:port2</c>. Must not be null or empty.
@@ -91,9 +97,77 @@ internal sealed class KafkaTransportOptions
     /// </summary>
     public TimeSpan FlushTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
+    // ── Consumer options ──────────────────────────────────────────────────────
+
     /// <summary>
-    /// Validates this options instance, throwing <see cref="BareWireConfigurationException"/>
-    /// when required values are missing or invalid.
+    /// Gets or sets the consumer group identifier. Required when using
+    /// <c>ITransportAdapter.ConsumeAsync</c>.
+    /// All consumers sharing the same <see cref="GroupId"/> coordinate partition assignment and
+    /// offset commits via the Kafka group coordinator.
+    /// </summary>
+    /// <remarks>
+    /// <b>Not required for producer-only usage.</b> Validation is enforced in
+    /// <see cref="ValidateConsumer"/> (called from <c>ConsumeAsync</c>) rather than
+    /// <see cref="Validate"/> (called from the constructor), so producer-only DI registrations
+    /// are not forced to supply a group id.
+    /// </remarks>
+    public string GroupId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the offset reset policy applied when a consumer group has no committed offset
+    /// for a partition, or when the committed offset is out of range.
+    /// Defaults to <see cref="Confluent.Kafka.AutoOffsetReset.Earliest"/> (start from the
+    /// beginning of the log).
+    /// </summary>
+    public AutoOffsetReset AutoOffsetReset { get; set; } = AutoOffsetReset.Earliest;
+
+    /// <summary>
+    /// Gets or sets the partition assignment strategy applied by the consumer group coordinator.
+    /// Defaults to <see cref="KafkaPartitionAssignmentStrategy.CooperativeSticky"/> (D9),
+    /// which performs incremental rebalancing and minimises stop-the-world pauses.
+    /// </summary>
+    public KafkaPartitionAssignmentStrategy ConsumerPartitionAssignmentStrategy { get; set; } =
+        KafkaPartitionAssignmentStrategy.CooperativeSticky;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether librdkafka should periodically commit offsets
+    /// to the broker in the background (<c>enable.auto.commit</c>).
+    /// Defaults to <see langword="true"/> — combined with <see cref="EnableAutoOffsetStore"/> =
+    /// <see langword="false"/> this achieves at-least-once delivery: offsets are only stored
+    /// (and therefore committed) after successful <c>SettleAsync(Ack, …)</c> (D6).
+    /// </summary>
+    public bool EnableAutoCommit { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether librdkafka should automatically store the offset
+    /// of the last message returned by <c>Consume()</c> before the message is processed
+    /// (<c>enable.auto.offset.store</c>).
+    /// Defaults to <see langword="false"/> so that offsets are stored manually via
+    /// <c>IConsumer.StoreOffset(…)</c> inside <c>SettleAsync(Ack, …)</c> only (D6).
+    /// </summary>
+    public bool EnableAutoOffsetStore { get; set; }
+
+    /// <summary>
+    /// Gets or sets the consumer group session timeout in milliseconds.
+    /// When <see langword="null"/>, the librdkafka default (45 000 ms) is used.
+    /// </summary>
+    public int? SessionTimeoutMs { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum interval in milliseconds between two consecutive poll calls
+    /// before the broker considers the consumer dead and triggers a rebalance
+    /// (<c>max.poll.interval.ms</c>).
+    /// When <see langword="null"/>, the librdkafka default (300 000 ms) is used.
+    /// Set this to a value larger than the maximum message processing latency to avoid
+    /// spurious rebalances when back-pressure slows the poll loop (D3).
+    /// </summary>
+    public int? MaxPollIntervalMs { get; set; }
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Validates this options instance for producer usage, throwing
+    /// <see cref="BareWireConfigurationException"/> when required values are missing or invalid.
     /// </summary>
     /// <exception cref="BareWireConfigurationException">
     /// Thrown when <see cref="BootstrapServers"/> is null or empty.
@@ -106,6 +180,25 @@ internal sealed class KafkaTransportOptions
                 optionName: nameof(BootstrapServers),
                 optionValue: BootstrapServers,
                 expectedValue: "A non-empty Kafka bootstrap server list (e.g. localhost:9092)");
+        }
+    }
+
+    /// <summary>
+    /// Validates consumer-specific options, throwing <see cref="BareWireConfigurationException"/>
+    /// when <see cref="GroupId"/> is null or empty. Called from <c>ConsumeAsync</c> before
+    /// building the <c>IConsumer</c> instance.
+    /// </summary>
+    /// <exception cref="BareWireConfigurationException">
+    /// Thrown when <see cref="GroupId"/> is null or empty.
+    /// </exception>
+    internal void ValidateConsumer()
+    {
+        if (string.IsNullOrEmpty(GroupId))
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(GroupId),
+                optionValue: GroupId,
+                expectedValue: "A non-empty consumer group id (e.g. my-service-group)");
         }
     }
 }

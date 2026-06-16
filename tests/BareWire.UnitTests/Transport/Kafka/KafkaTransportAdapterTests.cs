@@ -18,6 +18,9 @@ public sealed class KafkaTransportAdapterTests
     private static KafkaTransportOptions ValidOptions() =>
         new() { BootstrapServers = "localhost:9092" };
 
+    private static KafkaTransportOptions ValidOptionsWithGroup() =>
+        new() { BootstrapServers = "localhost:9092", GroupId = "test-group" };
+
     // ── TransportName ─────────────────────────────────────────────────────────
 
     [Fact]
@@ -77,7 +80,7 @@ public sealed class KafkaTransportAdapterTests
     [Fact]
     public void Capabilities_DoesNotHaveTransactions()
     {
-        // Arrange — GAP-4: Transactions capability NOT declared in R1.1 (no transactional producer)
+        // Arrange
         var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
 
         // Act
@@ -145,41 +148,7 @@ public sealed class KafkaTransportAdapterTests
             .Which.OptionName.Should().Be(nameof(KafkaTransportOptions.BootstrapServers));
     }
 
-    // ── Stubs (NotSupportedException) ─────────────────────────────────────────
-
-    [Fact]
-    public void ConsumeAsync_ThrowsNotSupportedException()
-    {
-        // Arrange
-        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
-        var flowControl = new FlowControlOptions();
-
-        // Act
-        Action act = () => _ = adapter.ConsumeAsync("test-topic", flowControl);
-
-        // Assert
-        act.Should().Throw<NotSupportedException>()
-            .WithMessage("*R1.2*");
-    }
-
-    [Fact]
-    public async Task SettleAsync_ThrowsNotSupportedException()
-    {
-        // Arrange
-        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
-        var message = new InboundMessage(
-            messageId: "msg-1",
-            headers: new Dictionary<string, string>(),
-            body: ReadOnlySequence<byte>.Empty,
-            deliveryTag: 1UL);
-
-        // Act
-        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Ack, message);
-
-        // Assert
-        await act.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*R1.2*");
-    }
+    // ── DeployTopologyAsync stub (remains until R1.4) ─────────────────────────
 
     [Fact]
     public async Task DeployTopologyAsync_ThrowsNotSupportedException()
@@ -194,6 +163,174 @@ public sealed class KafkaTransportAdapterTests
         // Assert
         await act.Should().ThrowAsync<NotSupportedException>()
             .WithMessage("*R1.4*");
+    }
+
+    // ── ConsumeAsync guard tests ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task ConsumeAsync_EmptyEndpoint_ThrowsArgumentException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptionsWithGroup(), CreateLogger());
+        var flowControl = new FlowControlOptions();
+
+        // Act — guards fire on first MoveNextAsync of the async iterator
+        Func<Task> act = async () =>
+        {
+            await foreach (InboundMessage _ in adapter.ConsumeAsync("", flowControl))
+            {
+            }
+        };
+
+        // Assert
+        await act.Should().ThrowAsync<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_NullEndpoint_ThrowsArgumentException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptionsWithGroup(), CreateLogger());
+        var flowControl = new FlowControlOptions();
+
+        // Act
+        Func<Task> act = async () =>
+        {
+            await foreach (InboundMessage _ in adapter.ConsumeAsync(null!, flowControl))
+            {
+            }
+        };
+
+        // Assert
+        await act.Should().ThrowAsync<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_MissingGroupId_ThrowsBareWireConfigurationException()
+    {
+        // Arrange — valid BootstrapServers but no GroupId
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        var flowControl = new FlowControlOptions();
+
+        // Act
+        Func<Task> act = async () =>
+        {
+            await foreach (InboundMessage _ in adapter.ConsumeAsync("my-topic", flowControl))
+            {
+            }
+        };
+
+        // Assert — ValidateConsumer fires before building the native consumer
+        await act.Should().ThrowAsync<BareWireConfigurationException>()
+            .WithMessage("*GroupId*");
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_AfterDispose_ThrowsObjectDisposedException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptionsWithGroup(), CreateLogger());
+        await adapter.DisposeAsync();
+        var flowControl = new FlowControlOptions();
+
+        // Act
+        Func<Task> act = async () =>
+        {
+            await foreach (InboundMessage _ in adapter.ConsumeAsync("my-topic", flowControl))
+            {
+            }
+        };
+
+        // Assert
+        await act.Should().ThrowAsync<ObjectDisposedException>();
+    }
+
+    // ── SettleAsync guard tests ───────────────────────────────────────────────
+
+    [Fact]
+    public async Task SettleAsync_NullMessage_ThrowsArgumentNullException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Ack, null!);
+
+        // Assert
+        await act.Should().ThrowAsync<ArgumentNullException>();
+    }
+
+    [Fact]
+    public async Task SettleAsync_Defer_ThrowsNotSupportedException()
+    {
+        // Arrange — Defer is checked before consumer resolution
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        var message = new InboundMessage(
+            messageId: "msg-defer",
+            headers: new Dictionary<string, string> { ["BW-ConsumerId"] = "some-id" },
+            body: ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1UL);
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Defer, message);
+
+        // Assert
+        await act.Should().ThrowAsync<NotSupportedException>();
+    }
+
+    [Fact]
+    public async Task SettleAsync_MissingBwConsumerIdHeader_ThrowsBareWireTransportException()
+    {
+        // Arrange — message with no BW-ConsumerId header
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        var message = new InboundMessage(
+            messageId: "msg-no-id",
+            headers: new Dictionary<string, string>(),
+            body: ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1UL);
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Ack, message);
+
+        // Assert
+        await act.Should().ThrowAsync<BareWireTransportException>();
+    }
+
+    [Fact]
+    public async Task SettleAsync_NoActiveConsumer_ThrowsBareWireTransportException()
+    {
+        // Arrange — message has BW-ConsumerId but no active consumer with that id
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        var message = new InboundMessage(
+            messageId: "msg-unknown",
+            headers: new Dictionary<string, string> { ["BW-ConsumerId"] = "does-not-exist" },
+            body: ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1UL);
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Ack, message);
+
+        // Assert
+        await act.Should().ThrowAsync<BareWireTransportException>();
+    }
+
+    [Fact]
+    public async Task SettleAsync_AfterDispose_ThrowsObjectDisposedException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        var message = new InboundMessage(
+            messageId: "msg-disposed",
+            headers: new Dictionary<string, string> { ["BW-ConsumerId"] = "some-id" },
+            body: ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1UL);
+        await adapter.DisposeAsync();
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Ack, message);
+
+        // Assert
+        await act.Should().ThrowAsync<ObjectDisposedException>();
     }
 
     // ── DI registration ───────────────────────────────────────────────────────

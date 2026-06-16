@@ -9,9 +9,9 @@ using Microsoft.Extensions.Logging;
 namespace BareWire.Transport.Kafka;
 
 /// <summary>
-/// Kafka transport adapter implementing the producer side (R1.1).
-/// Consumer side (<see cref="ConsumeAsync"/>), settlement, and topology deployment
-/// are stubs that will be implemented in R1.2 / R1.4 respectively.
+/// Kafka transport adapter. Producer side implemented in R1.1; consumer side
+/// (<see cref="ConsumeAsync"/>, <see cref="SettleAsync"/>) implemented in R1.2.
+/// Topology deployment (<see cref="DeployTopologyAsync"/>) is a stub until R1.4.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -152,35 +152,7 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         return results;
     }
 
-    /// <inheritdoc />
-    /// <remarks>
-    /// <b>Stub — not implemented in R1.1.</b>
-    /// Consumer side will be implemented in task R1.2.
-    /// </remarks>
-    public IAsyncEnumerable<InboundMessage> ConsumeAsync(
-        string endpointName,
-        FlowControlOptions flowControl,
-        CancellationToken cancellationToken = default)
-    {
-        throw new NotSupportedException(
-            "ConsumeAsync is not implemented in R1.1 (producer only). " +
-            "Consumer group support will be added in task R1.2.");
-    }
-
-    /// <inheritdoc />
-    /// <remarks>
-    /// <b>Stub — not implemented in R1.1.</b>
-    /// Settlement will be implemented in task R1.2.
-    /// </remarks>
-    public Task SettleAsync(
-        SettlementAction action,
-        InboundMessage message,
-        CancellationToken cancellationToken = default)
-    {
-        throw new NotSupportedException(
-            "SettleAsync is not implemented in R1.1 (producer only). " +
-            "Message settlement will be added in task R1.2.");
-    }
+    // ConsumeAsync and SettleAsync are implemented in KafkaTransportAdapter.Consumer.cs (R1.2).
 
     /// <inheritdoc />
     /// <remarks>
@@ -205,6 +177,14 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         }
 
         _disposed = true;
+
+        // GAP-3: Stop all active consumers BEFORE disposing the producer and connection lock.
+        // This ensures a clean leave-group + final offset commit for each consumer.
+        foreach (Internal.KafkaConsumer consumer in _consumerRegistry.AllConsumers())
+        {
+            await consumer.StopAsync().ConfigureAwait(false);
+            await consumer.DisposeAsync().ConfigureAwait(false);
+        }
 
         if (_producer is not null)
         {
