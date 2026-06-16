@@ -148,21 +148,34 @@ public sealed class KafkaTransportAdapterTests
             .Which.OptionName.Should().Be(nameof(KafkaTransportOptions.BootstrapServers));
     }
 
-    // ── DeployTopologyAsync stub (remains until R1.4) ─────────────────────────
+    // ── DeployTopologyAsync guard tests (R1.4) ────────────────────────────────
 
     [Fact]
-    public async Task DeployTopologyAsync_ThrowsNotSupportedException()
+    public async Task DeployTopologyAsync_NullTopology_ThrowsArgumentNullException()
     {
         // Arrange
         var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
-        var topology = new TopologyDeclaration();
 
         // Act
-        Func<Task> act = () => adapter.DeployTopologyAsync(topology);
+        Func<Task> act = () => adapter.DeployTopologyAsync(null!);
 
         // Assert
-        await act.Should().ThrowAsync<NotSupportedException>()
-            .WithMessage("*R1.4*");
+        await act.Should().ThrowAsync<ArgumentNullException>()
+            .WithParameterName("topology");
+    }
+
+    [Fact]
+    public async Task DeployTopologyAsync_AfterDispose_ThrowsObjectDisposedException()
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
+        await adapter.DisposeAsync();
+
+        // Act
+        Func<Task> act = () => adapter.DeployTopologyAsync(new TopologyDeclaration());
+
+        // Assert
+        await act.Should().ThrowAsync<ObjectDisposedException>();
     }
 
     // ── ConsumeAsync guard tests ──────────────────────────────────────────────

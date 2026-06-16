@@ -5,6 +5,7 @@ using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
+using Confluent.Kafka.Admin;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Transport.Kafka;
@@ -12,7 +13,7 @@ namespace BareWire.Transport.Kafka;
 /// <summary>
 /// Kafka transport adapter. Producer side implemented in R1.1; consumer side
 /// (<see cref="ConsumeAsync"/>, <see cref="SettleAsync"/>) implemented in R1.2.
-/// Topology deployment (<see cref="DeployTopologyAsync"/>) is a stub until R1.4.
+/// Topology deployment (<see cref="DeployTopologyAsync"/>) implemented in R1.4.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -41,6 +42,7 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
 
     private long _deliveryTagCounter;
     private IProducer<byte[], byte[]>? _producer;
+    private IAdminClient? _adminClient;
     private bool _disposed;
 
     public KafkaTransportAdapter(
@@ -210,16 +212,78 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
 
     /// <inheritdoc />
     /// <remarks>
-    /// <b>Stub — not implemented in R1.1.</b>
-    /// Kafka admin client topology deployment will be implemented in task R1.4.
+    /// Creates Kafka topics from <see cref="TopologyDeclaration.Queues"/> using the admin client.
+    /// Each queue declaration maps to a Kafka topic; topic-specific parameters (partition count,
+    /// replication factor, retention) are read from <c>QueueDeclaration.Arguments</c> via
+    /// <c>KafkaTopologyArguments</c> (D2). Exchanges and bindings are accepted (shared contract)
+    /// but produce no admin operations — Kafka has no exchange or binding concept (D1).
+    /// Topic-already-exists errors are silently swallowed (idempotent declaration, D3).
     /// </remarks>
-    public Task DeployTopologyAsync(
+    public async Task DeployTopologyAsync(
         TopologyDeclaration topology,
         CancellationToken cancellationToken = default)
     {
-        throw new NotSupportedException(
-            "DeployTopologyAsync is not implemented in R1.1 (producer only). " +
-            "Kafka admin client topic/partition management will be added in task R1.4.");
+        ArgumentNullException.ThrowIfNull(topology);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        await EnsureAdminClientAsync(cancellationToken).ConfigureAwait(false);
+
+        foreach (QueueDeclaration queue in topology.Queues)
+        {
+            KafkaTopicSpec spec = KafkaTopologyArguments.Parse(queue);
+
+            var topicSpec = new TopicSpecification
+            {
+                Name = queue.Name,
+                NumPartitions = spec.NumPartitions,
+                ReplicationFactor = spec.ReplicationFactor,
+                Configs = spec.Configs,
+            };
+
+            try
+            {
+                await _adminClient!.CreateTopicsAsync([topicSpec]).ConfigureAwait(false);
+                LogTopicCreated(queue.Name);
+            }
+            catch (CreateTopicsException ex)
+            {
+                bool allAlreadyExist = ex.Results.TrueForAll(
+                    r => r.Error.Code == ErrorCode.TopicAlreadyExists);
+
+                if (allAlreadyExist)
+                {
+                    LogTopicAlreadyExists(queue.Name);
+                }
+                else
+                {
+                    string firstReason = ex.Results
+                        .Find(r => r.Error.Code != ErrorCode.TopicAlreadyExists)
+                        ?.Error.Reason ?? ex.Message;
+
+                    throw new TopologyDeploymentException(
+                        topologyElement: queue.Name,
+                        transportName: TransportName,
+                        brokerError: firstReason,
+                        endpointAddress: null,
+                        innerException: ex);
+                }
+            }
+        }
+
+        foreach (ExchangeDeclaration exchange in topology.Exchanges)
+        {
+            LogExchangeSkipped(exchange.Name);
+        }
+
+        foreach (ExchangeQueueBinding binding in topology.ExchangeQueueBindings)
+        {
+            LogBindingSkipped(binding.ExchangeName, binding.QueueName);
+        }
+
+        foreach (ExchangeExchangeBinding binding in topology.ExchangeExchangeBindings)
+        {
+            LogBindingSkipped(binding.SourceExchangeName, binding.DestinationExchangeName);
+        }
     }
 
     /// <inheritdoc />
@@ -254,6 +318,10 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
             _producer.Dispose();
             _producer = null;
         }
+
+        // IAdminClient is IDisposable (not IAsyncDisposable) — dispose synchronously.
+        _adminClient?.Dispose();
+        _adminClient = null;
 
         _connectionLock.Dispose();
 
@@ -322,6 +390,38 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         }
     }
 
+    private async Task EnsureAdminClientAsync(CancellationToken cancellationToken)
+    {
+        // Fast path: admin client already built.
+        if (_adminClient is not null)
+        {
+            return;
+        }
+
+        await _connectionLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Double-check after acquiring the lock — another caller may have built the admin client.
+            if (_adminClient is not null)
+            {
+                return;
+            }
+
+            var config = new AdminClientConfig
+            {
+                BootstrapServers = _options.BootstrapServers,
+            };
+
+            _adminClient = new AdminClientBuilder(config).Build();
+
+            LogAdminClientCreated(_options.BootstrapServers);
+        }
+        finally
+        {
+            _connectionLock.Release();
+        }
+    }
+
     [LoggerMessage(Level = LogLevel.Information,
         Message = "Kafka idempotent producer created. BootstrapServers: {BootstrapServers}.")]
     private partial void LogProducerCreated(string bootstrapServers);
@@ -329,4 +429,24 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Kafka producer disposed with {UnflushedCount} message(s) still in the queue after {FlushTimeout} flush timeout. These messages may be lost.")]
     private partial void LogUnflushedMessages(int unflushedCount, TimeSpan flushTimeout);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka admin client created. BootstrapServers: {BootstrapServers}.")]
+    private partial void LogAdminClientCreated(string bootstrapServers);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka topic '{TopicName}' created successfully.")]
+    private partial void LogTopicCreated(string topicName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka topic '{TopicName}' already exists — skipping (idempotent declaration).")]
+    private partial void LogTopicAlreadyExists(string topicName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka topology deploy: exchange '{ExchangeName}' skipped — Kafka has no exchange concept.")]
+    private partial void LogExchangeSkipped(string exchangeName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka topology deploy: binding '{SourceName}' -> '{DestinationName}' skipped — Kafka has no binding concept.")]
+    private partial void LogBindingSkipped(string sourceName, string destinationName);
 }
