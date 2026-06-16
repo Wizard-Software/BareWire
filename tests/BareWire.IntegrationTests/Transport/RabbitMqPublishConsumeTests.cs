@@ -46,7 +46,11 @@ public sealed class RabbitMqPublishConsumeTests(AspireFixture fixture)
     private static OutboundMessage MakeMessage(string queueName, string payload = "{\"ok\":true}") =>
         new(
             routingKey: queueName,
-            headers: new Dictionary<string, string>(),
+            // BW-Exchange="" publishes via the AMQP default exchange (routing key = queue name),
+            // matching the production publish pattern (DelayRequeueScheduleProvider). The adapter
+            // honours an explicit BW-Exchange header even when empty, and RabbitMqHeaderMapper strips
+            // BW-* headers before the wire, so it never reaches the broker or the inbound message.
+            headers: new Dictionary<string, string> { ["BW-Exchange"] = string.Empty },
             body: Encoding.UTF8.GetBytes(payload),
             contentType: "application/json");
 
@@ -142,33 +146,47 @@ public sealed class RabbitMqPublishConsumeTests(AspireFixture fixture)
     }
 
     [Fact]
-    public async Task SendBatchAsync_UsesDefaultExchange_WhenNoHeaderOverride()
+    public async Task SendBatchAsync_UsesNamedDefaultExchange_WhenNoHeaderOverride()
     {
-        // Arrange
+        // Arrange — a named direct exchange bound to the queue (routing key = queue name).
+        // The adapter is configured with that exchange as DefaultExchange, so a publish WITHOUT a
+        // BW-Exchange header must fall back to the configured DefaultExchange and route to the queue.
+        // (Empty DefaultExchange means "unconfigured" and is rejected fail-fast per ADR-002; the
+        // AMQP default exchange is reached via an explicit BW-Exchange="" header instead.)
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
+
+        string exchangeName = $"test-default-ex-{Guid.NewGuid():N}";
         await using RabbitMqTransportAdapter adapter = CreateAdapter(opts =>
         {
-            // Default exchange is "" (AMQP default direct exchange).
-            // A message published to "" with routingKey = queueName reaches that queue directly.
-            opts.DefaultExchange = string.Empty;
+            opts.DefaultExchange = exchangeName;
         });
 
-        string queueName = $"test-default-ex-{Guid.NewGuid():N}";
-        await DeployQueueAsync(adapter, queueName, cts.Token);
+        string queueName = $"test-default-ex-q-{Guid.NewGuid():N}";
 
-        // No "BW-Exchange" header — adapter should fall back to DefaultExchange ("")
+        var configurator = new RabbitMqTopologyConfigurator();
+        configurator.DeclareExchange(exchangeName, ExchangeType.Direct, durable: false, autoDelete: false);
+        configurator.DeclareQueue(queueName, durable: false, autoDelete: false);
+        configurator.BindExchangeToQueue(exchangeName, queueName, routingKey: queueName);
+        await adapter.DeployTopologyAsync(configurator.Build(), cts.Token);
+
+        // No "BW-Exchange" header — adapter must fall back to the configured DefaultExchange.
+        byte[] expectedBody = Encoding.UTF8.GetBytes("{\"via\":\"named-default-exchange\"}");
         OutboundMessage message = new(
             routingKey: queueName,
             headers: new Dictionary<string, string>(),
-            body: Encoding.UTF8.GetBytes("{\"via\":\"default-exchange\"}"),
+            body: expectedBody,
             contentType: "application/json");
 
         // Act
         IReadOnlyList<SendResult> results = await adapter.SendBatchAsync([message], cts.Token);
 
-        // Assert — message routed through the default exchange and confirmed
+        // Assert — confirmed by the broker AND actually routed to the bound queue. Publisher confirms
+        // with mandatory:false would pass even for an unroutable message, so we consume to prove routing.
         results.Should().HaveCount(1);
         results[0].IsConfirmed.Should().BeTrue();
+
+        InboundMessage received = await ConsumeOneAsync(adapter, queueName, cts.Token);
+        ReadSequenceToArray(received.Body).Should().BeEquivalentTo(expectedBody);
     }
 
     // ── ConsumeAsync ──────────────────────────────────────────────────────────
@@ -186,7 +204,9 @@ public sealed class RabbitMqPublishConsumeTests(AspireFixture fixture)
         byte[] expectedBody = Encoding.UTF8.GetBytes("{\"msg\":\"hello\"}");
         OutboundMessage outbound = new(
             routingKey: queueName,
-            headers: new Dictionary<string, string> { ["x-test"] = "roundtrip" },
+            // BW-Exchange="" routes via the AMQP default exchange; it is stripped before the wire,
+            // so only the x-test header survives onto the inbound message (asserted below).
+            headers: new Dictionary<string, string> { ["x-test"] = "roundtrip", ["BW-Exchange"] = string.Empty },
             body: expectedBody,
             contentType: "application/json");
 
