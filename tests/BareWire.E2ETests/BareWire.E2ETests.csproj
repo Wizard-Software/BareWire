@@ -9,6 +9,8 @@
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
     <PackageReference Include="RabbitMQ.Client" />
+    <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
+    <PackageReference Include="MessagePack" />
   </ItemGroup>
 
   <ItemGroup>

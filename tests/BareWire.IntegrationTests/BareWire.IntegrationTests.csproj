@@ -11,6 +11,8 @@
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
     <PackageReference Include="OpenTelemetry.Exporter.InMemory" />
+    <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
+    <PackageReference Include="MessagePack" />
   </ItemGroup>
 
   <ItemGroup>

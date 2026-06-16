@@ -19,13 +19,15 @@
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.5" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.5" />
     <!-- OpenTelemetry -->
-    <PackageVersion Include="OpenTelemetry.Api" Version="1.15.0" />
-    <PackageVersion Include="OpenTelemetry" Version="1.15.0" />
-    <PackageVersion Include="OpenTelemetry.Exporter.InMemory" Version="1.15.0" />
-    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.0" />
-    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.0" />
+    <PackageVersion Include="OpenTelemetry.Api" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Exporter.InMemory" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
+    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.12.0" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.12.0" />
+    <!-- Transitive security pin (Aspire → MessagePack): patch dla GHSA-hv8m-jj95-wg3x (NU1903) -->
+    <PackageVersion Include="MessagePack" Version="2.5.301" />
     <!-- PostgreSQL (EF Core) -->
     <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
     <!-- Aspire -->
