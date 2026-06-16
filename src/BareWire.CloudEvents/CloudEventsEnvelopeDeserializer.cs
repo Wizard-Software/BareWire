@@ -109,13 +109,29 @@ file sealed class EnvelopeAttributeAdapter : ICloudEventAttributes
 /// and a capped raw-payload excerpt for diagnostics.
 /// </para>
 /// <para>
-/// SECURITY NOTE: Input size and extension-attribute-count limits are NOT enforced by this
-/// class. DoS hardening is deferred to task 13.10 (SEC-1) and currently relies on transport-
-/// frame limits imposed above this layer (e.g. RabbitMQ max-frame-size / max-message-size).
+/// SEC-1 hardening (task 13.10): <see cref="CloudEventsEnvelopeHardening.Validate"/> is called
+/// fail-fast before DTO deserialization and enforces the following bounded limits supplied via
+/// <see cref="CloudEventsEnvelopeLimits"/>:
+/// (1) maximum envelope size in bytes; (2) maximum context-attribute count;
+/// (3) maximum scalar attribute value length; (4) extension name charset/length (SEC-3);
+/// (5) no duplicate context attributes (STRIDE Spoofing/Tampering mitigation).
+/// Non-scalar extension values are counted against the attribute value limit (SEC-2).
+/// The inner <c>data</c> payload is deserialized with a bounded <see cref="System.Text.Json.JsonSerializerOptions.MaxDepth"/>
+/// to guard against deeply-nested payloads (SEC-1 depth DoS).
 /// </para>
 /// </remarks>
 internal sealed class CloudEventsEnvelopeDeserializer : IMessageDeserializer
 {
+    private readonly CloudEventsEnvelopeLimits _limits;
+
+    /// <summary>
+    /// Initializes a new instance using the supplied limits, or <see cref="CloudEventsEnvelopeLimits.Default"/>
+    /// when none are provided. Preserves the parameterless-construction behaviour relied upon by existing tests.
+    /// </summary>
+    /// <param name="limits">Optional custom hardening limits; <see langword="null"/> uses <see cref="CloudEventsEnvelopeLimits.Default"/>.</param>
+    internal CloudEventsEnvelopeDeserializer(CloudEventsEnvelopeLimits? limits = null)
+        => _limits = limits ?? CloudEventsEnvelopeLimits.Default;
+
     /// <inheritdoc/>
     public string ContentType => CloudEventsEnvelopeContentType.Value;
 
@@ -144,8 +160,17 @@ internal sealed class CloudEventsEnvelopeDeserializer : IMessageDeserializer
         var reader = new Utf8JsonReader(data);
         try
         {
+            // SEC-1 hardening: fail-fast pre-scan BEFORE DTO deserialization.
+            // Placed inside the try block so that JsonException from the pre-scan Utf8JsonReader
+            // (e.g. non-object top-level, malformed bytes) is caught and wrapped uniformly by
+            // the catch below — spójnie z 13.9. BareWireSerializationException thrown by
+            // CloudEventsEnvelopeHardening is NOT a JsonException, so it propagates past the
+            // catch directly to the caller (Q2 decision from 13.10 plan).
+            CloudEventsEnvelopeHardening.Validate(data, _limits, ContentType);
+            // SEC-1: use Bounded options (MaxDepth = CloudEventsEnvelopeLimits.Default.MaxDataDepth)
+            // for untrusted input deserialization. Default is kept for the serializer (13.8).
             CloudEventsEnvelope? envelope = JsonSerializer.Deserialize<CloudEventsEnvelope>(
-                ref reader, CloudEventsJsonSerializerOptions.Default);
+                ref reader, CloudEventsJsonSerializerOptions.Bounded);
 
             if (envelope is null)
                 return null;
@@ -156,7 +181,7 @@ internal sealed class CloudEventsEnvelopeDeserializer : IMessageDeserializer
             var adapter = new EnvelopeAttributeAdapter(envelope);
             CloudEventAttributeValidator.ValidateMandatory(adapter, ContentType);
 
-            return envelope.Data.Deserialize<T>(CloudEventsJsonSerializerOptions.Default);
+            return envelope.Data.Deserialize<T>(CloudEventsJsonSerializerOptions.Bounded);
         }
         catch (JsonException ex)
         {

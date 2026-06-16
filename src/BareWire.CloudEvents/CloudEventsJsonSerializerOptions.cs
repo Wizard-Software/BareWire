@@ -30,4 +30,18 @@ internal static class CloudEventsJsonSerializerOptions
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         WriteIndented = false,
     };
+
+    // SEC-1: a second singleton with MaxDepth = 32 used exclusively for DESERIALIZING untrusted
+    // envelope bytes and the inner data payload. Without MaxDepth, a deeply-nested 'data' value
+    // smaller than MaxEnvelopeSizeBytes can still cause CPU/allocation blow-up in the STJ
+    // reflection path. Default STJ MaxDepth = 64; 32 is a safe bounded cap for CE payloads.
+    // Do NOT mutate Default above — it is shared with CloudEventsEnvelopeSerializer (13.8)
+    // which produces trusted output and must not be constrained by the consumer-side depth limit
+    // (feedback_serializer_no_global_replace rule).
+    internal static readonly JsonSerializerOptions Bounded = new(JsonSerializerDefaults.Web)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false,
+        MaxDepth = CloudEventsEnvelopeLimits.Default.MaxDataDepth,
+    };
 }
