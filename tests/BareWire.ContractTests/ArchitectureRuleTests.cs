@@ -312,6 +312,59 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
+    // Rule 12: CloudEvents must NOT depend on any BareWire package except Abstractions
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void CloudEvents_DependsOnlyOnAbstractions()
+    {
+        var assembly = typeof(BareWire.CloudEvents.ICloudEventAttributes).Assembly;
+
+        AssertNoDependencyOnCore(assembly);
+
+        string[] forbidden =
+        [
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Observability",
+            "BareWire.Saga",
+            "BareWire.Outbox",
+            "BareWire.Serialization.Json",
+            "BareWire.Testing",
+            "BareWire.Interop.MassTransit",
+        ];
+
+        foreach (var dep in forbidden)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(dep)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 13: CloudEvents (production) must NOT reference the CloudNative.CloudEvents SDK
+    //          (allowed ONLY as a test-only oracle in interop tests — see task 13.15)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void CloudEvents_DoesNotReferenceCloudNativeSdk()
+    {
+        var assembly = typeof(BareWire.CloudEvents.ICloudEventAttributes).Assembly;
+
+        var result = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("CloudNative.CloudEvents")
+            .GetResult();
+
+        result.IsSuccessful.Should().BeTrue(
+            result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
