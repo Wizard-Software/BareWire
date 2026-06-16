@@ -81,4 +81,8 @@ builder.AddProject<Projects.BareWire_Samples_MassTransitInterop>("masstransit-in
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+builder.AddProject<Projects.BareWire_Samples_CloudEventsInterop>("cloudevents-interop")
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

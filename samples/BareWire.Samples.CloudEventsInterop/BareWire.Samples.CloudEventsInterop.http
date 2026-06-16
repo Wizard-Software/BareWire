@@ -1,0 +1,40 @@
+@host = http://localhost:5077
+
+### Publikacja w trybie binarnym CloudEvents (ce-* headers + raw payload)
+POST {{host}}/cloudevents/publish-binary
+Content-Type: application/json
+
+{
+  "shipmentId": "SHIP-001",
+  "destination": "Warszawa, ul. Marszałkowska 1",
+  "carrier": "DHL"
+}
+
+###
+
+### Publikacja w trybie structured CloudEvents (koperta application/cloudevents+json)
+POST {{host}}/cloudevents/publish-structured
+Content-Type: application/json
+
+{
+  "shipmentId": "SHIP-002",
+  "destination": "Kraków, ul. Floriańska 5",
+  "carrier": "InPost"
+}
+
+###
+
+### Publikacja w trybie raw JSON (ADR-001, brak metadanych CloudEvents)
+POST {{host}}/barewire/publish
+Content-Type: application/json
+
+{
+  "shipmentId": "SHIP-003",
+  "destination": "Gdańsk, ul. Długa 10",
+  "carrier": "UPS"
+}
+
+###
+
+### Health check
+GET {{host}}/health
