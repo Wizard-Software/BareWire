@@ -8,9 +8,12 @@ namespace BareWire.IntegrationTests;
 
 public sealed class AspireFixture : IAsyncLifetime
 {
-    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(60);
+    // Kafka (KRaft-mode container) starts noticeably slower than RabbitMQ, so the shared
+    // startup budget is generous enough to cover the slowest resource in the AppHost.
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(120);
     private DistributedApplication? _app;
     private string? _rabbitMqConnectionString;
+    private string? _kafkaBootstrapServers;
 
     public async ValueTask InitializeAsync()
     {
@@ -22,14 +25,27 @@ public sealed class AspireFixture : IAsyncLifetime
 
         using var cts = new CancellationTokenSource(StartupTimeout);
         await notifier.WaitForResourceHealthyAsync("rmq", cts.Token);
+        await notifier.WaitForResourceHealthyAsync("kafka", cts.Token);
 
         _rabbitMqConnectionString = await _app.GetConnectionStringAsync("rmq");
+        _kafkaBootstrapServers = await _app.GetConnectionStringAsync("kafka");
     }
 
     public string GetRabbitMqConnectionString()
     {
         return _rabbitMqConnectionString
             ?? throw new InvalidOperationException("RabbitMQ connection string not available");
+    }
+
+    /// <summary>
+    /// Returns the Kafka bootstrap-server list (e.g. <c>localhost:9092</c>) for the broker
+    /// provisioned by the AppHost. The Aspire connection string for a Kafka resource is the
+    /// bootstrap-server list expected by <c>KafkaTransportOptions.BootstrapServers</c>.
+    /// </summary>
+    public string GetKafkaBootstrapServers()
+    {
+        return _kafkaBootstrapServers
+            ?? throw new InvalidOperationException("Kafka bootstrap servers not available");
     }
 
     public async ValueTask DisposeAsync()

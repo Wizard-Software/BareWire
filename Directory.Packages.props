@@ -34,6 +34,7 @@
     <!-- Aspire -->
     <PackageVersion Include="Aspire.Hosting" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.RabbitMQ" Version="13.1.3" />
+    <PackageVersion Include="Aspire.Hosting.Kafka" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.PostgreSQL" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.Testing" Version="13.1.3" />
     <!-- Contract testing -->
