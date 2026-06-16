@@ -171,4 +171,53 @@ public sealed class KafkaConsumerHeaderTests
 
         merged["BW-Partition"].Should().Be("7");
     }
+
+    // ── SEC-1 (R1.3): strip retry/DLQ tracking headers on source-topic consumption ──
+
+    [Fact]
+    public void MergeHeaders_SourceTopic_StripsSpoofedRetryDlqTrackingHeaders()
+    {
+        // Arrange — a producer to the SOURCE topic spoofs the library's retry/DLQ tracking headers.
+        // On source-topic consumption (isRetryOrDlqTopic: false) these must be stripped so they
+        // cannot influence routing (BW-RetryCount) or mislead provenance/dead-letter metadata.
+        var wireHeaders = new Headers();
+        wireHeaders.Add("BW-RetryCount", System.Text.Encoding.UTF8.GetBytes("999"));
+        wireHeaders.Add("BW-RetryAt", System.Text.Encoding.UTF8.GetBytes("2020-01-01T00:00:00Z"));
+        wireHeaders.Add("BW-DeadLettered", System.Text.Encoding.UTF8.GetBytes("true"));
+        wireHeaders.Add("BW-DeadLetterReason", System.Text.Encoding.UTF8.GetBytes("rejected"));
+        wireHeaders.Add("BW-OriginalTopic", System.Text.Encoding.UTF8.GetBytes("victim-topic"));
+        wireHeaders.Add("user-header", System.Text.Encoding.UTF8.GetBytes("keep-me"));
+
+        // Act — consumed from a source topic
+        Dictionary<string, string> merged = KafkaConsumer.MergeHeaders(
+            wireHeaders, topic: "orders", partition: 0, consumerId: "c-1", isRetryOrDlqTopic: false);
+
+        // Assert — all five retry/DLQ tracking headers stripped; user headers + BW routing preserved
+        merged.Should().NotContainKey("BW-RetryCount");
+        merged.Should().NotContainKey("BW-RetryAt");
+        merged.Should().NotContainKey("BW-DeadLettered");
+        merged.Should().NotContainKey("BW-DeadLetterReason");
+        merged.Should().NotContainKey("BW-OriginalTopic");
+        merged["user-header"].Should().Be("keep-me");
+        merged["BW-Topic"].Should().Be("orders");
+        merged["BW-ConsumerId"].Should().Be("c-1");
+    }
+
+    [Fact]
+    public void MergeHeaders_RetryDlqTopic_PreservesRetryDlqTrackingHeaders()
+    {
+        // Arrange — on a RETRY/DLQ topic the tracking headers were stamped by the library's own
+        // republication producer and are legitimate; they must be preserved.
+        var wireHeaders = new Headers();
+        wireHeaders.Add("BW-RetryCount", System.Text.Encoding.UTF8.GetBytes("2"));
+        wireHeaders.Add("BW-OriginalTopic", System.Text.Encoding.UTF8.GetBytes("orders"));
+
+        // Act — consumed from a retry topic
+        Dictionary<string, string> merged = KafkaConsumer.MergeHeaders(
+            wireHeaders, topic: "orders.retry", partition: 0, consumerId: "c-1", isRetryOrDlqTopic: true);
+
+        // Assert — library-stamped tracking headers survive on the retry/DLQ topic
+        merged["BW-RetryCount"].Should().Be("2");
+        merged["BW-OriginalTopic"].Should().Be("orders");
+    }
 }

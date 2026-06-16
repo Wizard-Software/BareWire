@@ -1,3 +1,4 @@
+using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
 
 namespace BareWire.Transport.Kafka.Configuration;
@@ -8,6 +9,7 @@ internal sealed class KafkaConfigurator : IKafkaConfigurator
     private string? _groupId;
     private AutoOffsetReset? _autoOffsetReset;
     private KafkaPartitionAssignmentStrategy? _partitionAssignmentStrategy;
+    private KafkaRetryDlqOptions? _retryDlqOptions;
 
     public void BootstrapServers(string bootstrapServers)
     {
@@ -29,6 +31,15 @@ internal sealed class KafkaConfigurator : IKafkaConfigurator
     public void ConsumerPartitionAssignmentStrategy(KafkaPartitionAssignmentStrategy strategy)
     {
         _partitionAssignmentStrategy = strategy;
+    }
+
+    public void ConfigureRetryDlq(Action<IKafkaRetryDlqConfigurator> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var retryDlqConfigurator = new KafkaRetryDlqConfigurator();
+        configure(retryDlqConfigurator);
+        _retryDlqOptions = retryDlqConfigurator.Build();
     }
 
     internal KafkaTransportOptions Build()
@@ -53,6 +64,11 @@ internal sealed class KafkaConfigurator : IKafkaConfigurator
         if (_partitionAssignmentStrategy.HasValue)
         {
             options.ConsumerPartitionAssignmentStrategy = _partitionAssignmentStrategy.Value;
+        }
+
+        if (_retryDlqOptions is not null)
+        {
+            options.RetryDlq = _retryDlqOptions;
         }
 
         options.Validate();

@@ -261,9 +261,10 @@ public sealed class KafkaTransportAdapterTests
     }
 
     [Fact]
-    public async Task SettleAsync_Defer_ThrowsNotSupportedException()
+    public async Task SettleAsync_Defer_RetryDlqDisabled_ThrowsNotSupportedException()
     {
-        // Arrange — Defer is checked before consumer resolution
+        // Arrange — R1.2 back-compat: with the retry/DLQ pattern OFF (default), Defer is unsupported
+        // and is checked before consumer resolution.
         var adapter = new KafkaTransportAdapter(ValidOptions(), CreateLogger());
         var message = new InboundMessage(
             messageId: "msg-defer",
@@ -276,6 +277,34 @@ public sealed class KafkaTransportAdapterTests
 
         // Assert
         await act.Should().ThrowAsync<NotSupportedException>();
+    }
+
+    [Fact]
+    public async Task SettleAsync_Defer_RetryDlqEnabled_DoesNotThrowNotSupportedException()
+    {
+        // Arrange — R1.3: with the retry/DLQ pattern ON, Defer is routed (no longer NotSupported).
+        // The message has no active consumer, so it fails the consumer-resolution guard with a
+        // transport exception — proving Defer is NOT rejected as NotSupported anymore.
+        var options = new KafkaTransportOptions
+        {
+            BootstrapServers = "localhost:9092",
+            GroupId = "test-group",
+        };
+        options.RetryDlq.Enabled = true;
+        var adapter = new KafkaTransportAdapter(options, CreateLogger());
+        var message = new InboundMessage(
+            messageId: "msg-defer",
+            headers: new Dictionary<string, string> { ["BW-ConsumerId"] = "does-not-exist" },
+            body: ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1UL);
+
+        // Act
+        Func<Task> act = () => adapter.SettleAsync(SettlementAction.Defer, message);
+
+        // Assert — fails the consumer-resolution guard with a transport exception, proving Defer is
+        // routed rather than rejected as NotSupportedException.
+        (await act.Should().ThrowAsync<BareWireTransportException>())
+            .Which.Should().NotBeOfType<NotSupportedException>();
     }
 
     [Fact]

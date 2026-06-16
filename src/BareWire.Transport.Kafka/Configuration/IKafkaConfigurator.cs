@@ -52,4 +52,15 @@ public interface IKafkaConfigurator
     /// </summary>
     /// <param name="strategy">The <see cref="KafkaPartitionAssignmentStrategy"/> to apply.</param>
     void ConsumerPartitionAssignmentStrategy(KafkaPartitionAssignmentStrategy strategy);
+
+    /// <summary>
+    /// Configures the retry-topic + DLQ-topic pattern (R1.3, ADR-010). The pattern is opt-in —
+    /// call <see cref="IKafkaRetryDlqConfigurator.Enable"/> inside <paramref name="configure"/> to
+    /// activate it. When not configured (or not enabled), <c>SettleAsync(Defer)</c> throws
+    /// <see cref="NotSupportedException"/> and <c>SettleAsync(Reject)</c> logs and does not store
+    /// the offset (R1.2 behaviour).
+    /// </summary>
+    /// <param name="configure">A delegate that configures the pattern via <see cref="IKafkaRetryDlqConfigurator"/>.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="configure"/> is <see langword="null"/>.</exception>
+    void ConfigureRetryDlq(Action<IKafkaRetryDlqConfigurator> configure);
 }

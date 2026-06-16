@@ -54,6 +54,7 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     private readonly KafkaConsumerRegistry _registry;
     private readonly string _consumerId;
     private readonly string _topic;
+    private readonly bool _isRetryOrDlqTopic;
     private readonly ILogger _logger;
 
     private long _deliveryTagCounter;
@@ -67,7 +68,8 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         KafkaConsumerRegistry registry,
         string consumerId,
         string topic,
-        ILogger logger)
+        ILogger logger,
+        bool isRetryOrDlqTopic = false)
     {
         ArgumentNullException.ThrowIfNull(consumer);
         ArgumentNullException.ThrowIfNull(channel);
@@ -81,6 +83,7 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         _registry = registry;
         _consumerId = consumerId;
         _topic = topic;
+        _isRetryOrDlqTopic = isRetryOrDlqTopic;
         _logger = logger;
     }
 
@@ -319,7 +322,8 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
             kafkaHeaders,
             topic: result.Topic,
             partition: result.Partition.Value,
-            consumerId: _consumerId);
+            consumerId: _consumerId,
+            isRetryOrDlqTopic: _isRetryOrDlqTopic);
 
         string messageId = headers.TryGetValue("message-id", out string? mappedId) && !string.IsNullOrEmpty(mappedId)
             ? mappedId
@@ -341,29 +345,59 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Retry/DLQ tracking-header prefix (R1.3). These headers are stamped only by the library's own
+    /// republication producer onto the retry/DLQ topics — never legitimately present on a source
+    /// topic. They are stripped on source-topic consumption (SEC-1, ADR-010) so a producer to the
+    /// source topic cannot spoof the retry count, dead-letter status, reason, or original-topic
+    /// provenance.
+    /// </summary>
+    private static readonly string[] RetryDlqTrackingHeaders =
+        ["BW-RetryCount", "BW-RetryAt", "BW-OriginalTopic", "BW-DeadLettered", "BW-DeadLetterReason"];
+
+    /// <summary>
     /// Pure header-merge function: maps Kafka wire headers via <see cref="KafkaHeaderMapper.MapInbound"/>,
     /// then stamps BareWire routing headers (<c>BW-Topic</c>, <c>BW-Partition</c>,
-    /// <c>BW-ConsumerId</c>) using the indexer (last-write-wins, D5).
+    /// <c>BW-ConsumerId</c>) using the indexer (last-write-wins, D5). When the message was consumed
+    /// from a source topic (not a retry/DLQ topic), the retry/DLQ tracking-header prefix is stripped
+    /// first so a source-topic producer cannot spoof it (SEC-1, ADR-010).
     /// </summary>
     /// <remarks>
     /// Extracted as a <c>static internal</c> method so unit tests can verify the last-write-wins
-    /// override of a spoofed <c>BW-ConsumerId</c> wire header without needing a live broker.
+    /// override of a spoofed <c>BW-ConsumerId</c> wire header — and the SEC-1 strip of spoofed
+    /// retry/DLQ headers — without needing a live broker.
     /// </remarks>
     /// <param name="kafkaHeaders">The raw wire headers from the <c>ConsumeResult</c>.</param>
     /// <param name="topic">The Kafka topic name.</param>
     /// <param name="partition">The partition number from which the message was consumed.</param>
     /// <param name="consumerId">The BareWire consumer id to stamp.</param>
+    /// <param name="isRetryOrDlqTopic">
+    /// <see langword="true"/> when <paramref name="topic"/> is a retry/DLQ topic (where the
+    /// library's own retry/DLQ tracking headers are legitimate and must be preserved);
+    /// <see langword="false"/> for a source topic (where any retry/DLQ tracking header is
+    /// untrusted and is stripped — SEC-1).
+    /// </param>
     /// <returns>A merged header dictionary with BW-* values guaranteed to be authoritative.</returns>
     internal static Dictionary<string, string> MergeHeaders(
         Confluent.Kafka.Headers? kafkaHeaders,
         string topic,
         int partition,
-        string consumerId)
+        string consumerId,
+        bool isRetryOrDlqTopic = false)
     {
-        // Step 1: map all wire headers (may include attacker-supplied BW-ConsumerId).
+        // Step 1: map all wire headers (may include attacker-supplied BW-* headers).
         Dictionary<string, string> headers = KafkaHeaderMapper.MapInbound(kafkaHeaders);
 
-        // Step 2: overwrite with authoritative values AFTER the mapper (last-write-wins, D5).
+        // Step 2 (SEC-1): strip the retry/DLQ tracking-header prefix on source-topic consumption.
+        // On a retry/DLQ topic these were stamped by the library's own producer and are kept.
+        if (!isRetryOrDlqTopic)
+        {
+            foreach (string trackingHeader in RetryDlqTrackingHeaders)
+            {
+                headers.Remove(trackingHeader);
+            }
+        }
+
+        // Step 3: overwrite with authoritative values AFTER the mapper (last-write-wins, D5).
         headers["BW-Topic"] = topic;
         headers["BW-Partition"] = partition.ToString(System.Globalization.CultureInfo.InvariantCulture);
         headers["BW-ConsumerId"] = consumerId;

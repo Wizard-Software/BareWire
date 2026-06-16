@@ -117,6 +117,57 @@ public sealed class KafkaConfiguratorTests
         options.ConsumerPartitionAssignmentStrategy.Should().Be(KafkaPartitionAssignmentStrategy.CooperativeSticky);
     }
 
+    // ── ConfigureRetryDlq (R1.3) ──────────────────────────────────────────────
+
+    [Fact]
+    public void Build_WithoutConfigureRetryDlq_RetryDlqDisabledByDefault()
+    {
+        // Arrange — no ConfigureRetryDlq call (opt-in)
+        KafkaConfigurator configurator = WithBootstrap();
+
+        // Act
+        KafkaTransportOptions options = configurator.Build();
+
+        // Assert — default disabled instance
+        options.RetryDlq.Enabled.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Build_WithConfigureRetryDlqEnabled_PropagatesSettings()
+    {
+        // Arrange
+        KafkaConfigurator configurator = WithBootstrap();
+        configurator.ConfigureRetryDlq(r =>
+        {
+            r.Enable();
+            r.MaxRetries(5);
+            r.RetryTopicSuffix("-retry");
+            r.DlqTopicSuffix("-dlq");
+        });
+
+        // Act
+        KafkaTransportOptions options = configurator.Build();
+
+        // Assert
+        options.RetryDlq.Enabled.Should().BeTrue();
+        options.RetryDlq.MaxRetryCount.Should().Be(5);
+        options.RetryDlq.RetryTopicSuffix.Should().Be("-retry");
+        options.RetryDlq.DlqTopicSuffix.Should().Be("-dlq");
+    }
+
+    [Fact]
+    public void ConfigureRetryDlq_NullConfigure_ThrowsArgumentNullException()
+    {
+        // Arrange
+        KafkaConfigurator configurator = WithBootstrap();
+
+        // Act
+        Action act = () => configurator.ConfigureRetryDlq(null!);
+
+        // Assert
+        act.Should().Throw<ArgumentNullException>();
+    }
+
     // ── Build validation ──────────────────────────────────────────────────────
 
     [Fact]

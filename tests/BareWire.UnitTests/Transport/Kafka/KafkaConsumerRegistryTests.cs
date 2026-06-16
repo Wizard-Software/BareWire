@@ -143,6 +143,34 @@ public sealed class KafkaConsumerRegistryTests
         second.Should().BeNull();
     }
 
+    // ── PERF-1 (R1.3): offset map empty after the settle/republish eviction point ──
+    //
+    // SettleAsync evicts the DeliveryTag→TPO entry exactly once, BEFORE the routing switch, so
+    // every outcome (StoreOffset, NoStore, RepublishRetryThenStore, RepublishDlqThenStore) leaves
+    // the map empty for that tag. This guards the no-unbounded-buffers invariant for the new
+    // republish branches: a republished message must not leave a dangling offset-map entry.
+
+    [Fact]
+    public void TryEvictOffset_AfterStore_LeavesNoResidualEntryForTag()
+    {
+        // Arrange — store offsets for several tags (as the polling loop would)
+        var registry = new KafkaConsumerRegistry();
+        KafkaConsumer consumer = CreateFakeConsumer("c-perf1");
+        registry.Register("c-perf1", consumer);
+        registry.StoreOffset("c-perf1", 1UL, new TopicPartitionOffset("orders", 0, 10));
+        registry.StoreOffset("c-perf1", 2UL, new TopicPartitionOffset("orders", 1, 20));
+
+        // Act — evict tag 1 (the eviction point shared by every SettleAsync outcome, incl. republish)
+        TopicPartitionOffset? evicted = registry.TryEvictOffset("c-perf1", 1UL);
+
+        // Assert — tag 1 returned its TPO then is gone; re-evicting tag 1 returns null (no residual)
+        evicted.Should().NotBeNull();
+        registry.TryEvictOffset("c-perf1", 1UL).Should().BeNull(
+            "the republish/settle eviction point must leave no residual offset-map entry (PERF-1)");
+        // Unrelated tag 2 is unaffected — eviction is per-tag.
+        registry.TryEvictOffset("c-perf1", 2UL).Should().NotBeNull();
+    }
+
     // ── D1 CRITICAL: partition-collision test ─────────────────────────────────
     //
     // Two messages with the SAME Kafka offset on DIFFERENT partitions must receive

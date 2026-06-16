@@ -3,6 +3,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
+using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
 
@@ -152,7 +153,60 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         return results;
     }
 
-    // ConsumeAsync and SettleAsync are implemented in KafkaTransportAdapter.Consumer.cs (R1.2).
+    // ConsumeAsync and SettleAsync are implemented in KafkaTransportAdapter.Consumer.cs (R1.2/R1.3).
+
+    /// <summary>
+    /// Publishes a single retry/DLQ republication message, reusing the shared idempotent producer
+    /// (D3). Called by <see cref="RetryDlqPublisher"/> from the retry/DLQ producer (R1.3).
+    /// </summary>
+    /// <remarks>
+    /// Republication is a synchronous failure-path produce (<c>await ProduceAsync</c>) with
+    /// <c>Acks.All</c> + idempotence (ADR-008). It is intentionally NOT on the hot Ack path and is
+    /// excluded from the &gt;300K msgs/s throughput goal (ADR-009/ADR-010).
+    /// </remarks>
+    private async Task PublishRepublicationAsync(OutboundMessage message, CancellationToken cancellationToken)
+    {
+        await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+
+        byte[]? partitionKey = message.Headers.TryGetValue(PartitionKeyHeader, out string? keyValue)
+            ? Encoding.UTF8.GetBytes(keyValue)
+            : null;
+
+        byte[] body = message.Body.ToArray();
+        Headers kafkaHeaders = KafkaHeaderMapper.MapOutbound(message.Headers);
+
+        var kafkaMessage = new Message<byte[], byte[]>
+        {
+            Key = partitionKey!,
+            Value = body,
+            Headers = kafkaHeaders,
+        };
+
+        try
+        {
+            await _producer!.ProduceAsync(message.RoutingKey, kafkaMessage, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new BareWireTransportException(
+                message: $"Failed to republish message to retry/DLQ topic '{message.RoutingKey}'.",
+                transportName: TransportName,
+                endpointAddress: null,
+                innerException: ex);
+        }
+    }
+
+    /// <summary>
+    /// Adapter from <see cref="IRetryDlqPublisher"/> to <see cref="PublishRepublicationAsync"/>,
+    /// so the retry/DLQ producer (R1.3) can publish through the shared idempotent producer without
+    /// depending on the adapter type directly (D4 — keeps the producer unit-testable in isolation).
+    /// </summary>
+    private sealed class RetryDlqPublisher(KafkaTransportAdapter adapter) : IRetryDlqPublisher
+    {
+        public Task PublishAsync(OutboundMessage message, CancellationToken cancellationToken) =>
+            adapter.PublishRepublicationAsync(message, cancellationToken);
+    }
 
     /// <inheritdoc />
     /// <remarks>

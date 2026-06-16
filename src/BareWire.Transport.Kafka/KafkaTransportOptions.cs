@@ -1,4 +1,5 @@
 using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
 
 namespace BareWire.Transport.Kafka;
@@ -162,6 +163,17 @@ internal sealed class KafkaTransportOptions
     /// spurious rebalances when back-pressure slows the poll loop (D3).
     /// </summary>
     public int? MaxPollIntervalMs { get; set; }
+
+    // ── Retry-topic + DLQ-topic pattern (R1.3) ─────────────────────────────────
+
+    /// <summary>
+    /// Gets or sets the emulated retry-topic + DLQ-topic configuration (R1.3, ADR-010).
+    /// Kafka has no native DLQ; this drives republication of failed messages to a retry-topic
+    /// (with exponential backoff) or a DLQ-topic (on rejection / retry exhaustion).
+    /// Defaults to a disabled instance (<see cref="KafkaRetryDlqOptions.Enabled"/> = <see langword="false"/>)
+    /// so producer-only and R1.2-style consumer usage are unaffected (opt-in).
+    /// </summary>
+    public KafkaRetryDlqOptions RetryDlq { get; set; } = new();
 
     // ── Validation ────────────────────────────────────────────────────────────
 

@@ -18,6 +18,8 @@
     <InternalsVisibleTo Include="BareWire.UnitTests" />
     <InternalsVisibleTo Include="BareWire.IntegrationTests" />
     <InternalsVisibleTo Include="BareWire.ContractTests" />
+    <!-- Allows NSubstitute (Castle DynamicProxy) to mock internal interfaces, e.g. IRetryDlqPublisher (R1.3). -->
+    <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
   </ItemGroup>
 
 </Project>
