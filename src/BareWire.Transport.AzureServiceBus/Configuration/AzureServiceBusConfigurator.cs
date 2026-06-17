@@ -6,16 +6,38 @@ internal sealed class AzureServiceBusConfigurator : IAzureServiceBusConfigurator
     private int? _prefetchCount;
     private int? _maxConcurrentCalls;
 
+    // Auth mode fields (R2.4 — GAP-3: every field must be explicitly threaded through Build()).
+    private AzureServiceBusAuthMode _authMode = AzureServiceBusAuthMode.Sas;
+    private string? _fullyQualifiedNamespace;
+    private Azure.Core.TokenCredential? _credential;
+
     // Session fields (R2.2 — GAP-3: every field must be explicitly threaded through Build()).
     private bool _enableSessions;
     private int _maxConcurrentSessions = 1;
     private TimeSpan? _sessionIdleTimeout;
     private TimeSpan? _maxAutoLockRenewDuration;
 
+    public void UseSasAuth(string connectionString)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(connectionString);
+        _connectionString = connectionString;
+        _authMode = AzureServiceBusAuthMode.Sas;
+    }
+
     public void ConnectionString(string connectionString)
     {
         ArgumentException.ThrowIfNullOrEmpty(connectionString);
         _connectionString = connectionString;
+        _authMode = AzureServiceBusAuthMode.Sas;
+    }
+
+    public void UseEntraIdAuth(string fullyQualifiedNamespace, Azure.Core.TokenCredential credential)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(fullyQualifiedNamespace);
+        ArgumentNullException.ThrowIfNull(credential);
+        _fullyQualifiedNamespace = fullyQualifiedNamespace;
+        _credential = credential;
+        _authMode = AzureServiceBusAuthMode.EntraId;
     }
 
     public void PrefetchCount(int prefetchCount)
@@ -50,9 +72,22 @@ internal sealed class AzureServiceBusConfigurator : IAzureServiceBusConfigurator
     {
         var options = new AzureServiceBusTransportOptions();
 
+        // Auth mode fields — GAP-3: every new field MUST be explicitly wired here.
+        options.AuthMode = _authMode;
+
         if (_connectionString is not null)
         {
             options.ConnectionString = _connectionString;
+        }
+
+        if (_fullyQualifiedNamespace is not null)
+        {
+            options.FullyQualifiedNamespace = _fullyQualifiedNamespace;
+        }
+
+        if (_credential is not null)
+        {
+            options.Credential = _credential;
         }
 
         if (_prefetchCount.HasValue)

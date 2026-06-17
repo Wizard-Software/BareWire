@@ -5,14 +5,40 @@ namespace BareWire.Transport.AzureServiceBus.Configuration;
 /// Obtained via <see cref="ServiceCollectionExtensions.AddBareWireAzureServiceBus"/>.
 /// </summary>
 /// <remarks>
-/// R2.1: connection-string auth, prefetch count, and max concurrent calls.
-/// R2.2: session support — <see cref="UseSessions"/>, <see cref="SessionIdleTimeout"/>,
+/// <para>
+/// Authentication modes (R2.4):
+/// <list type="bullet">
+/// <item><see cref="UseSasAuth"/> — Shared Access Signature via connection string.</item>
+/// <item><see cref="UseEntraIdAuth"/> — Azure Entra ID via <see cref="Azure.Core.TokenCredential"/>.</item>
+/// <item><see cref="ConnectionString"/> — legacy alias for <see cref="UseSasAuth"/>, preserved for backward compatibility.</item>
+/// </list>
+/// </para>
+/// <para>
+/// Session support (R2.2): <see cref="UseSessions"/>, <see cref="SessionIdleTimeout"/>,
 /// <see cref="MaxAutoLockRenewDuration"/>.
-/// Full SAS token refresh and Azure Entra ID (<c>DefaultAzureCredential</c>) are deferred to R2.4.
-/// Native scheduled messages (R2.3) will extend this interface.
+/// </para>
+/// <para>
+/// Scheduling (R2.3): native scheduled messages via the Azure Service Bus broker.
+/// </para>
 /// </remarks>
 public interface IAzureServiceBusConfigurator
 {
+    /// <summary>
+    /// Configures SAS (Shared Access Signature) authentication via a connection string.
+    /// Sets <c>AuthMode = Sas</c>. Semantically equivalent to calling <see cref="ConnectionString"/>
+    /// and can be used interchangeably; <see cref="ConnectionString"/> is preserved for
+    /// backward compatibility.
+    /// </summary>
+    /// <param name="connectionString">
+    /// The Service Bus connection string containing the namespace endpoint and SAS credentials.
+    /// Format: <c>Endpoint=sb://&lt;namespace&gt;.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=...</c>
+    /// Must not be <see langword="null"/> or empty. Never logged or stored in diagnostic output.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="connectionString"/> is <see langword="null"/> or empty.
+    /// </exception>
+    void UseSasAuth(string connectionString);
+
     /// <summary>
     /// Configures the Azure Service Bus connection string (SAS connection string).
     /// Must be called before the bus is started.
@@ -25,7 +51,41 @@ public interface IAzureServiceBusConfigurator
     /// <exception cref="ArgumentException">
     /// Thrown when <paramref name="connectionString"/> is <see langword="null"/> or empty.
     /// </exception>
+    /// <remarks>
+    /// This method is preserved for backward compatibility with R2.1 code. New code should prefer
+    /// <see cref="UseSasAuth"/> for clarity. Both methods set <c>AuthMode = Sas</c> and
+    /// <c>ConnectionString</c> to the same value.
+    /// </remarks>
     void ConnectionString(string connectionString);
+
+    /// <summary>
+    /// Configures Azure Entra ID authentication via a <see cref="Azure.Core.TokenCredential"/>
+    /// against a fully-qualified namespace host. Sets <c>AuthMode = EntraId</c>.
+    /// </summary>
+    /// <param name="fullyQualifiedNamespace">
+    /// The fully-qualified Azure Service Bus namespace host.
+    /// Format: <c>&lt;namespace&gt;.servicebus.windows.net</c>.
+    /// Must not be <see langword="null"/> or empty. The namespace host is a non-secret identifier
+    /// and is safe to include in logs and diagnostic output.
+    /// </param>
+    /// <param name="credential">
+    /// The <see cref="Azure.Core.TokenCredential"/> used to authenticate. Must not be
+    /// <see langword="null"/>. Typically <c>new DefaultAzureCredential()</c> for Managed Identity
+    /// or local developer credential chain.
+    /// </param>
+    /// <remarks>
+    /// Token refresh is performed automatically by the Azure SDK
+    /// (<c>Azure.Messaging.ServiceBus</c> 7.x); BareWire does not implement its own refresh loop.
+    /// The credential object is never serialised, never logged, and never echoed in exception
+    /// messages — it is represented by type name only in diagnostic output.
+    /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="fullyQualifiedNamespace"/> is <see langword="null"/> or empty.
+    /// </exception>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="credential"/> is <see langword="null"/>.
+    /// </exception>
+    void UseEntraIdAuth(string fullyQualifiedNamespace, Azure.Core.TokenCredential credential);
 
     /// <summary>
     /// Configures the number of messages the receiver will pre-fetch from the broker.

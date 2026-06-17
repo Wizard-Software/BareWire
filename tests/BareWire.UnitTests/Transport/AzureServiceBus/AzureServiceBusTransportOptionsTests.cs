@@ -1,6 +1,8 @@
+using Azure.Core;
 using AwesomeAssertions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Transport.AzureServiceBus;
+using NSubstitute;
 using Xunit;
 
 namespace BareWire.UnitTests.Transport.AzureServiceBus;
@@ -112,6 +114,49 @@ public sealed class AzureServiceBusTransportOptionsTests
         // Assert — non-secret properties are visible for diagnostics.
         rendered.Should().Contain("PrefetchCount = 5");
         rendered.Should().Contain("MaxConcurrentCalls = 3");
+    }
+
+    // ── ToString — EntraId mode redaction (SEC-02/SEC-06) ────────────────────
+
+    [Fact]
+    public void ToString_EntraIdMode_RedactsSecretsAndShowsNamespace()
+    {
+        // Arrange
+        const string ns = "myns.servicebus.windows.net";
+        const string rawCs = "Endpoint=sb://other.servicebus.windows.net/;SharedAccessKeyName=k;SharedAccessKey=secret";
+        TokenCredential cred = Substitute.For<TokenCredential>();
+
+        var options = new AzureServiceBusTransportOptions
+        {
+            AuthMode = AzureServiceBusAuthMode.EntraId,
+            FullyQualifiedNamespace = ns,
+            Credential = cred,
+            ConnectionString = rawCs, // set but must appear only redacted
+            PrefetchCount = 5,
+        };
+
+        // Act
+        string rendered = options.ToString();
+
+        // Assert — SEC-02/SEC-06
+        // 1. Raw connection string must NOT appear.
+        rendered.Should().NotContain("SharedAccessKey=secret",
+            "the SAS key in the connection string must never appear in ToString()");
+
+        // 2. Redaction placeholder must be present.
+        rendered.Should().Contain("[Redacted]",
+            "ConnectionString is always shown as [Redacted]");
+
+        // 3. Namespace host (non-secret) must appear.
+        rendered.Should().Contain(ns,
+            "FullyQualifiedNamespace is a non-secret host identifier and must be visible");
+
+        // 4. Credential is shown by type name, never by object serialisation.
+        // NSubstitute creates a proxy type whose name contains the interface name.
+        rendered.Should().NotContain("System.Object",
+            "Credential must not be ToString()-serialised");
+        rendered.Should().Contain("Credential = ",
+            "the Credential field label must be present");
     }
 
     // ── Default values ────────────────────────────────────────────────────────

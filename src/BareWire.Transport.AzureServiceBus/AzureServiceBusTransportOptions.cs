@@ -8,24 +8,89 @@ namespace BareWire.Transport.AzureServiceBus;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Scope note (R2.1):</b> R2.1 supports only connection-string-based authentication.
-/// Full SAS token refresh and Azure Entra ID (<c>DefaultAzureCredential</c>) are deferred to R2.4.
+/// Two authentication modes are supported — selected by <see cref="AuthMode"/>:
+/// <list type="bullet">
+/// <item>
+/// <term><see cref="AzureServiceBusAuthMode.Sas"/> (default)</term>
+/// <description>
+/// Shared Access Signature via <see cref="ConnectionString"/>. Configure with
+/// <c>UseSasAuth(connectionString)</c> or the legacy <c>ConnectionString(connectionString)</c>
+/// method on the configurator.
+/// </description>
+/// </item>
+/// <item>
+/// <term><see cref="AzureServiceBusAuthMode.EntraId"/></term>
+/// <description>
+/// Azure Entra ID via <see cref="Credential"/> against <see cref="FullyQualifiedNamespace"/>.
+/// Configure with <c>UseEntraIdAuth(fullyQualifiedNamespace, credential)</c> on the configurator.
+/// Token refresh is handled automatically by the Azure SDK — BareWire does not implement its own
+/// refresh loop.
+/// </description>
+/// </item>
+/// </list>
 /// Azure Service Bus uses AMQP-over-TLS (port 5671) by default — no credential is transmitted
-/// in plaintext. Do not use this adapter against a production namespace until R2.4 is complete.
+/// in plaintext.
 /// </para>
 /// </remarks>
 internal sealed class AzureServiceBusTransportOptions
 {
     /// <summary>
+    /// Gets or sets the authentication mode used to connect to the Azure Service Bus namespace.
+    /// Defaults to <see cref="AzureServiceBusAuthMode.Sas"/> (connection-string SAS — R2.1 behaviour).
+    /// </summary>
+    /// <remarks>
+    /// Set via the configurator methods:
+    /// <list type="bullet">
+    /// <item><c>UseSasAuth(connectionString)</c> — sets <see cref="AzureServiceBusAuthMode.Sas"/>.</item>
+    /// <item><c>UseEntraIdAuth(fullyQualifiedNamespace, credential)</c> — sets <see cref="AzureServiceBusAuthMode.EntraId"/>.</item>
+    /// </list>
+    /// Token refresh in Entra ID mode is handled automatically by the Azure SDK
+    /// (<c>Azure.Messaging.ServiceBus</c> 7.x); BareWire does not implement its own refresh loop.
+    /// </remarks>
+    public AzureServiceBusAuthMode AuthMode { get; set; } = AzureServiceBusAuthMode.Sas;
+
+    /// <summary>
     /// Gets or sets the Service Bus connection string, including the SAS key.
     /// Format: <c>Endpoint=sb://&lt;namespace&gt;.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=...</c>
     /// </summary>
     /// <remarks>
+    /// <para>Used only when <see cref="AuthMode"/> is <see cref="AzureServiceBusAuthMode.Sas"/>.</para>
+    /// <para>
     /// <b>Security (SEC-02/SEC-06):</b> This property contains a secret (<c>SharedAccessKey</c>).
     /// It is never logged, never included in <see cref="ToString"/>, and never echoed in exception
     /// messages. See <see cref="ToString"/> for the redacted representation.
+    /// </para>
     /// </remarks>
     public string ConnectionString { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the fully-qualified Azure Service Bus namespace host name.
+    /// Format: <c>&lt;namespace&gt;.servicebus.windows.net</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>Used only when <see cref="AuthMode"/> is <see cref="AzureServiceBusAuthMode.EntraId"/>.</para>
+    /// <para>
+    /// The namespace host is a non-secret identifier (it contains no key or token) and is safe
+    /// to include in logs and diagnostic output.
+    /// </para>
+    /// </remarks>
+    public string FullyQualifiedNamespace { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Gets or sets the <see cref="Azure.Core.TokenCredential"/> used to authenticate against
+    /// the Azure Service Bus namespace.
+    /// </summary>
+    /// <remarks>
+    /// <para>Used only when <see cref="AuthMode"/> is <see cref="AzureServiceBusAuthMode.EntraId"/>.</para>
+    /// <para>
+    /// <b>Security (SEC-02/SEC-06):</b> The credential object is never serialised, never logged,
+    /// and never echoed in exception messages. <see cref="ToString"/> represents it by type name
+    /// only (<c>Credential?.GetType().Name</c>). Token refresh is performed automatically by the
+    /// Azure SDK (<c>Azure.Messaging.ServiceBus</c> 7.x); BareWire does not implement its own
+    /// refresh loop.
+    /// </para>
+    /// </remarks>
+    public Azure.Core.TokenCredential? Credential { get; set; }
 
     /// <summary>
     /// Gets or sets the number of messages the Service Bus receiver will pre-fetch from the broker
@@ -117,12 +182,22 @@ internal sealed class AzureServiceBusTransportOptions
     public TimeSpan MaxAutoLockRenewDuration { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Returns a diagnostic representation of these options with the <see cref="ConnectionString"/>
-    /// redacted as <c>[Redacted]</c> to prevent accidental secret exposure in logs, exception
-    /// messages, and diagnostic output (SEC-02/SEC-06).
+    /// Returns a diagnostic representation of these options with secrets redacted to prevent
+    /// accidental secret exposure in logs, exception messages, and diagnostic output (SEC-02/SEC-06).
     /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><see cref="ConnectionString"/> is always shown as <c>[Redacted]</c>.</item>
+    /// <item><see cref="Credential"/> is shown as its runtime type name (e.g. <c>DefaultAzureCredential</c>)
+    /// or <c>null</c> — never the object itself.</item>
+    /// <item><see cref="FullyQualifiedNamespace"/> is shown as-is — it is a non-secret host identifier.</item>
+    /// </list>
+    /// </remarks>
     public override string ToString() =>
-        $"AzureServiceBusTransportOptions {{ ConnectionString = [Redacted], PrefetchCount = {PrefetchCount}, " +
+        $"AzureServiceBusTransportOptions {{ AuthMode = {AuthMode}, ConnectionString = [Redacted], " +
+        $"FullyQualifiedNamespace = {FullyQualifiedNamespace}, " +
+        $"Credential = {Credential?.GetType().Name ?? "null"}, " +
+        $"PrefetchCount = {PrefetchCount}, " +
         $"MaxConcurrentCalls = {MaxConcurrentCalls}, EnableSessions = {EnableSessions}, " +
         $"MaxConcurrentSessions = {MaxConcurrentSessions}, " +
         $"SessionIdleTimeout = {SessionIdleTimeout?.ToString() ?? "null"}, " +
@@ -132,22 +207,58 @@ internal sealed class AzureServiceBusTransportOptions
     /// Validates this options instance, throwing <see cref="BareWireConfigurationException"/>
     /// when required values are missing or invalid.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Validation is mode-aware:
+    /// <list type="bullet">
+    /// <item>
+    /// <see cref="AzureServiceBusAuthMode.Sas"/> — <see cref="ConnectionString"/> must be non-empty.
+    /// </item>
+    /// <item>
+    /// <see cref="AzureServiceBusAuthMode.EntraId"/> — <see cref="FullyQualifiedNamespace"/> must
+    /// be non-empty <b>and</b> <see cref="Credential"/> must not be <see langword="null"/>.
+    /// <see cref="ConnectionString"/> is not validated and should be left empty.
+    /// </item>
+    /// </list>
+    /// </para>
+    /// </remarks>
     /// <exception cref="BareWireConfigurationException">
-    /// Thrown when <see cref="ConnectionString"/> is <see langword="null"/> or empty,
-    /// <see cref="MaxConcurrentSessions"/> is less than 1,
-    /// <see cref="SessionIdleTimeout"/> is set and not positive, or
-    /// <see cref="MaxAutoLockRenewDuration"/> is negative.
-    /// The exception message does not echo the connection string value (SEC-02).
+    /// Thrown when required values are missing or out of range. Exception messages never echo
+    /// secrets (SEC-02): <see cref="ConnectionString"/> and <see cref="Credential"/> are never
+    /// included in exception detail.
     /// </exception>
     public void Validate()
     {
-        if (string.IsNullOrEmpty(ConnectionString))
+        if (AuthMode == AzureServiceBusAuthMode.Sas)
         {
-            throw new BareWireConfigurationException(
-                optionName: nameof(ConnectionString),
-                optionValue: string.Empty,
-                expectedValue: "A non-empty Azure Service Bus connection string " +
-                               "(Endpoint=sb://<namespace>.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=...)");
+            if (string.IsNullOrEmpty(ConnectionString))
+            {
+                throw new BareWireConfigurationException(
+                    optionName: nameof(ConnectionString),
+                    optionValue: string.Empty,
+                    expectedValue: "A non-empty Azure Service Bus connection string " +
+                                   "(Endpoint=sb://<namespace>.servicebus.windows.net/;SharedAccessKeyName=...;SharedAccessKey=...)");
+            }
+        }
+        else // AzureServiceBusAuthMode.EntraId
+        {
+            if (string.IsNullOrEmpty(FullyQualifiedNamespace))
+            {
+                throw new BareWireConfigurationException(
+                    optionName: nameof(FullyQualifiedNamespace),
+                    optionValue: string.Empty,
+                    expectedValue: "A non-empty Azure Service Bus fully-qualified namespace host " +
+                                   "(e.g. myns.servicebus.windows.net)");
+            }
+
+            if (Credential is null)
+            {
+                throw new BareWireConfigurationException(
+                    optionName: nameof(Credential),
+                    optionValue: string.Empty,
+                    expectedValue: "A non-null Azure.Core.TokenCredential instance " +
+                                   "(e.g. new DefaultAzureCredential())");
+            }
         }
 
         if (MaxConcurrentSessions < 1)

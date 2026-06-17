@@ -13,7 +13,7 @@ namespace BareWire.Transport.AzureServiceBus;
 
 /// <summary>
 /// Azure Service Bus transport adapter. Implements producer (<see cref="SendBatchAsync"/>),
-/// topology deployment (<see cref="DeployTopologyAsync"/>), and lifecycle management (R2.1).
+/// topology deployment (<see cref="DeployTopologyAsync"/>), and lifecycle management.
 /// Consumer side (<see cref="ConsumeAsync"/>, <see cref="SettleAsync"/>) is implemented in
 /// <c>AzureServiceBusTransportAdapter.Consumer.cs</c>.
 /// </summary>
@@ -31,15 +31,33 @@ namespace BareWire.Transport.AzureServiceBus;
 /// <b>Capabilities note (R-1):</b> <see cref="TransportCapabilities.Sessions"/> and
 /// <see cref="TransportCapabilities.NativeScheduling"/> are declared in <see cref="Capabilities"/>
 /// because the ASB broker natively supports these features. Full BareWire-level support (session
-/// receivers, session-id mapping) arrives in R2.2. Native scheduling (<c>ScheduleMessageAsync</c>)
-/// is implemented in R2.3. There is no public surface for the R2.2 session capability
-/// in R2.1 — a caller cannot invoke the unimplemented path.
+/// receivers, session-id mapping) is implemented in R2.2. Native scheduling
+/// (<c>ScheduleMessageAsync</c>) is implemented in R2.3.
 /// </para>
 /// <para>
-/// <b>Auth note (R2.1):</b> Only SAS connection-string authentication is supported.
+/// <b>Authentication (R2.4):</b> Two auth modes are supported, selected via
+/// <c>IAzureServiceBusConfigurator</c>:
+/// <list type="bullet">
+/// <item>
+/// <term>SAS (default)</term>
+/// <description>
+/// Connection-string SAS — <c>UseSasAuth(connectionString)</c>. The connection string is passed
+/// directly to the SDK and never logged (SEC-02/SEC-03).
+/// </description>
+/// </item>
+/// <item>
+/// <term>Entra ID</term>
+/// <description>
+/// Azure RBAC / Managed Identity — <c>UseEntraIdAuth(fullyQualifiedNamespace, credential)</c>.
+/// A <see cref="Azure.Core.TokenCredential"/> is passed to the SDK constructor; token refresh
+/// is handled automatically by the Azure SDK — BareWire does not implement its own refresh loop.
+/// The credential object is never logged or serialised (SEC-02/SEC-06); only the namespace host
+/// (a non-secret identifier) appears in diagnostic output.
+/// </description>
+/// </item>
+/// </list>
 /// Azure Service Bus uses AMQP-over-TLS (port 5671) by default — no credential is transmitted
-/// in plaintext. Full token refresh and Entra ID (<c>DefaultAzureCredential</c>) support is
-/// deferred to R2.4.
+/// in plaintext.
 /// </para>
 /// </remarks>
 internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapter, INativeMessageScheduler, IAsyncDisposable
@@ -298,12 +316,21 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
                 return;
             }
 
-            // SEC-02/SEC-03: connection string is passed directly to the SDK — never logged.
-            // The SDK exposes FullyQualifiedNamespace (host without the key) after construction.
-            _client = new ServiceBusClient(_options.ConnectionString);
+            // SEC-02/SEC-03: secrets are never logged.
+            // Branch on auth mode — both SDK constructors accept the same ServiceBusClientOptions.
+            _client = _options.AuthMode switch
+            {
+                AzureServiceBusAuthMode.EntraId =>
+                    // Entra ID: namespace host + TokenCredential (automatic token refresh by SDK).
+                    new ServiceBusClient(_options.FullyQualifiedNamespace, _options.Credential!),
+                _ =>
+                    // SAS: connection string passed directly to the SDK, never logged.
+                    // The SDK exposes FullyQualifiedNamespace (host without the key) after construction.
+                    new ServiceBusClient(_options.ConnectionString),
+            };
 
             // Log only the non-secret namespace host (FullyQualifiedNamespace, which the SDK
-            // exposes separately from the SAS key — safe to include in diagnostics).
+            // exposes separately from any key/token — safe to include in diagnostics).
             LogClientCreated(_client.FullyQualifiedNamespace);
         }
         finally
@@ -328,8 +355,18 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
                 return;
             }
 
-            // SEC-02: connection string not logged — only the derived namespace host is safe.
-            _adminClient = new ServiceBusAdministrationClient(_options.ConnectionString);
+            // SEC-02: secrets are never logged.
+            // Branch on auth mode — both SDK constructors accept the same ServiceBusAdministrationClientOptions.
+            _adminClient = _options.AuthMode switch
+            {
+                AzureServiceBusAuthMode.EntraId =>
+                    // Entra ID: namespace host + TokenCredential (automatic token refresh by SDK).
+                    new ServiceBusAdministrationClient(_options.FullyQualifiedNamespace, _options.Credential!),
+                _ =>
+                    // SAS: connection string not logged — only the derived namespace host is safe.
+                    new ServiceBusAdministrationClient(_options.ConnectionString),
+            };
+
             LogAdminClientCreated();
         }
         finally

@@ -25,6 +25,40 @@ builder.Services.AddBareWireAzureServiceBus(asb =>
 
 > The connection string contains a SAS `SharedAccessKey` (a secret). It is never logged, never included in `ToString()`, and never echoed in exception messages.
 
+## Authentication
+
+BareWire supports two authentication modes for the Azure Service Bus transport.
+
+### SAS (Shared Access Signature) — default
+
+Use a connection string containing a SAS key. Suitable for local development and environments without Managed Identity.
+
+```csharp
+builder.Services.AddBareWireAzureServiceBus(asb =>
+{
+    asb.UseSasAuth("Endpoint=sb://myns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=...");
+});
+```
+
+The legacy `ConnectionString(...)` method is preserved for backward compatibility and is equivalent to `UseSasAuth(...)`.
+
+### Entra ID (Azure RBAC / Managed Identity)
+
+Use a `TokenCredential` against the fully-qualified namespace host. Recommended for production workloads with Managed Identity or Azure RBAC.
+
+```csharp
+using Azure.Identity;
+
+builder.Services.AddBareWireAzureServiceBus(asb =>
+{
+    asb.UseEntraIdAuth("myns.servicebus.windows.net", new DefaultAzureCredential());
+});
+```
+
+The `TokenCredential` performs automatic token refresh — BareWire does not implement its own refresh loop. The credential object is never logged or serialised; only the namespace host (a non-secret identifier) appears in diagnostic output.
+
+> **Tip:** Assign the `Azure Service Bus Data Owner` (or `Data Sender` / `Data Receiver`) role to the Managed Identity on the namespace or individual queues/topics in Azure IAM.
+
 ## Sessions (R2.2)
 
 Azure Service Bus sessions provide **FIFO ordering per `SessionId`**. BareWire maps a session per correlation/saga instance and processes each session's messages in order.
