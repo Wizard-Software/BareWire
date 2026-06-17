@@ -13,10 +13,19 @@ public sealed class ScheduleProviderFactoryTests
 {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static ITransportAdapter CreateTransportAdapter()
+    // A transport that does NOT implement INativeMessageScheduler (e.g. RabbitMQ)
+    private static ITransportAdapter CreateNonNativeTransport()
     {
         var adapter = Substitute.For<ITransportAdapter>();
         adapter.TransportName.Returns("RabbitMQ");
+        return adapter;
+    }
+
+    // A transport that implements INativeMessageScheduler (e.g. Azure Service Bus)
+    private static ITransportAdapter CreateNativeTransport()
+    {
+        var adapter = Substitute.For<ITransportAdapter, INativeMessageScheduler>();
+        adapter.TransportName.Returns("AzureServiceBus");
         return adapter;
     }
 
@@ -33,49 +42,58 @@ public sealed class ScheduleProviderFactoryTests
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void Create_Auto_ReturnsDelayRequeueProvider()
+    public void Create_Auto_NonNativeTransport_ReturnsDelayRequeueProvider()
     {
-        var transport = CreateTransportAdapter();
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
+        var transport = CreateNonNativeTransport();
 
-        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.Auto, transport, loggerFactory, serializer);
+        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.Auto, transport, CreateLoggerFactory(), CreateSerializer());
 
         provider.Should().BeOfType<DelayRequeueScheduleProvider>();
+    }
+
+    [Fact]
+    public void Create_Auto_NativeTransport_ReturnsTransportNativeProvider()
+    {
+        var transport = CreateNativeTransport();
+
+        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.Auto, transport, CreateLoggerFactory(), CreateSerializer());
+
+        provider.Should().BeOfType<TransportNativeScheduleProvider>();
     }
 
     [Fact]
     public void Create_DelayRequeue_ReturnsDelayRequeueProvider()
     {
-        var transport = CreateTransportAdapter();
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
-
-        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.DelayRequeue, transport, loggerFactory, serializer);
+        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.DelayRequeue, CreateNonNativeTransport(), CreateLoggerFactory(), CreateSerializer());
 
         provider.Should().BeOfType<DelayRequeueScheduleProvider>();
     }
 
     [Fact]
-    public void Create_TransportNative_ThrowsNotSupportedException()
+    public void Create_TransportNative_WithNativeTransport_ReturnsTransportNativeProvider()
     {
-        var transport = CreateTransportAdapter();
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
+        var transport = CreateNativeTransport();
 
-        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.TransportNative, transport, loggerFactory, serializer);
+        var provider = ScheduleProviderFactory.Create(SchedulingStrategy.TransportNative, transport, CreateLoggerFactory(), CreateSerializer());
 
-        act.Should().Throw<NotSupportedException>();
+        provider.Should().BeOfType<TransportNativeScheduleProvider>();
+    }
+
+    [Fact]
+    public void Create_TransportNative_WithNonNativeTransport_ThrowsDescriptiveNotSupportedException()
+    {
+        var transport = CreateNonNativeTransport();
+
+        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.TransportNative, transport, CreateLoggerFactory(), CreateSerializer());
+
+        act.Should().Throw<NotSupportedException>()
+            .WithMessage("*RabbitMQ*");
     }
 
     [Fact]
     public void Create_ExternalScheduler_ThrowsNotSupportedException()
     {
-        var transport = CreateTransportAdapter();
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
-
-        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.ExternalScheduler, transport, loggerFactory, serializer);
+        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.ExternalScheduler, CreateNonNativeTransport(), CreateLoggerFactory(), CreateSerializer());
 
         act.Should().Throw<NotSupportedException>();
     }
@@ -83,11 +101,7 @@ public sealed class ScheduleProviderFactoryTests
     [Fact]
     public void Create_DelayTopic_ThrowsNotSupportedException()
     {
-        var transport = CreateTransportAdapter();
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
-
-        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.DelayTopic, transport, loggerFactory, serializer);
+        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.DelayTopic, CreateNonNativeTransport(), CreateLoggerFactory(), CreateSerializer());
 
         act.Should().Throw<NotSupportedException>();
     }
@@ -95,10 +109,7 @@ public sealed class ScheduleProviderFactoryTests
     [Fact]
     public void Create_NullTransport_ThrowsArgumentNullException()
     {
-        var loggerFactory = CreateLoggerFactory();
-        var serializer = CreateSerializer();
-
-        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.Auto, null!, loggerFactory, serializer);
+        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.Auto, null!, CreateLoggerFactory(), CreateSerializer());
 
         act.Should().Throw<ArgumentNullException>();
     }
@@ -106,11 +117,38 @@ public sealed class ScheduleProviderFactoryTests
     [Fact]
     public void Create_NullLoggerFactory_ThrowsArgumentNullException()
     {
-        var transport = CreateTransportAdapter();
-        var serializer = CreateSerializer();
-
-        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.Auto, transport, null!, serializer);
+        Action act = () => ScheduleProviderFactory.Create(SchedulingStrategy.Auto, CreateNonNativeTransport(), null!, CreateSerializer());
 
         act.Should().Throw<ArgumentNullException>();
+    }
+
+    /// <summary>
+    /// PERF-1 verification: a custom maxTokens passed to Create flows through to the
+    /// TransportNativeScheduleProvider and enforces the cap (schedule 3 messages with
+    /// maxTokens: 2 — TokenCount must not exceed 2).
+    /// </summary>
+    [Fact]
+    public async Task Create_TransportNative_WithCustomMaxTokens_CapIsHonored()
+    {
+        const int customMax = 2;
+        var transport = CreateNativeTransport();
+        var nativeScheduler = (INativeMessageScheduler)transport;
+        nativeScheduler.ScheduleAsync(Arg.Any<OutboundMessage>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(new ScheduledMessageToken(1L, "q"));
+
+        var provider = ScheduleProviderFactory.Create(
+            SchedulingStrategy.TransportNative, transport, CreateLoggerFactory(), CreateSerializer(),
+            maxTokens: customMax);
+
+        var nativeProvider = provider.Should().BeOfType<TransportNativeScheduleProvider>().Subject;
+
+        // Schedule 3 messages against a cap of 2 — oldest is evicted on the 3rd insert
+        for (int i = 0; i < customMax + 1; i++)
+        {
+            await nativeProvider.ScheduleAsync(
+                new object(), TimeSpan.FromMinutes(i + 1), "q", Guid.NewGuid());
+        }
+
+        nativeProvider.TokenCount.Should().Be(customMax);
     }
 }
