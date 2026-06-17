@@ -47,6 +47,7 @@ public sealed class ArchitectureRuleTests
             "BareWire.Saga",
             "BareWire.Outbox",
             "BareWire.Serialization.Json",
+            "BareWire.Serialization.MsgPack",
             "BareWire.Testing",
             "BareWire.Interop.MassTransit",
         ];
@@ -117,6 +118,36 @@ public sealed class ArchitectureRuleTests
 
         resultTransport.IsSuccessful.Should().BeTrue(
             resultTransport.FailingTypeNames is { Count: > 0 } tNames ? tNames[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 3b: Serialization.MsgPack must NOT depend on Core or Transport
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void MsgPack_ShouldNotDependOn_CoreOrTransport()
+    {
+        var assembly = GetAssembly("BareWire.Serialization.MsgPack");
+
+        AssertNoDependencyOnCore(assembly);
+
+        string[] forbiddenTransports =
+        [
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Transport.Kafka",
+            "BareWire.Transport.AzureServiceBus",
+        ];
+
+        foreach (var dep in forbiddenTransports)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(dep)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+        }
     }
 
     // -------------------------------------------------------------------------
