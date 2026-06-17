@@ -71,7 +71,7 @@ Azure Service Bus sessions provide **FIFO ordering per `SessionId`**. BareWire m
 - **SAGA integration** — the same `CorrelationId` → same `SessionId` → joint FIFO processing per saga (mechanism only; full session-state persistence of saga machine state is out of scope — see **ADR-011**). The transport depends on `BareWire.Abstractions` only; the SAGA bridge is a header convention, never a project reference.
 - **Security note** — a session is an **ordering** boundary, **not** an isolation/authorization boundary. `SessionId` derives from an unauthenticated header (raw-first); cross-session injection ("session squatting") is a known, accepted risk. Tenant isolation depends on SAS/Entra authorization (R2.4), not on sessions. See **ADR-011**.
 
-Full FIFO behaviour (real broker, end-to-end ordering, session-lock renewal under load) is validated by the integration tests in **R2.5**; R2.2 ships broker-free unit tests for the pure mapping, options, topology, channel-ordering and accept-gate invariants.
+Full FIFO behaviour (real broker, end-to-end ordering, session-lock renewal under load) is covered by the **R2.5** integration test suite (`BareWire.IntegrationTests`, trait `Category=AzureServiceBus`), gated on the `BAREWIRE_ASB_CONNECTION_STRING` environment variable and skipped cleanly when no broker is configured; R2.2 ships broker-free unit tests for the pure mapping, options, topology, channel-ordering and accept-gate invariants.
 
 ## Features
 
@@ -89,7 +89,7 @@ Full FIFO behaviour (real broker, end-to-end ordering, session-lock renewal unde
 
 `NativeDeduplication | Sessions | NativeScheduling | DlqNative`
 
-> **Note:** `Sessions` (ordered processing per `SessionId`) is implemented as of **R2.2** (see the **Sessions** section above; full end-to-end FIFO is validated by the R2.5 integration tests). `NativeScheduling` (native scheduled messages) arrives in **R2.3**. Authentication beyond a SAS connection string (Entra ID / `DefaultAzureCredential` with token refresh) arrives in **R2.4**.
+> **Note:** `Sessions` (ordered processing per `SessionId`) is implemented as of **R2.2** (see the **Sessions** section above; full end-to-end FIFO is covered by the R2.5 integration test suite, gated on `BAREWIRE_ASB_CONNECTION_STRING`). `NativeScheduling` (native scheduled messages) arrives in **R2.3**. Authentication beyond a SAS connection string (Entra ID / `DefaultAzureCredential` with token refresh) arrives in **R2.4**. End-to-end coverage for all of the above (publish/consume, sessions, scheduled messages + cancel, DLQ, Entra ID config) ships in **R2.5**.
 
 ## Documentation
 
