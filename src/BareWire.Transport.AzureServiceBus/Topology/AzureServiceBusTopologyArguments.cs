@@ -12,7 +12,8 @@ namespace BareWire.Transport.AzureServiceBus.Topology;
 internal readonly record struct AzureServiceBusQueueSpec(
     int MaxDeliveryCount,
     TimeSpan LockDuration,
-    bool RequiresDuplicateDetection);
+    bool RequiresDuplicateDetection,
+    bool RequiresSession);
 
 /// <summary>
 /// Constant argument keys recognised by the Azure Service Bus transport adapter and the
@@ -42,15 +43,24 @@ internal static class AzureServiceBusTopologyArguments
     internal const string RequiresDuplicateDetection = "bw.asb.requires-duplicate-detection";
 
     /// <summary>
+    /// Argument key for enabling session-based (FIFO per <c>SessionId</c>) processing on the queue.
+    /// Value: <c>bool</c> or <c>"true"</c>/<c>"false"</c>, default: <see langword="false"/>.
+    /// When <see langword="true"/>, the queue is created with <c>RequiresSession = true</c>.
+    /// This property cannot be changed after the queue is created — declare it up-front.
+    /// </summary>
+    internal const string RequiresSession = "bw.asb.requires-session";
+
+    /// <summary>
     /// Parses <see cref="QueueDeclaration.Arguments"/> into an <see cref="AzureServiceBusQueueSpec"/>.
     /// When <paramref name="queue"/> has no <c>Arguments</c>, returns defaults
-    /// (10 max-delivery-count, 30-second lock, no duplicate detection).
+    /// (10 max-delivery-count, 30-second lock, no duplicate detection, no sessions).
     /// </summary>
     /// <param name="queue">The queue declaration to parse.</param>
     /// <returns>An <see cref="AzureServiceBusQueueSpec"/> with the extracted or default values.</returns>
     /// <exception cref="BareWireConfigurationException">
-    /// Thrown when <c>bw.asb.max-delivery-count</c> is not a valid positive integer, or
-    /// <c>bw.asb.lock-duration</c> is not a parseable <see cref="TimeSpan"/> or ISO-8601 duration.
+    /// Thrown when <c>bw.asb.max-delivery-count</c> is not a valid positive integer,
+    /// <c>bw.asb.lock-duration</c> is not a parseable <see cref="TimeSpan"/> or ISO-8601 duration, or
+    /// <c>bw.asb.requires-session</c> is not a parseable boolean.
     /// </exception>
     internal static AzureServiceBusQueueSpec Parse(QueueDeclaration queue)
     {
@@ -64,6 +74,7 @@ internal static class AzureServiceBusTopologyArguments
         int maxDeliveryCount = 10;
         TimeSpan lockDuration = TimeSpan.FromSeconds(30);
         bool requiresDuplicateDetection = false;
+        bool requiresSession = false;
 
         foreach ((string key, object value) in args)
         {
@@ -86,14 +97,18 @@ internal static class AzureServiceBusTopologyArguments
             {
                 requiresDuplicateDetection = ParseBool(key, value);
             }
+            else if (key == RequiresSession)
+            {
+                requiresSession = ParseBool(key, value);
+            }
             // Unknown BW argument keys are silently ignored (forward-compatible).
         }
 
-        return new AzureServiceBusQueueSpec(maxDeliveryCount, lockDuration, requiresDuplicateDetection);
+        return new AzureServiceBusQueueSpec(maxDeliveryCount, lockDuration, requiresDuplicateDetection, requiresSession);
     }
 
     private static AzureServiceBusQueueSpec DefaultSpec() =>
-        new(MaxDeliveryCount: 10, LockDuration: TimeSpan.FromSeconds(30), RequiresDuplicateDetection: false);
+        new(MaxDeliveryCount: 10, LockDuration: TimeSpan.FromSeconds(30), RequiresDuplicateDetection: false, RequiresSession: false);
 
     private static int ParseInt32(string key, object value)
     {

@@ -124,6 +124,15 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
             // Apply BareWire headers to ApplicationProperties.
             AzureServiceBusHeaderMapper.MapOutbound(outbound.Headers, sbMessage);
 
+            // R2.2: resolve SessionId from BW-SessionId header (priority) or correlation-id
+            // fallback (D-1/D-13). When neither is present, leave SessionId unset (R2.1 behaviour).
+            string? resolvedSessionId = AzureServiceBusSessionMapper.Resolve(outbound.Headers);
+            if (!string.IsNullOrEmpty(resolvedSessionId))
+            {
+                sbMessage.SessionId = resolvedSessionId;
+                LogSessionIdResolved(resolvedSessionId, outbound.RoutingKey);
+            }
+
             // Propagate content-type if available.
             if (!string.IsNullOrEmpty(outbound.ContentType))
             {
@@ -177,6 +186,7 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
                 MaxDeliveryCount = spec.MaxDeliveryCount,
                 LockDuration = spec.LockDuration,
                 RequiresDuplicateDetection = spec.RequiresDuplicateDetection,
+                RequiresSession = spec.RequiresSession,
             };
 
             try
@@ -227,11 +237,24 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
 
         _disposed = true;
 
-        // Stop all active consumers BEFORE disposing the client.
+        // Stop all active non-session consumers BEFORE disposing the client.
         foreach (AzureServiceBusConsumer consumer in _consumerRegistry.AllConsumers())
         {
             await consumer.StopAsync().ConfigureAwait(false);
             await consumer.DisposeAsync().ConfigureAwait(false);
+        }
+
+        // Stop all active session consumers (R2.2).
+        AzureServiceBusSessionConsumer[] sessionConsumersSnapshot;
+        lock (_sessionConsumersLock)
+        {
+            sessionConsumersSnapshot = [.. _sessionConsumers];
+        }
+
+        foreach (AzureServiceBusSessionConsumer sessionConsumer in sessionConsumersSnapshot)
+        {
+            await sessionConsumer.StopAsync().ConfigureAwait(false);
+            await sessionConsumer.DisposeAsync().ConfigureAwait(false);
         }
 
         // Dispose all cached senders.
@@ -347,4 +370,8 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
     [LoggerMessage(Level = LogLevel.Information,
         Message = "Azure Service Bus topology deploy: binding '{SourceName}' -> '{DestinationName}' skipped — ASB has no binding concept.")]
     private partial void LogBindingSkipped(string sourceName, string destinationName);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Azure Service Bus produce: resolved SessionId='{SessionId}' for queue/topic '{RoutingKey}'.")]
+    private partial void LogSessionIdResolved(string sessionId, string routingKey);
 }

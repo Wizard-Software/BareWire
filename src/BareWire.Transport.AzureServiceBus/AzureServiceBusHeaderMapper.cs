@@ -9,6 +9,31 @@ namespace BareWire.Transport.AzureServiceBus;
 internal sealed class AzureServiceBusHeaderMapper
 {
     /// <summary>
+    /// The BareWire header key used to carry the Azure Service Bus <c>SessionId</c> field
+    /// on both the produce path (override via <c>BW-SessionId</c> header) and the consume path
+    /// (stamped by <c>AzureServiceBusSessionConsumer</c> after <c>MapInbound</c>).
+    /// </summary>
+    /// <remarks>
+    /// On the produce path the session resolver checks this header first, then falls back to
+    /// <see cref="CorrelationIdHeader"/>. On the consume path the value is stamped after
+    /// <c>MapInbound</c> so it cannot be spoofed from <c>ApplicationProperties</c>.
+    /// </remarks>
+    internal const string SessionIdHeader = "BW-SessionId";
+
+    /// <summary>
+    /// The canonical BareWire correlation-id header key (kebab-case, as populated by the bus).
+    /// Used as a fallback source for <see cref="ServiceBusMessage.SessionId"/> on the produce path
+    /// when <see cref="SessionIdHeader"/> is absent, enabling automatic per-saga-instance FIFO
+    /// ordering without explicit header setting.
+    /// </summary>
+    /// <remarks>
+    /// This key is kebab-case (<c>"correlation-id"</c>) matching how <c>BareWireBus</c> populates
+    /// the header. The PascalCase form (<c>"CorrelationId"</c>) is a known pre-existing latent bug
+    /// in <c>PartitionerMiddleware</c> and is out of scope for R2.2.
+    /// </remarks>
+    internal const string CorrelationIdHeader = "correlation-id";
+
+    /// <summary>
     /// Copies all entries from <paramref name="bareWireHeaders"/> into the
     /// <see cref="ServiceBusMessage.ApplicationProperties"/> dictionary of the given
     /// <paramref name="message"/>. Never returns <see langword="null"/>.
