@@ -227,6 +227,24 @@ public sealed class ArchitectureRuleTests
 
         resultObservability.IsSuccessful.Should().BeTrue(
             resultObservability.FailingTypeNames is { Count: > 0 } oNames ? oNames[0] : null);
+
+        // GAP-2: explicitly guard against BareWire.Saga accidentally gaining a direct reference
+        // to any concrete transport project (enforces the INativeMessageScheduler probing pattern).
+        var resultAsb = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.AzureServiceBus")
+            .GetResult();
+
+        resultAsb.IsSuccessful.Should().BeTrue(
+            resultAsb.FailingTypeNames is { Count: > 0 } aNames ? aNames[0] : null);
+
+        var resultKafka = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.Kafka")
+            .GetResult();
+
+        resultKafka.IsSuccessful.Should().BeTrue(
+            resultKafka.FailingTypeNames is { Count: > 0 } kNames ? kNames[0] : null);
     }
 
     // -------------------------------------------------------------------------

@@ -11,7 +11,8 @@ internal static class ScheduleProviderFactory
         SchedulingStrategy strategy,
         ITransportAdapter transport,
         ILoggerFactory loggerFactory,
-        IMessageSerializer serializer)
+        IMessageSerializer serializer,
+        int maxTokens = TransportNativeScheduleProvider.DefaultMaxTokens)
     {
         ArgumentNullException.ThrowIfNull(transport);
         ArgumentNullException.ThrowIfNull(loggerFactory);
@@ -19,11 +20,10 @@ internal static class ScheduleProviderFactory
 
         return strategy switch
         {
-            SchedulingStrategy.Auto => ResolveAuto(transport, serializer, loggerFactory),
+            SchedulingStrategy.Auto => ResolveAuto(transport, serializer, loggerFactory, maxTokens),
             SchedulingStrategy.DelayRequeue => new DelayRequeueScheduleProvider(
                 transport, serializer, loggerFactory.CreateLogger<DelayRequeueScheduleProvider>()),
-            SchedulingStrategy.TransportNative => throw new NotSupportedException(
-                "Transport-native scheduling is not yet implemented."),
+            SchedulingStrategy.TransportNative => ResolveTransportNative(transport, serializer, loggerFactory, maxTokens),
             SchedulingStrategy.DelayTopic => throw new NotSupportedException(
                 "Delay-topic scheduling is not yet implemented."),
             SchedulingStrategy.ExternalScheduler => throw new NotSupportedException(
@@ -33,15 +33,54 @@ internal static class ScheduleProviderFactory
         };
     }
 
-    private static DelayRequeueScheduleProvider ResolveAuto(
+    private static TransportNativeScheduleProvider CreateNativeProvider(
+        INativeMessageScheduler nativeScheduler,
+        IMessageSerializer serializer,
+        ILoggerFactory loggerFactory,
+        int maxTokens) =>
+        new(nativeScheduler,
+            serializer,
+            loggerFactory.CreateLogger<TransportNativeScheduleProvider>(),
+            TimeProvider.System,
+            maxTokens);
+
+    private static DelayRequeueScheduleProvider CreateDelayRequeueProvider(
         ITransportAdapter transport,
         IMessageSerializer serializer,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory) =>
+        new(transport, serializer, loggerFactory.CreateLogger<DelayRequeueScheduleProvider>());
+
+    private static TransportNativeScheduleProvider ResolveTransportNative(
+        ITransportAdapter transport,
+        IMessageSerializer serializer,
+        ILoggerFactory loggerFactory,
+        int maxTokens)
     {
-        // For now, Auto always resolves to DelayRequeue — the only fully implemented strategy.
-        // Future: inspect transport.TransportName to select the optimal strategy per transport
-        // (e.g. TransportNative for RabbitMQ delayed message plugin, TransportNative for ASB).
-        return new DelayRequeueScheduleProvider(
-            transport, serializer, loggerFactory.CreateLogger<DelayRequeueScheduleProvider>());
+        if (transport is INativeMessageScheduler nativeScheduler)
+        {
+            return CreateNativeProvider(nativeScheduler, serializer, loggerFactory, maxTokens);
+        }
+
+        throw new NotSupportedException(
+            $"Transport '{transport.TransportName}' does not implement {nameof(INativeMessageScheduler)}. " +
+            "Native scheduling requires a transport adapter that supports broker-level scheduled delivery " +
+            "(e.g. Azure Service Bus). Use SchedulingStrategy.Auto or SchedulingStrategy.DelayRequeue instead.");
+    }
+
+    private static IScheduleProvider ResolveAuto(
+        ITransportAdapter transport,
+        IMessageSerializer serializer,
+        ILoggerFactory loggerFactory,
+        int maxTokens)
+    {
+        // Prefer native scheduling when the transport supports it (e.g. Azure Service Bus).
+        // Fall back to DelayRequeue for transports that do not implement INativeMessageScheduler
+        // (e.g. RabbitMQ), preserving existing behaviour.
+        if (transport is INativeMessageScheduler nativeScheduler)
+        {
+            return CreateNativeProvider(nativeScheduler, serializer, loggerFactory, maxTokens);
+        }
+
+        return CreateDelayRequeueProvider(transport, serializer, loggerFactory);
     }
 }

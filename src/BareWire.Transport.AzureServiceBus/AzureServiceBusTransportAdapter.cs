@@ -31,9 +31,9 @@ namespace BareWire.Transport.AzureServiceBus;
 /// <b>Capabilities note (R-1):</b> <see cref="TransportCapabilities.Sessions"/> and
 /// <see cref="TransportCapabilities.NativeScheduling"/> are declared in <see cref="Capabilities"/>
 /// because the ASB broker natively supports these features. Full BareWire-level support (session
-/// receivers, session-id mapping, <c>ScheduleMessageAsync</c>) arrives in R2.2 and R2.3
-/// respectively. There is no public surface for these capabilities in R2.1 — a caller cannot
-/// invoke the unimplemented paths.
+/// receivers, session-id mapping) arrives in R2.2. Native scheduling (<c>ScheduleMessageAsync</c>)
+/// is implemented in R2.3. There is no public surface for the R2.2 session capability
+/// in R2.1 — a caller cannot invoke the unimplemented path.
 /// </para>
 /// <para>
 /// <b>Auth note (R2.1):</b> Only SAS connection-string authentication is supported.
@@ -42,7 +42,7 @@ namespace BareWire.Transport.AzureServiceBus;
 /// deferred to R2.4.
 /// </para>
 /// </remarks>
-internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapter, IAsyncDisposable
+internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapter, INativeMessageScheduler, IAsyncDisposable
 {
     private readonly AzureServiceBusTransportOptions _options;
     private readonly ILogger<AzureServiceBusTransportAdapter> _logger;
@@ -77,7 +77,7 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
     /// <b>Capabilities note (R-1):</b>
     /// <list type="bullet">
     /// <item><term><see cref="TransportCapabilities.Sessions"/></term><description>Full session-receiver support arrives in R2.2.</description></item>
-    /// <item><term><see cref="TransportCapabilities.NativeScheduling"/></term><description>Full scheduled-message support (<c>ScheduleMessageAsync</c>) arrives in R2.3.</description></item>
+    /// <item><term><see cref="TransportCapabilities.NativeScheduling"/></term><description>Full scheduled-message support (<c>ScheduleMessageAsync</c>) is implemented in R2.3.</description></item>
     /// </list>
     /// </remarks>
     public TransportCapabilities Capabilities =>

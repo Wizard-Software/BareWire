@@ -592,6 +592,11 @@ namespace BareWire.Abstractions.Topology
 }
 namespace BareWire.Abstractions.Transport
 {
+    public interface INativeMessageScheduler
+    {
+        System.Threading.Tasks.Task CancelScheduledAsync(BareWire.Abstractions.Transport.ScheduledMessageToken token, System.Threading.CancellationToken cancellationToken = default);
+        System.Threading.Tasks.Task<BareWire.Abstractions.Transport.ScheduledMessageToken> ScheduleAsync(BareWire.Abstractions.Transport.OutboundMessage message, System.DateTimeOffset scheduledEnqueueTime, System.Threading.CancellationToken cancellationToken = default);
+    }
     public interface ITransportAdapter
     {
         BareWire.Abstractions.TransportCapabilities Capabilities { get; }
@@ -617,6 +622,12 @@ namespace BareWire.Abstractions.Transport
         public string ContentType { get; }
         public System.Collections.Generic.IReadOnlyDictionary<string, string> Headers { get; }
         public string RoutingKey { get; }
+    }
+    public readonly struct ScheduledMessageToken : System.IEquatable<BareWire.Abstractions.Transport.ScheduledMessageToken>
+    {
+        public ScheduledMessageToken(long SequenceNumber, string Destination) { }
+        public string Destination { get; init; }
+        public long SequenceNumber { get; init; }
     }
     public readonly struct SendResult : System.IEquatable<BareWire.Abstractions.Transport.SendResult>
     {

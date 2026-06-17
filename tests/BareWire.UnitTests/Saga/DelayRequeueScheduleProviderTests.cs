@@ -39,7 +39,7 @@ public sealed class DelayRequeueScheduleProviderTests
         var message = new PaymentTimeout(Guid.NewGuid());
 
         Func<Task> act = () => provider.ScheduleAsync(
-            message, TimeSpan.FromSeconds(30), "order-timeout", CancellationToken.None);
+            message, TimeSpan.FromSeconds(30), "order-timeout", Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().NotThrowAsync();
     }
@@ -58,7 +58,7 @@ public sealed class DelayRequeueScheduleProviderTests
         var message = new PaymentTimeout(Guid.NewGuid());
 
         Func<Task> act = () => provider.ScheduleAsync(
-            message, TimeSpan.FromSeconds(30), "order-timeout", CancellationToken.None);
+            message, TimeSpan.FromSeconds(30), "order-timeout", Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().NotThrowAsync();
     }
@@ -91,7 +91,7 @@ public sealed class DelayRequeueScheduleProviderTests
         var (provider, _, _) = CreateProvider();
 
         Func<Task> act = () => provider.ScheduleAsync<PaymentTimeout>(
-            null!, TimeSpan.FromSeconds(30), "order-timeout", CancellationToken.None);
+            null!, TimeSpan.FromSeconds(30), "order-timeout", Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().ThrowAsync<ArgumentNullException>();
     }
@@ -103,7 +103,7 @@ public sealed class DelayRequeueScheduleProviderTests
         var message = new PaymentTimeout(Guid.NewGuid());
 
         Func<Task> act = () => provider.ScheduleAsync(
-            message, TimeSpan.FromSeconds(30), null!, CancellationToken.None);
+            message, TimeSpan.FromSeconds(30), null!, Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().ThrowAsync<ArgumentNullException>();
     }
@@ -119,7 +119,7 @@ public sealed class DelayRequeueScheduleProviderTests
         var message = new PaymentTimeout(Guid.NewGuid());
 
         Func<Task> act = () => provider.ScheduleAsync(
-            message, TimeSpan.Zero, "my-queue", CancellationToken.None);
+            message, TimeSpan.Zero, "my-queue", Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().NotThrowAsync();
     }
@@ -167,7 +167,7 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(true, 1UL) });
 
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await transport.Received(1).DeployTopologyAsync(
             Arg.Is<TopologyDeclaration>(t =>
@@ -186,7 +186,7 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(true, 1UL) });
 
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await transport.Received(1).SendBatchAsync(
             Arg.Is<IReadOnlyList<OutboundMessage>>(msgs =>
@@ -206,7 +206,7 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(true, 1UL) });
 
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await transport.Received(1).DeployTopologyAsync(
             Arg.Is<TopologyDeclaration>(t =>
@@ -227,7 +227,7 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(true, 1UL) });
 
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await transport.Received(1).SendBatchAsync(
             Arg.Is<IReadOnlyList<OutboundMessage>>(msgs =>
@@ -247,8 +247,8 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(true, 1UL) });
 
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
-        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
+        await provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await transport.Received(1).DeployTopologyAsync(Arg.Any<TopologyDeclaration>(), Arg.Any<CancellationToken>());
         await transport.Received(2).SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>());
@@ -264,7 +264,7 @@ public sealed class DelayRequeueScheduleProviderTests
         transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(new List<SendResult> { new(false, 0UL) });
 
-        Func<Task> act = () => provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", CancellationToken.None);
+        Func<Task> act = () => provider.ScheduleAsync(message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
 
         await act.Should().ThrowAsync<InvalidOperationException>();
     }

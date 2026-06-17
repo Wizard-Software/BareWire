@@ -31,6 +31,7 @@ internal sealed partial class DelayRequeueScheduleProvider : IScheduleProvider
         T message,
         TimeSpan delay,
         string destinationQueue,
+        Guid correlationId,
         CancellationToken cancellationToken = default) where T : class
     {
         ArgumentNullException.ThrowIfNull(message);

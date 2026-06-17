@@ -106,7 +106,7 @@ internal sealed partial class StateMachineExecutor<TSaga>
                 {
                     foreach (var timeout in context.ScheduledTimeouts)
                     {
-                        await DispatchScheduledTimeoutAsync(timeout, cancellationToken).ConfigureAwait(false);
+                        await DispatchScheduledTimeoutAsync(timeout, correlationId, cancellationToken).ConfigureAwait(false);
                     }
 
                     foreach (var cancelled in context.CancelledTimeouts)
@@ -127,7 +127,10 @@ internal sealed partial class StateMachineExecutor<TSaga>
         throw new ConcurrencyException(typeof(TSaga), correlationId, lastVersion, lastVersion);
     }
 
-    private Task DispatchScheduledTimeoutAsync(ScheduledTimeout timeout, CancellationToken cancellationToken)
+    private Task DispatchScheduledTimeoutAsync(
+        ScheduledTimeout timeout,
+        Guid correlationId,
+        CancellationToken cancellationToken)
     {
         // Use reflection to invoke the generic ScheduleAsync<T> with the concrete message type.
         var scheduleMethod = typeof(IScheduleProvider)
@@ -139,9 +142,11 @@ internal sealed partial class StateMachineExecutor<TSaga>
         var destinationQueue = _sourceEndpointName
             ?? timeout.MessageType.Name.ToLowerInvariant();
 
+        // GAP-1: pass the saga correlationId so the provider can key its token map on the SAME
+        // value that CancelAsync uses — guaranteeing that schedule and cancel share a key.
         return (Task)scheduleMethod.Invoke(
             _scheduleProvider,
-            [timeout.Message, timeout.Delay, destinationQueue, cancellationToken])!;
+            [timeout.Message, timeout.Delay, destinationQueue, correlationId, cancellationToken])!;
     }
 
     private Task DispatchCancelledTimeoutAsync(
