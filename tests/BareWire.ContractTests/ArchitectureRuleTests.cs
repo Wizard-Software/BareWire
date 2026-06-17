@@ -42,6 +42,7 @@ public sealed class ArchitectureRuleTests
             .. CoreNamespaces,
             "BareWire.Transport.RabbitMQ",
             "BareWire.Transport.Kafka",
+            "BareWire.Transport.AzureServiceBus",
             "BareWire.Observability",
             "BareWire.Saga",
             "BareWire.Outbox",
@@ -164,6 +165,42 @@ public sealed class ArchitectureRuleTests
 
         resultRabbitMq.IsSuccessful.Should().BeTrue(
             resultRabbitMq.FailingTypeNames is { Count: > 0 } rNames ? rNames[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 4c: Transport.AzureServiceBus must NOT depend on Core, Observability, or other Transports
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void AzureServiceBusTransport_ShouldNotDependOn_CoreOrObservability()
+    {
+        var assembly = GetAssembly("BareWire.Transport.AzureServiceBus");
+
+        AssertNoDependencyOnCore(assembly);
+
+        var resultObservability = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Observability")
+            .GetResult();
+
+        resultObservability.IsSuccessful.Should().BeTrue(
+            resultObservability.FailingTypeNames is { Count: > 0 } oNames ? oNames[0] : null);
+
+        var resultRabbitMq = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.RabbitMQ")
+            .GetResult();
+
+        resultRabbitMq.IsSuccessful.Should().BeTrue(
+            resultRabbitMq.FailingTypeNames is { Count: > 0 } rNames ? rNames[0] : null);
+
+        var resultKafka = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.Kafka")
+            .GetResult();
+
+        resultKafka.IsSuccessful.Should().BeTrue(
+            resultKafka.FailingTypeNames is { Count: > 0 } kNames ? kNames[0] : null);
     }
 
     // -------------------------------------------------------------------------

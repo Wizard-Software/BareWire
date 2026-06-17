@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Transport.AzureServiceBus\BareWire.Transport.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Transport.Kafka\BareWire.Transport.Kafka.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga\BareWire.Saga.csproj" />

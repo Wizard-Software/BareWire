@@ -28,6 +28,7 @@
     <Project Path="src/BareWire.Saga/BareWire.Saga.csproj" />
     <Project Path="src/BareWire.Serialization.Json/BareWire.Serialization.Json.csproj" />
     <Project Path="src/BareWire.Testing/BareWire.Testing.csproj" />
+    <Project Path="src/BareWire.Transport.AzureServiceBus/BareWire.Transport.AzureServiceBus.csproj" />
     <Project Path="src/BareWire.Transport.Kafka/BareWire.Transport.Kafka.csproj" />
     <Project Path="src/BareWire.Transport.RabbitMQ/BareWire.Transport.RabbitMQ.csproj" />
   </Folder>
