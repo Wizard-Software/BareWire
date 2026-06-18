@@ -8,7 +8,7 @@ Google Cloud Pub/Sub transport adapter for BareWire. Implements `ITransportAdapt
 |------------|--------|-------|
 | `OrderingKeys` | Declared (R5.1) | `BW-OrderingKey` header passed through to `PubsubMessage.OrderingKey`. Full CorrelationId→ordering key mapping in **R5.2**. |
 | `BatchReceive` | Active | Pull supports `maxMessages > 1`. |
-| `DlqNative` | Declared (R5.1) | `DeadLetterPolicy` args parsed from topology. Full subscription wiring in **R5.3**. |
+| `DlqNative` | Implemented (R5.3) | `DeadLetterPolicy` applied to subscriptions during topology deployment when `bw.pubsub.dead-letter-topic` / `bw.pubsub.max-delivery-attempts` arguments are set. The subscription's service account requires `roles/pubsub.publisher` on the dead-letter topic (environment config, verified in R5.4). |
 | `FlowControl` | Active | `MaxOutstandingMessages` / `MaxOutstandingBytes` map 1:1 to `FlowControlOptions`. |
 
 ## Configuration
@@ -70,5 +70,5 @@ If the inbound or outbound message has a `BW-OrderingKey` header, it is passed t
 ## Roadmap
 
 - **R5.2** — Full ordering key support: `CorrelationId` → `PubsubMessage.OrderingKey`, resume-on-failure (`ResumePublish`).
-- **R5.3** — Dead-letter topic wiring: `DeadLetterPolicy` applied to subscriptions from `bw.pubsub.dead-letter-topic` / `bw.pubsub.max-delivery-attempts` topology arguments.
+- ~~**R5.3** — Dead-letter topic wiring: `DeadLetterPolicy` applied to subscriptions from `bw.pubsub.dead-letter-topic` / `bw.pubsub.max-delivery-attempts` topology arguments.~~ **Done.**
 - **R5.4** — Integration tests against the Pub/Sub emulator via Aspire.

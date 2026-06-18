@@ -33,11 +33,12 @@ namespace BareWire.Transport.Google.PubSub;
 /// unavoidable at the transport boundary (acknowledged ADR-003 deviation, same as SQS/Kafka).
 /// </para>
 /// <para>
-/// <b>Capabilities note (R-1):</b>
+/// <b>Capabilities note:</b>
 /// <see cref="TransportCapabilities.OrderingKeys"/> is declared because Pub/Sub natively supports
 /// ordering keys; full BareWire-level mapping (CorrelationId → ordering key) implemented (R5.2).
-/// <see cref="TransportCapabilities.DlqNative"/> is declared because <c>DeadLetterPolicy</c> is
-/// native; full wiring in R5.3.
+/// <see cref="TransportCapabilities.DlqNative"/> is active: <c>DeadLetterPolicy</c> is wired onto
+/// subscriptions during <see cref="DeployTopologyAsync"/> when <c>bw.pubsub.dead-letter-topic</c>
+/// and <c>bw.pubsub.max-delivery-attempts</c> topology arguments are present (R5.3).
 /// <see cref="TransportCapabilities.FlowControl"/> is declared because
 /// <c>MaxOutstandingMessages</c>/<c>MaxOutstandingBytes</c> map 1:1 to BareWire
 /// <c>FlowControlOptions</c>, making Pub/Sub's flow control model directly equivalent.
@@ -103,11 +104,11 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
 
     /// <inheritdoc />
     /// <remarks>
-    /// <b>Capabilities note (R-1):</b>
+    /// <b>Capabilities:</b>
     /// <list type="bullet">
     /// <item><term><see cref="TransportCapabilities.OrderingKeys"/></term><description>Pub/Sub supports ordering keys natively; full CorrelationId mapping implemented (R5.2).</description></item>
     /// <item><term><see cref="TransportCapabilities.BatchReceive"/></term><description>Pull supports <c>maxMessages</c> &gt; 1.</description></item>
-    /// <item><term><see cref="TransportCapabilities.DlqNative"/></term><description>DeadLetterPolicy is native; full wiring in R5.3.</description></item>
+    /// <item><term><see cref="TransportCapabilities.DlqNative"/></term><description><c>DeadLetterPolicy</c> is wired onto subscriptions during topology deployment when <c>bw.pubsub.dead-letter-topic</c> is specified (R5.3).</description></item>
     /// <item><term><see cref="TransportCapabilities.FlowControl"/></term><description>MaxOutstandingMessages/MaxOutstandingBytes map 1:1 to BareWire FlowControlOptions.</description></item>
     /// </list>
     /// </remarks>
@@ -292,13 +293,15 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
     /// <see cref="TopologyDeclaration.ExchangeQueueBindings"/> — the first binding whose
     /// <c>QueueName</c> matches the queue name is used.
     /// <para>
-    /// <b>Idempotence:</b> <c>AlreadyExists</c> gRPC status is swallowed on both topic and
+    /// <b>Idempotence:</b> <c>AlreadyExists</c> gRPC status is swallowed on topic and
     /// subscription creation — it is safe to call this method multiple times.
     /// </para>
     /// <para>
-    /// <b>DLQ wiring (R5.3):</b> <c>bw.pubsub.dead-letter-topic</c> and
-    /// <c>bw.pubsub.max-delivery-attempts</c> are parsed from topology arguments but
-    /// <c>DeadLetterPolicy</c> is NOT applied to the subscription in R5.1. Full wiring in R5.3.
+    /// <b>DLQ wiring (R5.3):</b> When a queue declares <c>bw.pubsub.dead-letter-topic</c> and
+    /// <c>bw.pubsub.max-delivery-attempts</c> topology arguments, the dead-letter topic is created
+    /// idempotently and <c>DeadLetterPolicy</c> is applied to the subscription before it is
+    /// registered with Pub/Sub. The subscription's service account must hold
+    /// <c>roles/pubsub.publisher</c> on the dead-letter topic for the broker to route messages.
     /// </para>
     /// </remarks>
     public async Task DeployTopologyAsync(
@@ -371,8 +374,42 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
                 EnableMessageOrdering = orderingEnabled,
             };
 
-            // R5.1: DLQ topology args are parsed (bw.pubsub.dead-letter-topic, bw.pubsub.max-delivery-attempts)
-            // but DeadLetterPolicy is NOT applied here. Full wiring in R5.3.
+            // R5.3: When a dead-letter topic is declared, create it idempotently and wire
+            // DeadLetterPolicy onto the subscription before calling CreateSubscriptionAsync.
+            if (!string.IsNullOrEmpty(spec.DeadLetterTopic))
+            {
+                var deadLetterTopicName = TopicName.FromProjectTopic(_options.ProjectId, spec.DeadLetterTopic);
+
+                // The DLQ topic must exist before DeadLetterPolicy references it.
+                // Same idempotent pattern as source topic creation above.
+                try
+                {
+                    await _publisher!.CreateTopicAsync(deadLetterTopicName, cancellationToken)
+                        .ConfigureAwait(false);
+                    LogDeadLetterTopicCreated(spec.DeadLetterTopic, queue.Name);
+                }
+                catch (RpcException rpc) when (rpc.StatusCode == StatusCode.AlreadyExists)
+                {
+                    // Idempotent — DLQ topic already exists; skip.
+                    LogDeadLetterTopicAlreadyExists(spec.DeadLetterTopic);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new TopologyDeploymentException(
+                        topologyElement: spec.DeadLetterTopic,
+                        transportName: TransportName,
+                        brokerError: ex.Message,
+                        endpointAddress: null,
+                        innerException: ex);
+                }
+
+                subscription.DeadLetterPolicy = new DeadLetterPolicy
+                {
+                    DeadLetterTopic = deadLetterTopicName.ToString(),
+                    MaxDeliveryAttempts = spec.MaxDeliveryAttempts,
+                };
+                LogDeadLetterPolicyApplied(queue.Name, spec.DeadLetterTopic, spec.MaxDeliveryAttempts);
+            }
 
             try
             {
@@ -542,4 +579,16 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Pub/Sub message publish failed for topic '{TopicName}' — no MessageId returned.")]
     private partial void LogMessageSendFailed(string topicName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Pub/Sub dead-letter topic '{DeadLetterTopic}' created for subscription '{SubscriptionName}'.")]
+    private partial void LogDeadLetterTopicCreated(string deadLetterTopic, string subscriptionName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Pub/Sub dead-letter topic '{DeadLetterTopic}' already exists — skipping (idempotent declaration).")]
+    private partial void LogDeadLetterTopicAlreadyExists(string deadLetterTopic);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Pub/Sub DeadLetterPolicy applied to subscription '{SubscriptionName}': dead-letter topic '{DeadLetterTopic}', max delivery attempts {MaxDeliveryAttempts}.")]
+    private partial void LogDeadLetterPolicyApplied(string subscriptionName, string deadLetterTopic, int maxDeliveryAttempts);
 }

@@ -38,14 +38,14 @@ internal static class PubSubTopologyArguments
 
     /// <summary>
     /// Argument key for the dead-letter topic name to route messages to after
-    /// <see cref="MaxDeliveryAttemptsKey"/> is exhausted. Full DLQ wiring in R5.3.
+    /// <see cref="MaxDeliveryAttemptsKey"/> is exhausted. DLQ wiring implemented in R5.3.
     /// Value: non-empty topic name. Default: <see langword="null"/> (no dead-letter policy).
     /// </summary>
     internal const string DeadLetterTopicKey = "bw.pubsub.dead-letter-topic";
 
     /// <summary>
     /// Argument key for the maximum delivery attempts before a message is sent to the
-    /// dead-letter topic (<see cref="DeadLetterTopicKey"/>). Full DLQ wiring in R5.3.
+    /// dead-letter topic (<see cref="DeadLetterTopicKey"/>). DLQ wiring implemented in R5.3.
     /// Value: <c>int</c>, range 5 – 100 (Pub/Sub enforced). Default: 5.
     /// </summary>
     internal const string MaxDeliveryAttemptsKey = "bw.pubsub.max-delivery-attempts";
