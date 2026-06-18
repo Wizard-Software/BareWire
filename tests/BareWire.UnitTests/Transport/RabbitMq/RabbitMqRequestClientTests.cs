@@ -3,6 +3,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Serialization;
+using BareWire.Abstractions.Transport;
 using BareWire.Transport.RabbitMQ;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -28,14 +29,14 @@ public sealed class RabbitMqRequestClientTests
     {
         IConnection connection = Substitute.For<IConnection>();
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         serializer.ContentType.Returns("application/json");
 
         return new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "test-queue",
@@ -50,13 +51,13 @@ public sealed class RabbitMqRequestClientTests
     {
         // Arrange
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         // Act
         Action act = () => _ = new RabbitMqRequestClient<TestRequest>(
             connection: null!,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
@@ -72,13 +73,13 @@ public sealed class RabbitMqRequestClientTests
     {
         // Arrange
         IConnection connection = Substitute.For<IConnection>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         // Act
         Action act = () => _ = new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: null!,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
@@ -90,7 +91,7 @@ public sealed class RabbitMqRequestClientTests
     }
 
     [Fact]
-    public void Constructor_NullDeserializer_ThrowsArgumentNull()
+    public void Constructor_NullDeserializerResolver_ThrowsArgumentNull()
     {
         // Arrange
         IConnection connection = Substitute.For<IConnection>();
@@ -100,7 +101,7 @@ public sealed class RabbitMqRequestClientTests
         Action act = () => _ = new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: null!,
+            deserializerResolver: null!,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
@@ -108,7 +109,7 @@ public sealed class RabbitMqRequestClientTests
 
         // Assert
         act.Should().Throw<ArgumentNullException>()
-            .WithParameterName("deserializer");
+            .WithParameterName("deserializerResolver");
     }
 
     [Fact]
@@ -117,13 +118,13 @@ public sealed class RabbitMqRequestClientTests
         // Arrange
         IConnection connection = Substitute.For<IConnection>();
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         // Act
         Action act = () => _ = new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: null!,
             targetExchange: string.Empty,
             routingKey: "queue",
@@ -140,13 +141,13 @@ public sealed class RabbitMqRequestClientTests
         // Arrange
         IConnection connection = Substitute.For<IConnection>();
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         // Act
         Action act = () => _ = new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
@@ -156,6 +157,75 @@ public sealed class RabbitMqRequestClientTests
         // Assert
         act.Should().Throw<ArgumentOutOfRangeException>()
             .WithParameterName("maxPendingRequests");
+    }
+
+    // ── DeserializeResponse — content-type routing (issue #13) ─────────────────
+
+    [Fact]
+    public void DeserializeResponse_ResolvesDeserializerByResponseContentType()
+    {
+        // Arrange — the response carries the MassTransit envelope content-type. The client must
+        // route to the deserializer registered for that content-type, not the default.
+        const string mtContentType = "application/vnd.masstransit+json";
+        var expected = new TestResponse("ok");
+
+        IMessageDeserializer mtDeserializer = Substitute.For<IMessageDeserializer>();
+        mtDeserializer.Deserialize<TestResponse>(Arg.Any<ReadOnlySequence<byte>>()).Returns(expected);
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(mtContentType).Returns(mtDeserializer);
+
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: Substitute.For<IConnection>(),
+            serializer: Substitute.For<IMessageSerializer>(),
+            deserializerResolver: resolver,
+            logger: NullLogger.Instance,
+            targetExchange: "ex",
+            routingKey: "rk",
+            timeout: TimeSpan.FromSeconds(30));
+
+        var headers = new Dictionary<string, string> { ["content-type"] = mtContentType };
+        var inbound = new InboundMessage("mid", headers, ReadOnlySequence<byte>.Empty, deliveryTag: 1);
+
+        // Act
+        TestResponse result = client.DeserializeResponse<TestResponse>(inbound, correlationId: "corr-1");
+
+        // Assert — deserializer selected by response content-type and its output returned.
+        result.Should().BeSameAs(expected);
+        resolver.Received(1).Resolve(mtContentType);
+    }
+
+    [Fact]
+    public void DeserializeResponse_WhenDeserializerReturnsNull_ThrowsTransportException()
+    {
+        // Arrange
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.Deserialize<TestResponse>(Arg.Any<ReadOnlySequence<byte>>()).Returns((TestResponse?)null);
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: Substitute.For<IConnection>(),
+            serializer: Substitute.For<IMessageSerializer>(),
+            deserializerResolver: resolver,
+            logger: NullLogger.Instance,
+            targetExchange: "ex",
+            routingKey: "rk",
+            timeout: TimeSpan.FromSeconds(30));
+
+        var inbound = new InboundMessage(
+            "mid",
+            new Dictionary<string, string> { ["content-type"] = "application/json" },
+            ReadOnlySequence<byte>.Empty,
+            deliveryTag: 1);
+
+        // Act
+        Action act = () => client.DeserializeResponse<TestResponse>(inbound, correlationId: "corr-1");
+
+        // Assert
+        act.Should().Throw<BareWireTransportException>()
+            .WithMessage("*Failed to deserialize response*");
     }
 
     // ── GetResponseAsync — null guard ──────────────────────────────────────────
@@ -196,27 +266,10 @@ public sealed class RabbitMqRequestClientTests
     [Fact]
     public async Task GetResponseAsync_MaxPendingExceeded_ThrowsTransportException()
     {
-        // Arrange — create a client with limit 1, then exhaust the gate manually
-        // by setting up a mock IChannel that stalls so we can hold the semaphore.
+        // The full overflow scenario is covered by integration tests. Here we only verify a client
+        // with limit=1 is created without error (the gate-acquire/release path is exercised there).
+        await Task.CompletedTask;
 
-        // We use maxPendingRequests=1 and simulate "already full" by draining the
-        // semaphore directly (via reflection would be fragile; instead we verify via
-        // a real scenario using a mock channel that never completes).
-        // Simpler: use maxPendingRequests=0 which throws in the constructor,
-        // so we test the gate overflow via a client with limit=1 and a stalled call.
-
-        // The cleanest approach: create a client, call WaitAsync(TimeSpan.Zero) on the
-        // internal semaphore pre-emptively isn't possible from outside. Instead, we rely
-        // on the constructor guard test above (zero) and the integration test for the overflow
-        // scenario. Here we test the code path that follows a successful WaitAsync to ensure
-        // the gate IS acquired and released symmetrically.
-
-        // Verify the gate works at maxPendingRequests=1 by checking the semaphore count
-        // transitions through the constructor guard test (above) and the following
-        // dispose-cancellation test.
-        await Task.CompletedTask; // placeholder — full overflow test in integration tests
-
-        // Minimal assertion: a client with limit=1 is created without error
         var client = CreateClient(maxPendingRequests: 1);
         client.Should().NotBeNull();
     }
@@ -231,7 +284,7 @@ public sealed class RabbitMqRequestClientTests
         IConnection connection = Substitute.For<IConnection>();
         IChannel responseChannel = Substitute.For<IChannel>();
         IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
 
         serializer.ContentType.Returns("application/json");
 
@@ -267,7 +320,7 @@ public sealed class RabbitMqRequestClientTests
         var client = new RabbitMqRequestClient<TestRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "test-queue",

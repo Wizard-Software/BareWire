@@ -477,10 +477,11 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         await using IConnection clientConnection = await factory.CreateConnectionAsync(cts.Token);
 
         var serializer = new BareWire.Serialization.Json.SystemTextJsonSerializer();
-        var deserializer = new BareWire.Serialization.Json.SystemTextJsonRawDeserializer();
+        var deserializerResolver = new BareWire.Serialization.SingleDeserializerResolver(
+            new BareWire.Serialization.Json.SystemTextJsonRawDeserializer());
 
         var client = new RabbitMqRequestClient<TestPaymentRequest>(
-            clientConnection, serializer, deserializer, NullLogger.Instance,
+            clientConnection, serializer, deserializerResolver, NullLogger.Instance,
             targetExchange: string.Empty, routingKey: queueName,
             timeout: TimeSpan.FromSeconds(10));
         await client.InitializeAsync(cts.Token);
@@ -546,10 +547,11 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         await using IConnection clientConnection = await factory.CreateConnectionAsync(cts.Token);
 
         var serializer = new BareWire.Serialization.Json.SystemTextJsonSerializer();
-        var deserializer = new BareWire.Serialization.Json.SystemTextJsonRawDeserializer();
+        var deserializerResolver = new BareWire.Serialization.SingleDeserializerResolver(
+            new BareWire.Serialization.Json.SystemTextJsonRawDeserializer());
 
         var client = new RabbitMqRequestClient<TestPaymentRequest>(
-            clientConnection, serializer, deserializer, NullLogger.Instance,
+            clientConnection, serializer, deserializerResolver, NullLogger.Instance,
             targetExchange: string.Empty, routingKey: queueName,
             timeout: TimeSpan.FromMilliseconds(500));
         await client.InitializeAsync(cts.Token);
