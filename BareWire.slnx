@@ -30,6 +30,7 @@
     <Project Path="src/BareWire.Serialization.MsgPack/BareWire.Serialization.MsgPack.csproj" />
     <Project Path="src/BareWire.Testing/BareWire.Testing.csproj" />
     <Project Path="src/BareWire.Transport.AWS.SQS/BareWire.Transport.AWS.SQS.csproj" />
+    <Project Path="src/BareWire.Transport.Google.PubSub/BareWire.Transport.Google.PubSub.csproj" />
     <Project Path="src/BareWire.Transport.AzureServiceBus/BareWire.Transport.AzureServiceBus.csproj" />
     <Project Path="src/BareWire.Transport.Kafka/BareWire.Transport.Kafka.csproj" />
     <Project Path="src/BareWire.Transport.RabbitMQ/BareWire.Transport.RabbitMQ.csproj" />

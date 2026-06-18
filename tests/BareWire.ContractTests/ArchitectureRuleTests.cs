@@ -41,6 +41,7 @@ public sealed class ArchitectureRuleTests
         [
             .. CoreNamespaces,
             "BareWire.Transport.AWS.SQS",
+            "BareWire.Transport.Google.PubSub",
             "BareWire.Transport.RabbitMQ",
             "BareWire.Transport.Kafka",
             "BareWire.Transport.AzureServiceBus",
@@ -252,6 +253,38 @@ public sealed class ArchitectureRuleTests
             "BareWire.Transport.RabbitMQ",
             "BareWire.Transport.Kafka",
             "BareWire.Transport.AzureServiceBus",
+        ];
+
+        foreach (var dep in forbidden)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(dep)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 4e: Transport.Google.PubSub must NOT depend on Core, Observability, or other Transports
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void PubSubTransport_ShouldNotDependOn_CoreOrObservability()
+    {
+        var assembly = GetAssembly("BareWire.Transport.Google.PubSub");
+
+        AssertNoDependencyOnCore(assembly);
+
+        string[] forbidden =
+        [
+            "BareWire.Observability",
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Transport.Kafka",
+            "BareWire.Transport.AzureServiceBus",
+            "BareWire.Transport.AWS.SQS",
         ];
 
         foreach (var dep in forbidden)
