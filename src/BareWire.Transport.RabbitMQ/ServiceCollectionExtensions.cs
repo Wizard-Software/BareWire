@@ -61,9 +61,14 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<RabbitMqHeaderMapper>()));
         services.TryAddSingleton<IRequestClientFactory>(sp => new RabbitMqRequestClientFactory(
             sp.GetRequiredService<RabbitMqTransportOptions>(),
-            sp.GetRequiredService<IMessageSerializer>(),
-            sp.GetRequiredService<IMessageDeserializer>(),
+            sp.GetRequiredService<ISerializerResolver>(),
+            // Honour content-type-routed deserializers (e.g. MassTransit envelope) when registered;
+            // fall back to wrapping the default deserializer for serializer packages that register none.
+            sp.GetService<IDeserializerResolver>()
+                ?? new Internal.SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
+            sp.GetRequiredService<IExchangeResolver>(),
             sp.GetRequiredService<IRoutingKeyResolver>(),
+            sp.GetRequiredService<RabbitMqHeaderMapper>(),
             sp.GetRequiredService<ILoggerFactory>()));
 
         // Register topology so the core bus can deploy it on startup.

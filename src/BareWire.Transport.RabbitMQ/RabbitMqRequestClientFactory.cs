@@ -18,9 +18,11 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(30);
 
     private readonly RabbitMqTransportOptions _options;
-    private readonly IMessageSerializer _serializer;
-    private readonly IMessageDeserializer _deserializer;
+    private readonly ISerializerResolver _serializerResolver;
+    private readonly IDeserializerResolver _deserializerResolver;
+    private readonly IExchangeResolver _exchangeResolver;
     private readonly IRoutingKeyResolver _routingKeyResolver;
+    private readonly RabbitMqHeaderMapper _headerMapper;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<RabbitMqRequestClientFactory> _logger;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
@@ -30,21 +32,27 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
 
     internal RabbitMqRequestClientFactory(
         RabbitMqTransportOptions options,
-        IMessageSerializer serializer,
-        IMessageDeserializer deserializer,
+        ISerializerResolver serializerResolver,
+        IDeserializerResolver deserializerResolver,
+        IExchangeResolver exchangeResolver,
         IRoutingKeyResolver routingKeyResolver,
+        RabbitMqHeaderMapper headerMapper,
         ILoggerFactory loggerFactory)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentNullException.ThrowIfNull(serializer);
-        ArgumentNullException.ThrowIfNull(deserializer);
+        ArgumentNullException.ThrowIfNull(serializerResolver);
+        ArgumentNullException.ThrowIfNull(deserializerResolver);
+        ArgumentNullException.ThrowIfNull(exchangeResolver);
         ArgumentNullException.ThrowIfNull(routingKeyResolver);
+        ArgumentNullException.ThrowIfNull(headerMapper);
         ArgumentNullException.ThrowIfNull(loggerFactory);
 
         _options = options;
-        _serializer = serializer;
-        _deserializer = deserializer;
+        _serializerResolver = serializerResolver;
+        _deserializerResolver = deserializerResolver;
+        _exchangeResolver = exchangeResolver;
         _routingKeyResolver = routingKeyResolver;
+        _headerMapper = headerMapper;
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<RabbitMqRequestClientFactory>();
     }
@@ -57,22 +65,49 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
 
         await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
 
-        string routingKey = _routingKeyResolver.Resolve<T>();
+        (IMessageSerializer serializer, string targetExchange, string routingKey) = ResolveDispatch<T>();
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
 
         var client = new RabbitMqRequestClient<T>(
             connection: _connection!,
-            serializer: _serializer,
-            deserializer: _deserializer,
+            serializer: serializer,
+            deserializerResolver: _deserializerResolver,
             logger: clientLogger,
-            targetExchange: _options.DefaultExchange,
+            targetExchange: targetExchange,
             routingKey: routingKey,
-            timeout: DefaultRequestTimeout);
+            timeout: DefaultRequestTimeout,
+            headerMapper: _headerMapper);
 
         await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
 
-        LogRequestClientCreated(typeof(T).Name, routingKey);
+        LogRequestClientCreated(typeof(T).Name, targetExchange, routingKey);
         return client;
+    }
+
+    /// <summary>
+    /// Resolves the per-message-type dispatch settings for request type <typeparamref name="T"/> —
+    /// the serializer, target exchange, and routing key — using the same resolvers consulted by the
+    /// publish path (<c>BareWireBus.PublishAsync</c>). This is what makes request clients honour
+    /// <c>MapSerializer&lt;T&gt;</c>, <c>MapExchange&lt;T&gt;</c>, and <c>MapRoutingKey&lt;T&gt;</c>
+    /// configuration instead of silently falling back to transport defaults (issue #13).
+    /// </summary>
+    /// <typeparam name="T">The request message type.</typeparam>
+    /// <returns>The serializer, target exchange, and routing key to use for the request client.</returns>
+    /// <remarks>
+    /// Exchange precedence mirrors the publish path: an explicit <c>MapExchange&lt;T&gt;</c> mapping
+    /// wins, otherwise the transport <see cref="RabbitMqTransportOptions.DefaultExchange"/> is used.
+    /// </remarks>
+    internal (IMessageSerializer Serializer, string TargetExchange, string RoutingKey) ResolveDispatch<T>()
+        where T : class
+    {
+        IMessageSerializer serializer = _serializerResolver.Resolve<T>();
+        string routingKey = _routingKeyResolver.Resolve<T>();
+
+        // Exchange precedence mirrors the publish path: explicit MapExchange<T> mapping wins,
+        // otherwise fall back to the transport DefaultExchange (issue #13).
+        string targetExchange = _exchangeResolver.Resolve<T>() ?? _options.DefaultExchange;
+
+        return (serializer, targetExchange, routingKey);
     }
 
     /// <inheritdoc/>
@@ -175,8 +210,8 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     private partial void LogConnectionEstablished(string host, int port);
 
     [LoggerMessage(Level = LogLevel.Information,
-        Message = "Request client created for '{MessageType}' (routingKey='{RoutingKey}').")]
-    private partial void LogRequestClientCreated(string messageType, string routingKey);
+        Message = "Request client created for '{MessageType}' (exchange='{Exchange}', routingKey='{RoutingKey}').")]
+    private partial void LogRequestClientCreated(string messageType, string exchange, string routingKey);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Exception while closing RabbitMQ request client factory connection during dispose.")]

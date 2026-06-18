@@ -27,7 +27,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
     private readonly IConnection _connection;
     private readonly IMessageSerializer _serializer;
-    private readonly IMessageDeserializer _deserializer;
+    private readonly IDeserializerResolver _deserializerResolver;
     private readonly ILogger _logger;
     private readonly TimeSpan _timeout;
     private readonly string _targetExchange;
@@ -48,7 +48,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     internal RabbitMqRequestClient(
         IConnection connection,
         IMessageSerializer serializer,
-        IMessageDeserializer deserializer,
+        IDeserializerResolver deserializerResolver,
         ILogger logger,
         string targetExchange,
         string routingKey,
@@ -58,7 +58,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(serializer);
-        ArgumentNullException.ThrowIfNull(deserializer);
+        ArgumentNullException.ThrowIfNull(deserializerResolver);
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(targetExchange);
         ArgumentNullException.ThrowIfNull(routingKey);
@@ -66,7 +66,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
         _connection = connection;
         _serializer = serializer;
-        _deserializer = deserializer;
+        _deserializerResolver = deserializerResolver;
         _logger = logger;
         _targetExchange = targetExchange;
         _routingKey = routingKey;
@@ -213,17 +213,10 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
                     transportName: TransportName);
             }
 
-            // Deserialize the response body.
-            TResponse? deserialized = _deserializer.Deserialize<TResponse>(responseMessage.Body);
-
-            if (deserialized is null)
-            {
-                throw new BareWireTransportException(
-                    message: $"Failed to deserialize response of type '{typeof(TResponse).Name}' " +
-                             $"for correlationId '{correlationId}'.",
-                    transportName: TransportName,
-                    endpointAddress: null);
-            }
+            // Deserialize the response body using the deserializer that matches the response's
+            // content-type header — honouring content-type-routed deserializers such as the
+            // MassTransit envelope deserializer (issue #13), mirroring the consume path.
+            TResponse deserialized = DeserializeResponse<TResponse>(responseMessage, correlationId);
 
             bool hasMessageId = responseMessage.Headers.TryGetValue("message-id", out string? msgIdStr);
             Guid messageId = hasMessageId && Guid.TryParse(msgIdStr, out Guid parsed)
@@ -276,6 +269,37 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         }
 
         _pendingGate.Dispose();
+    }
+
+    /// <summary>
+    /// Resolves the deserializer for the response's <c>content-type</c> header via the
+    /// <see cref="IDeserializerResolver"/> and deserializes the body into <typeparamref name="TResponse"/>.
+    /// Mirrors the consume path so request clients honour content-type-routed deserializers
+    /// (e.g. the MassTransit envelope deserializer) rather than always using the default — issue #13.
+    /// </summary>
+    /// <typeparam name="TResponse">The expected response message type.</typeparam>
+    /// <param name="responseMessage">The inbound response message.</param>
+    /// <param name="correlationId">The correlation id, used for diagnostics on failure.</param>
+    /// <returns>The deserialized response.</returns>
+    /// <exception cref="BareWireTransportException">Thrown when the body cannot be deserialized.</exception>
+    internal TResponse DeserializeResponse<TResponse>(InboundMessage responseMessage, string correlationId)
+        where TResponse : class
+    {
+        responseMessage.Headers.TryGetValue("content-type", out string? contentType);
+        IMessageDeserializer deserializer = _deserializerResolver.Resolve(contentType);
+
+        TResponse? deserialized = deserializer.Deserialize<TResponse>(responseMessage.Body);
+
+        if (deserialized is null)
+        {
+            throw new BareWireTransportException(
+                message: $"Failed to deserialize response of type '{typeof(TResponse).Name}' " +
+                         $"for correlationId '{correlationId}'.",
+                transportName: TransportName,
+                endpointAddress: null);
+        }
+
+        return deserialized;
     }
 
     private Task OnResponseReceivedAsync(object sender, BasicDeliverEventArgs args)

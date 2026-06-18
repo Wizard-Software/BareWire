@@ -3,6 +3,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Topology;
+using BareWire.Serialization;
 using BareWire.Serialization.Json;
 using BareWire.Transport.RabbitMQ;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -69,12 +70,12 @@ public sealed class RabbitMqRequestResponseTests(AspireFixture fixture)
         CancellationToken ct)
     {
         var serializer = new SystemTextJsonSerializer();
-        var deserializer = new SystemTextJsonRawDeserializer();
+        var deserializerResolver = new SingleDeserializerResolver(new SystemTextJsonRawDeserializer());
 
         var client = new RabbitMqRequestClient<PingRequest>(
             connection: connection,
             serializer: serializer,
-            deserializer: deserializer,
+            deserializerResolver: deserializerResolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,   // default exchange routes by routing key = queue name
             routingKey: queueName,
@@ -366,6 +367,106 @@ public sealed class RabbitMqRequestResponseTests(AspireFixture fixture)
         // Assert — the pending task must complete with OperationCanceledException
         Func<Task> act = async () => await pendingTask;
         await act.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    /// <summary>
+    /// Regression test for issue #13: a request client created via <see cref="RabbitMqRequestClientFactory"/>
+    /// must route the request through the exchange mapped for the request type
+    /// (<c>MapExchange&lt;TRequest&gt;</c>), not the transport <c>DefaultExchange</c>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RabbitMqTransportOptions.DefaultExchange"/> is deliberately set to a different,
+    /// unbound exchange. If the request client ignored the mapping (the original bug), the request
+    /// would never reach the responder and the call would time out instead of returning a response.
+    /// </remarks>
+    [Fact]
+    public async Task GetResponseAsync_WhenExchangeMappedForRequestType_RoutesViaMappedExchange()
+    {
+        // Arrange — declare a direct exchange + queue bound by routing key; start a responder.
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
+
+        string exchangeName = $"rr-mapped-ex-{Guid.NewGuid():N}";
+        string queueName = $"rr-mapped-q-{Guid.NewGuid():N}";
+        string routingKey = $"rr-mapped-rk-{Guid.NewGuid():N}";
+
+        await DeclareDirectExchangeBoundQueueAsync(exchangeName, queueName, routingKey, cts.Token);
+
+        (CancellationTokenSource responderCts, Task responderTask) =
+            await StartResponderAsync(queueName, cts.Token);
+
+        var options = new RabbitMqTransportOptions
+        {
+            ConnectionString = _fixture.GetRabbitMqConnectionString(),
+            DefaultExchange = "barewire-default-unbound",   // wrong on purpose — must NOT be used
+        };
+
+        var serializerResolver = new DefaultSerializerResolver(new SystemTextJsonSerializer());
+        var deserializerResolver = new SingleDeserializerResolver(new SystemTextJsonRawDeserializer());
+        var exchangeResolver = new BareWire.Transport.RabbitMQ.Internal.ExchangeResolver(
+            new Dictionary<Type, string> { [typeof(PingRequest)] = exchangeName });
+        var routingKeyResolver = new BareWire.Transport.RabbitMQ.Internal.RoutingKeyResolver(
+            new Dictionary<Type, string> { [typeof(PingRequest)] = routingKey });
+
+        await using var factory = new RabbitMqRequestClientFactory(
+            options,
+            serializerResolver,
+            deserializerResolver,
+            exchangeResolver,
+            routingKeyResolver,
+            new RabbitMqHeaderMapper(),
+            NullLoggerFactory.Instance);
+
+        await using var client =
+            (RabbitMqRequestClient<PingRequest>)await factory.CreateRequestClientAsync<PingRequest>(cts.Token);
+
+        // Act
+        Response<PingResponse> response =
+            await client.GetResponseAsync<PingResponse>(new PingRequest("hello"), cts.Token);
+
+        // Assert — receiving a response proves the request reached the responder via the mapped exchange.
+        response.Message.Echo.Should().Be("hello");
+
+        // Cleanup
+        await responderCts.CancelAsync();
+        await responderTask;
+        responderCts.Dispose();
+    }
+
+    /// <summary>
+    /// Declares a non-durable direct exchange, a queue, and binds the queue to the exchange with
+    /// <paramref name="routingKey"/>, using a short-lived direct connection.
+    /// </summary>
+    private async Task DeclareDirectExchangeBoundQueueAsync(
+        string exchangeName,
+        string queueName,
+        string routingKey,
+        CancellationToken ct)
+    {
+        await using IConnection connection = await CreateDirectConnectionAsync(ct).ConfigureAwait(false);
+        await using IChannel channel = await connection.CreateChannelAsync(cancellationToken: ct).ConfigureAwait(false);
+
+        await channel.ExchangeDeclareAsync(
+            exchange: exchangeName,
+            type: "direct",
+            durable: false,
+            autoDelete: false,
+            arguments: null,
+            cancellationToken: ct).ConfigureAwait(false);
+
+        await channel.QueueDeclareAsync(
+            queue: queueName,
+            durable: false,
+            exclusive: false,
+            autoDelete: false,
+            arguments: null,
+            cancellationToken: ct).ConfigureAwait(false);
+
+        await channel.QueueBindAsync(
+            queue: queueName,
+            exchange: exchangeName,
+            routingKey: routingKey,
+            arguments: null,
+            cancellationToken: ct).ConfigureAwait(false);
     }
 }
 
