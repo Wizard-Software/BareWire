@@ -35,7 +35,7 @@ namespace BareWire.Transport.Google.PubSub;
 /// <para>
 /// <b>Capabilities note (R-1):</b>
 /// <see cref="TransportCapabilities.OrderingKeys"/> is declared because Pub/Sub natively supports
-/// ordering keys; full BareWire-level mapping (CorrelationId → ordering key) is implemented in R5.2.
+/// ordering keys; full BareWire-level mapping (CorrelationId → ordering key) implemented (R5.2).
 /// <see cref="TransportCapabilities.DlqNative"/> is declared because <c>DeadLetterPolicy</c> is
 /// native; full wiring in R5.3.
 /// <see cref="TransportCapabilities.FlowControl"/> is declared because
@@ -105,7 +105,7 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
     /// <remarks>
     /// <b>Capabilities note (R-1):</b>
     /// <list type="bullet">
-    /// <item><term><see cref="TransportCapabilities.OrderingKeys"/></term><description>Pub/Sub supports ordering keys natively; full CorrelationId mapping in R5.2.</description></item>
+    /// <item><term><see cref="TransportCapabilities.OrderingKeys"/></term><description>Pub/Sub supports ordering keys natively; full CorrelationId mapping implemented (R5.2).</description></item>
     /// <item><term><see cref="TransportCapabilities.BatchReceive"/></term><description>Pull supports <c>maxMessages</c> &gt; 1.</description></item>
     /// <item><term><see cref="TransportCapabilities.DlqNative"/></term><description>DeadLetterPolicy is native; full wiring in R5.3.</description></item>
     /// <item><term><see cref="TransportCapabilities.FlowControl"/></term><description>MaxOutstandingMessages/MaxOutstandingBytes map 1:1 to BareWire FlowControlOptions.</description></item>
@@ -184,11 +184,21 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
                 {
                     (int originalIndex, OutboundMessage outbound) = group[i];
 
-                    // Determine ordering key from header (R5.1: pass-through only; R5.2 adds CorrelationId mapping).
-                    string orderingKey = outbound.Headers.TryGetValue(
-                        PubSubHeaderMapper.OrderingKeyHeader, out string? ok) && !string.IsNullOrEmpty(ok)
-                        ? ok
-                        : string.Empty;
+                    // Resolve ordering key: BW-OrderingKey → correlation-id → empty (R5.2, PubSubOrderingKeyResolver).
+                    string orderingKey = PubSubOrderingKeyResolver.Resolve(outbound.Headers);
+
+                    // D3: when ordering is required, a missing key breaks ordering guarantees — fail fast.
+                    // Message contains only header NAMES, never values (SEC-4).
+                    if (_options.EnableMessageOrdering && string.IsNullOrEmpty(orderingKey))
+                    {
+                        throw new BareWireTransportException(
+                            message: $"Cannot send message to Pub/Sub topic '{topicName}' with message ordering " +
+                                     $"enabled: no ordering key resolved. Provide a non-empty " +
+                                     $"'{PubSubHeaderMapper.OrderingKeyHeader}' or " +
+                                     $"'{PubSubOrderingKeyResolver.CorrelationIdHeader}' header.",
+                            transportName: TransportName,
+                            endpointAddress: null);
+                    }
 
                     // PERF-1: estimate inclusive bytes (body + attributes + ordering key).
                     long msgBytes = PubSubHeaderMapper.EstimateMessageBytes(
@@ -221,6 +231,21 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
                     response = await _publisher!
                         .PublishAsync(topicResourceName, chunk, cancellationToken)
                         .ConfigureAwait(false);
+                }
+                catch (RpcException rpc) when (rpc.StatusCode is StatusCode.FailedPrecondition or StatusCode.InvalidArgument)
+                {
+                    // D4: ordering key rejected by the broker. With the low-level API there is no
+                    // client-side ResumePublish; subsequent ordered publishes for the same key are
+                    // blocked server-side until a successful publish. Surface a clear BareWire error
+                    // so the caller knows this is an ordering failure, not a generic publish error.
+                    // Message names the topic and RPC status enum only — never the ordering key value (SEC-4).
+                    throw new BareWireTransportException(
+                        message: $"Failed to publish ordered message batch to Pub/Sub topic '{topicName}' " +
+                                 $"(ordering key rejected: {rpc.StatusCode}). Subsequent ordered publishes for " +
+                                 $"the same key are blocked until a successful publish.",
+                        transportName: TransportName,
+                        endpointAddress: null,
+                        innerException: rpc);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {

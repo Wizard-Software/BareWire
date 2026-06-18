@@ -1,11 +1,15 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.Google.PubSub;
+using BareWire.Transport.Google.PubSub.Internal;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
+using Grpc.Core;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 using Xunit;
 
 namespace BareWire.UnitTests.Transport.PubSub;
@@ -293,5 +297,204 @@ public sealed class PubSubTransportAdapterTests
 
         Func<Task> act = async () => await adapter.DisposeAsync();
         await act.Should().NotThrowAsync();
+    }
+
+    // ── SendBatchAsync — ordering key from correlation-id (R5.2) ─────────────
+
+    [Fact]
+    public async Task SendBatchAsync_MessageWithCorrelationIdHeader_SetsOrderingKeyFromCorrelationId()
+    {
+        const string topicName = "ordered-topic";
+        const string correlationIdValue = "saga-corr-xyz";
+
+        var (adapter, publisher, _) = CreateAdapterWithMocks();
+
+        IEnumerable<PubsubMessage>? capturedMessages = null;
+        publisher.PublishAsync(
+                Arg.Any<TopicName>(),
+                Arg.Do<IEnumerable<PubsubMessage>>(m => capturedMessages = m.ToList()),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var resp = new PublishResponse();
+                resp.MessageIds.Add("msg-corr-1");
+                return Task.FromResult(resp);
+            });
+
+        var message = new OutboundMessage(
+            routingKey: topicName,
+            headers: new Dictionary<string, string>
+            {
+                [PubSubOrderingKeyResolver.CorrelationIdHeader] = correlationIdValue,
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        capturedMessages.Should().NotBeNull();
+        capturedMessages!.Single().OrderingKey.Should().Be(correlationIdValue,
+            "correlation-id must be used as fallback ordering key (R5.2 priority 2)");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_MessageWithBothHeaders_OrderingKeyWinsOverCorrelationId()
+    {
+        const string topicName = "ordered-topic";
+        const string explicitKey = "explicit-partition-key";
+        const string correlationIdValue = "saga-corr-xyz";
+
+        var (adapter, publisher, _) = CreateAdapterWithMocks();
+
+        IEnumerable<PubsubMessage>? capturedMessages = null;
+        publisher.PublishAsync(
+                Arg.Any<TopicName>(),
+                Arg.Do<IEnumerable<PubsubMessage>>(m => capturedMessages = m.ToList()),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var resp = new PublishResponse();
+                resp.MessageIds.Add("msg-both-1");
+                return Task.FromResult(resp);
+            });
+
+        var message = new OutboundMessage(
+            routingKey: topicName,
+            headers: new Dictionary<string, string>
+            {
+                [PubSubHeaderMapper.OrderingKeyHeader] = explicitKey,
+                [PubSubOrderingKeyResolver.CorrelationIdHeader] = correlationIdValue,
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        capturedMessages.Should().NotBeNull();
+        capturedMessages!.Single().OrderingKey.Should().Be(explicitKey,
+            "BW-OrderingKey (priority 1) must override correlation-id (priority 2)");
+    }
+
+    // ── SendBatchAsync — guard: EnableMessageOrdering=true, no key (D3) ──────
+
+    [Fact]
+    public async Task SendBatchAsync_EnableMessageOrderingWithNoKey_ThrowsBareWireTransportException()
+    {
+        const string topicName = "strict-ordered-topic";
+        const string testHeaderValue = "should-not-appear-in-exception-message";
+
+        var options = DefaultOptions();
+        options.EnableMessageOrdering = true;
+
+        var (adapter, _, _) = CreateAdapterWithMocks(options);
+
+        var message = new OutboundMessage(
+            routingKey: topicName,
+            headers: new Dictionary<string, string>
+            {
+                // Deliberately using a value that must NOT appear in the exception message (SEC-4).
+                ["some-irrelevant-header"] = testHeaderValue,
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        Func<Task> act = async () => await adapter.SendBatchAsync([message]);
+
+        BareWireTransportException ex = (await act.Should()
+            .ThrowAsync<BareWireTransportException>()).Which;
+
+        // Assert: exception message contains the header NAMES (for diagnostics).
+        ex.Message.Should().Contain(PubSubHeaderMapper.OrderingKeyHeader,
+            "the exception must name the ordering key header so the caller knows what to provide");
+        ex.Message.Should().Contain(PubSubOrderingKeyResolver.CorrelationIdHeader,
+            "the exception must name the correlation-id header as the fallback option");
+
+        // Assert: exception message must NOT contain any header value (SEC-4 anti-leak).
+        ex.Message.Should().NotContain(testHeaderValue,
+            "exception messages must never include header values (SEC-4)");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_EnableMessageOrderingFalseWithNoKey_PublishesWithEmptyOrderingKey()
+    {
+        const string topicName = "unordered-topic";
+
+        // EnableMessageOrdering defaults to false — no guard should fire.
+        var (adapter, publisher, _) = CreateAdapterWithMocks();
+
+        IEnumerable<PubsubMessage>? capturedMessages = null;
+        publisher.PublishAsync(
+                Arg.Any<TopicName>(),
+                Arg.Do<IEnumerable<PubsubMessage>>(m => capturedMessages = m.ToList()),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var resp = new PublishResponse();
+                resp.MessageIds.Add("msg-unordered-1");
+                return Task.FromResult(resp);
+            });
+
+        var message = new OutboundMessage(
+            routingKey: topicName,
+            headers: new Dictionary<string, string>(),  // no ordering headers
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        // Act — must not throw.
+        IReadOnlyList<SendResult> results = await adapter.SendBatchAsync([message]);
+
+        results.Should().HaveCount(1);
+        results[0].IsConfirmed.Should().BeTrue();
+
+        capturedMessages.Should().NotBeNull();
+        capturedMessages!.Single().OrderingKey.Should().BeEmpty(
+            "no ordering key header → empty string → Pub/Sub publishes without ordering");
+    }
+
+    // ── SendBatchAsync — RpcException(FailedPrecondition) surfacing (D4) ─────
+
+    [Fact]
+    public async Task SendBatchAsync_PublishThrowsRpcFailedPrecondition_ThrowsBareWireTransportExceptionWithOrderingContext()
+    {
+        const string topicName = "ordered-topic";
+        const string orderingKeyValue = "test-ordering-key-value";
+
+        var (adapter, publisher, _) = CreateAdapterWithMocks();
+
+        var rpcException = new RpcException(new Status(StatusCode.FailedPrecondition, "ordering key error"));
+
+        publisher.PublishAsync(
+                Arg.Any<TopicName>(),
+                Arg.Any<IEnumerable<PubsubMessage>>(),
+                Arg.Any<CancellationToken>())
+            .ThrowsAsync(rpcException);
+
+        var message = new OutboundMessage(
+            routingKey: topicName,
+            headers: new Dictionary<string, string>
+            {
+                [PubSubHeaderMapper.OrderingKeyHeader] = orderingKeyValue,
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        Func<Task> act = async () => await adapter.SendBatchAsync([message]);
+
+        BareWireTransportException ex = (await act.Should()
+            .ThrowAsync<BareWireTransportException>()).Which;
+
+        // Assert: inner exception is the original RpcException.
+        ex.InnerException.Should().Be(rpcException,
+            "the original RpcException must be preserved as InnerException for diagnostics");
+
+        // Assert: message provides ordering context.
+        ex.Message.Should().Contain(topicName,
+            "the exception must name the topic so the caller can identify the failed endpoint");
+        ex.Message.Should().Contain("FailedPrecondition",
+            "the RPC status enum name must be included for diagnostics");
+
+        // Assert SEC-4 hardening: ordering key VALUE must not appear in the exception message.
+        ex.Message.Should().NotContain(orderingKeyValue,
+            "exception messages must never include ordering key values (SEC-4)");
     }
 }

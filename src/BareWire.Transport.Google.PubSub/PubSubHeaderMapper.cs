@@ -17,8 +17,9 @@ namespace BareWire.Transport.Google.PubSub;
 /// </para>
 /// <para>
 /// <b>Ordering key:</b> when the BareWire header <c>BW-OrderingKey</c> is present, it is
-/// extracted and set on <c>PubsubMessage.OrderingKey</c> by the adapter. Full mapping from
-/// <c>CorrelationId</c> to ordering key is implemented in R5.2.
+/// extracted and set on <c>PubsubMessage.OrderingKey</c> by the adapter. Full resolution
+/// logic (priority ladder: <c>BW-OrderingKey</c> → <c>correlation-id</c> → empty) lives in
+/// <c>PubSubOrderingKeyResolver</c> (implemented in R5.2).
 /// </para>
 /// </remarks>
 internal sealed class PubSubHeaderMapper
@@ -30,7 +31,8 @@ internal sealed class PubSubHeaderMapper
     /// <summary>
     /// BareWire canonical header for the Pub/Sub ordering key.
     /// When present and non-empty, the value is passed through to
-    /// <c>PubsubMessage.OrderingKey</c>. Full CorrelationId mapping is implemented in R5.2.
+    /// <c>PubsubMessage.OrderingKey</c>. Full resolution logic (priority ladder including
+    /// <c>correlation-id</c> fallback) is implemented in <c>PubSubOrderingKeyResolver</c> (R5.2).
     /// </summary>
     internal const string OrderingKeyHeader = "BW-OrderingKey";
 
