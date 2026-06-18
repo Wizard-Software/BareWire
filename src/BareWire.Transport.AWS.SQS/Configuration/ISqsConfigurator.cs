@@ -93,4 +93,18 @@ public interface ISqsConfigurator
     /// </summary>
     /// <param name="max">Must be at least 1.</param>
     void MaxInFlightMessages(int max);
+
+    /// <summary>
+    /// Enables content-based deduplication for FIFO queue produce.
+    /// When called, BareWire does not generate an explicit <c>MessageDeduplicationId</c> —
+    /// the broker computes the dedup id from a SHA-256 hash of the message body server-side.
+    /// </summary>
+    /// <remarks>
+    /// Requires that the target SQS FIFO queue was created with <c>ContentBasedDeduplication=true</c>
+    /// (set via the <c>bw.sqs.content-based-deduplication</c> topology argument).
+    /// When not called, BareWire generates a deterministic dedup id from a SHA-256 hash of
+    /// (<c>MessageGroupId</c> + body) unless an explicit <c>BW-MessageDeduplicationId</c> header
+    /// is present.
+    /// </remarks>
+    void ContentBasedDeduplication();
 }

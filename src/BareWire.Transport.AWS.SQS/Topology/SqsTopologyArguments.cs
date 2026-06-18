@@ -13,7 +13,8 @@ internal readonly record struct SqsQueueSpec(
     TimeSpan VisibilityTimeout,
     int WaitTimeSeconds,
     bool IsFifo,
-    int MaxReceiveCount);
+    int MaxReceiveCount,
+    bool ContentBasedDeduplication);
 
 /// <summary>
 /// Constant argument keys recognised by the Amazon SQS transport adapter and the
@@ -53,6 +54,18 @@ internal static class SqsTopologyArguments
     internal const string MaxReceiveCountKey = "bw.sqs.max-receive-count";
 
     /// <summary>
+    /// Argument key for enabling content-based deduplication on FIFO queues (R4.2).
+    /// Value: <c>bool</c> or <c>"true"</c>/<c>"false"</c>. Default: <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// When <see langword="true"/>, SQS computes <c>MessageDeduplicationId</c> from a SHA-256
+    /// hash of the message body — no explicit dedup id is required. Only valid for FIFO queues
+    /// (SQS enforces this at the queue level). Set in combination with
+    /// <c>ISqsConfigurator.ContentBasedDeduplication()</c> on the produce side.
+    /// </remarks>
+    internal const string ContentBasedDeduplicationKey = "bw.sqs.content-based-deduplication";
+
+    /// <summary>
     /// Parses <see cref="QueueDeclaration.Arguments"/> into a <see cref="SqsQueueSpec"/>.
     /// When <paramref name="queue"/> has no <c>Arguments</c>, returns defaults
     /// (30-second visibility, 20-second wait, no FIFO, maxReceiveCount=5).
@@ -78,6 +91,7 @@ internal static class SqsTopologyArguments
         int waitTimeSeconds = 20;
         bool isFifo = false;
         int maxReceiveCount = 5;
+        bool contentBasedDeduplication = false;
 
         foreach ((string key, object value) in args)
         {
@@ -99,10 +113,15 @@ internal static class SqsTopologyArguments
                 maxReceiveCount = ParseInt32InRange(key, value, min: 1, max: int.MaxValue,
                     expectedDescription: "An integer >= 1");
             }
+            else if (key == ContentBasedDeduplicationKey)
+            {
+                contentBasedDeduplication = ParseBool(key, value);
+            }
             // Unknown bw.sqs.* keys are silently ignored (forward-compatible).
         }
 
-        return new SqsQueueSpec(visibilityTimeout, waitTimeSeconds, isFifo, maxReceiveCount);
+        return new SqsQueueSpec(
+            visibilityTimeout, waitTimeSeconds, isFifo, maxReceiveCount, contentBasedDeduplication);
     }
 
     private static SqsQueueSpec DefaultSpec() =>
@@ -110,7 +129,8 @@ internal static class SqsTopologyArguments
             VisibilityTimeout: TimeSpan.FromSeconds(30),
             WaitTimeSeconds: 20,
             IsFifo: false,
-            MaxReceiveCount: 5);
+            MaxReceiveCount: 5,
+            ContentBasedDeduplication: false);
 
     private static int ParseInt32InRange(string key, object value, int min, int max, string expectedDescription)
     {

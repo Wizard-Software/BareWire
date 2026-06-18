@@ -34,8 +34,8 @@ namespace BareWire.Transport.AWS.SQS;
 /// </para>
 /// <para>
 /// <b>Capabilities note (R-1):</b> <see cref="TransportCapabilities.NativeDeduplication"/>
-/// is declared because FIFO queues support native deduplication. Full BareWire-level
-/// MessageGroupId / MessageDeduplicationId mapping is introduced in R4.2.
+/// is declared because FIFO queues support native deduplication. BareWire-level
+/// MessageGroupId / MessageDeduplicationId mapping is implemented in R4.2.
 /// </para>
 /// <para>
 /// <b>Batch chunking (PERF-1):</b> SQS hard-limits <c>SendMessageBatch</c> to 10 entries.
@@ -46,6 +46,13 @@ namespace BareWire.Transport.AWS.SQS;
 internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDisposable
 {
     private const int MaxBatchSize = 10;
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the given queue name or URL identifies a FIFO queue.
+    /// SQS enforces that all FIFO queue names end with <c>.fifo</c>.
+    /// </summary>
+    private static bool IsFifoQueue(string queueNameOrUrl) =>
+        queueNameOrUrl.EndsWith(".fifo", StringComparison.Ordinal);
 
     private readonly SqsTransportOptions _options;
     private readonly ILogger<SqsTransportAdapter> _logger;
@@ -98,7 +105,7 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
     /// <remarks>
     /// <b>Capabilities note (R-1):</b>
     /// <list type="bullet">
-    /// <item><term><see cref="TransportCapabilities.NativeDeduplication"/></term><description>FIFO queues support native dedup; full BareWire mapping lands in R4.2.</description></item>
+    /// <item><term><see cref="TransportCapabilities.NativeDeduplication"/></term><description>FIFO queues support native dedup; BareWire MessageGroupId/MessageDeduplicationId mapping implemented in R4.2.</description></item>
     /// <item><term><see cref="TransportCapabilities.DlqNative"/></term><description>SQS RedrivePolicy routes exhausted messages to a DLQ automatically.</description></item>
     /// <item><term><see cref="TransportCapabilities.BatchReceive"/></term><description><c>ReceiveMessage</c> supports <c>MaxNumberOfMessages</c> up to 10.</description></item>
     /// </list>
@@ -159,6 +166,9 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
             string queueUrl = await GetOrResolveQueueUrlAsync(queueName, cancellationToken)
                 .ConfigureAwait(false);
 
+            // Hoist FIFO detection outside the chunk loop — queueName is constant per group (GAP-1).
+            bool isFifo = IsFifoQueue(queueName);
+
             // Chunk the group in batches of MaxBatchSize (10) using index-based slicing (PERF-1).
             int groupCount = group.Count;
             for (int offset = 0; offset < groupCount; offset += MaxBatchSize)
@@ -183,11 +193,37 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                     string entryId = j.ToString(CultureInfo.InvariantCulture);
                     entryIds[j] = entryId;
 
+                    // Resolve FIFO fields before building the entry (GAP-1: set in initializer).
+                    string? groupId = null;
+                    string? dedupId = null;
+
+                    if (isFifo)
+                    {
+                        groupId = SqsFifoMapper.ResolveMessageGroupId(outbound.Headers);
+
+                        // SEC: guard message contains queue name and header NAMES only — never values.
+                        if (string.IsNullOrEmpty(groupId))
+                        {
+                            throw new BareWireTransportException(
+                                message: $"FIFO queue '{queueName}' requires a MessageGroupId. " +
+                                         $"Set the '{SqsHeaderMapper.MessageGroupIdHeader}' or " +
+                                         $"'{SqsHeaderMapper.CorrelationIdHeader}' header before sending.",
+                                transportName: TransportName,
+                                endpointAddress: null);
+                        }
+
+                        dedupId = SqsFifoMapper.ResolveOrGenerateDeduplicationId(
+                            outbound.Headers, groupId, outbound.Body.Span,
+                            _options.EnableContentBasedDeduplication);
+                    }
+
                     entries.Add(new SendMessageBatchRequestEntry
                     {
                         Id = entryId,
                         MessageBody = SqsHeaderMapper.EncodeBodyAsString(outbound.Body, outbound.ContentType),
                         MessageAttributes = SqsHeaderMapper.MapOutbound(outbound.Headers),
+                        MessageGroupId = groupId,
+                        MessageDeduplicationId = dedupId,
                     });
                 }
 
@@ -289,6 +325,11 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
             if (spec.IsFifo)
             {
                 attributes["FifoQueue"] = "true";
+
+                if (spec.ContentBasedDeduplication)
+                {
+                    attributes["ContentBasedDeduplication"] = "true";
+                }
             }
 
             if (spec.MaxReceiveCount > 0)

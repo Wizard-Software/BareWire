@@ -47,7 +47,7 @@ services.AddBareWireSqs(sqs =>
 TransportCapabilities.NativeDeduplication | DlqNative | BatchReceive
 ```
 
-- **NativeDeduplication** — FIFO queues support content-based deduplication. Full BareWire-level `MessageGroupId`/`MessageDeduplicationId` mapping arrives in **R4.2**.
+- **NativeDeduplication** — FIFO queues support `MessageGroupId`-based ordering and content-based deduplication. Full BareWire-level `MessageGroupId`/`MessageDeduplicationId` mapping implemented in R4.2 — see [FIFO (R4.2)](#fifo-r42) section.
 - **DlqNative** — Exhausted messages are routed to a DLQ automatically via `RedrivePolicy`. Configure `bw.sqs.max-receive-count` on your `QueueDeclaration`.
 - **BatchReceive** — `ReceiveMessage` retrieves up to 10 messages per call.
 
@@ -82,19 +82,72 @@ var topology = new TopologyDeclaration
 };
 ```
 
-| Argument key                    | Type              | Default | Description                             |
-|---------------------------------|-------------------|---------|-----------------------------------------|
-| `bw.sqs.visibility-timeout`     | `TimeSpan`/string | 30 s    | Queue visibility timeout                |
-| `bw.sqs.wait-time-seconds`      | int (0–20)        | 20      | `ReceiveMessageWaitTimeSeconds`         |
-| `bw.sqs.fifo`                   | bool              | false   | FIFO queue (name must end in `.fifo`)   |
-| `bw.sqs.max-receive-count`      | int (≥1)          | 5       | DLQ redrive `maxReceiveCount`           |
+| Argument key                           | Type              | Default | Description                                   |
+|----------------------------------------|-------------------|---------|-------------------------------------------------|
+| `bw.sqs.visibility-timeout`            | `TimeSpan`/string | 30 s    | Queue visibility timeout                        |
+| `bw.sqs.wait-time-seconds`             | int (0–20)        | 20      | `ReceiveMessageWaitTimeSeconds`                 |
+| `bw.sqs.fifo`                          | bool              | false   | FIFO queue (name must end in `.fifo`)           |
+| `bw.sqs.max-receive-count`             | int (≥1)          | 5       | DLQ redrive `maxReceiveCount`                   |
+| `bw.sqs.content-based-deduplication`   | bool              | false   | Enable content-based dedup for FIFO queues      |
 
-## Known limitations by phase
+## FIFO (R4.2)
 
-### R4.2 (FIFO — not yet implemented)
-- `MessageGroupId` from BareWire headers → `MessageGroupId` in SQS FIFO batch entry.
-- `MessageDeduplicationId` for exactly-once within the 5-minute dedup window.
-- Ordering guarantees per group.
+BareWire fully supports SQS FIFO queues. FIFO fields (`MessageGroupId`, `MessageDeduplicationId`) are set **only** when the target queue name ends with `.fifo` — standard queues are unaffected (backward-compatible).
+
+### MessageGroupId mapping
+
+| Resolution order | Header / source | Notes |
+|-----------------|-----------------|-------|
+| 1 (explicit)    | `BW-MessageGroupId` header | Set by the producer for explicit group control. |
+| 2 (fallback)    | `correlation-id` header (kebab-case) | Populated automatically by `BareWireBus` from `ISagaState.CorrelationId` — delivers per-saga FIFO ordering with no extra configuration. |
+| absent          | Guard throws `BareWireTransportException` | FIFO queues require a `MessageGroupId` per batch entry; BareWire fails fast rather than letting SQS return `InvalidParameterValue`. The exception message contains only the queue name and header **names** — never header values (SEC-4). |
+
+**Security note (ADR-015):** `MessageGroupId` is an **ordering** boundary, NOT an authorization or tenant-isolation boundary. A sender can supply any group id they choose. Do not use `BW-MessageGroupId` for access-control decisions. See ADR-015 for the full rationale.
+
+### MessageDeduplicationId
+
+| Resolution order | Source | Notes |
+|-----------------|--------|-------|
+| 1 (explicit)    | `BW-MessageDeduplicationId` header | Full control; ignored by broker if content-based dedup is enabled at the queue level. |
+| 2 (content-based) | Broker (SHA-256 of body, server-side) | When `EnableContentBasedDeduplication = true` / `ContentBasedDeduplication()` is configured. BareWire sends no explicit id. |
+| 3 (generated)   | SHA-256 of (`MessageGroupId` + body) → URL-safe Base64 (43 chars) | Deterministic: same (group, body) within 5 minutes → same dedup id. Different groups with the same body → different ids. |
+
+### Content-based deduplication
+
+Enable content-based dedup (requires the queue to have `ContentBasedDeduplication=true`):
+
+```csharp
+// Configurator (produce side):
+services.AddBareWireSqs(sqs =>
+{
+    sqs.Region("eu-central-1");
+    sqs.ContentBasedDeduplication(); // do not generate explicit MessageDeduplicationId
+});
+
+// Topology (queue creation):
+new QueueDeclaration("my-orders.fifo", Arguments: new Dictionary<string, object>
+{
+    ["bw.sqs.fifo"] = true,
+    ["bw.sqs.content-based-deduplication"] = true, // sets ContentBasedDeduplication=true on queue
+});
+```
+
+### Inbound stamping (BW-MessageGroupId / BW-SequenceNumber)
+
+For consumed FIFO messages the following BareWire headers are stamped from **SQS system attributes** (broker-set, not sender-controlled):
+
+| BareWire header | SQS system attribute | Description |
+|-----------------|---------------------|-------------|
+| `BW-MessageGroupId` | `MessageGroupId` | The FIFO group the message belongs to. |
+| `BW-SequenceNumber` | `SequenceNumber` | Monotonic sequence number assigned by the FIFO broker within the group. |
+
+Stamping happens **after** `MapInbound` (which copies sender-supplied `MessageAttributes`). This means a sender cannot spoof `BW-MessageGroupId` via a `MessageAttribute` — the trusted broker value always wins (SEC-3 anti-squatting, consistent with ADR-011 pattern for ASB sessions).
+
+### Consumer ordering note
+
+SQS FIFO guarantees ordering within a `MessageGroupId` at the broker level. BareWire R4.2 does not add a per-group sequential consumer channel (unlike ASB per-session consumers). The long-polling consumer receives messages from a single group sequentially as long as they remain un-settled. Full per-group consumer sequencing is deferred to R4.4.
+
+### Known limitations by phase
 
 ### R4.3 (IAM / Encryption — not yet implemented)
 - `InstanceProfileCredentialsProvider` for EC2/ECS metadata-service credential refresh.

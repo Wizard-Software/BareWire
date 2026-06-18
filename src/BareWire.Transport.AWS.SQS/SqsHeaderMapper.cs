@@ -45,6 +45,33 @@ internal sealed class SqsHeaderMapper
     private const int MaxSqsMessageAttributes = 10;
 
     /// <summary>
+    /// BareWire canonical header for the SQS FIFO <c>MessageGroupId</c>.
+    /// When present and non-empty, overrides the <see cref="CorrelationIdHeader"/> fallback.
+    /// </summary>
+    internal const string MessageGroupIdHeader = "BW-MessageGroupId";
+
+    /// <summary>
+    /// BareWire canonical header for the SQS FIFO <c>MessageDeduplicationId</c>.
+    /// When present and non-empty, used as the explicit dedup id (skips hash generation).
+    /// </summary>
+    internal const string DeduplicationIdHeader = "BW-MessageDeduplicationId";
+
+    /// <summary>
+    /// BareWire canonical header stamped on inbound FIFO messages with the SQS <c>SequenceNumber</c>
+    /// system attribute (monotonic ordering sequence assigned by the FIFO broker).
+    /// </summary>
+    internal const string SequenceNumberHeader = "BW-SequenceNumber";
+
+    /// <summary>
+    /// Canonical correlation identifier header key (kebab-case).
+    /// Mirrors the key populated by <c>BareWireBus</c> (BareWireBus.cs:451-453) and
+    /// <c>AzureServiceBusHeaderMapper.CorrelationIdHeader</c>.
+    /// Used as the fallback source for <see cref="MessageGroupIdHeader"/> when the explicit
+    /// header is absent.
+    /// </summary>
+    internal const string CorrelationIdHeader = "correlation-id";
+
+    /// <summary>
     /// Copies BareWire headers to a <see cref="Dictionary{TKey,TValue}"/> of
     /// <see cref="MessageAttributeValue"/> instances suitable for use in an SQS request.
     /// All values use <c>DataType = "String"</c>.

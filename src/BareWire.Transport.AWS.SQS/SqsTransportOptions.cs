@@ -119,6 +119,25 @@ internal sealed class SqsTransportOptions
     public int MaxInFlightMessages { get; set; } = 100;
 
     /// <summary>
+    /// Gets or sets a value indicating whether FIFO queues use content-based deduplication.
+    /// Defaults to <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When <see langword="true"/>, the broker computes <c>MessageDeduplicationId</c> from the SHA-256
+    /// hash of the message body — no explicit <c>MessageDeduplicationId</c> is sent on the wire.
+    /// This requires the SQS queue to have <c>ContentBasedDeduplication=true</c> (set at queue
+    /// creation via <c>bw.sqs.content-based-deduplication</c> topology argument).
+    /// </para>
+    /// <para>
+    /// When <see langword="false"/> (default), BareWire generates a deterministic
+    /// <c>MessageDeduplicationId</c> from a SHA-256 hash of (<c>MessageGroupId</c> + body)
+    /// unless an explicit <c>BW-MessageDeduplicationId</c> header is present.
+    /// </para>
+    /// </remarks>
+    public bool EnableContentBasedDeduplication { get; set; }
+
+    /// <summary>
     /// Returns a diagnostic representation of these options with secrets redacted to prevent
     /// accidental secret exposure in logs, exception messages, and diagnostic output (SEC-02).
     /// </summary>
@@ -136,7 +155,8 @@ internal sealed class SqsTransportOptions
         $"SecretAccessKey = [Redacted], RegionEndpoint = {RegionEndpoint}, " +
         $"ServiceUrl = {ServiceUrl ?? "null"}, AllowInsecureEndpoint = {AllowInsecureEndpoint}, " +
         $"DefaultVisibilityTimeout = {DefaultVisibilityTimeout}, WaitTimeSeconds = {WaitTimeSeconds}, " +
-        $"MaxNumberOfMessages = {MaxNumberOfMessages}, MaxInFlightMessages = {MaxInFlightMessages} }}";
+        $"MaxNumberOfMessages = {MaxNumberOfMessages}, MaxInFlightMessages = {MaxInFlightMessages}, " +
+        $"EnableContentBasedDeduplication = {EnableContentBasedDeduplication} }}";
 
     /// <summary>
     /// Validates this options instance, throwing <see cref="BareWireConfigurationException"/>

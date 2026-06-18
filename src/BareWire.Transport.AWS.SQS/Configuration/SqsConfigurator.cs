@@ -12,6 +12,7 @@ internal sealed class SqsConfigurator : ISqsConfigurator
     private int? _waitTimeSeconds;
     private int? _maxNumberOfMessages;
     private int? _maxInFlightMessages;
+    private bool _enableContentBasedDeduplication;
 
     public void UseDefaultCredentials()
     {
@@ -64,6 +65,11 @@ internal sealed class SqsConfigurator : ISqsConfigurator
         _maxInFlightMessages = max;
     }
 
+    public void ContentBasedDeduplication()
+    {
+        _enableContentBasedDeduplication = true;
+    }
+
     // Every field is explicitly threaded into options to prevent silent defaults
     // (mirror ASB configurator GAP-3 fix).
     internal SqsTransportOptions Build()
@@ -113,6 +119,8 @@ internal sealed class SqsConfigurator : ISqsConfigurator
         {
             options.MaxInFlightMessages = _maxInFlightMessages.Value;
         }
+
+        options.EnableContentBasedDeduplication = _enableContentBasedDeduplication;
 
         options.Validate();
 

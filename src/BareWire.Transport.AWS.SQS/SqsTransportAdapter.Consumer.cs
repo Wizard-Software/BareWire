@@ -215,6 +215,7 @@ internal sealed partial class SqsTransportAdapter
                             WaitTimeSeconds = _options.WaitTimeSeconds,
                             MaxNumberOfMessages = maxMessages,
                             MessageAttributeNames = ["All"],
+                            MessageSystemAttributeNames = ["MessageGroupId", "SequenceNumber", "MessageDeduplicationId"],
                         },
                         cancellationToken).ConfigureAwait(false);
                 }
@@ -252,6 +253,25 @@ internal sealed partial class SqsTransportAdapter
 
                     Dictionary<string, string> headers = SqsHeaderMapper.MapInbound(
                         sqsMessage.MessageAttributes);
+
+                    // Stamp trusted FIFO system attributes AFTER MapInbound (SEC-3 anti-squatting).
+                    // System attributes are set by the SQS broker (not the sender) and cannot be
+                    // forged via MessageAttributes. Stamping after MapInbound ensures broker values
+                    // always win over any sender-supplied MessageAttribute with the same BW key.
+                    if (sqsMessage.Attributes is not null)
+                    {
+                        if (sqsMessage.Attributes.TryGetValue("MessageGroupId", out string? gid) &&
+                            !string.IsNullOrEmpty(gid))
+                        {
+                            headers[SqsHeaderMapper.MessageGroupIdHeader] = gid;
+                        }
+
+                        if (sqsMessage.Attributes.TryGetValue("SequenceNumber", out string? seq) &&
+                            !string.IsNullOrEmpty(seq))
+                        {
+                            headers[SqsHeaderMapper.SequenceNumberHeader] = seq;
+                        }
+                    }
 
                     // Determine content type from headers for body decoding.
                     string contentType = headers.TryGetValue("content-type", out string? ct)

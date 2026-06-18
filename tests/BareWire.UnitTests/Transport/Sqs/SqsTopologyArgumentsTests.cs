@@ -175,6 +175,71 @@ public sealed class SqsTopologyArgumentsTests
             .Which.OptionName.Should().Be(SqsTopologyArguments.MaxReceiveCountKey);
     }
 
+    // ── bw.sqs.content-based-deduplication ───────────────────────────────────
+
+    [Fact]
+    public void Parse_ContentBasedDeduplicationTrue_ParsedCorrectly()
+    {
+        var queue = new QueueDeclaration("q.fifo", Arguments: new Dictionary<string, object>
+        {
+            [SqsTopologyArguments.ContentBasedDeduplicationKey] = true,
+        });
+
+        SqsQueueSpec spec = SqsTopologyArguments.Parse(queue);
+
+        spec.ContentBasedDeduplication.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Parse_ContentBasedDeduplicationStringTrue_ParsedCorrectly()
+    {
+        var queue = new QueueDeclaration("q.fifo", Arguments: new Dictionary<string, object>
+        {
+            [SqsTopologyArguments.ContentBasedDeduplicationKey] = "true",
+        });
+
+        SqsQueueSpec spec = SqsTopologyArguments.Parse(queue);
+
+        spec.ContentBasedDeduplication.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Parse_ContentBasedDeduplicationFalse_ParsedCorrectly()
+    {
+        var queue = new QueueDeclaration("q.fifo", Arguments: new Dictionary<string, object>
+        {
+            [SqsTopologyArguments.ContentBasedDeduplicationKey] = false,
+        });
+
+        SqsQueueSpec spec = SqsTopologyArguments.Parse(queue);
+
+        spec.ContentBasedDeduplication.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Parse_ContentBasedDeduplicationInvalidValue_ThrowsBareWireConfigurationException()
+    {
+        var queue = new QueueDeclaration("q.fifo", Arguments: new Dictionary<string, object>
+        {
+            [SqsTopologyArguments.ContentBasedDeduplicationKey] = "yes",
+        });
+
+        Action act = () => SqsTopologyArguments.Parse(queue);
+
+        act.Should().Throw<BareWireConfigurationException>()
+            .Which.OptionName.Should().Be(SqsTopologyArguments.ContentBasedDeduplicationKey);
+    }
+
+    [Fact]
+    public void Parse_NoArguments_ContentBasedDeduplicationDefaultsFalse()
+    {
+        var queue = new QueueDeclaration("q.fifo");
+
+        SqsQueueSpec spec = SqsTopologyArguments.Parse(queue);
+
+        spec.ContentBasedDeduplication.Should().BeFalse();
+    }
+
     // ── Unknown keys ignored ──────────────────────────────────────────────────
 
     [Fact]

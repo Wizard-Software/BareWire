@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Transport.AWS.SQS;
+using BareWire.Transport.AWS.SQS.Configuration;
 using Xunit;
 
 namespace BareWire.UnitTests.Transport.Sqs;
@@ -251,5 +252,48 @@ public sealed class SqsTransportOptionsTests
         options.MaxInFlightMessages.Should().Be(100);
         options.DefaultVisibilityTimeout.Should().Be(TimeSpan.FromSeconds(30));
         options.AllowInsecureEndpoint.Should().BeFalse();
+        options.EnableContentBasedDeduplication.Should().BeFalse();
+    }
+
+    // ── EnableContentBasedDeduplication (R4.2) ────────────────────────────────
+
+    [Fact]
+    public void ToString_ContainsEnableContentBasedDeduplication()
+    {
+        var options = new SqsTransportOptions
+        {
+            EnableContentBasedDeduplication = true,
+        };
+
+        string rendered = options.ToString();
+
+        rendered.Should().Contain("EnableContentBasedDeduplication = True");
+    }
+
+    // ── SqsConfigurator.ContentBasedDeduplication() threads into options ──────
+
+    [Fact]
+    public void SqsConfigurator_ContentBasedDeduplication_ThreadsIntoOptions()
+    {
+        // Arrange — build options via the configurator with ContentBasedDeduplication() called.
+        var configurator = new SqsConfigurator();
+        configurator.ContentBasedDeduplication();
+
+        // Act
+        SqsTransportOptions options = configurator.Build();
+
+        // Assert
+        options.EnableContentBasedDeduplication.Should().BeTrue(
+            "ContentBasedDeduplication() must set EnableContentBasedDeduplication = true in options");
+    }
+
+    [Fact]
+    public void SqsConfigurator_WithoutContentBasedDeduplication_DefaultsFalse()
+    {
+        var configurator = new SqsConfigurator();
+
+        SqsTransportOptions options = configurator.Build();
+
+        options.EnableContentBasedDeduplication.Should().BeFalse();
     }
 }

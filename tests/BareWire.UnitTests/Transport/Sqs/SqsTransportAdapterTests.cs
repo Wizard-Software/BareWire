@@ -3,6 +3,7 @@ using Amazon.SQS;
 using Amazon.SQS.Model;
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.AWS.SQS;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -203,5 +204,303 @@ public sealed class SqsTransportAdapterTests
 
         Func<Task> act = async () => await adapter.DisposeAsync();
         await act.Should().NotThrowAsync();
+    }
+
+    // ── SendBatchAsync — FIFO queues ──────────────────────────────────────────
+
+    [Fact]
+    public async Task SendBatchAsync_FifoQueueWithCorrelationIdHeader_SetsMessageGroupIdOnEntry()
+    {
+        // Arrange
+        const string fifoQueueName = "my-orders.fifo";
+        const string fifoQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-orders.fifo";
+        const string correlationId = "saga-correlation-abc";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(fifoQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = fifoQueueUrl }));
+
+        SendMessageBatchRequest? captured = null;
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                captured = callInfo.Arg<SendMessageBatchRequest>();
+                return Task.FromResult(new SendMessageBatchResponse
+                {
+                    Successful = captured.Entries.Select(e => new SendMessageBatchResultEntry
+                    {
+                        Id = e.Id,
+                        MessageId = $"msg-{e.Id}",
+                    }).ToList(),
+                    Failed = [],
+                });
+            });
+
+        var options = DefaultOptions();
+        var adapter = new SqsTransportAdapter(
+            options,
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        var message = new OutboundMessage(
+            routingKey: fifoQueueName,
+            headers: new Dictionary<string, string>
+            {
+                [SqsHeaderMapper.CorrelationIdHeader] = correlationId,
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        // Act
+        await adapter.SendBatchAsync([message]);
+
+        // Assert — MessageGroupId must be set to the correlation-id fallback value.
+        captured.Should().NotBeNull();
+        captured!.Entries.Should().HaveCount(1);
+        captured.Entries[0].MessageGroupId.Should().Be(correlationId);
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_FifoQueueWithExplicitMessageGroupIdHeader_PrioritisesExplicitHeader()
+    {
+        const string fifoQueueName = "my-orders.fifo";
+        const string fifoQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-orders.fifo";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(fifoQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = fifoQueueUrl }));
+
+        SendMessageBatchRequest? captured = null;
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                captured = callInfo.Arg<SendMessageBatchRequest>();
+                return Task.FromResult(new SendMessageBatchResponse
+                {
+                    Successful = captured.Entries.Select(e => new SendMessageBatchResultEntry
+                    {
+                        Id = e.Id,
+                        MessageId = $"msg-{e.Id}",
+                    }).ToList(),
+                    Failed = [],
+                });
+            });
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        var message = new OutboundMessage(
+            routingKey: fifoQueueName,
+            headers: new Dictionary<string, string>
+            {
+                [SqsHeaderMapper.MessageGroupIdHeader] = "explicit-group",
+                [SqsHeaderMapper.CorrelationIdHeader] = "should-not-be-used",
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        captured.Should().NotBeNull();
+        captured!.Entries[0].MessageGroupId.Should().Be("explicit-group");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_StandardQueue_DoesNotSetMessageGroupId()
+    {
+        // Standard queues (no .fifo suffix) must NOT have MessageGroupId set.
+        const string standardQueueName = "my-standard-queue";
+        const string standardQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-standard-queue";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(standardQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = standardQueueUrl }));
+
+        SendMessageBatchRequest? captured = null;
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                captured = callInfo.Arg<SendMessageBatchRequest>();
+                return Task.FromResult(new SendMessageBatchResponse
+                {
+                    Successful = captured.Entries.Select(e => new SendMessageBatchResultEntry
+                    {
+                        Id = e.Id,
+                        MessageId = $"msg-{e.Id}",
+                    }).ToList(),
+                    Failed = [],
+                });
+            });
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        var message = new OutboundMessage(
+            routingKey: standardQueueName,
+            headers: new Dictionary<string, string>
+            {
+                [SqsHeaderMapper.CorrelationIdHeader] = "some-corr-id",
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        captured.Should().NotBeNull();
+        captured!.Entries[0].MessageGroupId.Should().BeNull(
+            "standard queues must not have MessageGroupId — SQS returns InvalidParameterValue");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_FifoQueueWithNoGroupOrCorrelationHeader_ThrowsBareWireTransportException()
+    {
+        const string fifoQueueName = "my-orders.fifo";
+        const string fifoQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-orders.fifo";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(fifoQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = fifoQueueUrl }));
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        // No BW-MessageGroupId and no correlation-id headers.
+        var message = new OutboundMessage(
+            routingKey: fifoQueueName,
+            headers: new Dictionary<string, string>
+            {
+                ["content-type"] = "application/json",
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        Func<Task> act = async () => await adapter.SendBatchAsync([message]);
+
+        BareWireTransportException ex = (await act.Should().ThrowAsync<BareWireTransportException>()).Which;
+
+        // SEC: exception message must contain the queue name and header NAMES but NOT header VALUES.
+        ex.Message.Should().Contain(fifoQueueName);
+        ex.Message.Should().Contain(SqsHeaderMapper.MessageGroupIdHeader);
+        ex.Message.Should().Contain(SqsHeaderMapper.CorrelationIdHeader);
+        // The "application/json" content-type value must not appear in the message.
+        ex.Message.Should().NotContain("application/json");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_FifoQueueWithContentBasedDeduplicationEnabled_DoesNotSetMessageDeduplicationId()
+    {
+        const string fifoQueueName = "my-orders.fifo";
+        const string fifoQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-orders.fifo";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(fifoQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = fifoQueueUrl }));
+
+        SendMessageBatchRequest? captured = null;
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                captured = callInfo.Arg<SendMessageBatchRequest>();
+                return Task.FromResult(new SendMessageBatchResponse
+                {
+                    Successful = captured.Entries.Select(e => new SendMessageBatchResultEntry
+                    {
+                        Id = e.Id,
+                        MessageId = $"msg-{e.Id}",
+                    }).ToList(),
+                    Failed = [],
+                });
+            });
+
+        var options = DefaultOptions();
+        options.EnableContentBasedDeduplication = true;
+
+        var adapter = new SqsTransportAdapter(
+            options,
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        var message = new OutboundMessage(
+            routingKey: fifoQueueName,
+            headers: new Dictionary<string, string>
+            {
+                [SqsHeaderMapper.CorrelationIdHeader] = "corr-abc",
+            },
+            body: ReadOnlyMemory<byte>.Empty,
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        captured.Should().NotBeNull();
+        // MessageDeduplicationId must be null — broker computes it from content.
+        captured!.Entries[0].MessageDeduplicationId.Should().BeNull(
+            "content-based dedup means the broker computes the dedup id, not the client");
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_FifoQueueWithContentBasedDeduplicationDisabled_SetsMessageDeduplicationId()
+    {
+        const string fifoQueueName = "my-orders.fifo";
+        const string fifoQueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/my-orders.fifo";
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(fifoQueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = fifoQueueUrl }));
+
+        SendMessageBatchRequest? captured = null;
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                captured = callInfo.Arg<SendMessageBatchRequest>();
+                return Task.FromResult(new SendMessageBatchResponse
+                {
+                    Successful = captured.Entries.Select(e => new SendMessageBatchResultEntry
+                    {
+                        Id = e.Id,
+                        MessageId = $"msg-{e.Id}",
+                    }).ToList(),
+                    Failed = [],
+                });
+            });
+
+        var options = DefaultOptions();
+        options.EnableContentBasedDeduplication = false; // explicit for clarity
+
+        var adapter = new SqsTransportAdapter(
+            options,
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        var message = new OutboundMessage(
+            routingKey: fifoQueueName,
+            headers: new Dictionary<string, string>
+            {
+                [SqsHeaderMapper.CorrelationIdHeader] = "corr-abc",
+            },
+            body: "hello"u8.ToArray(),
+            contentType: "application/json");
+
+        await adapter.SendBatchAsync([message]);
+
+        captured.Should().NotBeNull();
+        // MessageDeduplicationId must be non-null and non-empty (generated hash).
+        captured!.Entries[0].MessageDeduplicationId.Should().NotBeNullOrEmpty(
+            "without content-based dedup, BareWire must generate a deterministic dedup id");
     }
 }

@@ -3,6 +3,7 @@ using Amazon.SQS;
 using Amazon.SQS.Model;
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.AWS.SQS;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -223,6 +224,149 @@ public sealed class SqsTransportAdapterConsumerTests
         await sqsClient.DidNotReceive().ChangeMessageVisibilityAsync(
             Arg.Any<ChangeMessageVisibilityRequest>(),
             Arg.Any<CancellationToken>());
+    }
+
+    // ── ConsumeAsync — FIFO system attributes stamped on inbound ─────────────
+
+    [Fact]
+    public async Task ConsumeAsync_MessageWithFifoSystemAttributes_StampsMessageGroupIdAndSequenceNumber()
+    {
+        // Arrange — broker sets MessageGroupId and SequenceNumber as system attributes.
+        var sqsClient = Substitute.For<IAmazonSQS>();
+
+        sqsClient.GetQueueUrlAsync(QueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = QueueUrl }));
+
+        int callCount = 0;
+        sqsClient.ReceiveMessageAsync(
+                Arg.Any<ReceiveMessageRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                if (callCount++ == 0)
+                {
+                    return Task.FromResult(new ReceiveMessageResponse
+                    {
+                        Messages =
+                        [
+                            new Message
+                            {
+                                MessageId = "fifo-msg-001",
+                                ReceiptHandle = ReceiptHandle,
+                                Body = "{\"hello\":\"world\"}",
+                                MessageAttributes = [],
+                                // System attributes set by the FIFO broker.
+                                Attributes = new Dictionary<string, string>
+                                {
+                                    ["MessageGroupId"] = "grp-1",
+                                    ["SequenceNumber"] = "111",
+                                },
+                            },
+                        ],
+                    });
+                }
+
+                throw new OperationCanceledException();
+            });
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        using var cts = new CancellationTokenSource();
+        var flowControl = new FlowControlOptions { InternalQueueCapacity = 10 };
+
+        InboundMessage? received = null;
+
+        // Act
+        await foreach (InboundMessage msg in adapter.ConsumeAsync(QueueName, flowControl, cts.Token))
+        {
+            received = msg;
+            cts.Cancel();
+            break;
+        }
+
+        // Assert — BW-MessageGroupId and BW-SequenceNumber must be stamped from system attributes.
+        received.Should().NotBeNull();
+        received!.Headers.Should().ContainKey(SqsHeaderMapper.MessageGroupIdHeader)
+            .WhoseValue.Should().Be("grp-1");
+        received.Headers.Should().ContainKey(SqsHeaderMapper.SequenceNumberHeader)
+            .WhoseValue.Should().Be("111");
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_MessageAttributeNamedBwMessageGroupId_DoesNotOverrideTrustedSystemAttribute()
+    {
+        // SEC-3 anti-squatting: sender sets MessageAttribute "BW-MessageGroupId" = "spoofed".
+        // The broker's system attribute "MessageGroupId" = "real" must win because stamping
+        // happens AFTER MapInbound (which processes MessageAttributes), overwriting the spoofed value.
+        var sqsClient = Substitute.For<IAmazonSQS>();
+
+        sqsClient.GetQueueUrlAsync(QueueName, Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse { QueueUrl = QueueUrl }));
+
+        int callCount = 0;
+        sqsClient.ReceiveMessageAsync(
+                Arg.Any<ReceiveMessageRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                if (callCount++ == 0)
+                {
+                    return Task.FromResult(new ReceiveMessageResponse
+                    {
+                        Messages =
+                        [
+                            new Message
+                            {
+                                MessageId = "spoof-test-msg",
+                                ReceiptHandle = ReceiptHandle,
+                                Body = "{}",
+                                // Sender-controlled MessageAttributes — untrusted.
+                                MessageAttributes = new Dictionary<string, MessageAttributeValue>
+                                {
+                                    [SqsHeaderMapper.MessageGroupIdHeader] = new MessageAttributeValue
+                                    {
+                                        DataType = "String",
+                                        StringValue = "spoofed",
+                                    },
+                                },
+                                // Broker-controlled system attribute — trusted.
+                                Attributes = new Dictionary<string, string>
+                                {
+                                    ["MessageGroupId"] = "real",
+                                },
+                            },
+                        ],
+                    });
+                }
+
+                throw new OperationCanceledException();
+            });
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        using var cts = new CancellationTokenSource();
+        var flowControl = new FlowControlOptions { InternalQueueCapacity = 10 };
+
+        InboundMessage? received = null;
+
+        await foreach (InboundMessage msg in adapter.ConsumeAsync(QueueName, flowControl, cts.Token))
+        {
+            received = msg;
+            cts.Cancel();
+            break;
+        }
+
+        // Assert — trusted system attribute ("real") must win over spoofed MessageAttribute ("spoofed").
+        received.Should().NotBeNull();
+        received!.Headers.Should().ContainKey(SqsHeaderMapper.MessageGroupIdHeader)
+            .WhoseValue.Should().Be("real",
+                "system attributes stamped after MapInbound must override sender-supplied MessageAttributes");
     }
 
     // ── SettleAsync — evict-once ──────────────────────────────────────────────
