@@ -27,6 +27,7 @@
     <Project Path="src/BareWire.Saga.EntityFramework/BareWire.Saga.EntityFramework.csproj" />
     <Project Path="src/BareWire.Saga/BareWire.Saga.csproj" />
     <Project Path="src/BareWire.Serialization.Json/BareWire.Serialization.Json.csproj" />
+    <Project Path="src/BareWire.Serialization.MsgPack/BareWire.Serialization.MsgPack.csproj" />
     <Project Path="src/BareWire.Testing/BareWire.Testing.csproj" />
     <Project Path="src/BareWire.Transport.AzureServiceBus/BareWire.Transport.AzureServiceBus.csproj" />
     <Project Path="src/BareWire.Transport.Kafka/BareWire.Transport.Kafka.csproj" />

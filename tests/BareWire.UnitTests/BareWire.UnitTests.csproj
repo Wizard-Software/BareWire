@@ -18,6 +18,7 @@
     <ProjectReference Include="..\..\src\BareWire.Interop.MassTransit\BareWire.Interop.MassTransit.csproj" />
     <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Serialization.MsgPack\BareWire.Serialization.MsgPack.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga\BareWire.Saga.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.EntityFramework\BareWire.Saga.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
