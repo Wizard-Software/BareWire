@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Google Cloud Pub/Sub transport provider for BareWire with pull-based consumer, batch send, credit-based flow control, native ordering keys, and dead-letter topic support via DeadLetterPolicy.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Cloud.PubSub.V1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BareWire.UnitTests" />
+    <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+    <InternalsVisibleTo Include="BareWire.ContractTests" />
+    <!-- Allows NSubstitute (Castle DynamicProxy) to mock internal types. -->
+    <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
+  </ItemGroup>
+
+</Project>
