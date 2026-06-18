@@ -40,6 +40,7 @@ public sealed class ArchitectureRuleTests
         string[] forbidden =
         [
             .. CoreNamespaces,
+            "BareWire.Transport.AWS.SQS",
             "BareWire.Transport.RabbitMQ",
             "BareWire.Transport.Kafka",
             "BareWire.Transport.AzureServiceBus",
@@ -232,6 +233,37 @@ public sealed class ArchitectureRuleTests
 
         resultKafka.IsSuccessful.Should().BeTrue(
             resultKafka.FailingTypeNames is { Count: > 0 } kNames ? kNames[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 4d: Transport.AWS.SQS must NOT depend on Core, Observability, or other Transports
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void SqsTransport_ShouldNotDependOn_CoreOrObservability()
+    {
+        var assembly = GetAssembly("BareWire.Transport.AWS.SQS");
+
+        AssertNoDependencyOnCore(assembly);
+
+        string[] forbidden =
+        [
+            "BareWire.Observability",
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Transport.Kafka",
+            "BareWire.Transport.AzureServiceBus",
+        ];
+
+        foreach (var dep in forbidden)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(dep)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+        }
     }
 
     // -------------------------------------------------------------------------
