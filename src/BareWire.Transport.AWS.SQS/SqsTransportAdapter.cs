@@ -300,6 +300,15 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
     /// <c>IAmazonSQS.CreateQueueAsync</c>. Exchanges and bindings are accepted (shared contract)
     /// but produce no admin operations — SQS has no exchange concept (mirror ASB D-6).
     /// Queue-already-exists responses are swallowed (idempotent declaration).
+    /// <para>
+    /// <b>Dead Letter Queue ordering contract:</b> When a queue declares
+    /// <c>bw.sqs.dead-letter-queue</c>, the named DLQ queue <b>must</b> appear <em>earlier</em> in
+    /// <see cref="TopologyDeclaration.Queues"/> than the source queue. This deploy is single-pass:
+    /// the source queue's <c>RedrivePolicy</c> is set via a second <c>SetQueueAttributesAsync</c>
+    /// call immediately after the source queue is created, and it resolves the DLQ's ARN from the
+    /// queue URL cache populated during the same pass. If the DLQ has not been created yet at that
+    /// point the deploy will fail with a queue-not-found error.
+    /// </para>
     /// </remarks>
     public async Task DeployTopologyAsync(
         TopologyDeclaration topology,
@@ -332,13 +341,7 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                 }
             }
 
-            if (spec.MaxReceiveCount > 0)
-            {
-                // RedrivePolicy requires a DLQ ARN — for R4.1 we set only the maxReceiveCount
-                // without a DeadLetterTargetArn; the user must supply the full RedrivePolicy
-                // JSON via queue Arguments if a DLQ ARN is known. We store count as a hint.
-                // Full RedrivePolicy wiring is part of R4.4 (integration tests).
-            }
+            // RedrivePolicy is set post-create (see block below CreateQueueAsync).
 
             // SSE attribute mapping (R4.3): map SqsQueueSpec SSE fields to CreateQueueRequest
             // attributes. SSE-SQS and SSE-KMS are mutually exclusive (validated in Parse).
@@ -395,6 +398,60 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                     brokerError: ex.Message,
                     endpointAddress: null,
                     innerException: ex);
+            }
+
+            // Post-create: wire RedrivePolicy when bw.sqs.dead-letter-queue and
+            // bw.sqs.max-receive-count are both set (R4.4).
+            // The DLQ MUST appear earlier in topology.Queues so its ARN is already in the cache.
+            if (!string.IsNullOrEmpty(spec.DeadLetterQueueName) && spec.MaxReceiveCount > 0)
+            {
+                string dlqUrl = await GetOrResolveQueueUrlAsync(spec.DeadLetterQueueName, cancellationToken)
+                    .ConfigureAwait(false);
+
+                GetQueueAttributesResponse dlqAttrs = await _client!
+                    .GetQueueAttributesAsync(
+                        new GetQueueAttributesRequest
+                        {
+                            QueueUrl = dlqUrl,
+                            AttributeNames = ["QueueArn"],
+                        },
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
+                string dlqArn = dlqAttrs.Attributes["QueueArn"];
+
+                string sourceUrl = await GetOrResolveQueueUrlAsync(queue.Name, cancellationToken)
+                    .ConfigureAwait(false);
+
+                string redrivePolicy =
+                    $$"""{"deadLetterTargetArn":"{{dlqArn}}","maxReceiveCount":"{{spec.MaxReceiveCount.ToString(CultureInfo.InvariantCulture)}}"}""";
+
+                try
+                {
+                    await _client!
+                        .SetQueueAttributesAsync(
+                            new SetQueueAttributesRequest
+                            {
+                                QueueUrl = sourceUrl,
+                                Attributes = new Dictionary<string, string>
+                                {
+                                    ["RedrivePolicy"] = redrivePolicy,
+                                },
+                            },
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                    LogRedrivePolicyConfigured(queue.Name, spec.DeadLetterQueueName);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    throw new TopologyDeploymentException(
+                        topologyElement: queue.Name,
+                        transportName: TransportName,
+                        brokerError: ex.Message,
+                        endpointAddress: null,
+                        innerException: ex);
+                }
             }
         }
 
@@ -545,6 +602,10 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
     [LoggerMessage(Level = LogLevel.Information,
         Message = "SQS queue '{QueueName}' already exists — skipping (idempotent declaration).")]
     private partial void LogQueueAlreadyExists(string queueName);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "SQS RedrivePolicy configured on queue '{QueueName}': dead-letter queue is '{DeadLetterQueueName}'.")]
+    private partial void LogRedrivePolicyConfigured(string queueName, string deadLetterQueueName);
 
     [LoggerMessage(Level = LogLevel.Information,
         Message = "SQS topology deploy: exchange '{ExchangeName}' skipped — SQS has no exchange concept.")]

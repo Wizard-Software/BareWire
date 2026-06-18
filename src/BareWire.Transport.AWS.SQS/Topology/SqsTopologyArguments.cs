@@ -17,7 +17,8 @@ internal readonly record struct SqsQueueSpec(
     bool ContentBasedDeduplication,
     bool SseManaged,
     string? KmsMasterKeyId,
-    int KmsDataKeyReusePeriodSeconds);
+    int KmsDataKeyReusePeriodSeconds,
+    string? DeadLetterQueueName);
 
 /// <summary>
 /// Constant argument keys recognised by the Amazon SQS transport adapter and the
@@ -95,6 +96,19 @@ internal static class SqsTopologyArguments
     internal const string KmsDataKeyReusePeriodSecondsKey = "bw.sqs.kms-data-key-reuse-period";
 
     /// <summary>
+    /// Argument key for the name of the Dead Letter Queue (DLQ) that this source queue redrives to
+    /// once <see cref="MaxReceiveCountKey"/> is exhausted.
+    /// </summary>
+    /// <remarks>
+    /// The DLQ queue <b>must</b> be declared earlier in <see cref="BareWire.Abstractions.Topology.TopologyDeclaration.Queues"/>
+    /// than this source queue. <c>DeployTopologyAsync</c> is a single-pass deploy: it resolves the DLQ's ARN by name
+    /// from the queue URL cache populated during the same pass. If the DLQ has not been created yet when the
+    /// source queue's <c>RedrivePolicy</c> is being wired, the deploy will fail with a queue-not-found error.
+    /// Value: non-empty string (queue name, without URL). Default: <see langword="null"/> (no <c>RedrivePolicy</c>).
+    /// </remarks>
+    internal const string DeadLetterQueueName = "bw.sqs.dead-letter-queue";
+
+    /// <summary>
     /// Parses <see cref="QueueDeclaration.Arguments"/> into a <see cref="SqsQueueSpec"/>.
     /// When <paramref name="queue"/> has no <c>Arguments</c>, returns defaults
     /// (30-second visibility, 20-second wait, no FIFO, maxReceiveCount=5).
@@ -127,6 +141,7 @@ internal static class SqsTopologyArguments
         bool sseManaged = false;
         string? kmsMasterKeyId = null;
         int kmsDataKeyReusePeriodSeconds = 0;
+        string? deadLetterQueueName = null;
 
         foreach ((string key, object value) in args)
         {
@@ -165,6 +180,10 @@ internal static class SqsTopologyArguments
                 kmsDataKeyReusePeriodSeconds = ParseInt32InRange(key, value, min: 60, max: 86400,
                     expectedDescription: "An integer in the range 60–86400 (KMS data key reuse period)");
             }
+            else if (key == DeadLetterQueueName)
+            {
+                deadLetterQueueName = value.ToString();
+            }
             // Unknown bw.sqs.* keys are silently ignored (forward-compatible).
         }
 
@@ -180,7 +199,7 @@ internal static class SqsTopologyArguments
 
         return new SqsQueueSpec(
             visibilityTimeout, waitTimeSeconds, isFifo, maxReceiveCount, contentBasedDeduplication,
-            sseManaged, kmsMasterKeyId, kmsDataKeyReusePeriodSeconds);
+            sseManaged, kmsMasterKeyId, kmsDataKeyReusePeriodSeconds, deadLetterQueueName);
     }
 
     private static SqsQueueSpec DefaultSpec() =>
@@ -192,7 +211,8 @@ internal static class SqsTopologyArguments
             ContentBasedDeduplication: false,
             SseManaged: false,
             KmsMasterKeyId: null,
-            KmsDataKeyReusePeriodSeconds: 0);
+            KmsDataKeyReusePeriodSeconds: 0,
+            DeadLetterQueueName: null);
 
     private static int ParseInt32InRange(string key, object value, int min, int max, string expectedDescription)
     {
