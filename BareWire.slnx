@@ -25,6 +25,7 @@
     <Project Path="src/BareWire.Outbox.EntityFramework/BareWire.Outbox.EntityFramework.csproj" />
     <Project Path="src/BareWire.Outbox/BareWire.Outbox.csproj" />
     <Project Path="src/BareWire.Saga.EntityFramework/BareWire.Saga.EntityFramework.csproj" />
+    <Project Path="src/BareWire.Saga.Redis/BareWire.Saga.Redis.csproj" />
     <Project Path="src/BareWire.Saga/BareWire.Saga.csproj" />
     <Project Path="src/BareWire.Serialization.Json/BareWire.Serialization.Json.csproj" />
     <Project Path="src/BareWire.Serialization.MsgPack/BareWire.Serialization.MsgPack.csproj" />
