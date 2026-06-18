@@ -6,6 +6,7 @@
   <ItemGroup>
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Aspire.Hosting.Kafka" />
+    <PackageReference Include="Aspire.Hosting.Redis" />
     <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
     <PackageReference Include="MessagePack" />
   </ItemGroup>

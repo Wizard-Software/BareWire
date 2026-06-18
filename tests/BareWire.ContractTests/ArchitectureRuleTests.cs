@@ -396,6 +396,32 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
+    // Rule 7b: Saga.Redis must NOT depend on Transport or Observability
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void SagaRedis_ShouldNotDependOn_TransportOrObservability()
+    {
+        var assembly = GetAssembly("BareWire.Saga.Redis");
+
+        var resultTransport = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.RabbitMQ")
+            .GetResult();
+
+        resultTransport.IsSuccessful.Should().BeTrue(
+            resultTransport.FailingTypeNames is { Count: > 0 } tNames ? tNames[0] : null);
+
+        var resultObservability = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Observability")
+            .GetResult();
+
+        resultObservability.IsSuccessful.Should().BeTrue(
+            resultObservability.FailingTypeNames is { Count: > 0 } oNames ? oNames[0] : null);
+    }
+
+    // -------------------------------------------------------------------------
     // Rule 8: Outbox.EntityFramework must NOT depend on Transport or Observability
     // -------------------------------------------------------------------------
 

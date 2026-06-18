@@ -17,6 +17,8 @@
     <PackageVersion Include="Azure.Messaging.ServiceBus" Version="7.20.1" />
     <PackageVersion Include="Confluent.Kafka" Version="2.14.2" />
     <PackageVersion Include="RabbitMQ.Client" Version="7.2.1" />
+    <!-- Redis -->
+    <PackageVersion Include="StackExchange.Redis" Version="2.13.17" />
     <!-- Entity Framework -->
     <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.5" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.5" />
@@ -39,6 +41,7 @@
     <PackageVersion Include="Aspire.Hosting" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.RabbitMQ" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.Kafka" Version="13.1.3" />
+    <PackageVersion Include="Aspire.Hosting.Redis" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.PostgreSQL" Version="13.1.3" />
     <PackageVersion Include="Aspire.Hosting.Testing" Version="13.1.3" />
     <!-- Contract testing -->
