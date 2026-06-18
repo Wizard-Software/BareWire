@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-06-18
+
+### Added
+
+- Azure Service Bus transport (`BareWire.Transport.AzureServiceBus`): `AzureServiceBusTransportAdapter` with native sessions (per-session FIFO, lock auto-renewal), scheduled messages (schedule + cancel), and Entra ID + SAS authentication — tasks R2.1–R2.5
+- MessagePack serialization (`BareWire.Serialization.MsgPack`): `MessagePackSerializer` with zero-copy pipeline and Content-Type deserializer routing — tasks R3.1–R3.3
+- AWS SQS transport (`BareWire.Transport.AWS.SQS`): `SqsTransportAdapter` with batch producer and long-polling consumer, FIFO queues (MessageGroupId + deduplication), IAM instance-profile auth, SSE encryption at rest, and RedrivePolicy DLQ — tasks R4.1–R4.4
+- Google Pub/Sub transport (`BareWire.Transport.Google.PubSub`): Pub/Sub transport adapter with ordering keys and dead-letter topics — tasks R5.1–R5.4
+
+### Fixed
+
+- RabbitMQ request clients now honour per-type serializer/exchange configuration (#13)
+
 ## [1.3.1] - 2026-06-16
 
 ### Fixed
