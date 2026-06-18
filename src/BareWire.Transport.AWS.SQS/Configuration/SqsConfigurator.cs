@@ -3,6 +3,7 @@ namespace BareWire.Transport.AWS.SQS.Configuration;
 internal sealed class SqsConfigurator : ISqsConfigurator
 {
     private SqsAuthMode _authMode = SqsAuthMode.DefaultChain;
+    private string _instanceProfileRoleName = string.Empty;
     private string _accessKeyId = string.Empty;
     private string _secretAccessKey = string.Empty;
     private string _regionEndpoint = string.Empty;
@@ -17,6 +18,12 @@ internal sealed class SqsConfigurator : ISqsConfigurator
     public void UseDefaultCredentials()
     {
         _authMode = SqsAuthMode.DefaultChain;
+    }
+
+    public void UseInstanceProfileCredentials(string? roleName = null)
+    {
+        _authMode = SqsAuthMode.InstanceProfile;
+        _instanceProfileRoleName = roleName ?? string.Empty;
     }
 
     public void UseExplicitCredentials(string accessKeyId, string secretAccessKey)
@@ -77,6 +84,11 @@ internal sealed class SqsConfigurator : ISqsConfigurator
         var options = new SqsTransportOptions();
 
         options.AuthMode = _authMode;
+
+        if (!string.IsNullOrEmpty(_instanceProfileRoleName))
+        {
+            options.InstanceProfileRoleName = _instanceProfileRoleName;
+        }
 
         if (!string.IsNullOrEmpty(_accessKeyId))
         {

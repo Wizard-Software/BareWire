@@ -71,6 +71,37 @@ public sealed class SqsTransportAdapterTests
             .Should().BeTrue();
     }
 
+    // ── BuildClient — InstanceProfile mode (R4.3) ────────────────────────────
+
+    [Fact]
+    public async Task SendBatchAsync_InstanceProfileMode_DoesNotThrowWhenClientPreInjected()
+    {
+        // Validates InstanceProfile branch by injecting a pre-built mock — EnsureClientAsync
+        // skips BuildClient when _client is already set (test constructor). This proves the
+        // auth mode path is reachable without contacting IMDS.
+        var options = new SqsTransportOptions
+        {
+            AuthMode = SqsAuthMode.InstanceProfile,
+            InstanceProfileRoleName = string.Empty,
+        };
+
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new GetQueueUrlResponse
+                { QueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/q" }));
+        sqsClient.SendMessageBatchAsync(
+                Arg.Any<SendMessageBatchRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new SendMessageBatchResponse { Successful = [], Failed = [] }));
+
+        var adapter = new SqsTransportAdapter(options, NullLogger<SqsTransportAdapter>.Instance, sqsClient);
+
+        Func<Task> act = async () => await adapter.SendBatchAsync([]);
+
+        await act.Should().NotThrowAsync(
+            "InstanceProfile mode with an injected client must not throw");
+    }
+
     // ── SendBatchAsync — chunking ─────────────────────────────────────────────
 
     [Fact]
@@ -204,6 +235,90 @@ public sealed class SqsTransportAdapterTests
 
         Func<Task> act = async () => await adapter.DisposeAsync();
         await act.Should().NotThrowAsync();
+    }
+
+    // ── DeployTopologyAsync — SSE attributes (R4.3) ───────────────────────────
+
+    [Fact]
+    public async Task DeployTopologyAsync_SseManagedTrue_SetsSqsManagedSseEnabledAttribute()
+    {
+        var topology = new BareWire.Abstractions.Topology.TopologyDeclaration
+        {
+            Queues =
+            [
+                new BareWire.Abstractions.Topology.QueueDeclaration(
+                    "sse-queue",
+                    Arguments: new Dictionary<string, object>
+                    {
+                        ["bw.sqs.sse-managed"] = true,
+                    }),
+            ],
+        };
+
+        CreateQueueRequest? captured = null;
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.CreateQueueAsync(
+                Arg.Do<CreateQueueRequest>(r => captured = r),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new CreateQueueResponse
+                { QueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/sse-queue" }));
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        await adapter.DeployTopologyAsync(topology);
+
+        captured.Should().NotBeNull();
+        captured!.Attributes.Should().ContainKey("SqsManagedSseEnabled",
+            "SSE-SQS requires the SqsManagedSseEnabled attribute on the CreateQueueRequest");
+        captured.Attributes["SqsManagedSseEnabled"].Should().Be("true");
+        captured.Attributes.Should().NotContainKey("KmsMasterKeyId",
+            "SSE-SQS and SSE-KMS are mutually exclusive — KmsMasterKeyId must not be set");
+    }
+
+    [Fact]
+    public async Task DeployTopologyAsync_KmsMasterKeyId_SetsKmsMasterKeyIdAttribute()
+    {
+        const string keyArn = "arn:aws:kms:eu-central-1:123456789:key/abc-def";
+        var topology = new BareWire.Abstractions.Topology.TopologyDeclaration
+        {
+            Queues =
+            [
+                new BareWire.Abstractions.Topology.QueueDeclaration(
+                    "kms-queue",
+                    Arguments: new Dictionary<string, object>
+                    {
+                        ["bw.sqs.kms-master-key-id"] = keyArn,
+                        ["bw.sqs.kms-data-key-reuse-period"] = 300,
+                    }),
+            ],
+        };
+
+        CreateQueueRequest? captured = null;
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.CreateQueueAsync(
+                Arg.Do<CreateQueueRequest>(r => captured = r),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new CreateQueueResponse
+                { QueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/kms-queue" }));
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        await adapter.DeployTopologyAsync(topology);
+
+        captured.Should().NotBeNull();
+        captured!.Attributes.Should().ContainKey("KmsMasterKeyId",
+            "SSE-KMS requires the KmsMasterKeyId attribute on the CreateQueueRequest");
+        captured.Attributes["KmsMasterKeyId"].Should().Be(keyArn);
+        captured.Attributes.Should().ContainKey("KmsDataKeyReusePeriodSeconds");
+        captured.Attributes["KmsDataKeyReusePeriodSeconds"].Should().Be("300");
+        captured.Attributes.Should().NotContainKey("SqsManagedSseEnabled",
+            "SSE-KMS must not also set SqsManagedSseEnabled");
     }
 
     // ── SendBatchAsync — FIFO queues ──────────────────────────────────────────

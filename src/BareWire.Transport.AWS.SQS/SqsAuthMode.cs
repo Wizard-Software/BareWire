@@ -7,7 +7,8 @@ namespace BareWire.Transport.AWS.SQS;
 /// In production, prefer <see cref="DefaultChain"/> with IAM roles (EC2 instance profile,
 /// ECS task role, or Lambda execution role). Use <see cref="Explicit"/> only for local
 /// development or scenarios where a credential chain is not available.
-/// Full IAM InstanceProfile support with <c>InstanceProfileCredentialsProvider</c> arrives in R4.3.
+/// For explicit EC2 instance-profile / ECS task-role credential binding, use
+/// <see cref="InstanceProfile"/> (implemented in R4.3).
 /// </remarks>
 internal enum SqsAuthMode
 {
@@ -23,4 +24,14 @@ internal enum SqsAuthMode
     /// only for local development or static-credential scenarios.
     /// </summary>
     Explicit = 1,
+
+    /// <summary>
+    /// Fetches credentials from the EC2 Instance Metadata Service (IMDS) or ECS task-role endpoint,
+    /// binding to the IAM role assigned to the instance or task.
+    /// When <c>InstanceProfileRoleName</c> on <see cref="SqsTransportOptions"/> is set, the SDK
+    /// binds to that specific IAM role; otherwise the role assigned to the instance/task is used.
+    /// Credentials are refreshed automatically by the SDK before expiry — no secrets are stored
+    /// in application configuration (R4.3).
+    /// </summary>
+    InstanceProfile = 2,
 }

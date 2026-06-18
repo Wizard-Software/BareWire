@@ -340,6 +340,23 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                 // Full RedrivePolicy wiring is part of R4.4 (integration tests).
             }
 
+            // SSE attribute mapping (R4.3): map SqsQueueSpec SSE fields to CreateQueueRequest
+            // attributes. SSE-SQS and SSE-KMS are mutually exclusive (validated in Parse).
+            if (spec.SseManaged)
+            {
+                attributes["SqsManagedSseEnabled"] = "true";
+            }
+            else if (!string.IsNullOrEmpty(spec.KmsMasterKeyId))
+            {
+                attributes["KmsMasterKeyId"] = spec.KmsMasterKeyId;
+
+                if (spec.KmsDataKeyReusePeriodSeconds > 0)
+                {
+                    attributes["KmsDataKeyReusePeriodSeconds"] =
+                        spec.KmsDataKeyReusePeriodSeconds.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+
             var request = new CreateQueueRequest
             {
                 QueueName = queue.Name,
@@ -474,6 +491,12 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
             SqsAuthMode.Explicit =>
                 new AmazonSQSClient(
                     new BasicAWSCredentials(_options.AccessKeyId, _options.SecretAccessKey),
+                    config),
+            SqsAuthMode.InstanceProfile =>
+                new AmazonSQSClient(
+                    string.IsNullOrEmpty(_options.InstanceProfileRoleName)
+                        ? new InstanceProfileAWSCredentials()
+                        : new InstanceProfileAWSCredentials(_options.InstanceProfileRoleName),
                     config),
             _ =>
                 // DefaultChain: AWS SDK resolves credentials from environment, instance metadata, etc.

@@ -14,7 +14,10 @@ internal readonly record struct SqsQueueSpec(
     int WaitTimeSeconds,
     bool IsFifo,
     int MaxReceiveCount,
-    bool ContentBasedDeduplication);
+    bool ContentBasedDeduplication,
+    bool SseManaged,
+    string? KmsMasterKeyId,
+    int KmsDataKeyReusePeriodSeconds);
 
 /// <summary>
 /// Constant argument keys recognised by the Amazon SQS transport adapter and the
@@ -66,6 +69,32 @@ internal static class SqsTopologyArguments
     internal const string ContentBasedDeduplicationKey = "bw.sqs.content-based-deduplication";
 
     /// <summary>
+    /// Argument key for enabling SSE-SQS (SQS-managed server-side encryption) on the queue.
+    /// Value: <c>bool</c> or <c>"true"</c>/<c>"false"</c>. Default: <see langword="false"/>.
+    /// Mutually exclusive with <see cref="KmsMasterKeyIdKey"/> — SQS rejects both set simultaneously.
+    /// </summary>
+    /// <remarks>
+    /// When <see langword="true"/>, SQS encrypts messages at rest using an SQS-managed key.
+    /// No additional cost beyond SQS request pricing. Opt-in (R4.3).
+    /// </remarks>
+    internal const string SseManagedKey = "bw.sqs.sse-managed";
+
+    /// <summary>
+    /// Argument key for the AWS KMS CMK key ID or ARN used for SSE-KMS encryption.
+    /// Value: non-empty key ID, key ARN, or alias ARN (e.g. <c>alias/aws/sqs</c>).
+    /// Default: <see langword="null"/> (SSE-KMS disabled).
+    /// Mutually exclusive with <see cref="SseManagedKey"/>.
+    /// </summary>
+    internal const string KmsMasterKeyIdKey = "bw.sqs.kms-master-key-id";
+
+    /// <summary>
+    /// Argument key for the KMS data key reuse period in seconds.
+    /// Value: <c>int</c>, range 60–86400. Default: <c>0</c> (not set — SQS default of 300 s applies).
+    /// Only meaningful when <see cref="KmsMasterKeyIdKey"/> is also set.
+    /// </summary>
+    internal const string KmsDataKeyReusePeriodSecondsKey = "bw.sqs.kms-data-key-reuse-period";
+
+    /// <summary>
     /// Parses <see cref="QueueDeclaration.Arguments"/> into a <see cref="SqsQueueSpec"/>.
     /// When <paramref name="queue"/> has no <c>Arguments</c>, returns defaults
     /// (30-second visibility, 20-second wait, no FIFO, maxReceiveCount=5).
@@ -75,8 +104,11 @@ internal static class SqsTopologyArguments
     /// <exception cref="BareWireConfigurationException">
     /// Thrown when <c>bw.sqs.visibility-timeout</c> is not a parseable <see cref="TimeSpan"/>,
     /// <c>bw.sqs.wait-time-seconds</c> is not an integer in range 0–20,
-    /// <c>bw.sqs.fifo</c> is not a parseable boolean, or
-    /// <c>bw.sqs.max-receive-count</c> is not a positive integer.
+    /// <c>bw.sqs.fifo</c> is not a parseable boolean,
+    /// <c>bw.sqs.max-receive-count</c> is not a positive integer,
+    /// <c>bw.sqs.kms-data-key-reuse-period</c> is not an integer in range 60–86400, or
+    /// both <c>bw.sqs.sse-managed</c> and <c>bw.sqs.kms-master-key-id</c> are set simultaneously
+    /// (SSE-SQS and SSE-KMS are mutually exclusive).
     /// </exception>
     internal static SqsQueueSpec Parse(QueueDeclaration queue)
     {
@@ -92,6 +124,9 @@ internal static class SqsTopologyArguments
         bool isFifo = false;
         int maxReceiveCount = 5;
         bool contentBasedDeduplication = false;
+        bool sseManaged = false;
+        string? kmsMasterKeyId = null;
+        int kmsDataKeyReusePeriodSeconds = 0;
 
         foreach ((string key, object value) in args)
         {
@@ -117,11 +152,35 @@ internal static class SqsTopologyArguments
             {
                 contentBasedDeduplication = ParseBool(key, value);
             }
+            else if (key == SseManagedKey)
+            {
+                sseManaged = ParseBool(key, value);
+            }
+            else if (key == KmsMasterKeyIdKey)
+            {
+                kmsMasterKeyId = value.ToString();
+            }
+            else if (key == KmsDataKeyReusePeriodSecondsKey)
+            {
+                kmsDataKeyReusePeriodSeconds = ParseInt32InRange(key, value, min: 60, max: 86400,
+                    expectedDescription: "An integer in the range 60–86400 (KMS data key reuse period)");
+            }
             // Unknown bw.sqs.* keys are silently ignored (forward-compatible).
         }
 
+        // SEC-1: validate mutual exclusion after all keys are parsed (order-independent).
+        if (sseManaged && !string.IsNullOrEmpty(kmsMasterKeyId))
+        {
+            throw new BareWireConfigurationException(
+                optionName: SseManagedKey,
+                optionValue: "true",
+                expectedValue: $"SSE-SQS ({SseManagedKey}) and SSE-KMS ({KmsMasterKeyIdKey}) are " +
+                               "mutually exclusive. Set only one encryption mode per queue.");
+        }
+
         return new SqsQueueSpec(
-            visibilityTimeout, waitTimeSeconds, isFifo, maxReceiveCount, contentBasedDeduplication);
+            visibilityTimeout, waitTimeSeconds, isFifo, maxReceiveCount, contentBasedDeduplication,
+            sseManaged, kmsMasterKeyId, kmsDataKeyReusePeriodSeconds);
     }
 
     private static SqsQueueSpec DefaultSpec() =>
@@ -130,7 +189,10 @@ internal static class SqsTopologyArguments
             WaitTimeSeconds: 20,
             IsFifo: false,
             MaxReceiveCount: 5,
-            ContentBasedDeduplication: false);
+            ContentBasedDeduplication: false,
+            SseManaged: false,
+            KmsMasterKeyId: null,
+            KmsDataKeyReusePeriodSeconds: 0);
 
     private static int ParseInt32InRange(string key, object value, int min, int max, string expectedDescription)
     {

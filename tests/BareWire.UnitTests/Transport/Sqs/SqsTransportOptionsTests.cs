@@ -255,6 +255,56 @@ public sealed class SqsTransportOptionsTests
         options.EnableContentBasedDeduplication.Should().BeFalse();
     }
 
+    // ── InstanceProfile mode — R4.3 ───────────────────────────────────────────
+
+    [Fact]
+    public void Validate_InstanceProfileMode_DoesNotRequireCredentials()
+    {
+        var options = new SqsTransportOptions
+        {
+            AuthMode = SqsAuthMode.InstanceProfile,
+        };
+
+        Action act = () => options.Validate();
+
+        act.Should().NotThrow(
+            "InstanceProfile mode obtains credentials from IMDS — no static credentials required");
+    }
+
+    [Fact]
+    public void ToString_InstanceProfileMode_ContainsRoleName()
+    {
+        const string roleName = "my-ec2-role";
+        var options = new SqsTransportOptions
+        {
+            AuthMode = SqsAuthMode.InstanceProfile,
+            InstanceProfileRoleName = roleName,
+        };
+
+        string rendered = options.ToString();
+
+        rendered.Should().Contain(roleName,
+            "InstanceProfileRoleName is a non-secret identifier and must appear in ToString()");
+    }
+
+    [Fact]
+    public void ToString_InstanceProfileMode_StillRedactsSecretAccessKey()
+    {
+        const string sentinel = "super-secret-key";
+        var options = new SqsTransportOptions
+        {
+            AuthMode = SqsAuthMode.InstanceProfile,
+            InstanceProfileRoleName = "my-role",
+            SecretAccessKey = sentinel,
+        };
+
+        string rendered = options.ToString();
+
+        rendered.Should().NotContain(sentinel,
+            "SecretAccessKey must always be redacted even in InstanceProfile mode (SEC-02)");
+        rendered.Should().Contain("[Redacted]");
+    }
+
     // ── EnableContentBasedDeduplication (R4.2) ────────────────────────────────
 
     [Fact]
@@ -268,6 +318,48 @@ public sealed class SqsTransportOptionsTests
         string rendered = options.ToString();
 
         rendered.Should().Contain("EnableContentBasedDeduplication = True");
+    }
+
+    // ── SqsConfigurator.UseInstanceProfileCredentials — R4.3 ──────────────────
+
+    [Fact]
+    public void SqsConfigurator_UseInstanceProfileCredentials_WithRole_SetsAuthModeAndRole()
+    {
+        const string role = "arn:aws:iam::123456789012:role/my-ec2-role";
+        var configurator = new SqsConfigurator();
+        configurator.UseInstanceProfileCredentials(role);
+
+        SqsTransportOptions options = configurator.Build();
+
+        options.AuthMode.Should().Be(SqsAuthMode.InstanceProfile,
+            "UseInstanceProfileCredentials must set AuthMode = InstanceProfile");
+        options.InstanceProfileRoleName.Should().Be(role,
+            "the role name must be threaded into options");
+    }
+
+    [Fact]
+    public void SqsConfigurator_UseInstanceProfileCredentials_WithoutRole_SetsAuthModeAndEmptyRole()
+    {
+        var configurator = new SqsConfigurator();
+        configurator.UseInstanceProfileCredentials();
+
+        SqsTransportOptions options = configurator.Build();
+
+        options.AuthMode.Should().Be(SqsAuthMode.InstanceProfile);
+        options.InstanceProfileRoleName.Should().BeEmpty(
+            "no role name means bind to the instance-attached role (IMDS default)");
+    }
+
+    [Fact]
+    public void SqsConfigurator_UseInstanceProfileCredentials_NullRole_SetsAuthModeAndEmptyRole()
+    {
+        var configurator = new SqsConfigurator();
+        configurator.UseInstanceProfileCredentials(null);
+
+        SqsTransportOptions options = configurator.Build();
+
+        options.AuthMode.Should().Be(SqsAuthMode.InstanceProfile);
+        options.InstanceProfileRoleName.Should().BeEmpty();
     }
 
     // ── SqsConfigurator.ContentBasedDeduplication() threads into options ──────

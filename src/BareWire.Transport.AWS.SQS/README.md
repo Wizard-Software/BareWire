@@ -18,6 +18,14 @@ services.AddBareWireSqs(sqs =>
     sqs.Region("us-east-1");
 });
 
+// IAM instance profile (EC2 instance profile / ECS task role) — R4.3
+services.AddBareWireSqs(sqs =>
+{
+    sqs.UseInstanceProfileCredentials();           // default role attached to the profile
+    // sqs.UseInstanceProfileCredentials("MyAppRole"); // or an explicit role name
+    sqs.Region("eu-central-1");
+});
+
 // LocalStack (http allowed via opt-in)
 services.AddBareWireSqs(sqs =>
 {
@@ -33,6 +41,7 @@ services.AddBareWireSqs(sqs =>
 |---------------------------------|----------|--------------------------------------------------------------|
 | `UseDefaultCredentials()`       | *(default)* | AWS SDK credential chain (IAM role, env vars, etc.)       |
 | `UseExplicitCredentials(k, s)`  | —        | Static Access Key ID + Secret Access Key                    |
+| `UseInstanceProfileCredentials(role?)` | — | IAM instance profile (EC2 / ECS task role); credentials fetched lazily from IMDS. Optional role name (R4.3) |
 | `Region(string)`                | *(env)*  | AWS region name (e.g. `eu-central-1`)                       |
 | `ServiceUrl(string)`            | *(AWS)*  | Custom endpoint URL (LocalStack, custom SQS-compatible)     |
 | `AllowInsecureEndpoint()`       | false    | Opt out of TLS enforcement (test environments only)         |
@@ -89,6 +98,9 @@ var topology = new TopologyDeclaration
 | `bw.sqs.fifo`                          | bool              | false   | FIFO queue (name must end in `.fifo`)           |
 | `bw.sqs.max-receive-count`             | int (≥1)          | 5       | DLQ redrive `maxReceiveCount`                   |
 | `bw.sqs.content-based-deduplication`   | bool              | false   | Enable content-based dedup for FIFO queues      |
+| `bw.sqs.sse-managed`                   | bool              | false   | Enable SSE-SQS encryption at rest (SQS-managed key) — R4.3 |
+| `bw.sqs.kms-master-key-id`             | string            | —       | SSE-KMS at-rest key id/ARN (mutually exclusive with `sse-managed`) — R4.3 |
+| `bw.sqs.kms-data-key-reuse-period`     | int (60–86400)    | —       | `KmsDataKeyReusePeriodSeconds` for SSE-KMS — R4.3 |
 
 ## FIFO (R4.2)
 
@@ -149,18 +161,40 @@ SQS FIFO guarantees ordering within a `MessageGroupId` at the broker level. Bare
 
 ### Known limitations by phase
 
-### R4.3 (IAM / Encryption — not yet implemented)
-- `InstanceProfileCredentialsProvider` for EC2/ECS metadata-service credential refresh.
-- SSE-SQS and SSE-KMS encryption at rest. **Note: queues created by R4.1 are NOT encrypted at rest.**
-- Full credential rotation strategy.
+### R4.3 (IAM / Encryption — implemented)
+- IAM instance-profile authentication via `UseInstanceProfileCredentials(role?)` — `Amazon.Runtime.InstanceProfileAWSCredentials`, lazy IMDS credential refresh (EC2 instance profile / ECS task role). See ADR-016.
+- SSE-SQS / SSE-KMS encryption at rest via topology arguments `bw.sqs.sse-managed` / `bw.sqs.kms-master-key-id` / `bw.sqs.kms-data-key-reuse-period` (see [Encryption at rest (R4.3)](#encryption-at-rest-r43)). At-rest encryption is **opt-in** (off by default) — a queue declared without an SSE argument is not encrypted by BareWire.
+- Note: full credential rotation strategy is handled by the AWS SDK refresh cycle for InstanceProfile; static `Explicit` credentials are not auto-rotated.
 
 ### R4.4 (Integration tests — not yet implemented)
 - LocalStack integration tests in CI (Aspire orchestration).
 - Real-queue round-trip, DLQ routing, visibility timeout renewal.
 
+## Encryption at rest (R4.3)
+
+At-rest encryption is configured **per queue** via topology arguments (it is a queue attribute, not a client setting). It is **opt-in** — a queue without an SSE argument is not encrypted by BareWire. SSE-SQS and SSE-KMS are mutually exclusive: setting both `bw.sqs.sse-managed=true` and `bw.sqs.kms-master-key-id` throws `BareWireConfigurationException` at deploy (fail-fast, order-independent).
+
+```csharp
+// SSE-SQS (SQS-managed key)
+new QueueDeclaration("orders", Arguments: new Dictionary<string, object>
+{
+    ["bw.sqs.sse-managed"] = true,
+});
+
+// SSE-KMS (customer CMK)
+new QueueDeclaration("payments", Arguments: new Dictionary<string, object>
+{
+    ["bw.sqs.kms-master-key-id"] = "alias/my-cmk",      // key id or ARN
+    ["bw.sqs.kms-data-key-reuse-period"] = 300,          // optional, 60–86400
+});
+```
+
+See ADR-016 for the full rationale (per-queue config, mutual exclusion, off-by-default posture).
+
 ## Security notes
 
-- **Production:** always prefer `UseDefaultCredentials()` with IAM roles over `UseExplicitCredentials()`.
+- **Production:** prefer `UseDefaultCredentials()` or `UseInstanceProfileCredentials()` with IAM roles over `UseExplicitCredentials()`.
+- **IAM (R4.3):** `UseInstanceProfileCredentials(role?)` fetches credentials lazily from IMDS (EC2 instance profile / ECS task role). The IAM role name is an identifier (not a secret) and may appear in `ToString()` / logs, like `AccessKeyId`.
 - **TLS:** all requests use HTTPS by default. `AllowInsecureEndpoint()` is for test environments only (SEC-01).
 - **Secrets:** `SecretAccessKey` is never logged and never appears in `ToString()` output (SEC-02).
-- **Encryption at rest:** not configured in R4.1. Enable SSE-SQS/SSE-KMS via queue policy until R4.3 is available.
+- **Encryption at rest (R4.3):** opt-in per queue via `bw.sqs.sse-managed` (SSE-SQS) or `bw.sqs.kms-master-key-id` (SSE-KMS). See [Encryption at rest (R4.3)](#encryption-at-rest-r43) and ADR-016.

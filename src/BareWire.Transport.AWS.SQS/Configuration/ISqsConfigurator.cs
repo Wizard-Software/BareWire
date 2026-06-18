@@ -14,8 +14,8 @@ namespace BareWire.Transport.AWS.SQS.Configuration;
 /// </para>
 /// <para>
 /// <b>Production guidance:</b> prefer <see cref="UseDefaultCredentials"/> with IAM roles
-/// (EC2 instance profile, ECS task role, Lambda execution role). Full IAM
-/// <c>InstanceProfileCredentialsProvider</c> support arrives in R4.3.
+/// (EC2 instance profile, ECS task role, Lambda execution role). For explicit IMDS binding,
+/// use <see cref="UseInstanceProfileCredentials"/> (R4.3).
 /// </para>
 /// </remarks>
 public interface ISqsConfigurator
@@ -42,6 +42,23 @@ public interface ISqsConfigurator
     /// Thrown when either parameter is <see langword="null"/> or empty.
     /// </exception>
     void UseExplicitCredentials(string accessKeyId, string secretAccessKey);
+
+    /// <summary>
+    /// Configures the adapter to use EC2 Instance Metadata Service (IMDS) or ECS task-role
+    /// credentials, binding to the IAM role assigned to the current instance or task.
+    /// </summary>
+    /// <param name="roleName">
+    /// Optional IAM role name. When non-<see langword="null"/> and non-empty, the SDK binds to
+    /// this specific role via IMDS. When <see langword="null"/> or empty, the default role
+    /// assigned to the instance or ECS task is used (recommended for most deployments).
+    /// This value is an identifier (not a secret) and may appear in diagnostic output (R4.3).
+    /// </param>
+    /// <remarks>
+    /// No static secrets are required — credentials are fetched from IMDS and refreshed
+    /// automatically by the SDK before expiry. Prefer this over <see cref="UseExplicitCredentials"/>
+    /// for EC2 / ECS production deployments.
+    /// </remarks>
+    void UseInstanceProfileCredentials(string? roleName = null);
 
     /// <summary>
     /// Configures the AWS region (e.g. <c>eu-central-1</c>, <c>us-east-1</c>).

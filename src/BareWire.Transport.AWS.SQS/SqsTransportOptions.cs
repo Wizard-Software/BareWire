@@ -9,7 +9,7 @@ namespace BareWire.Transport.AWS.SQS;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Two authentication modes are supported — selected by <see cref="AuthMode"/>:
+/// Three authentication modes are supported — selected by <see cref="AuthMode"/>:
 /// <list type="bullet">
 /// <item>
 /// <term><see cref="SqsAuthMode.DefaultChain"/> (default)</term>
@@ -26,6 +26,13 @@ namespace BareWire.Transport.AWS.SQS;
 /// <see cref="ToString"/>, and never echoed in exception messages.
 /// </description>
 /// </item>
+/// <item>
+/// <term><see cref="SqsAuthMode.InstanceProfile"/> (R4.3)</term>
+/// <description>
+/// EC2 Instance Metadata Service (IMDS) / ECS task-role credentials. No static secrets
+/// required. Optionally bind to a specific IAM role via <see cref="InstanceProfileRoleName"/>.
+/// </description>
+/// </item>
 /// </list>
 /// </para>
 /// <para>
@@ -34,8 +41,9 @@ namespace BareWire.Transport.AWS.SQS;
 /// set to <see langword="true"/> (intended for LocalStack / integration-test environments only).
 /// </para>
 /// <para>
-/// <b>Encryption at rest:</b> Queues created by R4.1 are <b>not</b> encrypted at rest.
-/// SSE-SQS / SSE-KMS support is introduced in R4.3.
+/// <b>Encryption at rest (R4.3):</b> SSE-SQS and SSE-KMS per-queue encryption is supported
+/// via topology arguments (<c>bw.sqs.sse-managed</c>, <c>bw.sqs.kms-master-key-id</c>,
+/// <c>bw.sqs.kms-data-key-reuse-period</c>). Disabled by default (opt-in).
 /// </para>
 /// </remarks>
 internal sealed class SqsTransportOptions
@@ -44,6 +52,14 @@ internal sealed class SqsTransportOptions
     /// Gets or sets the authentication mode. Defaults to <see cref="SqsAuthMode.DefaultChain"/>.
     /// </summary>
     public SqsAuthMode AuthMode { get; set; } = SqsAuthMode.DefaultChain;
+
+    /// <summary>
+    /// Gets or sets the optional IAM role name used when <see cref="AuthMode"/> is
+    /// <see cref="SqsAuthMode.InstanceProfile"/>. When non-empty, the SDK binds to this specific
+    /// IAM role via IMDS; when empty, the role attached to the EC2 instance or ECS task is used.
+    /// This is an identifier (not a secret) and may appear in diagnostic output (R4.3).
+    /// </summary>
+    public string InstanceProfileRoleName { get; set; } = string.Empty;
 
     /// <summary>
     /// Gets or sets the AWS Access Key ID used when <see cref="AuthMode"/> is
@@ -151,8 +167,8 @@ internal sealed class SqsTransportOptions
     /// </list>
     /// </remarks>
     public override string ToString() =>
-        $"SqsTransportOptions {{ AuthMode = {AuthMode}, AccessKeyId = {AccessKeyId}, " +
-        $"SecretAccessKey = [Redacted], RegionEndpoint = {RegionEndpoint}, " +
+        $"SqsTransportOptions {{ AuthMode = {AuthMode}, InstanceProfileRoleName = {InstanceProfileRoleName}, " +
+        $"AccessKeyId = {AccessKeyId}, SecretAccessKey = [Redacted], RegionEndpoint = {RegionEndpoint}, " +
         $"ServiceUrl = {ServiceUrl ?? "null"}, AllowInsecureEndpoint = {AllowInsecureEndpoint}, " +
         $"DefaultVisibilityTimeout = {DefaultVisibilityTimeout}, WaitTimeSeconds = {WaitTimeSeconds}, " +
         $"MaxNumberOfMessages = {MaxNumberOfMessages}, MaxInFlightMessages = {MaxInFlightMessages}, " +
