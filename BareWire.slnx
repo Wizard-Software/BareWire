@@ -17,6 +17,7 @@
     <Project Path="samples/BareWire.Samples.CloudEventsInterop/BareWire.Samples.CloudEventsInterop.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/BareWire.Analyzers/BareWire.Analyzers.csproj" />
     <Project Path="src/BareWire.Abstractions/BareWire.Abstractions.csproj" />
     <Project Path="src/BareWire/BareWire.csproj" />
     <Project Path="src/BareWire.CloudEvents/BareWire.CloudEvents.csproj" />
@@ -37,6 +38,7 @@
     <Project Path="src/BareWire.Transport.RabbitMQ/BareWire.Transport.RabbitMQ.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/BareWire.Analyzers.Tests/BareWire.Analyzers.Tests.csproj" />
     <Project Path="tests/BareWire.AppHost/BareWire.AppHost.csproj" />
     <Project Path="tests/BareWire.Benchmarks/BareWire.Benchmarks.csproj" />
     <Project Path="tests/BareWire.ContractTests/BareWire.ContractTests.csproj" />

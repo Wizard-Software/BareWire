@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Override the unconditional net10.0 from Directory.Build.props (last-wins) — GAP-2 mitigation -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <!-- LangVersion, Nullable, ImplicitUsings are inherited and compatible with netstandard2.0 -->
+    <Description>Roslyn analyzers for BareWire enforcing async and API conventions from CONSTITUTION.md.</Description>
+    <!-- Analyzer packaging: no build output in consuming projects -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsPackable>true</IsPackable>
+    <!-- GAP-1 mitigation: RS1038 fires because of .Workspaces ref + EnforceExtendedAnalyzerRules.
+         With TreatWarningsAsErrors=true (inherited) this would break the build. -->
+    <NoWarn>$(NoWarn);RS1038</NoWarn>
+    <!-- NU5128: Expected for analyzer packages that use IncludeBuildOutput=false — no lib/ folder
+         is intentional; the DLL is packed to analyzers/dotnet/cs instead. -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Roslyn SDK — build-time only, not imposed on consumers -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Analyzers" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Analyzer release tracking files (required by EnforceExtendedAnalyzerRules) -->
+  <ItemGroup>
+    <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
+    <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
+  </ItemGroup>
+
+  <!-- Pack the analyzer DLL into the NuGet-conventional location -->
+  <ItemGroup>
+    <None Include="$(OutputPath)$(AssemblyName).dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
+  </ItemGroup>
+
+</Project>
