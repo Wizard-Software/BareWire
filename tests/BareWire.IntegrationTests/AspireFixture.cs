@@ -14,6 +14,7 @@ public sealed class AspireFixture : IAsyncLifetime
     private DistributedApplication? _app;
     private string? _rabbitMqConnectionString;
     private string? _kafkaBootstrapServers;
+    private string? _redisConnectionString;
 
     public async ValueTask InitializeAsync()
     {
@@ -26,9 +27,11 @@ public sealed class AspireFixture : IAsyncLifetime
         using var cts = new CancellationTokenSource(StartupTimeout);
         await notifier.WaitForResourceHealthyAsync("rmq", cts.Token);
         await notifier.WaitForResourceHealthyAsync("kafka", cts.Token);
+        await notifier.WaitForResourceHealthyAsync("redis", cts.Token);
 
         _rabbitMqConnectionString = await _app.GetConnectionStringAsync("rmq");
         _kafkaBootstrapServers = await _app.GetConnectionStringAsync("kafka");
+        _redisConnectionString = await _app.GetConnectionStringAsync("redis");
     }
 
     public string GetRabbitMqConnectionString()
@@ -46,6 +49,20 @@ public sealed class AspireFixture : IAsyncLifetime
     {
         return _kafkaBootstrapServers
             ?? throw new InvalidOperationException("Kafka bootstrap servers not available");
+    }
+
+    /// <summary>
+    /// Returns the Redis connection string for the container provisioned by the AppHost.
+    /// The Aspire connection string for a Redis resource is a full StackExchange.Redis
+    /// configuration string (e.g. <c>host:port,password=…,ssl=true</c>) and must be parsed
+    /// via <c>StackExchange.Redis.ConfigurationOptions.Parse(...)</c> before use — it is NOT
+    /// a bare endpoint suitable for <c>EndPointCollection.Add(...)</c>/<c>RedisConnectionOptions.Endpoints.Add(...)</c>,
+    /// which accept only <c>host</c> or <c>host:port</c>.
+    /// </summary>
+    public string GetRedisConnectionString()
+    {
+        return _redisConnectionString
+            ?? throw new InvalidOperationException("Redis connection string not available");
     }
 
     public async ValueTask DisposeAsync()

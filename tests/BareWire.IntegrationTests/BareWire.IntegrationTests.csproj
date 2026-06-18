@@ -30,6 +30,7 @@
     <ProjectReference Include="..\..\src\BareWire.Transport.Google.PubSub\BareWire.Transport.Google.PubSub.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga\BareWire.Saga.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.EntityFramework\BareWire.Saga.EntityFramework.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Saga.Redis\BareWire.Saga.Redis.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Outbox.EntityFramework\BareWire.Outbox.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Observability\BareWire.Observability.csproj" />
