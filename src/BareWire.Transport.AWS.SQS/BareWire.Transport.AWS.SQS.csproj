@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Amazon SQS transport provider for BareWire with long-polling consumer, batch send, credit-based flow control, and native DLQ via RedrivePolicy.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.SQS" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BareWire.UnitTests" />
+    <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+    <InternalsVisibleTo Include="BareWire.ContractTests" />
+    <!-- Allows NSubstitute (Castle DynamicProxy) to mock internal types. -->
+    <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
+  </ItemGroup>
+
+</Project>
