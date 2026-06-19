@@ -49,6 +49,45 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*' --exp
 | `SerializationBenchmarks` | JSON serialize/deserialize with System.Text.Json | < 1 μs |
 | `JsonVsMessagePackBenchmarks` | JSON vs MessagePack serialize/deserialize/on-wire size, same object graph, 100 B – 100 KB | MessagePack ~2-5x fewer allocations |
 
+## Cross-transport header mapping (R7.2)
+
+`CrossTransportHeaderMappingBenchmarks` mierzy narzut adaptera BareWire wyłącznie na
+deterministycznej powierzchni `*HeaderMapper.MapOutbound` dla wszystkich pięciu transportów
+(zero I/O — brak połączeń z brokerami).
+
+### Uruchomienie
+
+```bash
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- \
+  --filter '*CrossTransportHeaderMapping*' --exporters json csv markdown
+```
+
+Raport ląduje w `BenchmarkDotNet.Artifacts/results/*CrossTransportHeaderMapping*.md`.
+
+### Metryki
+
+- **Metryka główna: `Allocated` (B/op)** — mierzona przez `[MemoryDiagnoser]`. Bezpośredni
+  wskaźnik presji alokacyjnej adaptera per wiadomość.
+- **`Mean` (ns/op)** pełni rolę proxy throughput (R-2) — nie wymaga osobnej kolumny.
+
+### Czytanie tabeli Ratio
+
+`MapOutbound_RabbitMq` jest `[Benchmark(Baseline = true)]` w kategorii `CrossTransport`.
+RabbitMQ alokuje krotkę + dwie kolekcje (`BasicProperties` + `Dictionary`), więc
+`Ratio < 1.0` dla lżejszych transportów odzwierciedla różnice modelu obiektowego SDK —
+**nie** nieefektywność adaptera BareWire (R-1). Kolumna `Allocated` jest metryką
+nadrzędną nad `Ratio`.
+
+### Azure Service Bus — osobna kategoria (D-2)
+
+`MapOutbound_AzureServiceBus` jest w kategorii `AsbMutateInPlace` i **nie pojawia się
+w tabeli Ratio**. Metoda jest `static void` i mutuje `ServiceBusMessage.ApplicationProperties`
+in-place — po pierwszej iteracji klucze już istnieją w słowniku, więc alokacja w
+steady-state dąży do zera (brak resize / brak alokacji węzłów). Taki profil jest
+alokacyjnie nieporównywalny z transportami zwracającymi świeży obiekt per wywołanie.
+Wyniki ASB są poprawne i użyteczne jako pomiar steady-state mutacji in-place, ale
+nie należy ich zestawiać z kolumną `Ratio` grupy `CrossTransport` (D-2/R-3).
+
 ## JSON vs MessagePack Comparison (R3.3)
 
 `JsonVsMessagePackBenchmarks` compares the raw System.Text.Json serializer
