@@ -1,5 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- D-1: share prototype source without a Benchmarks↔UnitTests project reference -->
+  <ItemGroup>
+    <Compile Include="..\BareWire.Benchmarks\Prototype\DynamicMethodJsonSerializerPrototype.cs"
+             Link="Serialization\Prototype\DynamicMethodJsonSerializerPrototype.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
@@ -8,6 +14,8 @@
     <PackageReference Include="NSubstitute" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
+    <!-- Security pin: patched SQLitePCLRaw 3.x overrides vulnerable transitive 2.1.11 (GHSA-2m69-gcr7-jv3q) -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
     <PackageReference Include="CloudNative.CloudEvents" />
     <PackageReference Include="CloudNative.CloudEvents.SystemTextJson" />
   </ItemGroup>

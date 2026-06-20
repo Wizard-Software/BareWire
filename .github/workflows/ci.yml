@@ -49,6 +49,9 @@ jobs:
       - name: Contract Tests
         run: dotnet test tests/BareWire.ContractTests/ --no-build -c Release --logger "trx;LogFileName=contract-tests.trx" --results-directory ./test-results
 
+      - name: Analyzer Tests
+        run: dotnet test tests/BareWire.Analyzers.Tests/ --no-build -c Release --logger "trx;LogFileName=analyzer-tests.trx" --results-directory ./test-results
+
       - name: Run benchmarks (in-memory)
         run: >
           dotnet run --project tests/BareWire.Benchmarks/ -c Release --

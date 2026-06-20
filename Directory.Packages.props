@@ -3,6 +3,14 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Roslyn Analyzer -->
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.Analyzers" Version="3.11.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp.Analyzer.Testing" Version="1.1.3" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp.CodeFix.Testing" Version="1.1.3" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- Test frameworks -->
     <PackageVersion Include="xunit.v3" Version="3.2.2" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.0" />
@@ -33,8 +41,12 @@
     <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.16.0" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
     <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.15.1" />
-    <!-- Transitive security pin (Aspire → MessagePack): patch dla GHSA-hv8m-jj95-wg3x (NU1903) -->
+    <!-- Transitive security pin (Aspire → MessagePack): patch for GHSA-hv8m-jj95-wg3x (NU1903) -->
     <PackageVersion Include="MessagePack" Version="2.5.301" />
+    <!-- Transitive security pin (EF Core Sqlite → SQLitePCLRaw): patch for GHSA-2m69-gcr7-jv3q (NU1903).
+         Bundle 3.x pulls the patched branch (lib.e_sqlite3 3.50.x, SQLite 3.50.x); 2.1.11 is the last vulnerable 2.1.x.
+         SQLite is a test/sample-only dependency (EF SAGA/Outbox) — it is not present in any src/ package. -->
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.3" />
     <!-- PostgreSQL (EF Core) -->
     <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
     <!-- Aspire -->

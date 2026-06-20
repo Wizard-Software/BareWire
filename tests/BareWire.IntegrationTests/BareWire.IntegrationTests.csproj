@@ -11,8 +11,10 @@
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
     <PackageReference Include="OpenTelemetry.Exporter.InMemory" />
-    <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
+    <!-- Security pin: transitive MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
     <PackageReference Include="MessagePack" />
+    <!-- Security pin: transitive SQLitePCLRaw (EF Sqlite) — GHSA-2m69-gcr7-jv3q (NU1903) -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
   </ItemGroup>
 
   <ItemGroup>

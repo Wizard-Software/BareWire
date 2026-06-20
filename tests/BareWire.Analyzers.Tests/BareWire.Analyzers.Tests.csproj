@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Test project targets modern .NET; the ns2.0 analyzer is referenced via ProjectReference below -->
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- NU1701: Microsoft.CodeAnalysis.Testing bundles old Roslyn transitive deps targeting older TFMs.
+         They resolve at runtime to the newer Microsoft.CodeAnalysis.CSharp 4.14.0 pulled in by the
+         testing packages. Suppressing the compatibility warning here is safe and conventional for
+         analyzer test projects.
+         MSB3277: Version conflicts between old (1.0.1) transitive and the 4.14.0 we pin in CPM;
+         the higher version wins at runtime and the testing framework uses it correctly.
+         BW1001: Test methods are public Task per xUnit convention and don't need CancellationToken.
+         The analyzer is running on this project (via OutputItemType=Analyzer on the ProjectReference)
+         so it fires on its own test hosts — suppressing project-wide is the correct workaround. -->
+    <NoWarn>$(NoWarn);NU1701;MSB3277;BW1001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="AwesomeAssertions" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Analyzer.Testing" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.CodeFix.Testing" />
+    <!-- Explicit pin to 4.14.0 to override old transitive 1.0.1 from testing framework -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- OutputItemType=Analyzer loads the assembly as an analyzer in the test project.
+         ReferenceOutputAssembly=true also lets test code reference public types (verifiers, etc.). -->
+    <ProjectReference Include="..\..\src\BareWire.Analyzers\BareWire.Analyzers.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="true" />
+  </ItemGroup>
+
+</Project>
