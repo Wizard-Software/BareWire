@@ -1,5 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!-- D-1: share prototype source without a Benchmarks↔UnitTests project reference -->
+  <ItemGroup>
+    <Compile Include="..\BareWire.Benchmarks\Prototype\DynamicMethodJsonSerializerPrototype.cs"
+             Link="Serialization\Prototype\DynamicMethodJsonSerializerPrototype.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
