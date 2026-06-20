@@ -62,6 +62,10 @@
     <!-- Test-only CloudEvents oracle (NIGDY w produkcie — ADR-007 / NetArchTest 13.14) -->
     <PackageVersion Include="CloudNative.CloudEvents" Version="2.8.0" />
     <PackageVersion Include="CloudNative.CloudEvents.SystemTextJson" Version="2.8.0" />
+    <!-- Test-only MassTransit interop oracle (NIGDY w produkcie — B2 / NetArchTest scans only src/).
+         MassTransit 8.5.10 requires RabbitMQ.Client >= 7.2.1 — matches repo pin exactly. -->
+    <PackageVersion Include="MassTransit" Version="8.5.10" />
+    <PackageVersion Include="MassTransit.RabbitMQ" Version="8.5.10" />
     <!-- Microsoft Extensions -->
     <PackageVersion Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.1" />
     <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.1" />

@@ -1,9 +1,11 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Globalization;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
+using BareWire.Transport.RabbitMQ.Internal;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
@@ -13,7 +15,7 @@ namespace BareWire.Transport.RabbitMQ;
 /// <summary>
 /// RabbitMQ implementation of <see cref="IRequestClient{TRequest}"/>.
 /// Creates an exclusive auto-delete response queue per client instance and correlates responses
-/// back to callers via <c>CorrelationId</c>.
+/// back to callers via <c>CorrelationId</c> (primary) or envelope <c>requestId</c> (fallback).
 /// </summary>
 /// <remarks>
 /// ADR-004: pending requests are bounded by <see cref="DefaultMaxPendingRequests"/>. When the limit
@@ -24,6 +26,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 {
     private const int DefaultMaxPendingRequests = 1000;
     private const string TransportName = "RabbitMQ";
+    private const string MassTransitContentType = "application/vnd.masstransit+json";
 
     private readonly IConnection _connection;
     private readonly IMessageSerializer _serializer;
@@ -33,17 +36,28 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     private readonly string _targetExchange;
     private readonly string _routingKey;
     private readonly RabbitMqHeaderMapper _headerMapper;
+    private readonly Uri _connectionUri;
+    private readonly string? _vhost;
 
     // ADR-004: bounded — limits concurrent in-flight requests.
     private readonly SemaphoreSlim _pendingGate;
 
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<InboundMessage>> _pending
-        = new(StringComparer.Ordinal);
+    // Keyed by Guid requestId for clean Guid-based correlation (avoids string allocation per lookup).
+    private readonly ConcurrentDictionary<Guid, TaskCompletionSource<InboundMessage>> _pending = new();
 
     private IChannel? _responseChannel;
     private string? _responseQueueName;
     private bool _initialized;
     private bool _disposed;
+
+    // D4/PERF-1: computed once per client instance in InitializeAsync — timeout is constant
+    // per client, so _expirationMillis never allocates on the hot request path.
+    private string? _expirationMillis;
+
+    // Addresses computed once from the connection data + server-assigned queue name.
+    // Null until InitializeAsync completes.
+    private string? _responseAddress;
+    private string? _destinationAddress;
 
     internal RabbitMqRequestClient(
         IConnection connection,
@@ -53,6 +67,8 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         string targetExchange,
         string routingKey,
         TimeSpan timeout,
+        Uri connectionUri,
+        string? vhost,
         int maxPendingRequests = DefaultMaxPendingRequests,
         RabbitMqHeaderMapper? headerMapper = null)
     {
@@ -62,6 +78,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(targetExchange);
         ArgumentNullException.ThrowIfNull(routingKey);
+        ArgumentNullException.ThrowIfNull(connectionUri);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPendingRequests);
 
         _connection = connection;
@@ -71,6 +88,8 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         _targetExchange = targetExchange;
         _routingKey = routingKey;
         _timeout = timeout;
+        _connectionUri = connectionUri;
+        _vhost = vhost;
         _pendingGate = new SemaphoreSlim(maxPendingRequests, maxPendingRequests);
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
     }
@@ -106,6 +125,30 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         _responseQueueName = queueOk.QueueName;
+
+        // D4/PERF-1: hoist AMQP expiration string — timeout is constant per client, so compute
+        // once here instead of allocating a new string for every request in SerializeAndPublishAsync.
+        _expirationMillis = ((long)_timeout.TotalMilliseconds).ToString(CultureInfo.InvariantCulture);
+
+        // Build endpoint addresses once from the connection data.
+        // These are constant per client instance and are passed into every request envelope.
+        //
+        // MT interop: use the amq.rabbitmq.reply-to reply-to address rather than the server-named
+        // queue address (rabbitmq://host/amq.gen-xxx?temporary=true).  When MT's ConsumeContext
+        // sees a responseAddress ending with "amq.rabbitmq.reply-to" it routes the reply via the
+        // default AMQP exchange using the AMQP ReplyTo property (= _responseQueueName, set below
+        // in SerializeAndPublishAsync) as the routing key — which delivers the response directly
+        // to our exclusive reply queue.  Without this, MT declares a fanout exchange named after
+        // the server-assigned queue and silently drops the response (no binding).
+        _responseAddress = RabbitMqEndpointAddress.BuildReplyToAddress(_connectionUri, _vhost);
+
+        // Destination address: use the explicit exchange when set, else fall back to the routing key.
+        // This is best-effort/diagnostic — real routing uses the targetExchange + routingKey AMQP fields.
+        string destinationName = !string.IsNullOrEmpty(_targetExchange)
+            ? _targetExchange
+            : _routingKey;
+        _destinationAddress = RabbitMqEndpointAddress.Build(
+            _connectionUri, _vhost, destinationName, temporary: false);
 
         // Start consuming responses on the dedicated queue.
         var consumer = new AsyncEventingBasicConsumer(_responseChannel);
@@ -156,11 +199,13 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
                 endpointAddress: null);
         }
 
-        string correlationId = Guid.NewGuid().ToString();
+        // Use a single Guid as requestId — the same value keys _pending, goes into the envelope
+        // RequestId field, and is set as the AMQP CorrelationId for BareWire↔BareWire correlation.
+        Guid requestId = Guid.NewGuid();
         var tcs = new TaskCompletionSource<InboundMessage>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
-        _pending[correlationId] = tcs;
+        _pending[requestId] = tcs;
 
         try
         {
@@ -175,7 +220,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             {
                 // ADR-003: serialize and publish in a single scope — pooled buffer stays alive
                 // through the await, then returns to ArrayPool. Zero heap allocation.
-                await SerializeAndPublishAsync(request, publishChannel, correlationId, cancellationToken)
+                await SerializeAndPublishAsync(request, publishChannel, requestId, cancellationToken)
                     .ConfigureAwait(false);
             }
             finally
@@ -216,7 +261,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             // Deserialize the response body using the deserializer that matches the response's
             // content-type header — honouring content-type-routed deserializers such as the
             // MassTransit envelope deserializer (issue #13), mirroring the consume path.
-            TResponse deserialized = DeserializeResponse<TResponse>(responseMessage, correlationId);
+            TResponse deserialized = DeserializeResponse<TResponse>(responseMessage, requestId.ToString());
 
             bool hasMessageId = responseMessage.Headers.TryGetValue("message-id", out string? msgIdStr);
             Guid messageId = hasMessageId && Guid.TryParse(msgIdStr, out Guid parsed)
@@ -230,7 +275,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         }
         finally
         {
-            _pending.TryRemove(correlationId, out _);
+            _pending.TryRemove(requestId, out _);
             _pendingGate.Release();
         }
     }
@@ -246,7 +291,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         _disposed = true;
 
         // Cancel all in-flight TCS so callers are not stuck waiting.
-        foreach (KeyValuePair<string, TaskCompletionSource<InboundMessage>> entry in _pending)
+        foreach (KeyValuePair<Guid, TaskCompletionSource<InboundMessage>> entry in _pending)
         {
             entry.Value.TrySetCanceled();
         }
@@ -302,29 +347,105 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         return deserialized;
     }
 
+    /// <summary>
+    /// Attempts to resolve a pending <see cref="TaskCompletionSource{T}"/> for an incoming response,
+    /// implementing two-stage correlation:
+    /// <list type="number">
+    ///   <item>Primary: AMQP <c>CorrelationId</c> → parse to <see cref="Guid"/> → look up <c>_pending</c>.</item>
+    ///   <item>
+    ///     Fallback (only when primary fails and <paramref name="contentType"/> is
+    ///     <c>application/vnd.masstransit+json</c>): resolve the deserializer; if it implements
+    ///     <see cref="IResponseEnvelopeReader"/>, extract <c>requestId</c> from the envelope and verify
+    ///     it exists in <c>_pending</c> — SEC-2: never fabricate an entry from the body.
+    ///   </item>
+    /// </list>
+    /// Exposed as <c>internal</c> so unit tests can exercise correlation logic without a real broker.
+    /// </summary>
+    /// <param name="amqpCorrelationId">The AMQP <c>CorrelationId</c> property, or <see langword="null"/>.</param>
+    /// <param name="contentType">The <c>content-type</c> header of the response, or <see langword="null"/>.</param>
+    /// <param name="body">The raw response body (zero-copy).</param>
+    /// <param name="tcs">
+    /// When this method returns <see langword="true"/>, contains the matched pending TCS.
+    /// Otherwise <see langword="null"/>.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> if a pending TCS was found and should be completed; otherwise
+    /// <see langword="false"/> (caller should discard the message).
+    /// </returns>
+    internal bool TryResolvePending(
+        string? amqpCorrelationId,
+        string? contentType,
+        ReadOnlySequence<byte> body,
+        out TaskCompletionSource<InboundMessage>? tcs)
+    {
+        // Stage 1 — Primary: AMQP CorrelationId (BareWire↔BareWire and any transport that echoes it).
+        if (!string.IsNullOrEmpty(amqpCorrelationId)
+            && Guid.TryParse(amqpCorrelationId, out Guid amqpGuid)
+            && _pending.TryGetValue(amqpGuid, out tcs))
+        {
+            return true;
+        }
+
+        // Stage 2 — Fallback: envelope requestId (MassTransit response path).
+        // Only triggered when: AMQP correlation is absent/unknown AND content-type is MT JSON.
+        if (string.Equals(contentType, MassTransitContentType, StringComparison.OrdinalIgnoreCase))
+        {
+            IMessageDeserializer deserializer = _deserializerResolver.Resolve(contentType);
+
+            if (deserializer is IResponseEnvelopeReader envelopeReader
+                && envelopeReader.TryReadRequestId(body, out Guid envelopeRequestId))
+            {
+                // SEC-2: only look up — never create — an entry from the body-supplied requestId.
+                if (_pending.TryGetValue(envelopeRequestId, out tcs))
+                {
+                    return true;
+                }
+
+                // Body supplied a requestId that we never registered — discard.
+                LogUnknownCorrelationId(envelopeRequestId.ToString());
+                tcs = null;
+                return false;
+            }
+        }
+
+        tcs = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Seeds a pending entry directly into <c>_pending</c> for unit tests that need to exercise
+    /// correlation logic without a running broker or a full <see cref="GetResponseAsync{TResponse}"/>
+    /// call. Must only be called from test code (internal visibility via <c>InternalsVisibleTo</c>).
+    /// </summary>
+    internal void SeedPendingForTest(Guid requestId, TaskCompletionSource<InboundMessage> tcs)
+        => _pending[requestId] = tcs;
+
     private Task OnResponseReceivedAsync(object sender, BasicDeliverEventArgs args)
     {
-        string? correlationId = args.BasicProperties.CorrelationId;
-
-        if (string.IsNullOrEmpty(correlationId))
-        {
-            LogMissingCorrelationId();
-            return Task.CompletedTask;
-        }
-
-        if (!_pending.TryGetValue(correlationId, out TaskCompletionSource<InboundMessage>? tcs))
-        {
-            LogUnknownCorrelationId(correlationId);
-            return Task.CompletedTask;
-        }
-
-        // CRITICAL: copy body bytes — RabbitMQ.Client frees memory after the handler returns.
+        // CRITICAL: copy body bytes before any async resolution — RabbitMQ.Client frees the memory
+        // after the handler returns and we may need the bytes in TryResolvePending's fallback path.
         byte[] bodyCopy = args.Body.ToArray();
         ReadOnlySequence<byte> bodySequence = bodyCopy.Length == 0
             ? ReadOnlySequence<byte>.Empty
             : new ReadOnlySequence<byte>(bodyCopy);
 
+        string? amqpCorrelationId = args.BasicProperties.CorrelationId;
+
         Dictionary<string, string> headers = _headerMapper.MapInbound(args.BasicProperties);
+        headers.TryGetValue("content-type", out string? contentType);
+
+        if (!TryResolvePending(amqpCorrelationId, contentType, bodySequence, out TaskCompletionSource<InboundMessage>? tcs))
+        {
+            // TryResolvePending already logs specifics for the fallback discard path.
+            // Log the primary-path failures here (missing / unknown AMQP correlation without MT fallback).
+            if (string.IsNullOrEmpty(amqpCorrelationId)
+                && !string.Equals(contentType, MassTransitContentType, StringComparison.OrdinalIgnoreCase))
+            {
+                LogMissingCorrelationId();
+            }
+
+            return Task.CompletedTask;
+        }
 
         string messageId = headers.TryGetValue("message-id", out string? mappedId) && !string.IsNullOrEmpty(mappedId)
             ? mappedId
@@ -336,7 +457,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             body: bodySequence,
             deliveryTag: args.DeliveryTag);
 
-        tcs.TrySetResult(inbound);
+        tcs!.TrySetResult(inbound);
 
         return Task.CompletedTask;
     }
@@ -348,7 +469,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     private async ValueTask SerializeAndPublishAsync(
         TRequest request,
         IChannel publishChannel,
-        string correlationId,
+        Guid requestId,
         CancellationToken cancellationToken)
     {
         byte[] rentedBuffer;
@@ -356,7 +477,25 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
         using (var writer = new SimplePooledWriter(initialCapacity: 4096))
         {
-            _serializer.Serialize(request, writer);
+            // Build per-request envelope context. Addresses and _expirationMillis are already cached
+            // in InitializeAsync; only ExpirationTime varies per request (absolute deadline).
+            if (_serializer is IRequestEnvelopeSerializer envSerializer)
+            {
+                var ctx = new RequestEnvelopeContext(
+                    ResponseAddress: _responseAddress,
+                    DestinationAddress: _destinationAddress,
+                    FaultAddress: _responseAddress,  // faults come back to the response queue
+                    RequestId: requestId,
+                    CorrelationId: requestId,         // same Guid for both — BareWire↔BareWire echoes CorrelationId
+                    ExpirationTime: DateTimeOffset.UtcNow + _timeout);
+
+                envSerializer.Serialize(request, in ctx, writer);
+            }
+            else
+            {
+                _serializer.Serialize(request, writer);
+            }
+
             (rentedBuffer, length) = writer.DetachBuffer();
         }
 
@@ -364,9 +503,13 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         {
             var props = new BasicProperties
             {
-                CorrelationId = correlationId,
+                // AMQP CorrelationId set to requestId.ToString() so BareWire↔BareWire
+                // responders can echo it back for the primary correlation path.
+                CorrelationId = requestId.ToString(),
                 ReplyTo = _responseQueueName,
                 ContentType = _serializer.ContentType,
+                // D4/PERF-1: _expirationMillis computed once in InitializeAsync — no alloc per request.
+                Expiration = _expirationMillis,
             };
 
             await publishChannel.BasicPublishAsync<BasicProperties>(

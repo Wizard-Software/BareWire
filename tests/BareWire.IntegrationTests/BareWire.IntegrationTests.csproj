@@ -15,6 +15,11 @@
     <PackageReference Include="MessagePack" />
     <!-- Security pin: transitive SQLitePCLRaw (EF Sqlite) — GHSA-2m69-gcr7-jv3q (NU1903) -->
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
+    <!-- Test-only MassTransit interop oracle (B2 — GAP-1/GAP-2).
+         MassTransit 8.5.10 requires RabbitMQ.Client >= 7.2.1, matching the repo pin exactly.
+         NetArchTest scans only src/ — this test-only reference does not affect production boundaries. -->
+    <PackageReference Include="MassTransit" />
+    <PackageReference Include="MassTransit.RabbitMQ" />
   </ItemGroup>
 
   <ItemGroup>
@@ -37,6 +42,9 @@
     <ProjectReference Include="..\..\src\BareWire.Outbox.EntityFramework\BareWire.Outbox.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Observability\BareWire.Observability.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Testing\BareWire.Testing.csproj" />
+    <!-- GAP-1 (B2): ProjectReference to Interop.MassTransit required so the test can use
+         MassTransitEnvelopeSerializer/Deserializer in the acceptance test. -->
+    <ProjectReference Include="..\..\src\BareWire.Interop.MassTransit\BareWire.Interop.MassTransit.csproj" />
   </ItemGroup>
 
 </Project>

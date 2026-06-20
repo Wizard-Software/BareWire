@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Text;
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
@@ -23,24 +24,30 @@ public sealed class RabbitMqRequestClientTests
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
+    private static readonly Uri FakeConnectionUri = new("amqp://localhost");
+
     private static RabbitMqRequestClient<TestRequest> CreateClient(
         int maxPendingRequests = 10,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        IDeserializerResolver? deserializerResolver = null,
+        IMessageSerializer? serializer = null)
     {
         IConnection connection = Substitute.For<IConnection>();
-        IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        IMessageSerializer ser = serializer ?? Substitute.For<IMessageSerializer>();
+        IDeserializerResolver resolver = deserializerResolver ?? Substitute.For<IDeserializerResolver>();
 
-        serializer.ContentType.Returns("application/json");
+        ser.ContentType.Returns("application/json");
 
         return new RabbitMqRequestClient<TestRequest>(
             connection: connection,
-            serializer: serializer,
-            deserializerResolver: deserializerResolver,
+            serializer: ser,
+            deserializerResolver: resolver,
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "test-queue",
             timeout: timeout ?? TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null,
             maxPendingRequests: maxPendingRequests);
     }
 
@@ -61,7 +68,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         // Assert
         act.Should().Throw<ArgumentNullException>()
@@ -83,7 +92,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         // Assert
         act.Should().Throw<ArgumentNullException>()
@@ -105,7 +116,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "queue",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         // Assert
         act.Should().Throw<ArgumentNullException>()
@@ -128,7 +141,9 @@ public sealed class RabbitMqRequestClientTests
             logger: null!,
             targetExchange: string.Empty,
             routingKey: "queue",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         // Assert
         act.Should().Throw<ArgumentNullException>()
@@ -152,6 +167,8 @@ public sealed class RabbitMqRequestClientTests
             targetExchange: string.Empty,
             routingKey: "queue",
             timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null,
             maxPendingRequests: 0);
 
         // Assert
@@ -182,7 +199,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: "ex",
             routingKey: "rk",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         var headers = new Dictionary<string, string> { ["content-type"] = mtContentType };
         var inbound = new InboundMessage("mid", headers, ReadOnlySequence<byte>.Empty, deliveryTag: 1);
@@ -212,7 +231,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: "ex",
             routingKey: "rk",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         var inbound = new InboundMessage(
             "mid",
@@ -324,7 +345,9 @@ public sealed class RabbitMqRequestClientTests
             logger: NullLogger.Instance,
             targetExchange: string.Empty,
             routingKey: "test-queue",
-            timeout: TimeSpan.FromSeconds(30));
+            timeout: TimeSpan.FromSeconds(30),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
 
         await client.InitializeAsync(CancellationToken.None);
 
@@ -355,5 +378,145 @@ public sealed class RabbitMqRequestClientTests
 
         // Assert
         await act.Should().NotThrowAsync();
+    }
+
+    // ── TryResolvePending — AMQP-primary correlation (regression) ─────────────
+
+    /// <summary>
+    /// Verifies the primary AMQP CorrelationId path still completes the matching pending TCS —
+    /// regression guard for BareWire↔BareWire interop after the envelope-fallback is added.
+    /// </summary>
+    [Fact]
+    public void TryResolvePending_WhenAmqpCorrelationIdMatchesPending_ReturnsTrueAndResolvesTcs()
+    {
+        // Arrange
+        var client = CreateClient();
+        Guid requestId = Guid.NewGuid();
+        var tcs = new TaskCompletionSource<InboundMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.SeedPendingForTest(requestId, tcs);
+
+        // Act — primary AMQP CorrelationId path; no envelope body needed.
+        bool resolved = client.TryResolvePending(
+            amqpCorrelationId: requestId.ToString(),
+            contentType: null,
+            body: ReadOnlySequence<byte>.Empty,
+            out TaskCompletionSource<InboundMessage>? result);
+
+        // Assert — cast to object so AwesomeAssertions uses ObjectAssertions (not TaskCompletionSourceAssertions).
+        resolved.Should().BeTrue();
+        ((object?)result).Should().NotBeNull();
+        object.ReferenceEquals(result, tcs).Should().BeTrue("TryResolvePending must return the exact registered TCS");
+    }
+
+    // ── TryResolvePending — envelope fallback (SEC-2, plan step 9) ────────────
+
+    /// <summary>
+    /// Verifies that when AMQP CorrelationId is absent/unknown but the body is a MassTransit
+    /// envelope carrying a <c>requestId</c> that exists in <c>_pending</c>, the matching TCS
+    /// is returned (MT→BareWire response correlation path).
+    /// </summary>
+    [Fact]
+    public void TryResolvePending_WhenAmqpCorrelationMissing_CorrelatesByEnvelopeRequestId()
+    {
+        // Arrange — build a MassTransit-style envelope body with a known requestId.
+        Guid requestId = Guid.NewGuid();
+        string envelopeJson = $$$"""{"requestId":"{{{requestId}}}","messageType":["urn:message:TestResponse"],"message":{}}""";
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(envelopeJson);
+        var body = new ReadOnlySequence<byte>(bodyBytes);
+
+        // Set up a substitute that implements both IMessageDeserializer and IResponseEnvelopeReader
+        // so TryResolvePending can use the envelope-reader fallback path.
+        var multiSub = Substitute.For<IMessageDeserializer, IResponseEnvelopeReader>();
+        ((IResponseEnvelopeReader)multiSub)
+            .TryReadRequestId(Arg.Any<ReadOnlySequence<byte>>(), out Arg.Any<Guid>())
+            .Returns(call =>
+            {
+                call[1] = requestId;
+                return true;
+            });
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve("application/vnd.masstransit+json").Returns(multiSub);
+
+        var client = CreateClient(deserializerResolver: resolver);
+
+        var tcs = new TaskCompletionSource<InboundMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.SeedPendingForTest(requestId, tcs);
+
+        // Act — AMQP correlation id is null (MT does not echo it), content-type triggers fallback.
+        bool resolved = client.TryResolvePending(
+            amqpCorrelationId: null,
+            contentType: "application/vnd.masstransit+json",
+            body: body,
+            out TaskCompletionSource<InboundMessage>? result);
+
+        // Assert — fallback succeeded; the right TCS is returned.
+        resolved.Should().BeTrue();
+        ((object?)result).Should().NotBeNull();
+        object.ReferenceEquals(result, tcs).Should().BeTrue("fallback correlation must resolve the exact registered TCS");
+    }
+
+    /// <summary>
+    /// SEC-2: when the body carries a <c>requestId</c> that is NOT in <c>_pending</c> (e.g. an
+    /// unsolicited or replayed message), TryResolvePending must return false — never fabricate a
+    /// pending entry from the body.
+    /// </summary>
+    [Fact]
+    public void TryResolvePending_WhenBodyRequestIdHasNoPendingEntry_Discards()
+    {
+        // Arrange — envelope body with a requestId that was never registered in _pending.
+        Guid unknownRequestId = Guid.NewGuid();
+        string envelopeJson = $$$"""{"requestId":"{{{unknownRequestId}}}","messageType":["urn:message:TestResponse"],"message":{}}""";
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(envelopeJson);
+        var body = new ReadOnlySequence<byte>(bodyBytes);
+
+        var multiSub = Substitute.For<IMessageDeserializer, IResponseEnvelopeReader>();
+        ((IResponseEnvelopeReader)multiSub)
+            .TryReadRequestId(Arg.Any<ReadOnlySequence<byte>>(), out Arg.Any<Guid>())
+            .Returns(call =>
+            {
+                call[1] = unknownRequestId;
+                return true;
+            });
+
+        IDeserializerResolver resolver = Substitute.For<IDeserializerResolver>();
+        resolver.Resolve("application/vnd.masstransit+json").Returns(multiSub);
+
+        var client = CreateClient(deserializerResolver: resolver);
+        // No SeedPendingForTest — _pending is intentionally empty.
+
+        // Act
+        bool resolved = client.TryResolvePending(
+            amqpCorrelationId: null,
+            contentType: "application/vnd.masstransit+json",
+            body: body,
+            out TaskCompletionSource<InboundMessage>? result);
+
+        // Assert — SEC-2: unknown requestId must be discarded, not completed.
+        resolved.Should().BeFalse();
+        ((object?)result).Should().BeNull("SEC-2: no pending entry for the body-supplied requestId must produce null");
+    }
+
+    /// <summary>
+    /// Verifies that when AMQP CorrelationId is present but unknown (not in _pending) and the
+    /// content-type is NOT MassTransit, no envelope fallback is attempted — the message is discarded.
+    /// </summary>
+    [Fact]
+    public void TryResolvePending_WhenAmqpCorrelationUnknownAndNotMassTransit_Discards()
+    {
+        // Arrange
+        var client = CreateClient();
+        // Do not seed anything in _pending.
+
+        // Act — unknown AMQP correlation, non-MT content type; envelope fallback must NOT fire.
+        bool resolved = client.TryResolvePending(
+            amqpCorrelationId: Guid.NewGuid().ToString(),
+            contentType: "application/json",
+            body: ReadOnlySequence<byte>.Empty,
+            out TaskCompletionSource<InboundMessage>? result);
+
+        // Assert
+        resolved.Should().BeFalse();
+        ((object?)result).Should().BeNull("non-MT content-type must not trigger the envelope fallback path");
     }
 }

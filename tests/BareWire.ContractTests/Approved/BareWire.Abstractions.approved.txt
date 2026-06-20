@@ -511,10 +511,29 @@ namespace BareWire.Abstractions.Serialization
         void Serialize<T>(T message, System.Buffers.IBufferWriter<byte> output)
             where T :  class;
     }
+    public interface IRequestEnvelopeSerializer
+    {
+        void Serialize<T>(T message, in BareWire.Abstractions.Serialization.RequestEnvelopeContext context, System.Buffers.IBufferWriter<byte> output)
+            where T :  class;
+    }
+    public interface IResponseEnvelopeReader
+    {
+        bool TryReadRequestId(System.Buffers.ReadOnlySequence<byte> body, out System.Guid requestId);
+    }
     public interface ISerializerResolver
     {
         BareWire.Abstractions.Serialization.IMessageSerializer Resolve<T>()
             where T :  class;
+    }
+    public readonly struct RequestEnvelopeContext : System.IEquatable<BareWire.Abstractions.Serialization.RequestEnvelopeContext>
+    {
+        public RequestEnvelopeContext(string? ResponseAddress, string? DestinationAddress, string? FaultAddress, System.Guid RequestId, System.Guid? CorrelationId, System.DateTimeOffset? ExpirationTime) { }
+        public System.Guid? CorrelationId { get; init; }
+        public string? DestinationAddress { get; init; }
+        public System.DateTimeOffset? ExpirationTime { get; init; }
+        public string? FaultAddress { get; init; }
+        public System.Guid RequestId { get; init; }
+        public string? ResponseAddress { get; init; }
     }
 }
 namespace BareWire.Abstractions.Topology

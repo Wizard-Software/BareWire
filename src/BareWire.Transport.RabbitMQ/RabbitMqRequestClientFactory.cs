@@ -68,6 +68,11 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         (IMessageSerializer serializer, string targetExchange, string routingKey) = ResolveDispatch<T>();
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
 
+        // Parse connection URI and vhost once per client creation.
+        // The URI is already parsed in CreateConnectionAsync; we re-parse here to extract host/vhost
+        // for building rabbitmq:// endpoint addresses without passing the full Uri through the factory.
+        (Uri connectionUri, string? vhost) = ParseConnectionInfo();
+
         var client = new RabbitMqRequestClient<T>(
             connection: _connection!,
             serializer: serializer,
@@ -76,6 +81,8 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             targetExchange: targetExchange,
             routingKey: routingKey,
             timeout: DefaultRequestTimeout,
+            connectionUri: connectionUri,
+            vhost: vhost,
             headerMapper: _headerMapper);
 
         await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
@@ -175,6 +182,27 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         {
             _connectionLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Parses the connection URI from <see cref="RabbitMqTransportOptions.ConnectionString"/> and
+    /// extracts the virtual host so that <see cref="RabbitMqRequestClient{TRequest}"/> can build
+    /// correct <c>rabbitmq://</c> endpoint addresses for request envelopes.
+    /// </summary>
+    /// <returns>
+    /// The connection <see cref="Uri"/> and the resolved vhost string.
+    /// An empty or "/" path segment is normalized to <see langword="null"/> (default vhost).
+    /// </returns>
+    private (Uri ConnectionUri, string? Vhost) ParseConnectionInfo()
+    {
+        var uri = new Uri(_options.ConnectionString);
+
+        // AbsolutePath for amqp://host/vhost is "/vhost"; strip the leading "/".
+        // An empty path or "/" means the default vhost — return null so the address builder omits it.
+        string rawPath = uri.AbsolutePath.TrimStart('/');
+        string? vhost = string.IsNullOrEmpty(rawPath) ? null : rawPath;
+
+        return (uri, vhost);
     }
 
     private async Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken)

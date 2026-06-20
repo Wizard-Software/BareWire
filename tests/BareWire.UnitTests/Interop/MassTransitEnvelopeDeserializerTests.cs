@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Text;
 using AwesomeAssertions;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Serialization;
 using BareWire.Interop.MassTransit;
 
 namespace BareWire.UnitTests.Interop;
@@ -9,6 +10,7 @@ namespace BareWire.UnitTests.Interop;
 public sealed class MassTransitEnvelopeDeserializerTests
 {
     private readonly MassTransitEnvelopeDeserializer _sut = new();
+
 
     [Fact]
     public void Deserialize_ValidEnvelope_ReturnsMessage()
@@ -144,6 +146,63 @@ public sealed class MassTransitEnvelopeDeserializerTests
         result.Should().NotBeNull();
         result!.OrderId.Should().Be("ORD-SEG");
         result.Amount.Should().Be(7.77m);
+    }
+
+    // ── IResponseEnvelopeReader tests (RED → GREEN in step 6) ─────────────────
+
+    [Fact]
+    public void TryReadRequestId_WithValidEnvelope_ReturnsTrueAndGuid()
+    {
+        var expectedRequestId = Guid.NewGuid();
+        var json = $$"""
+            {
+              "messageId": "{{Guid.NewGuid()}}",
+              "requestId": "{{expectedRequestId}}",
+              "messageType": ["urn:message:TestOrder"],
+              "message": {"orderId":"ORD-1","amount":1.00}
+            }
+            """;
+        var data = ToSequence(json);
+
+        var result = _sut.TryReadRequestId(data, out var requestId);
+
+        result.Should().BeTrue();
+        requestId.Should().Be(expectedRequestId);
+    }
+
+    [Fact]
+    public void TryReadRequestId_WithMalformedJson_ReturnsFalse()
+    {
+        var data = ToSequence("not valid json {{{{");
+
+        var result = _sut.TryReadRequestId(data, out var requestId);
+
+        result.Should().BeFalse();
+        requestId.Should().Be(Guid.Empty);
+    }
+
+    [Fact]
+    public void TryReadRequestId_WithMissingRequestIdField_ReturnsFalse()
+    {
+        var json = """{"messageId":"11111111-1111-1111-1111-111111111111","message":{"orderId":"X","amount":1.00}}""";
+        var data = ToSequence(json);
+
+        var result = _sut.TryReadRequestId(data, out var requestId);
+
+        result.Should().BeFalse();
+        requestId.Should().Be(Guid.Empty);
+    }
+
+    [Fact]
+    public void TryReadRequestId_WithInvalidGuidValue_ReturnsFalse()
+    {
+        var json = """{"requestId":"not-a-guid","message":{"orderId":"X","amount":1.00}}""";
+        var data = ToSequence(json);
+
+        var result = _sut.TryReadRequestId(data, out var requestId);
+
+        result.Should().BeFalse();
+        requestId.Should().Be(Guid.Empty);
     }
 
     // --- Helpers ---

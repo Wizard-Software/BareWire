@@ -63,7 +63,7 @@ public sealed class RabbitMqRequestResponseTests(AspireFixture fixture)
     /// with routing key = <paramref name="queueName"/>, initializes it, and returns it.
     /// The caller owns disposal.
     /// </summary>
-    private static async Task<RabbitMqRequestClient<PingRequest>> CreateInitializedRequestClientAsync(
+    private async Task<RabbitMqRequestClient<PingRequest>> CreateInitializedRequestClientAsync(
         IConnection connection,
         TimeSpan timeout,
         string queueName,
@@ -72,6 +72,10 @@ public sealed class RabbitMqRequestResponseTests(AspireFixture fixture)
         var serializer = new SystemTextJsonSerializer();
         var deserializerResolver = new SingleDeserializerResolver(new SystemTextJsonRawDeserializer());
 
+        var connectionUri = new Uri(_fixture.GetRabbitMqConnectionString());
+        string rawPath = connectionUri.AbsolutePath.TrimStart('/');
+        string? vhost = string.IsNullOrEmpty(rawPath) ? null : rawPath;
+
         var client = new RabbitMqRequestClient<PingRequest>(
             connection: connection,
             serializer: serializer,
@@ -79,7 +83,9 @@ public sealed class RabbitMqRequestResponseTests(AspireFixture fixture)
             logger: NullLogger.Instance,
             targetExchange: string.Empty,   // default exchange routes by routing key = queue name
             routingKey: queueName,
-            timeout: timeout);
+            timeout: timeout,
+            connectionUri: connectionUri,
+            vhost: vhost);
 
         await client.InitializeAsync(ct).ConfigureAwait(false);
 
