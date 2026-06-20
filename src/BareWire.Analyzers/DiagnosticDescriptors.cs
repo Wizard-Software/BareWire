@@ -15,10 +15,10 @@ public static class DiagnosticDescriptors
     /// </summary>
     public static readonly DiagnosticDescriptor CancellationTokenPropagation = new(
         id: CancellationTokenPropagationId,
-        title: "Publiczna metoda async powinna przyjmować CancellationToken jako ostatni parametr",
-        messageFormat: "Publiczna metoda async '{0}' powinna przyjmować CancellationToken jako ostatni parametr",
+        title: "Public async method should accept CancellationToken as the last parameter",
+        messageFormat: "Public async method '{0}' should accept CancellationToken as the last parameter",
         category: "BareWire.Async",
         defaultSeverity: DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
-        description: "Zgodnie z CONSTITUTION.md, publiczne metody async muszą propagować CancellationToken jako ostatni parametr (domyślnie default).");
+        description: "Per CONSTITUTION.md, public async methods must propagate CancellationToken as their last parameter (defaulting to default).");
 }

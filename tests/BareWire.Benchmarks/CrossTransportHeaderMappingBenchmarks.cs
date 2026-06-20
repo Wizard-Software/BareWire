@@ -12,32 +12,32 @@ using Confluent.Kafka;
 namespace BareWire.Benchmarks;
 
 /// <summary>
-/// Porównuje narzut adaptera BareWire na deterministycznej powierzchni
-/// <c>*HeaderMapper.MapOutbound</c> dla wszystkich pięciu transportów
-/// (zero I/O — brak połączeń z brokerami).
+/// Compares the BareWire adapter overhead on the deterministic surface
+/// <c>*HeaderMapper.MapOutbound</c> across all five transports
+/// (zero I/O — no broker connections).
 ///
 /// <para>
-/// <b>Metryka główna:</b> kolumna <c>Allocated</c> (B/op) z
-/// <see cref="MemoryDiagnoserAttribute"/>. Kolumna <c>Mean</c> (ns/op)
-/// pełni rolę wskaźnika przepustowości (proxy throughput, R-2).
+/// <b>Primary metric:</b> the <c>Allocated</c> column (B/op) from
+/// <see cref="MemoryDiagnoserAttribute"/>. The <c>Mean</c> column (ns/op)
+/// serves as a proxy throughput indicator (R-2).
 /// </para>
 ///
 /// <para>
-/// <b>Baseline:</b> <see cref="MapOutbound_RabbitMq"/> alokuje krotkę + dwie
-/// kolekcje (<c>BasicProperties</c> + <c>Dictionary</c>), więc <c>Ratio &lt; 1.0</c>
-/// dla lżejszych transportów odzwierciedla różnice modelu obiektowego SDK,
-/// nie nieefektywność adaptera (R-1). Kolumna <c>Allocated</c> jest metryką
-/// nadrzędną nad <c>Ratio</c>.
+/// <b>Baseline:</b> <see cref="MapOutbound_RabbitMq"/> allocates a tuple plus two
+/// collections (<c>BasicProperties</c> + <c>Dictionary</c>), so <c>Ratio &lt; 1.0</c>
+/// for lighter transports reflects differences in the SDK object model,
+/// not adapter inefficiency (R-1). The <c>Allocated</c> column is the primary metric
+/// over <c>Ratio</c>.
 /// </para>
 ///
 /// <para>
-/// <b>Azure Service Bus</b> raportowany jest osobno w kategorii
-/// <c>AsbMutateInPlace</c> — patrz <see cref="MapOutbound_AzureServiceBus"/> (D-2).
+/// <b>Azure Service Bus</b> is reported separately in the
+/// <c>AsbMutateInPlace</c> category — see <see cref="MapOutbound_AzureServiceBus"/> (D-2).
 /// </para>
 ///
 /// <para>
-/// Benchmark jest narzędziem diagnostycznym — CI nie bramkuje merge'a
-/// na podstawie jego wyników (konwencja identyczna jak
+/// This benchmark is a diagnostic tool — CI does not gate merges
+/// on its results (same convention as
 /// <see cref="CloudEventsBinaryBenchmarks"/>).
 /// </para>
 /// </summary>
@@ -46,24 +46,24 @@ namespace BareWire.Benchmarks;
 [GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 public class CrossTransportHeaderMappingBenchmarks
 {
-    /// <summary>Wspólny, read-only słownik nagłówków kanonicznych BareWire
-    /// współdzielony przez wszystkie metody benchmarku. Budowany raz
-    /// w <see cref="GlobalSetup"/> — nie wlicza się do mierzonej alokacji.</summary>
+    /// <summary>Shared read-only dictionary of canonical BareWire headers
+    /// used by all benchmark methods. Built once in <see cref="GlobalSetup"/>
+    /// — does not count toward measured allocations.</summary>
     private IReadOnlyDictionary<string, string> _headers = null!;
 
-    /// <summary>Instancja mappera RabbitMQ (jedyna klasa niebędąca statyczną).</summary>
+    /// <summary>RabbitMQ mapper instance (the only non-static mapper class).</summary>
     private RabbitMqHeaderMapper _rabbitMapper = null!;
 
-    /// <summary>Wspólna wiadomość ASB reużywana między iteracjami benchmarku (D-2).</summary>
+    /// <summary>Shared ASB message reused across benchmark iterations (D-2).</summary>
     private ServiceBusMessage _asbMessage = null!;
 
     /// <summary>
-    /// Buduje wspólny zestaw wejściowych nagłówków kanonicznych BareWire
-    /// oraz inicjalizuje stan specyficzny dla transportu.
-    /// Wywoływana raz przed całym zestawem pomiarów.
+    /// Builds the shared set of canonical BareWire input headers
+    /// and initialises transport-specific state.
+    /// Called once before the entire measurement suite.
     ///
-    /// <para>Liczba nagłówków wynosi 9 — bezpieczna dla limitu 10 atrybutów SQS
-    /// (4 nagłówki passthrough + 5 kanonicznych; R-7).</para>
+    /// <para>Header count is 9 — safe for the SQS 10-attribute limit
+    /// (4 passthrough headers + 5 canonical; R-7).</para>
     /// </summary>
     [GlobalSetup]
     public void GlobalSetup()
@@ -86,10 +86,10 @@ public class CrossTransportHeaderMappingBenchmarks
     }
 
     /// <summary>
-    /// Mapowanie nagłówków BareWire do właściwości AMQP RabbitMQ
-    /// (<see cref="RabbitMQ.Client.BasicProperties"/> + słownik nagłówków AMQP).
-    /// Punkt odniesienia (baseline) dla tabeli <c>Ratio</c> — transporty w kategorii
-    /// <c>CrossTransport</c> (R-1).
+    /// Maps BareWire headers to RabbitMQ AMQP properties
+    /// (<see cref="RabbitMQ.Client.BasicProperties"/> + AMQP headers dictionary).
+    /// Serves as the baseline for the <c>Ratio</c> column — transports in the
+    /// <c>CrossTransport</c> category (R-1).
     /// </summary>
     [Benchmark(Baseline = true)]
     [BenchmarkCategory("CrossTransport")]
@@ -97,8 +97,8 @@ public class CrossTransportHeaderMappingBenchmarks
         _rabbitMapper.MapOutbound(_headers);
 
     /// <summary>
-    /// Mapowanie nagłówków BareWire do <see cref="Confluent.Kafka.Headers"/> Kafka.
-    /// Wszystkie wartości kodowane jako UTF-8.
+    /// Maps BareWire headers to Kafka <see cref="Confluent.Kafka.Headers"/>.
+    /// All values are encoded as UTF-8.
     /// </summary>
     [Benchmark]
     [BenchmarkCategory("CrossTransport")]
@@ -106,9 +106,9 @@ public class CrossTransportHeaderMappingBenchmarks
         KafkaHeaderMapper.MapOutbound(_headers);
 
     /// <summary>
-    /// Mapowanie nagłówków BareWire do słownika
-    /// <see cref="MessageAttributeValue"/> SQS.
-    /// Liczba nagłówków nieprzekraczająca 10 — brak wyjątku BareWireTransportException.
+    /// Maps BareWire headers to an SQS
+    /// <see cref="MessageAttributeValue"/> dictionary.
+    /// Header count does not exceed 10 — no BareWireTransportException is thrown.
     /// </summary>
     [Benchmark]
     [BenchmarkCategory("CrossTransport")]
@@ -116,7 +116,7 @@ public class CrossTransportHeaderMappingBenchmarks
         SqsHeaderMapper.MapOutbound(_headers);
 
     /// <summary>
-    /// Mapowanie nagłówków BareWire do słownika atrybutów Google Pub/Sub
+    /// Maps BareWire headers to a Google Pub/Sub attribute dictionary
     /// (<c>PubsubMessage.Attributes</c>).
     /// </summary>
     [Benchmark]
@@ -125,20 +125,20 @@ public class CrossTransportHeaderMappingBenchmarks
         PubSubHeaderMapper.MapOutbound(_headers);
 
     /// <summary>
-    /// Mapowanie nagłówków BareWire do <see cref="ServiceBusMessage.ApplicationProperties"/>
-    /// przez mutację in-place istniejącej wiadomości (<c>static void</c>).
+    /// Maps BareWire headers into <see cref="ServiceBusMessage.ApplicationProperties"/>
+    /// via in-place mutation of an existing message (<c>static void</c>).
     ///
     /// <para>
-    /// <b>Steady-state mutate-in-place (D-2):</b> Po pierwszej iteracji klucze już istnieją
-    /// w słowniku <c>ApplicationProperties</c>; kolejne iteracje nadpisują istniejące sloty
-    /// (string = typ referencyjny, brak boxingu, brak resize) — alokacja dąży do zera
-    /// w steady-state. Z tego powodu ten benchmark jest alokacyjnie nieporównywalny
-    /// z transportami zwracającymi świeży obiekt i raportowany jest <b>osobno</b>,
-    /// poza kolumną <c>Ratio</c> grupy <c>CrossTransport</c> (D-2/R-3).
+    /// <b>Steady-state mutate-in-place (D-2):</b> After the first iteration the keys already
+    /// exist in the <c>ApplicationProperties</c> dictionary; subsequent iterations overwrite
+    /// existing slots (string = reference type, no boxing, no resize) — allocation approaches
+    /// zero in steady state. For this reason the benchmark is allocation-wise incomparable
+    /// to transports that return a fresh object, and is reported <b>separately</b>,
+    /// outside the <c>Ratio</c> column of the <c>CrossTransport</c> group (D-2/R-3).
     /// </para>
     ///
     /// <para>
-    /// Wiadomość <c>_asbMessage</c> NIE jest resetowana w regionie timowanym — patrz D-2.
+    /// The <c>_asbMessage</c> instance is NOT reset inside the timed region — see D-2.
     /// </para>
     /// </summary>
     [Benchmark]

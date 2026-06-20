@@ -10,29 +10,30 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BareWire.IntegrationTests.E2E;
 
-/// <summary>Reprezentuje wiadomość używaną w testach reconnect.</summary>
+/// <summary>Represents a probe message used in reconnect tests.</summary>
 public sealed record ReconnectProbeMessage(string ProbeId, string Phase);
 
 /// <summary>
-/// Testy E2E scenariusza zerwania połączenia z brokerem i automatycznego reconnect.
+/// E2E tests for the broker connection-drop and automatic reconnect scenario.
 ///
 /// <para>
-/// Weryfikuje, że adapter <see cref="RabbitMqTransportAdapter"/> z włączonym
-/// <c>AutomaticRecoveryEnabled = true</c> wznawia konsumpcję nowo opublikowanych wiadomości
-/// po wymuszonym zamknięciu wszystkich połączeń po stronie serwera.
+/// Verifies that <see cref="RabbitMqTransportAdapter"/> with
+/// <c>AutomaticRecoveryEnabled = true</c> resumes consumption of newly published messages
+/// after all server-side connections are forcibly closed.
 /// </para>
 ///
 /// <para>
-/// Mechanizm wymuszenia dropu: polecenie <c>rabbitmqctl close_all_connections</c> wykonane
-/// przez <c>docker exec</c> w kontenerze RabbitMQ. Jeśli Docker lub kontener są niedostępne,
-/// test zostaje pominięty deterministycznie (<see cref="Assert.Skip"/>), nigdy cicho-zielony.
+/// Drop mechanism: <c>rabbitmqctl close_all_connections</c> executed via
+/// <c>docker exec</c> inside the RabbitMQ container. If Docker or the container are
+/// unavailable, the test is skipped deterministically (<see cref="Assert.Skip"/>),
+/// never silently green.
 /// </para>
 /// </summary>
 [Trait("Category", "E2E")]
 public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
     : IClassFixture<AspireFixture>
 {
-    // ── Helpery ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private RabbitMqTransportAdapter CreateAdapter(bool automaticRecovery = true, TimeSpan? recoveryInterval = null) =>
         new(
@@ -69,7 +70,7 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
         if (body.IsSingleSegment)
         {
             return JsonSerializer.Deserialize<T>(body.FirstSpan)
-                ?? throw new InvalidOperationException($"Nie udało się zdeserializować {typeof(T).Name}.");
+                ?? throw new InvalidOperationException($"Failed to deserialize {typeof(T).Name}.");
         }
 
         byte[] buffer = new byte[body.Length];
@@ -81,7 +82,7 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
         }
 
         return JsonSerializer.Deserialize<T>(buffer)
-            ?? throw new InvalidOperationException($"Nie udało się zdeserializować {typeof(T).Name}.");
+            ?? throw new InvalidOperationException($"Failed to deserialize {typeof(T).Name}.");
     }
 
     private static FlowControlOptions StandardFlow() =>
@@ -97,19 +98,19 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
             return msg;
         }
 
-        throw new InvalidOperationException("Strumień konsumpcji zakończył się przed dostarczeniem wiadomości.");
+        throw new InvalidOperationException("The consumption stream ended before a message was delivered.");
     }
 
     /// <summary>
-    /// Próbuje wymusić zamknięcie wszystkich połączeń RabbitMQ przez <c>docker exec rabbitmqctl</c>.
-    /// Zwraca <see langword="true"/> po sukcesie; <see langword="false"/> gdy Docker/kontener są
-    /// niedostępne lub polecenie zwróciło niezerowy kod wyjścia.
+    /// Attempts to force-close all RabbitMQ connections via <c>docker exec rabbitmqctl</c>.
+    /// Returns <see langword="true"/> on success; <see langword="false"/> when Docker or the
+    /// container are unavailable or the command returned a non-zero exit code.
     /// </summary>
     private static bool TryCloseAllConnections(out string skipReason)
     {
         skipReason = string.Empty;
 
-        // Krok 1: znajdź kontener RabbitMQ po obrazie
+        // Step 1: find the RabbitMQ container by image
         string containerId;
         try
         {
@@ -132,7 +133,7 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
 
             if (findProcess.ExitCode != 0 || string.IsNullOrEmpty(containerId))
             {
-                // Spróbuj też filtra po nazwie obrazu z tagiem
+                // Also try filtering by image name with tag
                 using var findProcess2 = new Process
                 {
                     StartInfo = new ProcessStartInfo
@@ -152,9 +153,9 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
                 if (string.IsNullOrEmpty(containerId))
                 {
                     skipReason =
-                        "Nie znaleziono uruchomionego kontenera RabbitMQ przez 'docker ps' " +
-                        "(filtr 'rabbitmq' i 'rabbitmq:management'). " +
-                        "Test reconnect wymaga Dockera z kontenerem RabbitMQ — pomijamy deterministycznie.";
+                        "No running RabbitMQ container found via 'docker ps' " +
+                        "(filters 'rabbitmq' and 'rabbitmq:management'). " +
+                        "The reconnect test requires Docker with a RabbitMQ container — skipping deterministically.";
                     return false;
                 }
             }
@@ -162,15 +163,15 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
         catch (Exception ex)
         {
             skipReason =
-                $"Docker niedostępny lub zwrócił wyjątek podczas 'docker ps': {ex.GetType().Name}: {ex.Message}. " +
-                "Test reconnect wymaga Dockera z kontenerem RabbitMQ — pomijamy deterministycznie.";
+                $"Docker unavailable or threw an exception during 'docker ps': {ex.GetType().Name}: {ex.Message}. " +
+                "The reconnect test requires Docker with a RabbitMQ container — skipping deterministically.";
             return false;
         }
 
-        // Weź tylko pierwszy ID (może być kilka linii jeśli wiele kontenerów)
+        // Take only the first ID (there may be multiple lines if several containers are running)
         containerId = containerId.Split('\n', StringSplitOptions.RemoveEmptyEntries)[0].Trim();
 
-        // Krok 2: wykonaj rabbitmqctl close_all_connections
+        // Step 2: execute rabbitmqctl close_all_connections
         try
         {
             using var execProcess = new Process
@@ -193,41 +194,41 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
             {
                 string stderr = execProcess.StandardError.ReadToEnd();
                 skipReason =
-                    $"'rabbitmqctl close_all_connections' zwrócił kod {execProcess.ExitCode}: {stderr}. " +
-                    "Nie można wymusić dropu połączenia adaptera — pomijamy deterministycznie.";
+                    $"'rabbitmqctl close_all_connections' returned exit code {execProcess.ExitCode}: {stderr}. " +
+                    "Cannot force-drop the adapter connection — skipping deterministically.";
                 return false;
             }
         }
         catch (Exception ex)
         {
             skipReason =
-                $"Wyjątek podczas 'docker exec rabbitmqctl close_all_connections': " +
+                $"Exception during 'docker exec rabbitmqctl close_all_connections': " +
                 $"{ex.GetType().Name}: {ex.Message}. " +
-                "Test reconnect wymaga dostępu do kontenera — pomijamy deterministycznie.";
+                "The reconnect test requires access to the container — skipping deterministically.";
             return false;
         }
 
         return true;
     }
 
-    // ── E2E: Drop połączenia i automatyczny reconnect ─────────────────────────
+    // ── E2E: Connection drop and automatic reconnect ──────────────────────────
 
     /// <summary>
-    /// Weryfikuje, że adapter RabbitMQ z włączonym <c>AutomaticRecoveryEnabled = true</c>
-    /// automatycznie wznawia konsumpcję nowych wiadomości po wymuszonym zamknięciu wszystkich
-    /// połączeń po stronie serwera (<c>rabbitmqctl close_all_connections</c>).
+    /// Verifies that the RabbitMQ adapter with <c>AutomaticRecoveryEnabled = true</c>
+    /// automatically resumes consumption of new messages after all server-side connections
+    /// are forcibly closed (<c>rabbitmqctl close_all_connections</c>).
     ///
     /// <para>
-    /// Fazy testu:
+    /// Test phases:
     /// <list type="number">
-    ///   <item>Publikacja i konsumpcja pierwszej wiadomości (weryfikacja baseline przed dropem).</item>
+    ///   <item>Publish and consume the first message (baseline verification before the drop).</item>
     ///   <item>
-    ///     Wymuszenie zamknięcia połączeń przez <c>docker exec rabbitmqctl close_all_connections</c>.
-    ///     Jeśli Docker lub kontener są niedostępne, test jest pomijany z jawnym powodem.
+    ///     Force-close connections via <c>docker exec rabbitmqctl close_all_connections</c>.
+    ///     If Docker or the container are unavailable, the test is skipped with an explicit reason.
     ///   </item>
     ///   <item>
-    ///     Publikacja nowej wiadomości po dropie; polling do momentu jej odebrania lub upływu
-    ///     timeout — behawioralna weryfikacja reconnect (bez nasłuchu zdarzenia recovery).
+    ///     Publish a new message after the drop; poll until it is received or the timeout
+    ///     elapses — behavioural reconnect verification (no recovery-event listener).
     ///   </item>
     /// </list>
     /// </para>
@@ -235,10 +236,10 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
     [Fact]
     public async Task ConnectionDrop_AdapterWithAutoRecovery_ResumesConsumptionAfterReconnect()
     {
-        // Arrange — 30 s: obejmuje fazę baseline + drop + oczekiwanie na reconnect (NetworkRecoveryInterval=2s)
+        // Arrange — 30 s: covers the baseline phase + drop + waiting for reconnect (NetworkRecoveryInterval=2s)
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
 
-        // Adapter pod testem: auto-recovery włączone, krótki interwał (2s) dla deterministyczności
+        // Adapter under test: auto-recovery enabled, short interval (2s) for determinism
         await using RabbitMqTransportAdapter adapter = CreateAdapter(
             automaticRecovery: true,
             recoveryInterval: TimeSpan.FromSeconds(2));
@@ -246,7 +247,7 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
         string suffix = Guid.NewGuid().ToString("N");
         (string exchangeName, string queueName) = await DeploySimpleTopologyAsync(adapter, suffix, cts.Token);
 
-        // ── Faza 1: baseline — wiadomość przed dropem ─────────────────────────
+        // ── Phase 1: baseline — message before the drop ───────────────────────
 
         byte[] phase1Body = SerializeToJson(new ReconnectProbeMessage(
             ProbeId: $"PROBE-{suffix[..8].ToUpperInvariant()}",
@@ -265,28 +266,28 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
         await adapter.SendBatchAsync([phase1Outbound], cts.Token);
         InboundMessage phase1Received = await ConsumeOneAsync(adapter, queueName, cts.Token);
 
-        // Weryfikacja baseline
+        // Baseline verification
         ReconnectProbeMessage phase1Msg = DeserializeFromSequence<ReconnectProbeMessage>(phase1Received.Body);
         phase1Msg.Phase.Should().Be("before-drop",
-            because: "wiadomość baseline musi dotrzeć przed wymuszonym dropem");
+            because: "the baseline message must arrive before the forced drop");
 
         await adapter.SettleAsync(SettlementAction.Ack, phase1Received, cts.Token);
         phase1Received.Dispose();
 
-        // ── Faza 2: wymuszony drop połączenia ─────────────────────────────────
+        // ── Phase 2: forced connection drop ───────────────────────────────────
 
-        // GAP-1: adapter._connection jest prywatny — nie możemy go zamknąć bezpośrednio.
-        // Jedyna opcja: rabbitmqctl close_all_connections przez docker exec.
-        // Jeśli niedostępne → deterministyczny Skip, nigdy cicho-zielony.
+        // GAP-1: adapter._connection is private — we cannot close it directly.
+        // Only option: rabbitmqctl close_all_connections via docker exec.
+        // If unavailable → deterministic Skip, never silently green.
         if (!TryCloseAllConnections(out string skipReason))
         {
             Assert.Skip(skipReason);
             return;
         }
 
-        // ── Faza 3: wiadomość po dropie — behawioralna weryfikacja reconnect ──
+        // ── Phase 3: message after the drop — behavioural reconnect verification ──
 
-        // Poczekaj chwilę, by drop zdążył dotrzeć do adaptera
+        // Wait briefly for the drop to propagate to the adapter
         await Task.Delay(TimeSpan.FromMilliseconds(500), cts.Token);
 
         byte[] phase2Body = SerializeToJson(new ReconnectProbeMessage(
@@ -303,7 +304,7 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
             body: phase2Body,
             contentType: "application/json");
 
-        // Publish może wymagać kilku prób w trakcie reconnect
+        // Publish may require several retries while reconnecting
         bool published = false;
         for (int attempt = 0; attempt < 5 && !published; attempt++)
         {
@@ -321,23 +322,23 @@ public sealed class ConnectionDropReconnectTests(AspireFixture fixture)
             }
             catch (Exception)
             {
-                // Adapter w trakcie reconnect — poczekaj i spróbuj ponownie
+                // Adapter is reconnecting — wait and retry
                 await Task.Delay(TimeSpan.FromSeconds(1), cts.Token);
             }
         }
 
         published.Should().BeTrue(
-            because: "adapter z włączonym auto-recovery musi móc opublikować wiadomość po reconnect");
+            because: "an adapter with auto-recovery enabled must be able to publish a message after reconnect");
 
-        // Pollinguj aż wiadomość po reconnect dotrze
+        // Poll until the post-reconnect message arrives
         InboundMessage phase2Received = await ConsumeOneAsync(adapter, queueName, cts.Token);
 
         try
         {
             ReconnectProbeMessage phase2Msg = DeserializeFromSequence<ReconnectProbeMessage>(phase2Received.Body);
             phase2Msg.Phase.Should().Be("after-reconnect",
-                because: "adapter z włączonym auto-recovery musi wznowić konsumpcję nowych wiadomości " +
-                         "po automatycznym reconnect do brokera RabbitMQ");
+                because: "an adapter with auto-recovery enabled must resume consumption of new messages " +
+                         "after automatic reconnect to the RabbitMQ broker");
         }
         finally
         {

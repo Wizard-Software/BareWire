@@ -9,35 +9,35 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BareWire.IntegrationTests.E2E;
 
-/// <summary>Minimalna wiadomość JSON używana w teście stabilności pamięci (~60 bajtów po serializacji).</summary>
+/// <summary>Minimal JSON message used in the memory stability test (~60 bytes serialised).</summary>
 public sealed record MemoryStabilityProbe(string Id, int Iteration);
 
 /// <summary>
-/// Testy E2E stabilności alokacji pamięci: weryfikuje, że N iteracji
-/// publish → consume → Ack → Dispose nie generuje monotonicznie rosnących alokacji,
-/// co sygnalizuje brak nieograniczonego wycieku pamięci w ścieżce hot-path adaptera.
+/// E2E memory allocation stability tests: verifies that N iterations of
+/// publish → consume → Ack → Dispose do not produce monotonically growing allocations,
+/// signalling the absence of an unbounded memory leak in the adapter's hot-path.
 ///
 /// <para>
-/// Metodologia pomiaru:
+/// Measurement methodology:
 /// <list type="bullet">
 ///   <item>
-///     Warmup (≥50 iteracji) przed pomiarem — pozwala JIT, tiered compilation i puli
-///     <c>ArrayPool&lt;byte&gt;</c> osiągnąć stan ustalony przed pomiarem baseline.
+///     Warmup (≥50 iterations) before measurement — allows JIT, tiered compilation, and the
+///     <c>ArrayPool&lt;byte&gt;</c> to reach a steady state before the baseline measurement.
 ///   </item>
 ///   <item>
-///     Metryka: <c>GC.GetTotalAllocatedBytes(precise: true)</c> process-wide — obejmuje
-///     alokacje ze wszystkich wątków (w tym wątku dispatch RabbitMQ.Client).
-///     NIE używamy <c>GetAllocatedBytesForCurrentThread</c>, który nie widzi alokacji
-///     na wątkach dispatchera brokera.
+///     Metric: <c>GC.GetTotalAllocatedBytes(precise: true)</c> process-wide — captures
+///     allocations from all threads (including the RabbitMQ.Client dispatch thread).
+///     We do NOT use <c>GetAllocatedBytesForCurrentThread</c>, which misses allocations
+///     on broker dispatcher threads.
 ///   </item>
 ///   <item>
-///     Asercja względna: alokacja drugiej połowy ≤ 2.5× alokacji pierwszej połowy.
-///     Wykrywa grube/monotoniczne wycieki. Twardy budżet B/op NIE jest tu asercją
-///     (niefalsyfikowalny pod współdzielonym hostem Aspire).
+///     Relative assertion: allocation of the second half ≤ 2.5× allocation of the first half.
+///     Detects gross/monotonic leaks. A hard B/op budget is NOT asserted here
+///     (non-falsifiable under a shared Aspire host).
 ///   </item>
 ///   <item>
-///     <c>GC.Collect() / WaitForPendingFinalizers()</c> przed każdym oknem pomiarowym
-///     minimalizuje szum nagromadzony między iteracjami.
+///     <c>GC.Collect() / WaitForPendingFinalizers()</c> before each measurement window
+///     minimises noise accumulated between iterations.
 ///   </item>
 /// </list>
 /// </para>
@@ -46,22 +46,22 @@ public sealed record MemoryStabilityProbe(string Id, int Iteration);
 public sealed class MemoryStabilityTests(AspireFixture fixture)
     : IClassFixture<AspireFixture>
 {
-    // ── Stałe ─────────────────────────────────────────────────────────────────
+    // ── Constants ─────────────────────────────────────────────────────────────
 
-    /// <summary>Liczba iteracji warmup przed pomiarem (obowiązkowe per PERF-1).</summary>
+    /// <summary>Number of warmup iterations before measurement (required per PERF-1).</summary>
     private const int WarmupIterations = 50;
 
-    /// <summary>Liczba iteracji w każdym oknie pomiarowym.</summary>
+    /// <summary>Number of iterations in each measurement window.</summary>
     private const int MeasuredIterationsPerWindow = 1_000;
 
     /// <summary>
-    /// Margines tolerancji: alokacja II okna ≤ 2.5× alokacji I okna.
-    /// Wartość 2.5× (per PERF-2) zapewnia odporność na hałas hosta Aspire i JIT warmup
-    /// przy zachowaniu czułości na grube/monotoniczne wycieki.
+    /// Tolerance margin: window-2 allocation ≤ 2.5× window-1 allocation.
+    /// The 2.5× factor (per PERF-2) provides resilience against Aspire host noise and JIT warmup
+    /// while remaining sensitive to gross/monotonic leaks.
     /// </summary>
     private const double LeakToleranceMultiplier = 2.5;
 
-    // ── Helpery ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private RabbitMqTransportAdapter CreateAdapter() =>
         new(
@@ -101,12 +101,12 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
             return msg;
         }
 
-        throw new InvalidOperationException("Strumień konsumpcji zakończył się przed dostarczeniem wiadomości.");
+        throw new InvalidOperationException("The consumption stream ended before a message was delivered.");
     }
 
     /// <summary>
-    /// Wykonuje jedną iterację publish → consume → Ack → Dispose.
-    /// Zwraca bufor do puli przez jawny <c>Dispose</c> po rozliczeniu (D-3).
+    /// Executes one iteration of publish → consume → Ack → Dispose.
+    /// Returns the buffer to the pool via explicit <c>Dispose</c> after settlement (D-3).
     /// </summary>
     private static async Task RunSingleIterationAsync(
         RabbitMqTransportAdapter adapter,
@@ -130,30 +130,31 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
         await adapter.SendBatchAsync([outbound], ct);
         InboundMessage received = await ConsumeOneAsync(adapter, queueName, ct);
         await adapter.SettleAsync(SettlementAction.Ack, received, ct);
-        received.Dispose(); // D-3: jawny Dispose — zwraca bufor ArrayPool
+        received.Dispose(); // D-3: explicit Dispose — returns buffer to ArrayPool
     }
 
-    // ── E2E: Stabilność alokacji pamięci ──────────────────────────────────────
+    // ── E2E: Memory allocation stability ─────────────────────────────────────
 
     /// <summary>
-    /// Weryfikuje, że ścieżka publish → consume → Ack → Dispose nie generuje monotonicznie
-    /// rosnących alokacji pamięci, co sygnalizuje brak nieograniczonego wycieku w adapterze RabbitMQ.
+    /// Verifies that the publish → consume → Ack → Dispose path does not produce monotonically
+    /// growing memory allocations, signalling the absence of an unbounded leak in the RabbitMQ adapter.
     ///
     /// <para>
-    /// Asercja: alokacja drugiej połowy iteracji (II okno) ≤ 2.5× alokacji pierwszej połowy
-    /// (I okno). Próg 2.5× jest celowo liberalny, by absorbować hałas współdzielonego hosta Aspire
-    /// i jednocześnie wykrywać grube wycieki liniowe/monotoniczne.
+    /// Assertion: allocation of the second half of iterations (window 2) ≤ 2.5× allocation of the
+    /// first half (window 1). The 2.5× threshold is intentionally liberal to absorb shared Aspire
+    /// host noise while still detecting gross linear/monotonic leaks.
     /// </para>
     ///
     /// <para>
-    /// Test pomija się deterministycznie (<see cref="Assert.Skip"/>), jeśli I okno dało ~0 bajtów
-    /// alokacji (co byłoby szumem pomiarowym) — zamiast dzielić przez zero lub asertować na szumie.
+    /// The test skips deterministically (<see cref="Assert.Skip"/>) if window 1 yielded ~0 bytes
+    /// of allocation (which would be measurement noise) — rather than dividing by zero or asserting
+    /// against noise.
     /// </para>
     /// </summary>
     [Fact]
     public async Task MemoryAllocations_NIterations_DoNotGrowMonotonically()
     {
-        // 180 s: warmup (50 iter) + 2×1000 iteracji round-trip na żywym brokerze
+        // 180 s: warmup (50 iter) + 2×1000 round-trip iterations against a live broker
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(180));
 
         await using RabbitMqTransportAdapter adapter = CreateAdapter();
@@ -161,14 +162,14 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
         string suffix = Guid.NewGuid().ToString("N");
         (string exchangeName, string queueName) = await DeploySimpleTopologyAsync(adapter, suffix, cts.Token);
 
-        // ── Warmup: JIT, tiered compilation, ArrayPool fill ───────────────────
+        // ── Warmup: JIT, tiered compilation, ArrayPool fill ──────────────────
 
         for (int i = 0; i < WarmupIterations; i++)
         {
             await RunSingleIterationAsync(adapter, exchangeName, queueName, iteration: i, cts.Token);
         }
 
-        // ── I okno pomiarowe ──────────────────────────────────────────────────
+        // ── Measurement window 1 ─────────────────────────────────────────────
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -184,7 +185,7 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
         long allocAfter1 = GC.GetTotalAllocatedBytes(precise: true);
         long window1Delta = allocAfter1 - allocBefore1;
 
-        // ── II okno pomiarowe ─────────────────────────────────────────────────
+        // ── Measurement window 2 ─────────────────────────────────────────────
 
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -203,18 +204,18 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
         long allocAfter2 = GC.GetTotalAllocatedBytes(precise: true);
         long window2Delta = allocAfter2 - allocBefore2;
 
-        // ── Asercja ───────────────────────────────────────────────────────────
+        // ── Assertion ────────────────────────────────────────────────────────
 
-        // Jeśli I okno dało ~0 (szum pomiarowy poniżej rozdzielczości licznika),
-        // nie możemy sensownie obliczyć progu — pomijamy deterministycznie.
-        const long MinMeaningfulDeltaBytes = 4096; // 4 KB: minimalna sensowna alokacja
+        // If window 1 yielded ~0 (measurement noise below counter resolution),
+        // we cannot meaningfully compute a threshold — skip deterministically.
+        const long MinMeaningfulDeltaBytes = 4096; // 4 KB: minimum meaningful allocation
         if (window1Delta < MinMeaningfulDeltaBytes)
         {
             Assert.Skip(
-                $"I okno alokacji ({window1Delta} B) jest poniżej progu szumu pomiarowego " +
-                $"({MinMeaningfulDeltaBytes} B). Pomiar process-wide GC.GetTotalAllocatedBytes " +
-                "może być zbyt zaszumiony przez hosta Aspire, by dać sensowny wynik. " +
-                "Test pomijamy deterministycznie — nigdy cicho-zielony.");
+                $"Window-1 allocation ({window1Delta} B) is below the measurement noise threshold " +
+                $"({MinMeaningfulDeltaBytes} B). Process-wide GC.GetTotalAllocatedBytes " +
+                "may be too noisy under the Aspire host to produce a meaningful result. " +
+                "Skipping deterministically — never silently green.");
             return;
         }
 
@@ -222,11 +223,11 @@ public sealed class MemoryStabilityTests(AspireFixture fixture)
 
         window2Delta.Should().BeLessThanOrEqualTo(threshold,
             because:
-                $"II okno ({MeasuredIterationsPerWindow} iter, {window2Delta:N0} B) " +
-                $"nie może przekroczyć {LeakToleranceMultiplier}× alokacji I okna " +
-                $"({MeasuredIterationsPerWindow} iter, {window1Delta:N0} B, próg: {threshold:N0} B). " +
-                "Przekroczenie sygnalizuje nieograniczony/monotoniczny wzrost alokacji w ścieżce " +
-                "publish→consume→Ack→Dispose adaptera RabbitMQ, co wskazuje na wyciek pamięci. " +
-                "Twardy budżet B/op jest weryfikowany przez izolowany benchmark BenchmarkDotNet.");
+                $"window 2 ({MeasuredIterationsPerWindow} iter, {window2Delta:N0} B) " +
+                $"must not exceed {LeakToleranceMultiplier}× the allocation of window 1 " +
+                $"({MeasuredIterationsPerWindow} iter, {window1Delta:N0} B, threshold: {threshold:N0} B). " +
+                "Exceeding this signals unbounded/monotonic allocation growth in the " +
+                "publish→consume→Ack→Dispose path of the RabbitMQ adapter, indicating a memory leak. " +
+                "The hard B/op budget is verified by the isolated BenchmarkDotNet benchmark.");
     }
 }

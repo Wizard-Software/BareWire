@@ -9,27 +9,27 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BareWire.IntegrationTests.E2E;
 
-// ── Lokalne typy wiadomości ────────────────────────────────────────────────────
+// ── Local message types ───────────────────────────────────────────────────────
 
-/// <summary>Reprezentuje zamówienie używane w testach cross-transport.</summary>
+/// <summary>Represents an order used in cross-transport tests.</summary>
 public sealed record CrossTransportOrder(string OrderId, decimal Amount, string Currency);
 
 /// <summary>
-/// Testy E2E scenariusza cross-transport: wiadomość publikowana przez jeden adapter RabbitMQ
-/// jest odbierana przez drugi niezależny adapter podłączony do tego samego brokera.
+/// E2E tests for the cross-transport scenario: a message published by one RabbitMQ adapter
+/// is received by a second, independent adapter connected to the same broker.
 ///
 /// <para>
-/// Symuluje przepływ zdarzeń między dwoma oddzielnymi instancjami transportu
-/// (np. dwie usługi w jednym klastrze) na żywym brokerze RabbitMQ dostarczonym
-/// przez <see cref="AspireFixture"/>. Każdy test używa nazw z sufiksem GUID, by uniknąć
-/// kolizji między przebiegami.
+/// Simulates event flow between two separate transport instances
+/// (e.g. two services in the same cluster) against a live RabbitMQ broker provided
+/// by <see cref="AspireFixture"/>. Each test uses GUID-suffixed names to avoid
+/// collisions across runs.
 /// </para>
 /// </summary>
 [Trait("Category", "E2E")]
 public sealed class CrossTransportFlowTests(AspireFixture fixture)
     : IClassFixture<AspireFixture>
 {
-    // ── Helpery ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     private RabbitMqTransportAdapter CreateAdapter() =>
         new(
@@ -64,7 +64,7 @@ public sealed class CrossTransportFlowTests(AspireFixture fixture)
         if (body.IsSingleSegment)
         {
             return JsonSerializer.Deserialize<T>(body.FirstSpan)
-                ?? throw new InvalidOperationException($"Nie udało się zdeserializować {typeof(T).Name}.");
+                ?? throw new InvalidOperationException($"Failed to deserialize {typeof(T).Name}.");
         }
 
         byte[] buffer = new byte[body.Length];
@@ -76,7 +76,7 @@ public sealed class CrossTransportFlowTests(AspireFixture fixture)
         }
 
         return JsonSerializer.Deserialize<T>(buffer)
-            ?? throw new InvalidOperationException($"Nie udało się zdeserializować {typeof(T).Name}.");
+            ?? throw new InvalidOperationException($"Failed to deserialize {typeof(T).Name}.");
     }
 
     private static FlowControlOptions StandardFlow() =>
@@ -92,23 +92,23 @@ public sealed class CrossTransportFlowTests(AspireFixture fixture)
             return msg;
         }
 
-        throw new InvalidOperationException("Strumień konsumpcji zakończył się przed dostarczeniem wiadomości.");
+        throw new InvalidOperationException("The consumption stream ended before a message was delivered.");
     }
 
     // ── E2E: Cross-transport round-trip ───────────────────────────────────────
 
     /// <summary>
-    /// Weryfikuje, że wiadomość opublikowana przez jeden adapter RabbitMQ (<c>publishAdapter</c>)
-    /// jest poprawnie odbierana przez drugi, niezależny adapter (<c>consumeAdapter</c>) podłączony
-    /// do tego samego brokera — symulując przepływ cross-transport między dwoma instancjami usługi.
+    /// Verifies that a message published by one RabbitMQ adapter (<c>publishAdapter</c>)
+    /// is correctly received by a second, independent adapter (<c>consumeAdapter</c>) connected
+    /// to the same broker — simulating a cross-transport flow between two service instances.
     ///
     /// <para>
-    /// Asercje:
+    /// Assertions:
     /// <list type="bullet">
-    ///   <item>Broker potwierdził publikację (<c>IsConfirmed == true</c>).</item>
-    ///   <item>Body deserializuje się do oryginalnych wartości (round-trip <c>OrderId</c>, <c>Amount</c>, <c>Currency</c>).</item>
-    ///   <item>Nagłówek <c>content-type</c> jest propagowany przez brokera.</item>
-    ///   <item>Co najmniej jeden nagłówek własny (<c>X-Source-Service</c>) dociera do konsumenta.</item>
+    ///   <item>The broker confirmed the publication (<c>IsConfirmed == true</c>).</item>
+    ///   <item>The body deserialises to the original values (round-trip <c>OrderId</c>, <c>Amount</c>, <c>Currency</c>).</item>
+    ///   <item>The <c>content-type</c> header is propagated by the broker.</item>
+    ///   <item>At least one custom header (<c>X-Source-Service</c>) reaches the consumer.</item>
     /// </list>
     /// </para>
     /// </summary>
@@ -141,39 +141,39 @@ public sealed class CrossTransportFlowTests(AspireFixture fixture)
             body: body,
             contentType: "application/json");
 
-        // Act — publikacja przez publishAdapter, konsumpcja przez consumeAdapter
+        // Act — publish via publishAdapter, consume via consumeAdapter
         IReadOnlyList<SendResult> sendResults = await publishAdapter.SendBatchAsync([outbound], cts.Token);
         InboundMessage received = await ConsumeOneAsync(consumeAdapter, queueName, cts.Token);
 
         try
         {
-            // Assert — broker potwierdził publikację
+            // Assert — broker confirmed the publication
             sendResults.Should().HaveCount(1);
             sendResults[0].IsConfirmed.Should().BeTrue(
-                because: "broker RabbitMQ musi potwierdzić każdą opublikowaną wiadomość");
+                because: "the RabbitMQ broker must confirm every published message");
 
-            // Assert — body round-trip: wszystkie pola muszą być identyczne
+            // Assert — body round-trip: all fields must be identical
             CrossTransportOrder roundTripped = DeserializeFromSequence<CrossTransportOrder>(received.Body);
             roundTripped.OrderId.Should().Be(order.OrderId,
-                because: "OrderId musi przeżyć round-trip przez brokera");
+                because: "OrderId must survive a round-trip through the broker");
             roundTripped.Amount.Should().Be(order.Amount,
-                because: "Amount musi przeżyć round-trip przez brokera");
+                because: "Amount must survive a round-trip through the broker");
             roundTripped.Currency.Should().Be(order.Currency,
-                because: "Currency musi przeżyć round-trip przez brokera");
+                because: "Currency must survive a round-trip through the broker");
 
-            // Assert — content-type propagowany przez brokera
+            // Assert — content-type propagated by the broker
             received.Headers.Should().ContainKey("content-type",
-                because: "broker musi propagować content-type z OutboundMessage do InboundMessage");
+                because: "the broker must propagate content-type from OutboundMessage to InboundMessage");
             received.Headers["content-type"].Should().Be("application/json");
 
-            // Assert — nagłówek własny propagowany
+            // Assert — custom header propagated
             received.Headers.Should().ContainKey("X-Source-Service",
-                because: "co najmniej jeden nagłówek własny musi przeżyć przepływ cross-transport");
+                because: "at least one custom header must survive the cross-transport flow");
             received.Headers["X-Source-Service"].Should().Be("service-a");
         }
         finally
         {
-            // Rozliczenie i zwolnienie bufora puli — D-3
+            // Settlement and pool-buffer release — D-3
             await consumeAdapter.SettleAsync(SettlementAction.Ack, received, cts.Token);
             received.Dispose();
         }
