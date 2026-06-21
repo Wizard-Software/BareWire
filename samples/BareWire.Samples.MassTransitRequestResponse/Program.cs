@@ -102,10 +102,15 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 {
     rmq.Host(rabbitMqConnectionString);
 
+    // Routing requestu: BareWire publikuje CheckOrderStatus na domyślny exchange AMQP ("")
+    // — DefaultExchange to "" — z routing key = RequestQueueName. W domyślnym exchange AMQP
+    // routing key = nazwa kolejki, więc request trafia bezpośrednio do kolejki "mt-order-status",
+    // na której nasłuchuje MassTransit. BEZ tego mapowania request client użyłby domyślnego
+    // routing key (nazwa typu) i wiadomość nigdy nie dotarłaby do respondera MT → timeout.
+    rmq.MapRoutingKey<CheckOrderStatus>(RequestQueueName);
+
     // ADR-002: Manual topology — BareWire nie tworzy żadnych zasobów dla kolejki MT.
     // MT sam deklaruje kolejkę "mt-order-status" przez ReceiveEndpoint poniżej.
-    // BareWire wysyła na domyślny exchange AMQP ("") z routing key = RequestQueueName,
-    // co odpowiada bezpośredniemu skierowaniu do kolejki o tej nazwie.
     rmq.ConfigureTopology(_ => { });
 };
 
