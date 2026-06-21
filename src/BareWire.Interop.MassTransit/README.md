@@ -64,6 +64,53 @@ services.AddBareWire(bus =>
 
 See [doc/masstransit-interop.md](../../../doc/masstransit-interop.md) for full documentation and the publish-only bridge scenario.
 
+## BareWire → MassTransit request/response
+
+When BareWire acts as the **request caller** and MassTransit acts as the **responder**, the serializer must emit the complete MassTransit request envelope so that MassTransit's `context.RespondAsync(...)` can route the reply back to BareWire's exclusive reply queue. Without these fields, MT falls back to publish and the reply never arrives (GH #19).
+
+### Opt-in per message type
+
+Use `MapSerializer<TRequest, MassTransitEnvelopeSerializer>()` on the bus configurator for the request message type:
+
+```csharp
+services.AddBareWireJsonSerializer();
+services.AddMassTransitEnvelopeSerializer();
+services.AddMassTransitEnvelopeDeserializer(); // needed to read MT response envelopes
+
+services.AddBareWire(bus =>
+{
+    bus.MapSerializer<PingRequest, MassTransitEnvelopeSerializer>();
+    // Response type uses the envelope deserializer registered above.
+});
+```
+
+### What the serializer emits
+
+When a request is sent through `IRequestClient<TRequest>.GetResponseAsync<TResponse>()`, the envelope serializer writes the full MassTransit request envelope:
+
+| Field | Value |
+|-------|-------|
+| `messageId` | Per-message GUID |
+| `requestId` | GUID identifying this request (MT correlates responses by this field) |
+| `responseAddress` | `rabbitmq://host/vhost/amq.gen-xyz?temporary=true` — BareWire's exclusive reply queue |
+| `destinationAddress` | `rabbitmq://host/vhost/target-queue` — the target queue |
+| `faultAddress` | Same as `responseAddress` — fault messages also return to the reply queue |
+| `expirationTime` | ISO 8601 UTC timestamp derived from the request client timeout |
+| `messageType` | MassTransit URN array |
+| `sentTime` | ISO 8601 UTC send time |
+| `message` | The serialized request payload |
+
+### Response correlation
+
+MassTransit responds by echo-ing `requestId` back in the response envelope (it does not set AMQP `correlation_id` to a matchable value). BareWire's `RabbitMqRequestClient` uses a two-step correlation strategy:
+
+1. **Primary:** AMQP `CorrelationId` header — works for BareWire↔BareWire and transports that echo `correlation_id`.
+2. **Fallback:** when AMQP `CorrelationId` is absent or unknown and `content-type == application/vnd.masstransit+json`, the `requestId` field is extracted from the response envelope via `IResponseEnvelopeReader` and matched against the pending-request table.
+
+### AMQP TTL (GH #18)
+
+An AMQP `expiration` header (TTL in milliseconds) is set on every outgoing request. This ensures that unconsumed requests expire automatically on the broker, preventing stale work when the caller times out before the responder processes the message.
+
 ## Dependencies
 
 - `BareWire.Abstractions`

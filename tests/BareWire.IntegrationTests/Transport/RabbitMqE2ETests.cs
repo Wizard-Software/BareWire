@@ -469,9 +469,13 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         (CancellationTokenSource responderCts, Task responderTask) =
             await StartPaymentResponderAsync(queueName, cts.Token);
 
+        var connectionUri = new Uri(fixture.GetRabbitMqConnectionString());
+        string rawPath = connectionUri.AbsolutePath.TrimStart('/');
+        string? vhost = string.IsNullOrEmpty(rawPath) ? null : rawPath;
+
         var factory = new RabbitMQ.Client.ConnectionFactory
         {
-            Uri = new Uri(fixture.GetRabbitMqConnectionString()),
+            Uri = connectionUri,
             AutomaticRecoveryEnabled = false,
         };
         await using IConnection clientConnection = await factory.CreateConnectionAsync(cts.Token);
@@ -483,7 +487,9 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         var client = new RabbitMqRequestClient<TestPaymentRequest>(
             clientConnection, serializer, deserializerResolver, NullLogger.Instance,
             targetExchange: string.Empty, routingKey: queueName,
-            timeout: TimeSpan.FromSeconds(10));
+            timeout: TimeSpan.FromSeconds(10),
+            connectionUri: connectionUri,
+            vhost: vhost);
         await client.InitializeAsync(cts.Token);
 
         // Act
@@ -539,9 +545,13 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         configurator.DeclareQueue(queueName, durable: false, autoDelete: false);
         await adapter.DeployTopologyAsync(configurator.Build(), cts.Token);
 
+        var connectionUri2 = new Uri(fixture.GetRabbitMqConnectionString());
+        string rawPath2 = connectionUri2.AbsolutePath.TrimStart('/');
+        string? vhost2 = string.IsNullOrEmpty(rawPath2) ? null : rawPath2;
+
         var factory = new RabbitMQ.Client.ConnectionFactory
         {
-            Uri = new Uri(fixture.GetRabbitMqConnectionString()),
+            Uri = connectionUri2,
             AutomaticRecoveryEnabled = false,
         };
         await using IConnection clientConnection = await factory.CreateConnectionAsync(cts.Token);
@@ -553,7 +563,9 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         var client = new RabbitMqRequestClient<TestPaymentRequest>(
             clientConnection, serializer, deserializerResolver, NullLogger.Instance,
             targetExchange: string.Empty, routingKey: queueName,
-            timeout: TimeSpan.FromMilliseconds(500));
+            timeout: TimeSpan.FromMilliseconds(500),
+            connectionUri: connectionUri2,
+            vhost: vhost2);
         await client.InitializeAsync(cts.Token);
 
         // Act & Assert
