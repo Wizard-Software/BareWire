@@ -1,37 +1,35 @@
-// BareWire.Samples.MassTransitRequestResponse — demonstruje scenariusz GH #19 (zadanie B2):
-// BareWire wysyła request przez IRequestClient<T> do PRAWDZIWEGO busa MassTransit,
-// który odpowiada przez RespondAsync, a BareWire odbiera odpowiedź Response<TResponse>.
+// BareWire.Samples.MassTransitRequestResponse — demonstrates the BareWire->MassTransit
+// request/response scenario: BareWire sends a request via IRequestClient<T> to a REAL
+// MassTransit bus, which replies via RespondAsync, and BareWire receives the Response<TResponse>.
 //
-// Co demonstruje ten sample:
-//   - ADR-021  BareWire→MassTransit request/response: klient BareWire ustawia pole
-//              responseAddress w kopercie na rabbitmq://host/amq.rabbitmq.reply-to.
-//              MassTransit wykrywa ten sufiks przez IsReplyToAddress() i kieruje odpowiedź
-//              przez AMQP ReplyTo (pole na wiadomości AMQP = nazwa wyłącznej kolejki
-//              odpowiedzi BareWire), zamiast próbować wysłać na zwykły exchange.
-//   - ADR-001  Raw-first: domyślny serializer pozostaje raw JSON. MassTransitEnvelopeSerializer
-//              jest aktywowany tylko dla CheckOrderStatus przez MapSerializer<T,S>().
-//   - ADR-002  Manual topology: ConfigureConsumeTopology = false po stronie MT — BareWire
-//              dociera do kolejki przez domyślny exchange AMQP (routing key = nazwa kolejki).
-//   - Kolejność DI: AddBareWireJsonSerializer() PRZED AddMassTransitEnvelopeSerializer()
-//              i AddMassTransitEnvelopeDeserializer() — odwrotna kolejność rzuca
-//              InvalidOperationException przy starcie.
+// What this sample shows:
+//   - BareWire->MassTransit request/response: the BareWire client sets the envelope's
+//     responseAddress to rabbitmq://host/amq.rabbitmq.reply-to. MassTransit detects this
+//     suffix via IsReplyToAddress() and routes the reply through the AMQP ReplyTo header
+//     (set to BareWire's exclusive reply-queue name), instead of publishing to an exchange.
+//   - Raw-first: the default serializer stays raw JSON. MassTransitEnvelopeSerializer is
+//     activated only for CheckOrderStatus via MapSerializer<T,S>().
+//   - Manual topology: ConfigureConsumeTopology = false on the MassTransit side — BareWire
+//     reaches the queue through the default AMQP exchange (routing key = queue name).
+//   - DI ordering: AddBareWireJsonSerializer() BEFORE AddMassTransitEnvelopeSerializer() and
+//     AddMassTransitEnvelopeDeserializer() — the reverse order throws at startup.
 //
-// Architektura:
+// Architecture:
 //
 //   POST /order-status
-//     → IRequestClient<CheckOrderStatus> (BareWire)
-//         → publikuje na "" (default AMQP exchange), routing key = "mt-order-status"
-//           Content-Type: application/vnd.masstransit+json
-//           responseAddress: rabbitmq://host/amq.rabbitmq.reply-to
-//         → kolejka "mt-order-status" → OrderStatusResponder (MassTransit IConsumer<T>)
-//             → context.RespondAsync(new OrderStatus(...))
-//               → MT wykrywa amq.rabbitmq.reply-to → routuje przez AMQP ReplyTo
-//         → BareWire odbiera na swojej tymczasowej kolejce odpowiedzi
-//         → Response<OrderStatus> zwracany do klienta HTTP
+//     -> IRequestClient<CheckOrderStatus> (BareWire)
+//         -> publishes to "" (default AMQP exchange), routing key = "mt-order-status"
+//            Content-Type: application/vnd.masstransit+json
+//            responseAddress: rabbitmq://host/amq.rabbitmq.reply-to
+//         -> queue "mt-order-status" -> OrderStatusResponder (MassTransit IConsumer<T>)
+//             -> context.RespondAsync(new OrderStatus(...))
+//               -> MassTransit detects amq.rabbitmq.reply-to -> routes via the AMQP ReplyTo header
+//         -> BareWire receives on its temporary reply queue
+//         -> Response<OrderStatus> returned to the HTTP caller
 //
-// Wymagania (runtime, NIE wymagane do kompilacji):
-//   - Broker RabbitMQ (domyślnie: amqp://guest:guest@localhost:5672/)
-//   Przy uruchomieniu przez Aspire AppHost broker jest udostępniany automatycznie.
+// Runtime requirements (NOT required to compile):
+//   - A RabbitMQ broker (default: amqp://guest:guest@localhost:5672/).
+//   When run via the Aspire AppHost the broker is provisioned automatically.
 
 // BareWire and MassTransit share several type names (IBus, IRequestClient<T>, Response<T>).
 // Using aliases disambiguate at the call sites in this file.
@@ -65,33 +63,33 @@ string rabbitMqConnectionString =
     builder.Configuration.GetConnectionString("rabbitmq")
     ?? "amqp://guest:guest@localhost:5672/";
 
-// MassTransit wymaga formatu amqp://user:pass@host:port/vhost.
-// Aspire wstrzykuje amqp:// URL, który MT akceptuje bezpośrednio.
+// MassTransit expects an amqp://user:pass@host:port/vhost URI.
+// Aspire injects an amqp:// URL that MassTransit accepts directly.
 Uri rabbitMqUri = new(rabbitMqConnectionString);
 string mtRabbitUri = $"amqp://{rabbitMqUri.UserInfo}@{rabbitMqUri.Host}:{rabbitMqUri.Port}{rabbitMqUri.AbsolutePath}";
 
-// Nazwa kolejki, na którą BareWire wysyła request, a MT nasłuchuje.
+// The queue BareWire sends the request to, and MassTransit listens on.
 // BareWire: targetExchange = "" (default AMQP exchange), routingKey = queueName.
 // MassTransit: ReceiveEndpoint(queueName, ep => ep.ConfigureConsumeTopology = false).
-// ConfigureConsumeTopology = false zapobiega tworzeniu fanout exchange przez MT —
-// BareWire trafia do kolejki bezpośrednio przez routing key w default AMQP exchange.
+// ConfigureConsumeTopology = false stops MassTransit from creating a fanout exchange —
+// BareWire reaches the queue directly via the routing key on the default AMQP exchange.
 const string RequestQueueName = "mt-order-status";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. BareWire serialization — ADR-001 raw-first + MassTransit envelope interop
+// 3. BareWire serialization — raw-first + MassTransit envelope interop
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ADR-001: Raw-first — rejestruje SystemTextJsonSerializer i SystemTextJsonRawDeserializer.
-// WAŻNE: musi być wywołane PRZED AddMassTransitEnvelopeSerializer/Deserializer.
+// Raw-first: registers SystemTextJsonSerializer and SystemTextJsonRawDeserializer.
+// IMPORTANT: must be called BEFORE AddMassTransitEnvelopeSerializer/Deserializer.
 builder.Services.AddBareWireJsonSerializer();
 
-// Rejestruje MassTransitEnvelopeDeserializer dla Content-Type application/vnd.masstransit+json.
-// BareWire używa go do zdekodowania odpowiedzi MT (IDeserializerResolver wybiera deserializer
-// na podstawie Content-Type w nagłówku odpowiedzi).
+// Registers MassTransitEnvelopeDeserializer for Content-Type application/vnd.masstransit+json.
+// BareWire uses it to decode the MassTransit reply (the IDeserializerResolver picks the
+// deserializer based on the response's Content-Type header).
 builder.Services.AddMassTransitEnvelopeDeserializer();
 
-// Rejestruje MassTransitEnvelopeSerializer w DI do użycia per-message-type.
-// Aktywowany dla CheckOrderStatus przez MapSerializer<T,S>() poniżej.
+// Registers MassTransitEnvelopeSerializer in DI for per-message-type use.
+// Activated for CheckOrderStatus via MapSerializer<T,S>() below.
 builder.Services.AddMassTransitEnvelopeSerializer();
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,15 +100,16 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 {
     rmq.Host(rabbitMqConnectionString);
 
-    // Routing requestu: BareWire publikuje CheckOrderStatus na domyślny exchange AMQP ("")
-    // — DefaultExchange to "" — z routing key = RequestQueueName. W domyślnym exchange AMQP
-    // routing key = nazwa kolejki, więc request trafia bezpośrednio do kolejki "mt-order-status",
-    // na której nasłuchuje MassTransit. BEZ tego mapowania request client użyłby domyślnego
-    // routing key (nazwa typu) i wiadomość nigdy nie dotarłaby do respondera MT → timeout.
+    // Request routing: BareWire publishes CheckOrderStatus to the default AMQP exchange ("")
+    // — DefaultExchange is "" — with routing key = RequestQueueName. On the default AMQP
+    // exchange the routing key equals the queue name, so the request goes straight to the
+    // "mt-order-status" queue MassTransit listens on. WITHOUT this mapping the request client
+    // would use the default routing key (the type name) and the message would never reach the
+    // MassTransit responder -> timeout.
     rmq.MapRoutingKey<CheckOrderStatus>(RequestQueueName);
 
-    // ADR-002: Manual topology — BareWire nie tworzy żadnych zasobów dla kolejki MT.
-    // MT sam deklaruje kolejkę "mt-order-status" przez ReceiveEndpoint poniżej.
+    // Manual topology — BareWire creates no resources for the MassTransit queue.
+    // MassTransit declares the "mt-order-status" queue itself via ReceiveEndpoint below.
     rmq.ConfigureTopology(_ => { });
 };
 
@@ -119,15 +118,15 @@ builder.Services.AddBareWire(cfg =>
 {
     cfg.UseRabbitMQ(configureRabbitMq);
 
-    // Kluczowy element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>()
-    // nakazuje BareWire pakować każdy CheckOrderStatus w kopertę MassTransit.
-    // Koperta zawiera pola messageId, requestId, responseAddress (= amq.rabbitmq.reply-to),
-    // correlationId, messageType i payload — dokładnie to, czego oczekuje MassTransit.
+    // Key element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>() tells
+    // BareWire to wrap every CheckOrderStatus in a MassTransit envelope. The envelope carries
+    // messageId, requestId, responseAddress (= amq.rabbitmq.reply-to), correlationId,
+    // messageType and the payload — exactly what MassTransit expects.
     cfg.MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. MassTransit bus — prawdziwy responder (strona MT w scenariuszu interop)
+// 5. MassTransit bus — the real responder (the MassTransit side of the interop)
 // ─────────────────────────────────────────────────────────────────────────────
 
 builder.Services.AddMassTransit(x =>
@@ -138,10 +137,10 @@ builder.Services.AddMassTransit(x =>
     {
         cfg.Host(new Uri(mtRabbitUri));
 
-        // ReceiveEndpoint z nazwą kolejki = RequestQueueName — MT nasłuchuje na tej kolejce.
-        // ConfigureConsumeTopology = false: MT NIE tworzy fanout exchange dla CheckOrderStatus.
-        // Dzięki temu BareWire może dotrzeć do kolejki przez domyślny exchange AMQP
-        // (routing key = RequestQueueName), bez potrzeby bindowania exchange-to-queue.
+        // ReceiveEndpoint named RequestQueueName — MassTransit listens on this queue.
+        // ConfigureConsumeTopology = false: MassTransit does NOT create a fanout exchange for
+        // CheckOrderStatus, so BareWire can reach the queue through the default AMQP exchange
+        // (routing key = RequestQueueName) without any exchange-to-queue binding.
         cfg.ReceiveEndpoint(RequestQueueName, ep =>
         {
             ep.ConfigureConsumeTopology = false;
@@ -162,16 +161,16 @@ WebApplication app = builder.Build();
 
 app.MapServiceDefaults();
 
-// POST /order-status — wysyła CheckOrderStatus przez BareWire IRequestClient<T>
-// do MassTransit OrderStatusResponder i zwraca odpowiedź Response<OrderStatus>.
+// POST /order-status — sends CheckOrderStatus via the BareWire IRequestClient<T> to the
+// MassTransit OrderStatusResponder and returns the Response<OrderStatus>.
 //
-// Przepływ wiadomości:
-//   1. BareWire serializuje CheckOrderStatus jako kopertę MT (MapSerializer<T,S>).
-//   2. Koperta trafia na domyślny exchange AMQP ("") z routing key "mt-order-status".
-//   3. MT odbiera z kolejki "mt-order-status", wywołuje OrderStatusResponder.Consume().
-//   4. RespondAsync() kieruje odpowiedź przez AMQP ReplyTo (amq.rabbitmq.reply-to).
-//   5. BareWire odbiera OrderStatus, dekoduje przez MassTransitEnvelopeDeserializer.
-//   6. IRequestClient<CheckOrderStatus>.GetResponseAsync<OrderStatus>() zwraca wynik.
+// Message flow:
+//   1. BareWire serializes CheckOrderStatus as a MassTransit envelope (MapSerializer<T,S>).
+//   2. The envelope goes to the default AMQP exchange ("") with routing key "mt-order-status".
+//   3. MassTransit receives from the "mt-order-status" queue and invokes OrderStatusResponder.Consume().
+//   4. RespondAsync() routes the reply via the AMQP ReplyTo header (amq.rabbitmq.reply-to).
+//   5. BareWire receives OrderStatus and decodes it via MassTransitEnvelopeDeserializer.
+//   6. IRequestClient<CheckOrderStatus>.GetResponseAsync<OrderStatus>() returns the result.
 app.MapPost("/order-status", async (
     OrderStatusRequest request,
     BwIBus bus,
@@ -195,7 +194,7 @@ app.MapPost("/order-status", async (
 .Produces<OrderStatus>()
 .ProducesProblem(StatusCodes.Status408RequestTimeout)
 .WithName("CheckOrderStatus")
-.WithSummary("Sprawdź status zamówienia przez BareWire→MassTransit request/response.");
+.WithSummary("Check an order's status via BareWire->MassTransit request/response.");
 
 app.Run();
 
@@ -212,10 +211,10 @@ internal sealed record OrderStatusRequest(string OrderId);
 internal static partial class Log
 {
     [LoggerMessage(Level = LogLevel.Information,
-        Message = "BareWire: wysyłam zapytanie o status zamówienia {OrderId} przez IRequestClient<CheckOrderStatus>")]
+        Message = "BareWire: sending order-status request {OrderId} via IRequestClient<CheckOrderStatus>")]
     internal static partial void SendingRequest(ILogger logger, string orderId);
 
     [LoggerMessage(Level = LogLevel.Information,
-        Message = "BareWire: otrzymano odpowiedź — OrderId={OrderId}, Status={Status}, ProcessedBy={ProcessedBy}")]
+        Message = "BareWire: received response — OrderId={OrderId}, Status={Status}, ProcessedBy={ProcessedBy}")]
     internal static partial void ReceivedResponse(ILogger logger, string orderId, string status, string processedBy);
 }

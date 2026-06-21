@@ -1,6 +1,6 @@
 # BareWire.Samples.MassTransitRequestResponse
 
-Sample demonstrujący scenariusz GH #19 (zadanie B2): klient BareWire wysyła request przez `IRequestClient<CheckOrderStatus>` do **prawdziwego busa MassTransit**, który odpowiada przez `RespondAsync`, a BareWire odbiera `Response<OrderStatus>` z powrotem.
+Sample demonstrujący scenariusz [GH #19](https://github.com/Wizard-Software/BareWire/issues/19): klient BareWire wysyła request przez `IRequestClient<CheckOrderStatus>` do **prawdziwego busa MassTransit**, który odpowiada przez `RespondAsync`, a BareWire odbiera `Response<OrderStatus>` z powrotem.
 
 ## Scenariusz
 
@@ -13,12 +13,13 @@ Dwie strony działają w tym samym procesie, na tym samym brokerze RabbitMQ:
 
 | Aspekt | Szczegół |
 |--------|----------|
-| ADR-021 BareWire→MT request/response | BareWire ustawia `responseAddress` na `amq.rabbitmq.reply-to`; MT kieruje odpowiedź przez AMQP `ReplyTo` |
-| ADR-001 raw-first | Domyślny serializer BareWire pozostaje raw JSON; `MassTransitEnvelopeSerializer` aktywowany tylko dla `CheckOrderStatus` |
-| ADR-002 manual topology | `ConfigureConsumeTopology = false` po stronie MT; BareWire dociera do kolejki przez domyślny exchange AMQP |
+| BareWire→MT request/response | BareWire ustawia `responseAddress` na `amq.rabbitmq.reply-to`; MT kieruje odpowiedź przez AMQP `ReplyTo` |
+| Raw-first | Domyślny serializer BareWire pozostaje raw JSON; `MassTransitEnvelopeSerializer` aktywowany tylko dla `CheckOrderStatus` |
+| Manual topology | `ConfigureConsumeTopology = false` po stronie MT; BareWire dociera do kolejki przez domyślny exchange AMQP |
 | `MapSerializer<T, S>()` | Per-message-type override serializera — nie zmienia domyślnego serializera dla innych typów |
+| `MapRoutingKey<T>()` | Kieruje request do kolejki respondera MT (domyślny exchange AMQP, routing key = nazwa kolejki) |
 | Kolejność DI | `AddBareWireJsonSerializer()` PRZED `AddMassTransitEnvelopeSerializer/Deserializer()` |
-| `IRequestClient<T>.GetResponseAsync<TResponse>()` | Typowany odbiór odpowiedzi z automatycznym dopasowaniem po correlationId / AMQP ReplyTo |
+| `IRequestClient<T>.GetResponseAsync<TResponse>()` | Typowany odbiór odpowiedzi z dopasowaniem po AMQP `CorrelationId` (fallback po `requestId` z koperty) |
 
 ## Architektura
 
@@ -27,7 +28,7 @@ POST /order-status
   → IRequestClient<CheckOrderStatus> (BareWire)
       → "" (default AMQP exchange), routing key = "mt-order-status"
         Content-Type: application/vnd.masstransit+json
-        responseAddress: rabbitmq://host/amq.rabbitmq.reply-to  ← kluczowe pole (ADR-021)
+        responseAddress: rabbitmq://host/amq.rabbitmq.reply-to  ← kluczowe pole
       → kolejka "mt-order-status" → OrderStatusResponder (MassTransit IConsumer<T>)
           → context.RespondAsync(new OrderStatus(...))
             → MT: IsReplyToAddress("amq.rabbitmq.reply-to") == true
@@ -36,7 +37,7 @@ POST /order-status
   → Response<OrderStatus> zwrócona do klienta HTTP
 ```
 
-### Kluczowy mechanizm routowania odpowiedzi (ADR-021)
+### Kluczowy mechanizm routowania odpowiedzi
 
 BareWire (przez `RabbitMqEndpointAddress.BuildReplyToAddress`) ustawia pole `responseAddress` w kopercie MassTransit na:
 
@@ -46,7 +47,7 @@ rabbitmq://host[:port]/[vhost/]amq.rabbitmq.reply-to
 
 MassTransit sprawdza ten adres metodą `IsReplyToAddress()` — jeśli sufiks to `amq.rabbitmq.reply-to`, MT wysyła odpowiedź przez domyślny exchange AMQP z kluczem routowania równym wartości pola `ReplyTo` na wiadomości AMQP. Pole `ReplyTo` zawiera prawdziwą nazwę wyłącznej kolejki odpowiedzi BareWire (przydzieloną przez broker), a nie literał `amq.rabbitmq.reply-to`.
 
-Bez tej naprawy MT próbowałby wysłać odpowiedź na queue o nazwie `amq.rabbitmq.reply-to`, co kończy się błędem `NOT_FOUND` na brokerze.
+Gdyby zamiast tego `responseAddress` wskazywał serwerowo-nazwaną kolejkę odpowiedzi (`rabbitmq://host/amq.gen-...`), MassTransit potraktowałby ostatni segment ścieżki jako exchange typu fanout, do którego wyłączna kolejka odpowiedzi nie jest podpięta — i odpowiedź zostałaby zgubiona (objaw z GH #19).
 
 ## Jak uruchomić
 
@@ -79,7 +80,7 @@ Oczekiwana odpowiedź:
 ```json
 {
   "orderId": "ORD-12345",
-  "status": "Potwierdzono",
+  "status": "Confirmed",
   "processedBy": "MassTransit/OrderStatusResponder"
 }
 ```

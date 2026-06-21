@@ -4,13 +4,13 @@ using MassTransit;
 namespace BareWire.Samples.MassTransitRequestResponse.Consumers;
 
 /// <summary>
-/// MassTransit consumer odpowiadający na zapytania BareWire o status zamówienia.
+/// MassTransit consumer that answers BareWire order-status requests.
 ///
-/// Odbiera <see cref="CheckOrderStatus"/> z kolejki RabbitMQ i odpowiada przez
-/// <c>context.RespondAsync</c>. MassTransit wykrywa, że pole <c>responseAddress</c>
-/// w kopercie BareWire kończy się na <c>amq.rabbitmq.reply-to</c> i kieruje odpowiedź
-/// bezpośrednio przez mechanizm AMQP Direct Reply-To (pole <c>ReplyTo</c> na wiadomości AMQP).
-/// BareWire odbiera odpowiedź na swojej tymczasowej kolejce odpowiedzi.
+/// Receives <see cref="CheckOrderStatus"/> from a RabbitMQ queue and replies via
+/// <c>context.RespondAsync</c>. MassTransit detects that the <c>responseAddress</c> field
+/// in the BareWire envelope ends with <c>amq.rabbitmq.reply-to</c> and routes the reply
+/// through the AMQP direct reply-to mechanism (the AMQP message's <c>ReplyTo</c> field).
+/// BareWire receives the reply on its temporary reply queue.
 /// </summary>
 public sealed partial class OrderStatusResponder : IConsumer<CheckOrderStatus>
 {
@@ -32,10 +32,10 @@ public sealed partial class OrderStatusResponder : IConsumer<CheckOrderStatus>
 
         Log.ReceivedRequest(_logger, orderId, requestId, responseAddress);
 
-        // Symulacja logiki biznesowej — w rzeczywistej aplikacji tu byłoby zapytanie do bazy danych.
+        // Simulated business logic — a real application would query a database here.
         string status = orderId.StartsWith("ERR", StringComparison.OrdinalIgnoreCase)
-            ? "Błąd przetwarzania"
-            : "Potwierdzono";
+            ? "ProcessingError"
+            : "Confirmed";
 
         await context.RespondAsync(new OrderStatus(
             OrderId: orderId,
@@ -46,7 +46,7 @@ public sealed partial class OrderStatusResponder : IConsumer<CheckOrderStatus>
     private static partial class Log
     {
         [LoggerMessage(Level = LogLevel.Information,
-            Message = "MassTransit: odebrano zapytanie o status zamówienia {OrderId}. requestId={RequestId}, responseAddress={ResponseAddress}")]
+            Message = "MassTransit: received order-status request {OrderId}. requestId={RequestId}, responseAddress={ResponseAddress}")]
         internal static partial void ReceivedRequest(ILogger logger, string orderId, string requestId, string responseAddress);
     }
 }

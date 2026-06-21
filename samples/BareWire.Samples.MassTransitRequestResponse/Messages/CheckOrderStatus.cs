@@ -1,13 +1,13 @@
 namespace BareWire.Samples.MassTransitRequestResponse.Messages;
 
 /// <summary>
-/// Request: BareWire klient pyta o status zamówienia.
-/// Wysyłany przez BareWire w formacie koperty MassTransit (application/vnd.masstransit+json).
+/// Request: a BareWire client asks for an order's status.
+/// Sent by BareWire in the MassTransit envelope format (application/vnd.masstransit+json).
 /// </summary>
 public record CheckOrderStatus(string OrderId);
 
 /// <summary>
-/// Odpowiedź: MassTransit responder zwraca aktualny status zamówienia.
-/// Odbierana przez BareWire po zdekodowaniu koperty MassTransit.
+/// Response: the MassTransit responder returns the current order status.
+/// Received by BareWire after the MassTransit envelope is decoded.
 /// </summary>
 public record OrderStatus(string OrderId, string Status, string ProcessedBy);
