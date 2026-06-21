@@ -22,6 +22,7 @@
     <ProjectReference Include="..\BareWire.Samples.InboxDeduplication\BareWire.Samples.InboxDeduplication.csproj" />
     <ProjectReference Include="..\BareWire.Samples.RabbitMQ\BareWire.Samples.RabbitMQ.csproj" />
     <ProjectReference Include="..\BareWire.Samples.MassTransitInterop\BareWire.Samples.MassTransitInterop.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.MassTransitRequestResponse\BareWire.Samples.MassTransitRequestResponse.csproj" />
     <ProjectReference Include="..\BareWire.Samples.CloudEventsInterop\BareWire.Samples.CloudEventsInterop.csproj" />
   </ItemGroup>
 </Project>
