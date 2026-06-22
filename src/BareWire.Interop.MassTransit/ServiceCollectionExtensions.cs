@@ -60,6 +60,9 @@ public static class ServiceCollectionExtensions
         }
 
         services.TryAddSingleton<MassTransitEnvelopeSerializer>();
+        // Register IResponseEnvelopeWriter forwarding to the already-registered singleton so
+        // BareWire core (ConsumerInvokerFactory) can resolve it without referencing the concrete type.
+        services.TryAddSingleton<IResponseEnvelopeWriter>(sp => sp.GetRequiredService<MassTransitEnvelopeSerializer>());
 
         return services;
     }

@@ -32,7 +32,7 @@ namespace BareWire.Interop.MassTransit;
 /// <c>MapSerializer&lt;TMessage, MassTransitEnvelopeSerializer&gt;()</c>.
 /// </para>
 /// </remarks>
-public sealed class MassTransitEnvelopeSerializer : IMessageSerializer, IRequestEnvelopeSerializer
+public sealed class MassTransitEnvelopeSerializer : IMessageSerializer, IRequestEnvelopeSerializer, IResponseEnvelopeWriter
 {
     // Pre-encoded property name bytes used with typed WriteString overloads (zero .ToString() allocations).
     private static readonly byte[] s_requestIdName = "requestId"u8.ToArray();
@@ -75,6 +75,32 @@ public sealed class MassTransitEnvelopeSerializer : IMessageSerializer, IRequest
         ArgumentNullException.ThrowIfNull(output);
 
         WriteEnvelope(message, in context, output);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Reuses <see cref="WriteEnvelope{T}"/> with a <see cref="RequestEnvelopeContext"/> whose
+    /// only meaningful field is <see cref="RequestEnvelopeContext.RequestId"/>. All other routing
+    /// fields are left empty — the response envelope carries just enough to allow MassTransit to
+    /// correlate the reply to the pending request.
+    /// </remarks>
+    public void WriteResponse<T>(T response, Guid requestId, IBufferWriter<byte> output)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentNullException.ThrowIfNull(output);
+
+        // Build a context carrying only the requestId; all other routing fields are not relevant
+        // for a response envelope (the caller already knows the destination).
+        RequestEnvelopeContext context = new(
+            ResponseAddress: null,
+            DestinationAddress: null,
+            FaultAddress: null,
+            RequestId: requestId,
+            CorrelationId: null,
+            ExpirationTime: null);
+
+        WriteEnvelope(response, in context, output);
     }
 
     /// <summary>

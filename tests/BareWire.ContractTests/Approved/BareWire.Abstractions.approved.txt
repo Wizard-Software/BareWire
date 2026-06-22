@@ -511,6 +511,10 @@ namespace BareWire.Abstractions.Serialization
         void Serialize<T>(T message, System.Buffers.IBufferWriter<byte> output)
             where T :  class;
     }
+    public interface IRequestEnvelopeRouteReader
+    {
+        bool TryReadRequestEnvelope(System.Buffers.ReadOnlySequence<byte> body, out BareWire.Abstractions.Serialization.RequestEnvelopeContext routing);
+    }
     public interface IRequestEnvelopeSerializer
     {
         void Serialize<T>(T message, in BareWire.Abstractions.Serialization.RequestEnvelopeContext context, System.Buffers.IBufferWriter<byte> output)
@@ -519,6 +523,11 @@ namespace BareWire.Abstractions.Serialization
     public interface IResponseEnvelopeReader
     {
         bool TryReadRequestId(System.Buffers.ReadOnlySequence<byte> body, out System.Guid requestId);
+    }
+    public interface IResponseEnvelopeWriter
+    {
+        void WriteResponse<T>(T response, System.Guid requestId, System.Buffers.IBufferWriter<byte> output)
+            where T :  class;
     }
     public interface ISerializerResolver
     {

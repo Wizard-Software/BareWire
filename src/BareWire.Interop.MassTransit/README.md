@@ -111,6 +111,47 @@ MassTransit responds by echo-ing `requestId` back in the response envelope (it d
 
 An AMQP `expiration` header (TTL in milliseconds) is set on every outgoing request. This ensures that unconsumed requests expire automatically on the broker, preventing stale work when the caller times out before the responder processes the message.
 
+## MassTransit → BareWire request/response
+
+The mirror direction: MassTransit acts as the **request caller** (`IRequestClient<TRequest>`) and a BareWire consumer acts as the **responder**, calling `context.RespondAsync(response)`. MassTransit carries the reply-routing data (`responseAddress`, `requestId`) **inside the `application/vnd.masstransit+json` envelope body**, not in AMQP properties, and correlates the reply by the envelope `requestId`. BareWire reads those fields on the consume side and emits a MassTransit response envelope echoing `requestId` (GH #22, ADR-022).
+
+### Setup
+
+Register the envelope deserializer (to read the inbound request envelope) and the serializer (to write the response envelope). The consumer responds via the standard `ConsumeContext.RespondAsync`:
+
+```csharp
+services.AddBareWireJsonSerializer();
+services.AddMassTransitEnvelopeDeserializer(); // reads the inbound MT request envelope
+services.AddMassTransitEnvelopeSerializer();   // writes the MT response envelope (echoes requestId)
+
+// Receive endpoint hosting the consumer; manual topology (ConfigureConsumeTopology = false).
+rmq.ReceiveEndpoint("bw-inventory-check", e =>
+{
+    e.Consumer<InventoryConsumer, CheckInventory>();
+});
+```
+
+```csharp
+public sealed class InventoryConsumer : IConsumer<CheckInventory>
+{
+    public Task Consume(ConsumeContext<CheckInventory> context)
+        => context.RespondAsync(new InventoryLevel(context.Message.Sku, 42));
+}
+```
+
+### Topology requirement
+
+MassTransit's `IRequestClient` publishes the request to a **fanout exchange named after the endpoint** (durable), not to the AMQP default exchange. Because BareWire uses manual topology (ADR-002), the consumer side must declare that **same fanout exchange, the queue, and a binding** between them — otherwise the request never reaches the consumer. (The MassTransit address form is `rabbitmq://host/[vhost/]queueName`, with no port.)
+
+### Reply routing
+
+`RespondAsync` resolves the reply target in two steps:
+
+1. **Transport AMQP `ReplyTo`** (preferred) — used when present.
+2. **Envelope `responseAddress`** — for a MassTransit server-named reply queue MassTransit does **not** set AMQP `ReplyTo`; the reply queue name (`amq.gen-xyz`) lives only in the envelope. BareWire extracts it, **sanitizes it** (rejects non-`rabbitmq` schemes, strips host/authority/credentials, takes only the queue name), and sends the MassTransit response envelope to that queue via the default AMQP exchange — echoing the request `requestId` so the MassTransit request client correlates it.
+
+Both typed (`IConsumer<T>`) and raw (`IRawConsumer`) consumers are supported. A runnable end-to-end example is in `samples/BareWire.Samples.MassTransitToBareWire`.
+
 ## Dependencies
 
 - `BareWire.Abstractions`

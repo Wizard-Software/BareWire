@@ -477,4 +477,87 @@ public sealed class BareWireBusTests
 
         await bus.DisposeAsync();
     }
+
+    // ── SendRawAsync via queue: scheme ────────────────────────────────────────
+    // These tests cover the B3 bug fix: SendRawAsync must apply the BW-Exchange=""
+    // header for queue:// URIs so the transport adapter routes via the default AMQP
+    // exchange instead of raising BareWireConfigurationException.
+
+    [Fact]
+    public async Task SendRawAsync_WithQueueSchemeUri_SetsBwExchangeToEmpty()
+    {
+        // Arrange — capture messages sent to the adapter.
+        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
+        var (bus, adapter, _) = CreateBus();
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo =>
+               {
+                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
+                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                   return Task.FromResult<IReadOnlyList<SendResult>>(
+                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+               });
+        bus.StartPublishing();
+
+        Uri queueUri = new("queue://localhost/amq.gen-reply-queue");
+        ISendEndpoint endpoint = await bus.GetSendEndpoint(queueUri, CancellationToken.None);
+
+        byte[] payload = [1, 2, 3];
+
+        // Act
+        await endpoint.SendRawAsync(payload, "application/vnd.masstransit+json", CancellationToken.None);
+        await Task.Delay(50);
+
+        // Assert — the outbound message must carry BW-Exchange="" to trigger default-exchange delivery.
+        capturedBatches.Should().HaveCount(1);
+        OutboundMessage sent = capturedBatches[0][0];
+        sent.Headers.Should().ContainKey("BW-Exchange",
+            because: "SendRawAsync with queue:// URI must set BW-Exchange=\"\" so the transport routes " +
+                     "via the AMQP default exchange (not DefaultExchange which may be empty)");
+        sent.Headers["BW-Exchange"].Should().BeEmpty();
+        sent.RoutingKey.Should().Be("amq.gen-reply-queue");
+        sent.ContentType.Should().Be("application/vnd.masstransit+json");
+
+        await bus.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task SendRawAsync_WithExchangeSchemeUri_SetsExchangeHeaderAndClearsRoutingKey()
+    {
+        // Arrange
+        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
+        var (bus, adapter, _) = CreateBus();
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo =>
+               {
+                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
+                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                   return Task.FromResult<IReadOnlyList<SendResult>>(
+                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+               });
+        bus.StartPublishing();
+
+        Uri exchangeUri = new("exchange:my-fanout");
+        ISendEndpoint endpoint = await bus.GetSendEndpoint(exchangeUri, CancellationToken.None);
+
+        byte[] payload = [10, 20, 30];
+
+        // Act
+        await endpoint.SendRawAsync(payload, "application/json", CancellationToken.None);
+        await Task.Delay(50);
+
+        // Assert — BW-Exchange must be the exchange name and RoutingKey must be empty.
+        capturedBatches.Should().HaveCount(1);
+        OutboundMessage sent = capturedBatches[0][0];
+        sent.Headers.Should().ContainKey("BW-Exchange");
+        sent.Headers["BW-Exchange"].Should().Be("my-fanout");
+        sent.RoutingKey.Should().BeEmpty();
+        sent.ContentType.Should().Be("application/json");
+
+        await bus.DisposeAsync();
+    }
 }

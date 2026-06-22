@@ -25,10 +25,12 @@ namespace BareWire.Interop.MassTransit;
 /// throws (SEC-3).
 /// </para>
 /// </remarks>
-internal sealed class MassTransitEnvelopeDeserializer : IMessageDeserializer, IResponseEnvelopeReader
+internal sealed class MassTransitEnvelopeDeserializer : IMessageDeserializer, IResponseEnvelopeReader, IRequestEnvelopeRouteReader
 {
-    // Pre-encoded property name for fast comparison in the Utf8JsonReader scan (no string alloc).
+    // Pre-encoded property name bytes for fast ValueTextEquals comparison (no string alloc).
     private static readonly byte[] s_requestIdPropertyName = "requestId"u8.ToArray();
+    private static readonly byte[] s_responseAddressPropertyName = "responseAddress"u8.ToArray();
+    private static readonly byte[] s_faultAddressPropertyName = "faultAddress"u8.ToArray();
 
     /// <inheritdoc/>
     public string ContentType => "application/vnd.masstransit+json";
@@ -109,10 +111,9 @@ internal sealed class MassTransitEnvelopeDeserializer : IMessageDeserializer, IR
                         if (reader.TokenType != JsonTokenType.String)
                             return false;
 
-                        // Guid.TryParse handles the standard "D" format (8-4-4-4-12) emitted by
-                        // Utf8JsonWriter.WriteString(ReadOnlySpan<byte>, Guid) as well as braced
-                        // and no-hyphen variants that MassTransit may produce.
-                        return Guid.TryParse(reader.GetString(), out requestId);
+                        // PERF-1 / ASSM-1: TryGetGuid is zero-alloc (no intermediate string).
+                        // Consistent with TryReadRequestEnvelope which already uses this API.
+                        return reader.TryGetGuid(out requestId);
                     }
                     else
                     {
@@ -128,6 +129,102 @@ internal sealed class MassTransitEnvelopeDeserializer : IMessageDeserializer, IR
         catch (JsonException)
         {
             requestId = default;
+            return false;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Uses an incremental <see cref="Utf8JsonReader"/> scan to locate the top-level
+    /// <c>requestId</c>, <c>responseAddress</c>, and <c>faultAddress</c> properties without
+    /// materializing the full <see cref="MassTransitEnvelope"/> record.
+    /// <para>
+    /// This method never throws. Any <see cref="JsonException"/> is caught and results in a
+    /// <see langword="false"/> return. Returns <see langword="false"/> when <c>requestId</c> is
+    /// absent — <c>responseAddress</c> alone is insufficient without a correlation id (SEC-1).
+    /// </para>
+    /// <para>
+    /// Uses <see cref="Utf8JsonReader.TryGetGuid"/> for <c>requestId</c> extraction to avoid
+    /// the string allocation that <c>Guid.TryParse(reader.GetString())</c> would incur (PERF-1).
+    /// </para>
+    /// </remarks>
+    public bool TryReadRequestEnvelope(ReadOnlySequence<byte> body, out RequestEnvelopeContext routing)
+    {
+        routing = default;
+
+        if (body.IsEmpty)
+            return false;
+
+        try
+        {
+            var reader = new Utf8JsonReader(body, isFinalBlock: true, state: default);
+
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+                return false;
+
+            Guid requestId = Guid.Empty;
+            string? responseAddress = null;
+            string? faultAddress = null;
+
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject)
+                    break;
+
+                if (reader.TokenType != JsonTokenType.PropertyName)
+                    continue;
+
+                if (reader.ValueTextEquals(s_requestIdPropertyName))
+                {
+                    if (!reader.Read())
+                        return false;
+
+                    if (reader.TokenType != JsonTokenType.String)
+                        return false;
+
+                    // PERF-1: TryGetGuid is zero-alloc (no intermediate string).
+                    if (!reader.TryGetGuid(out requestId))
+                        return false;
+                }
+                else if (reader.ValueTextEquals(s_responseAddressPropertyName))
+                {
+                    if (!reader.Read())
+                        return false;
+
+                    if (reader.TokenType == JsonTokenType.String)
+                        responseAddress = reader.GetString();
+                }
+                else if (reader.ValueTextEquals(s_faultAddressPropertyName))
+                {
+                    if (!reader.Read())
+                        return false;
+
+                    if (reader.TokenType == JsonTokenType.String)
+                        faultAddress = reader.GetString();
+                }
+                else
+                {
+                    // Skip any other top-level property value (including nested objects/arrays).
+                    reader.Skip();
+                }
+            }
+
+            if (requestId == Guid.Empty)
+                return false;
+
+            routing = new RequestEnvelopeContext(
+                ResponseAddress: responseAddress,
+                DestinationAddress: null,
+                FaultAddress: faultAddress,
+                RequestId: requestId,
+                CorrelationId: null,
+                ExpirationTime: null);
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            routing = default;
             return false;
         }
     }
