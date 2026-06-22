@@ -480,9 +480,26 @@ internal sealed partial class BareWireBus : IBus
         {
             ArgumentNullException.ThrowIfNull(contentType);
 
+            string routingKey = Address.AbsolutePath.TrimStart('/');
+            IReadOnlyDictionary<string, string> headers = s_emptyHeaders;
+
+            // queue: scheme indicates direct-to-queue delivery via the AMQP default exchange ("").
+            // Set BW-Exchange="" so the transport adapter routes via the default exchange (empty
+            // string) rather than falling back to DefaultExchange (which may be empty = misconfigured).
+            if (Address.Scheme.Equals("queue", StringComparison.OrdinalIgnoreCase))
+            {
+                headers = new Dictionary<string, string> { ["BW-Exchange"] = "" };
+            }
+            else if (Address.Scheme.Equals("exchange", StringComparison.OrdinalIgnoreCase))
+            {
+                // exchange: scheme routes to a named exchange; fanout exchanges don't use routing keys.
+                headers = new Dictionary<string, string> { ["BW-Exchange"] = routingKey };
+                routingKey = string.Empty;
+            }
+
             OutboundMessage outbound = new(
-                routingKey: Address.AbsolutePath.TrimStart('/'),
-                headers: s_emptyHeaders,
+                routingKey: routingKey,
+                headers: headers,
                 body: payload,
                 contentType: contentType);
 

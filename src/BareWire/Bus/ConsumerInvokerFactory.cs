@@ -111,9 +111,33 @@ internal static class ConsumerInvokerFactory
             body,
             publishEndpoint, sendEndpointProvider, cancellationToken);
 
-        await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
-        TConsumer consumer = scope.ServiceProvider.GetRequiredService<TConsumer>();
-        await ((IConsumer<TMessage>)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        // When the deserializer can read inbound MT request routing metadata, extract it once
+        // and thread it through the context so RespondAsync can route the reply correctly
+        // (echo requestId, send to responseAddress). Gate on content-type to avoid unnecessary
+        // work on raw-first messages (PERF-2 / ADR-003).
+        if (deserializer is IRequestEnvelopeRouteReader routeReader &&
+            string.Equals(contentType, "application/vnd.masstransit+json", StringComparison.OrdinalIgnoreCase))
+        {
+            await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
+            IResponseEnvelopeWriter? responseWriter = scope.ServiceProvider
+                .GetService<IResponseEnvelopeWriter>();
+
+            if (responseWriter is not null &&
+                routeReader.TryReadRequestEnvelope(body, out RequestEnvelopeContext routing))
+            {
+                context.InboundRequestContext = routing;
+                context.ResponseEnvelopeWriter = responseWriter;
+            }
+
+            TConsumer consumer = scope.ServiceProvider.GetRequiredService<TConsumer>();
+            await ((IConsumer<TMessage>)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        }
+        else
+        {
+            await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
+            TConsumer consumer = scope.ServiceProvider.GetRequiredService<TConsumer>();
+            await ((IConsumer<TMessage>)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        }
     }
 
     private static async Task InvokeRawConsumerAsync<TRawConsumer>(
@@ -142,9 +166,31 @@ internal static class ConsumerInvokerFactory
             body,
             publishEndpoint, sendEndpointProvider, deserializer, cancellationToken);
 
-        await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
-        TRawConsumer consumer = scope.ServiceProvider.GetRequiredService<TRawConsumer>();
-        await ((IRawConsumer)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        // Apply the same MT routing wiring as the typed path: gate on content-type to keep the
+        // raw-first path free from overhead (PERF-2 / ADR-003).
+        if (deserializer is IRequestEnvelopeRouteReader routeReader &&
+            string.Equals(contentType, "application/vnd.masstransit+json", StringComparison.OrdinalIgnoreCase))
+        {
+            await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
+            IResponseEnvelopeWriter? responseWriter = scope.ServiceProvider
+                .GetService<IResponseEnvelopeWriter>();
+
+            if (responseWriter is not null &&
+                routeReader.TryReadRequestEnvelope(body, out RequestEnvelopeContext routing))
+            {
+                context.InboundRequestContext = routing;
+                context.ResponseEnvelopeWriter = responseWriter;
+            }
+
+            TRawConsumer consumer = scope.ServiceProvider.GetRequiredService<TRawConsumer>();
+            await ((IRawConsumer)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        }
+        else
+        {
+            await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
+            TRawConsumer consumer = scope.ServiceProvider.GetRequiredService<TRawConsumer>();
+            await ((IRawConsumer)consumer).ConsumeAsync(context).ConfigureAwait(false);
+        }
     }
 
     private static Guid? TryParseGuidHeader(IReadOnlyDictionary<string, string> headers, string key)
