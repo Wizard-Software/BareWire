@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-06-23
+
+### Added
+
+- Redis SAGA persistence (`BareWire.Saga`): `RedisSagaRepository<T>` with Lua-script optimistic concurrency
+- Redis connection configuration with TLS, mutual-TLS (client PFX), Sentinel, and Cluster support
+- Roslyn analyzer that enforces `CancellationToken` propagation through async call chains
+- Cross-transport header-mapping benchmark suite
+- `BareWire.Samples.MassTransitRequestResponse` sample demonstrating BareWire → MassTransit request/response interop
+- MassTransit v8.5.10 API and wire-format reference documentation
+
+### Fixed
+
+- BareWire → MassTransit request/response interop: MassTransit requesters now receive replies — completed the request/response envelope mapping and `RespondAsync` reply delivery (#18, #19, #22)
+- Pinned `SQLitePCLRaw` to the patched 3.x line to resolve security advisory GHSA-2m69-gcr7-jv3q
+
+### Changed
+
+- Translated remaining Polish code comments and analyzer messages to English
+
 ## [1.4.0] - 2026-06-18
 
 ### Added
@@ -107,6 +127,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Enhanced unit tests for service collection extensions and pipeline components
 
+[1.5.0]: https://github.com/Wizard-Software/BareWire/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/Wizard-Software/BareWire/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Wizard-Software/BareWire/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/Wizard-Software/BareWire/compare/v1.2.7...v1.3.0
 [1.2.7]: https://github.com/Wizard-Software/BareWire/compare/v1.2.6...v1.2.7
