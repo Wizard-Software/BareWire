@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using BareWire.Abstractions.Transport;
 
 namespace BareWire.Outbox;
@@ -112,6 +113,37 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         }
 
         return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+        IReadOnlyList<long> ids,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(ids);
+
+        if (ids.Count == 0)
+        {
+            return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+        }
+
+        // This store has no lock column — "release" means re-enqueue so the entry is dispatched
+        // again on the next poll. The entry instance is still referenced from _all, so re-enqueuing
+        // keeps its pooled buffer alive; the returned set tells the dispatcher NOT to return those
+        // buffers to the ArrayPool. Delivered or unknown ids are skipped (idempotent). In the
+        // dispatcher flow each id was removed from _pending by GetPendingAsync, so re-enqueue is 1:1.
+        HashSet<long>? retained = null;
+
+        foreach (long id in ids)
+        {
+            if (_all.TryGetValue(id, out OutboxEntry? entry) && entry.Status == OutboxEntryStatus.Pending)
+            {
+                _pending.Enqueue(entry);
+                (retained ??= []).Add(id);
+            }
+        }
+
+        return ValueTask.FromResult<IReadOnlySet<long>>(retained ?? (IReadOnlySet<long>)FrozenSet<long>.Empty);
     }
 
     public ValueTask CleanupAsync(

@@ -2,6 +2,7 @@
 // The ValueTask is consumed internally by NSubstitute and never double-consumed.
 #pragma warning disable CA2012
 
+using System.Collections.Frozen;
 using AwesomeAssertions;
 using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
@@ -35,6 +36,12 @@ public sealed class OutboxDispatcherTests
         _adapter
             .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
             .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(Array.Empty<SendResult>()));
+
+        // Default: ReleaseLockAsync retains no buffers (mirrors EF Core, which rents fresh per-cycle
+        // buffers). Tests that assert on nacked behaviour override the capture but keep this shape.
+        _store
+            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty));
     }
 
     private OutboxDispatcher CreateSut(TimeSpan? pollingInterval = null, int batchSize = 100)
@@ -267,6 +274,15 @@ public sealed class OutboxDispatcherTests
                 return ValueTask.CompletedTask;
             });
 
+        IReadOnlyList<long>? releasedIds = null;
+        _store
+            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                releasedIds = ci.Arg<IReadOnlyList<long>>();
+                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+            });
+
         await using var sut = CreateSut();
 
         // Act
@@ -277,6 +293,13 @@ public sealed class OutboxDispatcherTests
         // Assert — only entries[0] (id=1) and entries[2] (id=3) were confirmed; entries[1] (id=2) was nacked.
         capturedIds.Should().NotBeNull();
         capturedIds!.Should().BeEquivalentTo([1L, 3L]);
+
+        // The nacked id (2) must be explicitly released for immediate retry on the next poll cycle.
+        await _store.Received().ReleaseLockAsync(
+            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Any<CancellationToken>());
+        releasedIds.Should().NotBeNull();
+        releasedIds!.Should().BeEquivalentTo([2L]);
     }
 
     [Fact]
@@ -323,6 +346,15 @@ public sealed class OutboxDispatcherTests
                 new(IsConfirmed: false, DeliveryTag: 2),
             }));
 
+        IReadOnlyList<long>? releasedIds = null;
+        _store
+            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                releasedIds = ci.Arg<IReadOnlyList<long>>();
+                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+            });
+
         await using var sut = CreateSut();
 
         // Act
@@ -334,6 +366,14 @@ public sealed class OutboxDispatcherTests
         await _store.DidNotReceive().MarkDeliveredAsync(
             Arg.Any<IReadOnlyList<long>>(),
             Arg.Any<CancellationToken>());
+
+        // All nacked ids must be explicitly released so they retry on the next poll cycle
+        // (~PollingInterval) instead of waiting for OutboxLockTimeout.
+        await _store.Received().ReleaseLockAsync(
+            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Any<CancellationToken>());
+        releasedIds.Should().NotBeNull();
+        releasedIds!.Should().BeEquivalentTo([1L, 2L, 3L]);
 
         // Adapter was called (messages were sent), but store was polled again (retry).
         await _adapter.Received().SendBatchAsync(

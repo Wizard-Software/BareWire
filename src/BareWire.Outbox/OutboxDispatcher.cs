@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Frozen;
 using BareWire.Abstractions.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -122,13 +123,18 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 contentType: entry.ContentType);
         }
 
+        // Ids whose pooled buffer the store retained ownership of when releasing the lock (e.g.
+        // re-enqueued in-memory entries). Their buffers must NOT be returned to the ArrayPool below
+        // — the store still references them. Empty for EF Core (fresh per-cycle buffers).
+        IReadOnlySet<long> retainedByStore = FrozenSet<long>.Empty;
+
         try
         {
             IReadOnlyList<SendResult> results = await _adapter.SendBatchAsync(messages, ct).ConfigureAwait(false);
 
             // Only mark entries as delivered if the broker confirmed them.
             List<long> confirmedIds = new(pending.Count);
-            int nackedCount = 0;
+            List<long> nackedIds = [];
 
             for (int i = 0; i < results.Count; i++)
             {
@@ -138,7 +144,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 }
                 else
                 {
-                    nackedCount++;
+                    nackedIds.Add(ids[i]);
                 }
             }
 
@@ -147,9 +153,12 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 await store.MarkDeliveredAsync(confirmedIds, ct).ConfigureAwait(false);
             }
 
-            if (nackedCount > 0)
+            if (nackedIds.Count > 0)
             {
-                LogPartialSendFailure(_logger, nackedCount, pending.Count);
+                // Explicitly release the per-instance lock on nacked rows so they are re-claimed on
+                // the next poll cycle (~PollingInterval) instead of waiting for OutboxLockTimeout.
+                retainedByStore = await store.ReleaseLockAsync(nackedIds, ct).ConfigureAwait(false);
+                LogPartialSendFailure(_logger, nackedIds.Count, pending.Count);
             }
 
             LogDispatched(_logger, confirmedIds.Count);
@@ -157,9 +166,14 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         finally
         {
             // Return rented buffers to ArrayPool — GetPendingAsync rents them via ArrayPool.Rent().
+            // Skip ids the store retained: re-enqueued in-memory entries still reference the buffer,
+            // so returning it here would be a use-after-return on the next dispatch.
             for (int i = 0; i < pending.Count; i++)
             {
-                ArrayPool<byte>.Shared.Return(pending[i].PooledBody);
+                if (retainedByStore.Count == 0 || !retainedByStore.Contains(pending[i].Id))
+                {
+                    ArrayPool<byte>.Shared.Return(pending[i].PooledBody);
+                }
             }
         }
     }
@@ -199,6 +213,6 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
     [LoggerMessage(
         Level = LogLevel.Warning,
-        Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker and will be retried.")]
+        Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker; their locks were released for retry on the next poll cycle.")]
     private static partial void LogPartialSendFailure(ILogger logger, int nackedCount, int totalCount);
 }
