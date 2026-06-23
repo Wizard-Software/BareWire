@@ -165,4 +165,131 @@ public sealed class OutboxConfiguratorValidationTests
         // Assert
         options.OutboxLockTimeout.Should().Be(expected);
     }
+
+    // ── OrderingMode.PerKey validation (U1) ──────────────────────────────────
+
+    [Fact]
+    public void OutboxOptions_WhenPerKeyAndHeaderNameIsNull_Throws()
+    {
+        // Arrange
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = null
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert — must throw; message must NOT contain any header value
+        var ex = act.Should().ThrowExactly<BareWireConfigurationException>().Which;
+        ex.Message.Should().Contain("OrderingKeyHeaderName");
+        ex.Message.Should().Contain("PerKey");
+        // The null value must not appear as a literal in the message.
+        ex.Message.Should().NotContain("null");
+    }
+
+    [Fact]
+    public void OutboxOptions_WhenPerKeyAndHeaderNameIsEmpty_Throws()
+    {
+        // Arrange
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = string.Empty
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert — must throw; message must not echo the empty-string value
+        var ex = act.Should().ThrowExactly<BareWireConfigurationException>().Which;
+        ex.Message.Should().Contain("OrderingKeyHeaderName");
+        // The supplied empty value must not appear as its own token in the message.
+        ex.Message.Should().NotBe(string.Empty);
+    }
+
+    [Fact]
+    public void OutboxOptions_WhenPerKeyAndHeaderNameIsWhitespace_Throws()
+    {
+        // Arrange
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = "   "
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert — must throw; message must NOT echo the whitespace value
+        var ex = act.Should().ThrowExactly<BareWireConfigurationException>().Which;
+        ex.Message.Should().Contain("OrderingKeyHeaderName");
+        ex.Message.Should().NotContain("   ");
+    }
+
+    // ── OrderingMode happy paths (U2) ─────────────────────────────────────────
+
+    [Fact]
+    public void OutboxOptions_WhenPerKeyAndHeaderNameIsNonEmpty_DoesNotThrow()
+    {
+        // Arrange — PerKey with a valid header name must be accepted
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = "x-aggregate-id"
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void OutboxOptions_WhenNoneWithoutHeaderName_DoesNotThrow()
+    {
+        // Arrange — None mode with no header name must not require the header name
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.None,
+            OrderingKeyHeaderName = null
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void OutboxConfigurator_SetOrderingModePerKey_PersistedInBuiltOptions()
+    {
+        // Arrange
+        var configurator = new OutboxConfigurator();
+
+        // Set via the interface to verify both properties are on IOutboxConfigurator.
+        ((IOutboxConfigurator)configurator).OrderingMode = OrderingMode.PerKey;
+        ((IOutboxConfigurator)configurator).OrderingKeyHeaderName = "x-order-id";
+
+        // Act
+        OutboxOptions options = configurator.Build();
+
+        // Assert — both properties must round-trip through Build()
+        options.OrderingMode.Should().Be(OrderingMode.PerKey);
+        options.OrderingKeyHeaderName.Should().Be("x-order-id");
+    }
+
+    [Fact]
+    public void OutboxConfigurator_DefaultOrderingMode_IsNone()
+    {
+        // Arrange & Act — default configurator must default to None
+        var options = new OutboxConfigurator().Build();
+
+        // Assert
+        options.OrderingMode.Should().Be(OrderingMode.None);
+        options.OrderingKeyHeaderName.Should().BeNull();
+    }
 }

@@ -32,6 +32,12 @@ internal sealed class OutboxMessageEntityTypeConfiguration : IEntityTypeConfigur
         builder.Property(m => m.LockedBy)
             .HasMaxLength(256);
 
+        // Nullable — NULL means keyless/passthrough. The conditional ordering index
+        // (IX_OutboxMessages_Ordering) is applied separately by OutboxModelCustomizer
+        // so it is only created when OrderingMode == PerKey.
+        builder.Property(m => m.OrderingKey)
+            .HasMaxLength(256);
+
         builder.HasIndex(m => m.MessageId);
 
         builder.HasIndex(m => m.CreatedAt);

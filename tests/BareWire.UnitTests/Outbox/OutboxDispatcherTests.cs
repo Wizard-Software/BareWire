@@ -54,6 +54,9 @@ public sealed class OutboxDispatcherTests
         return new OutboxDispatcher(_scopeFactory, _adapter, options, _logger);
     }
 
+    private OutboxDispatcher CreateSutWithOptions(OutboxOptions options)
+        => new OutboxDispatcher(_scopeFactory, _adapter, options, _logger);
+
     private static OutboxEntry CreateEntry(long id, string routingKey = "test.routing.key")
     {
         byte[] body = "test-body"u8.ToArray();
@@ -67,6 +70,23 @@ public sealed class OutboxDispatcherTests
             ContentType = "application/json",
             CreatedAt = DateTimeOffset.UtcNow,
             Status = OutboxEntryStatus.Pending
+        };
+    }
+
+    private static OutboxEntry CreateKeyedEntry(long id, string? orderingKey, string routingKey = "test.routing.key")
+    {
+        byte[] body = "test-body"u8.ToArray();
+        return new OutboxEntry
+        {
+            Id = id,
+            RoutingKey = routingKey,
+            Headers = new Dictionary<string, string>(),
+            PooledBody = body,
+            BodyLength = body.Length,
+            ContentType = "application/json",
+            CreatedAt = DateTimeOffset.UtcNow,
+            Status = OutboxEntryStatus.Pending,
+            OrderingKey = orderingKey
         };
     }
 
@@ -420,5 +440,172 @@ public sealed class OutboxDispatcherTests
         // Store was polled multiple times — messages are retained for retry.
         getPendingCallCount.Should().BeGreaterThanOrEqualTo(2,
             "the dispatcher must continue polling after a transient send error");
+    }
+
+    // U8 — R7.7.6: PerKey barrier blocks confirmed siblings behind a nacked head.
+    [Fact]
+    public async Task DispatchBatchAsync_PerKey_NackedHead_BlocksSiblings_OtherKeysDelivered()
+    {
+        // Arrange:
+        // Id=1 OrderingKey="K1" — nacked (the nacked head for K1)
+        // Id=2 OrderingKey="K1" — confirmed (blocked sibling: Id > firstNackedId for K1)
+        // Id=3 OrderingKey="K2" — confirmed (different key, unaffected by K1 barrier)
+        // Id=4 OrderingKey=null  — confirmed (keyless, always independent)
+        //
+        // Expected:
+        //   MarkDeliveredAsync([3, 4])
+        //   ReleaseLockAsync([1, 2])
+        var entries = new List<OutboxEntry>
+        {
+            CreateKeyedEntry(1, "K1"),
+            CreateKeyedEntry(2, "K1"),
+            CreateKeyedEntry(3, "K2"),
+            CreateKeyedEntry(4, null),
+        };
+
+        bool firstGetPending = true;
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (firstGetPending)
+                {
+                    firstGetPending = false;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(entries);
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        // Broker: nacks Id=1, confirms Id=2, Id=3, Id=4.
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
+            {
+                new(IsConfirmed: false, DeliveryTag: 0), // Id=1 nacked
+                new(IsConfirmed: true,  DeliveryTag: 1), // Id=2 confirmed (but blocked)
+                new(IsConfirmed: true,  DeliveryTag: 2), // Id=3 confirmed
+                new(IsConfirmed: true,  DeliveryTag: 3), // Id=4 confirmed
+            }));
+
+        IReadOnlyList<long>? markedIds = null;
+        _store
+            .MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                markedIds = ci.Arg<IReadOnlyList<long>>();
+                return ValueTask.CompletedTask;
+            });
+
+        IReadOnlyList<long>? releasedIds = null;
+        _store
+            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                releasedIds = ci.Arg<IReadOnlyList<long>>();
+                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+            });
+
+        var options = new OutboxOptions
+        {
+            PollingInterval = TimeSpan.FromMilliseconds(10),
+            DispatchBatchSize = 100,
+            OrderingMode = BareWire.Abstractions.Outbox.OrderingMode.PerKey,
+            OrderingKeyHeaderName = "x-order-key"
+        };
+        await using var sut = CreateSutWithOptions(options);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(50);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — only K2 (Id=3) and keyless (Id=4) are delivered; K1 (Id=1 nacked + Id=2 blocked) are released.
+        markedIds.Should().NotBeNull();
+        markedIds!.Should().BeEquivalentTo([3L, 4L],
+            "K2 and keyless entries are unaffected by the K1 barrier");
+
+        releasedIds.Should().NotBeNull();
+        releasedIds!.Should().BeEquivalentTo([1L, 2L],
+            "nacked K1 head (Id=1) and blocked K1 sibling (Id=2) are released for retry");
+    }
+
+    // U9 — R7.7.6: None mode path is bit-identical to pre-R7.7.6 — no grouping, no extra calls.
+    [Fact]
+    public async Task DispatchBatchAsync_None_NackedEntries_PathIdenticalToPreR776_NoGrouping()
+    {
+        // Arrange — 3 entries with default None ordering: Id=1 confirmed, Id=2 nacked, Id=3 confirmed.
+        // The test verifies that:
+        //   - MarkDeliveredAsync is called exactly once with [1, 3]
+        //   - ReleaseLockAsync is called exactly once with [2]
+        //   - No extra calls occur (no grouping artefacts)
+        var entries = new List<OutboxEntry>
+        {
+            CreateEntry(1),
+            CreateEntry(2),
+            CreateEntry(3),
+        };
+
+        bool firstGetPending = true;
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (firstGetPending)
+                {
+                    firstGetPending = false;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(entries);
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
+            {
+                new(IsConfirmed: true,  DeliveryTag: 0), // Id=1
+                new(IsConfirmed: false, DeliveryTag: 1), // Id=2 nacked
+                new(IsConfirmed: true,  DeliveryTag: 2), // Id=3
+            }));
+
+        IReadOnlyList<long>? markedIds = null;
+        int markDeliveredCallCount = 0;
+        _store
+            .MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                markedIds = ci.Arg<IReadOnlyList<long>>();
+                markDeliveredCallCount++;
+                return ValueTask.CompletedTask;
+            });
+
+        IReadOnlyList<long>? releasedIds = null;
+        int releaseLockCallCount = 0;
+        _store
+            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                releasedIds = ci.Arg<IReadOnlyList<long>>();
+                releaseLockCallCount++;
+                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+            });
+
+        await using var sut = CreateSut(); // default OutboxOptions: OrderingMode = None
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(50);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — exactly one MarkDeliveredAsync call with confirmed ids [1, 3].
+        markDeliveredCallCount.Should().Be(1, "None path must issue a single MarkDeliveredAsync call");
+        markedIds.Should().NotBeNull();
+        markedIds!.Should().BeEquivalentTo([1L, 3L]);
+
+        // Exactly one ReleaseLockAsync call with nacked id [2].
+        releaseLockCallCount.Should().Be(1, "None path must issue a single ReleaseLockAsync call");
+        releasedIds.Should().NotBeNull();
+        releasedIds!.Should().BeEquivalentTo([2L]);
     }
 }

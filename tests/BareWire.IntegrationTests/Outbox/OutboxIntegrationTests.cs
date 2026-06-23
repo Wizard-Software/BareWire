@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 using AwesomeAssertions;
+using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
@@ -8,6 +9,7 @@ using BareWire.Outbox.EntityFramework;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 
@@ -750,5 +752,318 @@ public sealed class TransactionalOutboxMiddlewareTests : IAsyncLifetime
         {
             ArrayPool<byte>.Shared.Return(entry.PooledBody);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R7.7 ordering column + index tests (I1, I3)
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Integration tests verifying the R7.7.2 data model: the nullable <c>OrderingKey</c> column
+/// is present, and the conditional index <c>IX_OutboxMessages_Ordering</c> is absent in
+/// <see cref="OrderingMode.None"/> (the default-OFF guard, I3) and the column promotion works
+/// end-to-end in <see cref="OrderingMode.PerKey"/> (I1).
+/// </summary>
+/// <remarks>
+/// All tests use SQLite in-memory. The PG partial index is only added by
+/// <c>OutboxModelCustomizer</c> when the active provider is PostgreSQL; these tests verify
+/// the column, the promotion path, and the index-absent guard for the default None mode.
+/// </remarks>
+public sealed class OutboxOrderingColumnTests
+{
+    private const string OrderingHeaderName = "x-ordering-key";
+
+    private static (OutboxDbContext dbContext, EfCoreOutboxStore store, SqliteConnection connection)
+        CreateSqliteContext(OutboxOptions outboxOptions)
+    {
+        var connection = new SqliteConnection("DataSource=:memory:");
+        connection.Open();
+
+        var efOptions = new DbContextOptionsBuilder<OutboxDbContext>()
+            .UseSqlite(connection)
+            .Options;
+
+        var dbContext = new OutboxDbContext(efOptions);
+        dbContext.Database.EnsureCreated();
+
+        var store = new EfCoreOutboxStore(
+            dbContext,
+            new OutboxInstanceId("test-i1-i3"),
+            new PostgresOutboxSqlDialect(),
+            outboxOptions);
+
+        return (dbContext, store, connection);
+    }
+
+    // -------------------------------------------------------------------------
+    // I1: PerKey — OrderingKey column present; promotion works end-to-end
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task SaveMessagesAsync_PerKey_OrderingKeyColumnPromotedAndReadBack()
+    {
+        // Arrange
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = OrderingHeaderName
+        };
+
+        var (dbContext, store, connection) = CreateSqliteContext(options);
+        await using (dbContext)
+        await using (connection)
+        {
+            byte[] body = System.Text.Encoding.UTF8.GetBytes("{}");
+            var message = new OutboundMessage(
+                routingKey: "orders.created",
+                headers: new Dictionary<string, string> { [OrderingHeaderName] = "tenant-A" },
+                body: body,
+                contentType: "application/json");
+
+            // Act — save and commit (simulates the ambient transaction commit by the middleware).
+            await store.SaveMessagesAsync([message]);
+            await dbContext.SaveChangesAsync();
+
+            // Read the raw OutboxMessage entity to confirm the column value was persisted.
+            OutboxMessage? saved = await dbContext.Set<OutboxMessage>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync();
+
+            // Assert — column present and stored value matches the header.
+            saved.Should().NotBeNull("the message must have been persisted");
+            saved!.OrderingKey.Should().Be("tenant-A",
+                "the ordering key must be promoted from the header into the OrderingKey column");
+
+            // Also verify the projected OutboxEntry carries the value after GetPendingAsync.
+            IReadOnlyList<OutboxEntry> pending = await store.GetPendingAsync(10);
+            pending.Should().ContainSingle();
+            pending[0].OrderingKey.Should().Be("tenant-A",
+                "the projected OutboxEntry must reflect the stored OrderingKey column value");
+
+            ArrayPool<byte>.Shared.Return(pending[0].PooledBody);
+        }
+    }
+
+    [Fact]
+    public async Task SaveMessagesAsync_PerKey_NoHeader_OrderingKeyIsNull()
+    {
+        // Arrange
+        var options = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = OrderingHeaderName
+        };
+
+        var (dbContext, store, connection) = CreateSqliteContext(options);
+        await using (dbContext)
+        await using (connection)
+        {
+            byte[] body = System.Text.Encoding.UTF8.GetBytes("{}");
+            var message = new OutboundMessage(
+                routingKey: "orders.created",
+                headers: new Dictionary<string, string>(), // no ordering header
+                body: body,
+                contentType: "application/json");
+
+            // Act
+            await store.SaveMessagesAsync([message]);
+            await dbContext.SaveChangesAsync();
+
+            OutboxMessage? saved = await dbContext.Set<OutboxMessage>()
+                .AsNoTracking()
+                .FirstOrDefaultAsync();
+
+            // Assert — missing header → stored as null (keyless passthrough).
+            saved.Should().NotBeNull();
+            saved!.OrderingKey.Should().BeNull("missing header must result in a null OrderingKey in the DB");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // I3: None mode — IX_OutboxMessages_Ordering index MUST be absent
+    // (default-OFF guard — this test fails if the index is ever created in None)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void Model_NoneMode_OrderingIndexIsAbsent()
+    {
+        // Arrange — build a context with default OutboxOptions (OrderingMode.None),
+        // exactly as all pre-R7.7 code paths do. OutboxModelCustomizer must NOT add the
+        // index here because: (a) the provider is SQLite (not PostgreSQL), and (b) the
+        // mode is None. The customizer itself is NOT registered here since the context is
+        // constructed directly, mirroring all existing test helpers. This test therefore
+        // verifies the EF model produced by OnModelCreating alone — which must never
+        // contain IX_OutboxMessages_Ordering regardless of how the context is constructed.
+        var connection = new SqliteConnection("DataSource=:memory:");
+        connection.Open();
+
+        using (connection)
+        {
+            var efOptions = new DbContextOptionsBuilder<OutboxDbContext>()
+                .UseSqlite(connection)
+                .Options;
+
+            using var dbContext = new OutboxDbContext(efOptions);
+            dbContext.Database.EnsureCreated();
+
+            // Act — inspect the EF model metadata for the OutboxMessage entity.
+            IEntityType? entityType = dbContext.Model.FindEntityType(typeof(OutboxMessage));
+            entityType.Should().NotBeNull("OutboxMessage must be registered in the EF model");
+
+            IIndex? orderingIndex = entityType!
+                .GetIndexes()
+                .FirstOrDefault(i => i.GetDatabaseName() == "IX_OutboxMessages_Ordering");
+
+            // Assert — index must NOT exist in None mode (default-OFF invariant §2.1).
+            // This test fails if OnModelCreating or any other path unconditionally creates the
+            // index, which would violate the no-write-amplification guarantee.
+            orderingIndex.Should().BeNull(
+                "IX_OutboxMessages_Ordering must NOT be present when OrderingMode is None " +
+                "(default-OFF invariant — the index must only exist in PerKey mode)");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I2 — SQLite fallback head-of-line before Take (R7.7.5)
+// ---------------------------------------------------------------------------
+
+/// <summary>
+/// Integration tests for the client-side head-of-line filter in
+/// <see cref="EfCoreOutboxStore.GetPendingAsync"/> when the provider is SQLite
+/// (no atomic dialect claim) and <see cref="OrderingMode.PerKey"/> is active.
+/// </summary>
+public sealed class EfCoreOutboxStorePerKeyFallbackTests : IAsyncLifetime
+{
+    private SqliteConnection _connection = null!;
+    private OutboxDbContext _dbContext = null!;
+
+    public async ValueTask InitializeAsync()
+    {
+        _connection = new SqliteConnection("DataSource=:memory:");
+        await _connection.OpenAsync();
+
+        var dbOptions = new DbContextOptionsBuilder<OutboxDbContext>()
+            .UseSqlite(_connection)
+            .Options;
+
+        _dbContext = new OutboxDbContext(dbOptions);
+        await _dbContext.Database.EnsureCreatedAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _dbContext.DisposeAsync();
+        await _connection.DisposeAsync();
+    }
+
+    private EfCoreOutboxStore CreateStore(OutboxOptions outboxOptions) =>
+        new(_dbContext, new OutboxInstanceId("test-instance"), new PostgresOutboxSqlDialect(), outboxOptions);
+
+    private static void ReturnPooledBuffers(IReadOnlyList<OutboxEntry> entries)
+    {
+        foreach (OutboxEntry entry in entries)
+        {
+            ArrayPool<byte>.Shared.Return(entry.PooledBody);
+        }
+    }
+
+    [Fact]
+    public async Task GetPendingAsync_PerKey_SQLiteFallback_ReturnsOnlyHeadForKey()
+    {
+        // Arrange — insert two rows for key "K" via SaveMessagesAsync (Id 1 < Id 2).
+        // SQLite does not use the PG dialect path, so the client-side fallback is exercised.
+        var outboxOptions = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = "x-ordering-key"
+        };
+
+        var store = CreateStore(outboxOptions);
+
+        byte[] body = Encoding.UTF8.GetBytes("{}");
+
+        await store.SaveMessagesAsync(
+            [
+                new OutboundMessage("route.a",
+                    new Dictionary<string, string> { ["x-ordering-key"] = "K" },
+                    body, "application/json"),
+                new OutboundMessage("route.b",
+                    new Dictionary<string, string> { ["x-ordering-key"] = "K" },
+                    body, "application/json")
+            ],
+            CancellationToken.None);
+
+        await _dbContext.SaveChangesAsync();
+
+        // Act — first GetPendingAsync: must return ONLY the head (lower Id).
+        IReadOnlyList<OutboxEntry> firstBatch =
+            await store.GetPendingAsync(100, CancellationToken.None);
+
+        // Assert — exactly one row (the head), not two.
+        firstBatch.Should().ContainSingle(
+            "the client-side head-of-line filter must block the sibling before Take(batchSize)");
+
+        long headId = firstBatch[0].Id;
+        firstBatch[0].OrderingKey.Should().Be("K", "the returned row must carry the ordering key");
+
+        ReturnPooledBuffers(firstBatch);
+
+        // Act — mark the head delivered, then re-poll.
+        await store.MarkDeliveredAsync([headId], CancellationToken.None);
+
+        IReadOnlyList<OutboxEntry> secondBatch =
+            await store.GetPendingAsync(100, CancellationToken.None);
+
+        // Assert — sibling is now the head and must be returned.
+        secondBatch.Should().ContainSingle(
+            "after the head is delivered the sibling becomes the new head and must be returned");
+        secondBatch[0].Id.Should().NotBe(headId, "the returned row must be the formerly blocked sibling");
+
+        ReturnPooledBuffers(secondBatch);
+    }
+
+    [Fact]
+    public async Task GetPendingAsync_PerKey_SQLiteFallback_HeadOfLineAppliedBeforeBatchLimit()
+    {
+        // Arrange — 3 rows for key "K" (Ids 1, 2, 3). BatchSize of 2 must return Id=1 only
+        // (not 2 rows), because only the head is eligible and the batch cap is applied afterward.
+        var outboxOptions = new OutboxOptions
+        {
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = "x-ordering-key"
+        };
+
+        var store = CreateStore(outboxOptions);
+
+        byte[] body = Encoding.UTF8.GetBytes("{}");
+
+        await store.SaveMessagesAsync(
+            [
+                new OutboundMessage("route.1",
+                    new Dictionary<string, string> { ["x-ordering-key"] = "K" },
+                    body, "application/json"),
+                new OutboundMessage("route.2",
+                    new Dictionary<string, string> { ["x-ordering-key"] = "K" },
+                    body, "application/json"),
+                new OutboundMessage("route.3",
+                    new Dictionary<string, string> { ["x-ordering-key"] = "K" },
+                    body, "application/json")
+            ],
+            CancellationToken.None);
+
+        await _dbContext.SaveChangesAsync();
+
+        // Act — claim with batchSize=2: only 1 row eligible (the head of K).
+        IReadOnlyList<OutboxEntry> batch =
+            await store.GetPendingAsync(2, CancellationToken.None);
+
+        // Assert — head-of-line filter applied before Take: only the head returned.
+        batch.Should().ContainSingle(
+            "head-of-line filter must be applied before Take(batchSize), so only the head " +
+            "of key K is returned even when batchSize would allow more rows");
+
+        ReturnPooledBuffers(batch);
     }
 }

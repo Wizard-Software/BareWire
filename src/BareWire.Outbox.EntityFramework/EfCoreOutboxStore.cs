@@ -60,7 +60,8 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 ContentType = message.ContentType,
                 Payload = payload,
                 Headers = headersJson,
-                CreatedAt = now
+                CreatedAt = now,
+                OrderingKey = ResolveOrderingKey(message.Headers)
             };
 
             _dbContext.OutboxMessages.Add(entity);
@@ -91,7 +92,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             // RETURNING cannot be materialized through EF Core here. The follow-up SELECT
             // (LockedBy == this instance) reads back exactly the rows this instance just claimed.
             await _dbContext.Database.ExecuteSqlAsync(
-                _dialect.GetClaimSql(_instanceId, now, staleCutoff, batchSize),
+                _dialect.GetClaimSql(_instanceId, now, staleCutoff, batchSize, _options.OrderingMode),
                 cancellationToken).ConfigureAwait(false);
         }
         else
@@ -99,21 +100,55 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             // SQLite / other providers: two-step non-concurrent claim.
             // Step 1: identify claimable ids — Take() in ExecuteUpdateAsync is not supported.
             // SQLite EF does not support nullable DateTimeOffset OR comparisons in a single Where.
-            // Fetch pending (undelivered) ids, LockedAt, and LockedBy client-side, then filter in-memory.
-            // Rows already owned by this instance are always included (refresh their lock timestamp).
+            // Fetch pending (undelivered) ids, LockedAt, LockedBy, and OrderingKey client-side,
+            // then filter in-memory. Rows already owned by this instance are always included
+            // (refresh their lock timestamp).
             var pendingRows = await _dbContext.Set<OutboxMessage>()
                 .Where(m => m.DeliveredAt == null)
-                .Select(m => new { m.Id, m.LockedAt, m.LockedBy })
+                .Select(m => new { m.Id, m.LockedAt, m.LockedBy, m.OrderingKey })
                 .ToListAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            List<long> claimableIds = pendingRows
+            // Head-of-line filter for PerKey mode — applied BEFORE Take(batchSize) so the batch
+            // limit is not consumed by blocked rows (O(n)/cycle over undelivered rows, where n is
+            // the number of undelivered messages). This path is for SQLite / test/dev only —
+            // NOT production. For production multi-instance deployments use PostgreSQL with the
+            // atomic FOR UPDATE SKIP LOCKED claim path above.
+            IEnumerable<long> claimableCandidates = pendingRows
                 .Where(x => x.LockedBy == _instanceId
                     || x.LockedAt is null
                     || x.LockedAt.Value < staleCutoff)
                 .OrderBy(x => x.Id)
+                .Select(x => x.Id);
+
+            if (_options.OrderingMode == BareWire.Abstractions.Outbox.OrderingMode.PerKey)
+            {
+                // Build a set of the minimum Id per key among all undelivered rows (not just
+                // claimable ones) — these are the heads. A keyed row is claimable only when its
+                // Id is the head Id for that key. Keyless rows (OrderingKey == null) always pass.
+                Dictionary<string, long> headIdPerKey = pendingRows
+                    .Where(x => x.OrderingKey is not null)
+                    .GroupBy(x => x.OrderingKey!)
+                    .ToDictionary(g => g.Key, g => g.Min(x => x.Id));
+
+                claimableCandidates = claimableCandidates
+                    .Where(id =>
+                    {
+                        var row = pendingRows.First(x => x.Id == id);
+                        // Keyless rows are never blocked.
+                        if (row.OrderingKey is null)
+                        {
+                            return true;
+                        }
+
+                        // A keyed row is claimable only if it is the head of its key group.
+                        return headIdPerKey.TryGetValue(row.OrderingKey, out long headId)
+                            && id == headId;
+                    });
+            }
+
+            List<long> claimableIds = claimableCandidates
                 .Take(batchSize)
-                .Select(x => x.Id)
                 .ToList();
 
             if (claimableIds.Count == 0)
@@ -168,7 +203,8 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 BodyLength = row.Payload.Length,
                 ContentType = row.ContentType,
                 CreatedAt = row.CreatedAt,
-                Status = OutboxEntryStatus.Pending
+                Status = OutboxEntryStatus.Pending,
+                OrderingKey = row.OrderingKey
             });
         }
 
@@ -233,5 +269,44 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             .Where(m => m.DeliveredAt != null && m.DeliveredAt < cutoff)
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    // Promotes the ordering key from the message headers when PerKey mode is active.
+    // Rules (SEC-2 / §2.4 of the R7.7 plan):
+    //   - Only active when OrderingMode == PerKey.
+    //   - Key must be present in headers, non-whitespace, and <= 256 characters.
+    //   - Keys longer than 256 characters produce null (keyless/passthrough) — NEVER truncated,
+    //     because truncation would collapse distinct long keys to the same stored value, creating
+    //     a head-of-line collision vector and an anti-pattern for tenant-isolation use cases.
+    private string? ResolveOrderingKey(IReadOnlyDictionary<string, string> headers)
+    {
+        if (_options.OrderingMode != BareWire.Abstractions.Outbox.OrderingMode.PerKey)
+        {
+            return null;
+        }
+
+        string? headerName = _options.OrderingKeyHeaderName;
+        if (string.IsNullOrEmpty(headerName))
+        {
+            return null;
+        }
+
+        if (!headers.TryGetValue(headerName, out string? key))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        // Over-limit keys become keyless (passthrough). Never truncate — see comment above.
+        if (key.Length > 256)
+        {
+            return null;
+        }
+
+        return key;
     }
 }

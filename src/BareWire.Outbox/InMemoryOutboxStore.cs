@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
+using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Transport;
 
 namespace BareWire.Outbox;
@@ -8,12 +9,13 @@ namespace BareWire.Outbox;
 internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
 {
     private readonly int _maxPendingMessages;
+    private readonly OutboxOptions _options;
     private readonly ConcurrentQueue<OutboxEntry> _pending = new();
     private readonly ConcurrentDictionary<long, OutboxEntry> _all = new();
     private long _nextId;
     private bool _disposed;
 
-    internal InMemoryOutboxStore(int maxPendingMessages = 10_000)
+    internal InMemoryOutboxStore(OutboxOptions? options = null, int maxPendingMessages = 10_000)
     {
         if (maxPendingMessages <= 0)
         {
@@ -23,6 +25,7 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
                 "maxPendingMessages must be greater than zero.");
         }
 
+        _options = options ?? OutboxOptions.Default;
         _maxPendingMessages = maxPendingMessages;
     }
 
@@ -65,7 +68,8 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
                 BodyLength = originalBody.Length,
                 ContentType = message.ContentType,
                 CreatedAt = now,
-                Status = OutboxEntryStatus.Pending
+                Status = OutboxEntryStatus.Pending,
+                OrderingKey = ResolveOrderingKey(message.Headers)
             };
 
             _all[id] = entry;
@@ -81,18 +85,73 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var batch = new List<OutboxEntry>(Math.Min(batchSize, _pending.Count));
-
-        while (batch.Count < batchSize && _pending.TryDequeue(out OutboxEntry? entry))
+        if (_options.OrderingMode != OrderingMode.PerKey)
         {
-            // Skip entries that were already delivered (e.g. by a concurrent dispatch call).
-            if (entry.Status == OutboxEntryStatus.Pending)
+            // None: original path — no grouping, no extra allocation, bit-identical to pre-R7.7.
+            var batch = new List<OutboxEntry>(Math.Min(batchSize, _pending.Count));
+
+            while (batch.Count < batchSize && _pending.TryDequeue(out OutboxEntry? entry))
             {
-                batch.Add(entry);
+                // Skip entries that were already delivered (e.g. by a concurrent dispatch call).
+                if (entry.Status == OutboxEntryStatus.Pending)
+                {
+                    batch.Add(entry);
+                }
+            }
+
+            return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(batch);
+        }
+
+        // PerKey: head-of-line enforcement per ordering key.
+        // A keyed row is claimable only when there is no strictly older undelivered row with the
+        // same key (i.e., the row must be the head of its key group). Keyless rows always pass
+        // through. Filter applied before the batch limit.
+        //
+        // Implementation: O(undelivered)/cycle — scans _all to find the minimum Id per key group
+        // among all undelivered entries, then dequeues from _pending and keeps only heads or
+        // keyless entries. This is test/dev only — NOT production. For production use PostgreSQL
+        // with the atomic FOR UPDATE SKIP LOCKED claim path in EfCoreOutboxStore.
+        Dictionary<string, long> headIdPerKey = _all
+            .Values
+            .Where(e => e.Status == OutboxEntryStatus.Pending && e.OrderingKey is not null)
+            .GroupBy(e => e.OrderingKey!)
+            .ToDictionary(g => g.Key, g => g.Min(e => e.Id));
+
+        // Drain candidates from the pending queue; re-enqueue blocked keyed rows for the next
+        // cycle (they are not yet the head of their key).
+        var perKeyBatch = new List<OutboxEntry>(Math.Min(batchSize, _pending.Count));
+        var blocked = new List<OutboxEntry>();
+
+        while (perKeyBatch.Count < batchSize && _pending.TryDequeue(out OutboxEntry? entry))
+        {
+            if (entry.Status != OutboxEntryStatus.Pending)
+            {
+                continue;
+            }
+
+            if (entry.OrderingKey is null)
+            {
+                // Keyless: always eligible.
+                perKeyBatch.Add(entry);
+            }
+            else if (headIdPerKey.TryGetValue(entry.OrderingKey, out long headId) && entry.Id == headId)
+            {
+                // This entry is the head of its key group.
+                perKeyBatch.Add(entry);
+            }
+            else
+            {
+                // Not the head — block and re-enqueue after this sweep.
+                blocked.Add(entry);
             }
         }
 
-        return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(batch);
+        foreach (OutboxEntry blockedEntry in blocked)
+        {
+            _pending.Enqueue(blockedEntry);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(perKeyBatch);
     }
 
     public ValueTask MarkDeliveredAsync(
@@ -198,5 +257,43 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     private static void ReturnPooledBody(OutboxEntry entry)
     {
         ArrayPool<byte>.Shared.Return(entry.PooledBody);
+    }
+
+    // Promotes the ordering key from the message headers when PerKey mode is active.
+    // Rules (SEC-2 / §2.4 of the R7.7 plan — parity with EfCoreOutboxStore):
+    //   - Only active when OrderingMode == PerKey.
+    //   - Key must be present, non-whitespace, and <= 256 characters.
+    //   - Keys longer than 256 characters produce null (keyless) — NEVER truncated,
+    //     to avoid collapsing distinct long keys and creating a head-of-line collision vector.
+    private string? ResolveOrderingKey(IReadOnlyDictionary<string, string> headers)
+    {
+        if (_options.OrderingMode != OrderingMode.PerKey)
+        {
+            return null;
+        }
+
+        string? headerName = _options.OrderingKeyHeaderName;
+        if (string.IsNullOrEmpty(headerName))
+        {
+            return null;
+        }
+
+        if (!headers.TryGetValue(headerName, out string? key))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        // Over-limit keys become keyless (passthrough). Never truncate — see comment above.
+        if (key.Length > 256)
+        {
+            return null;
+        }
+
+        return key;
     }
 }

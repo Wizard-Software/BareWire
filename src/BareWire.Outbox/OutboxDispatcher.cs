@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Frozen;
+using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Transport;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -148,6 +149,98 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 }
             }
 
+            // R7.7.6 — Per-key barrier: when PerKey ordering is active and at least one entry was
+            // nacked, apply head-of-line blocking per key. Any confirmed sibling with a higher Id
+            // than the first nacked entry in its key group is moved to "release" — it must not be
+            // marked delivered until the nacked head is retried and confirmed. Keyless entries
+            // (OrderingKey == null) are always independent and are never blocked.
+            //
+            // The None path is bit-identical to pre-R7.7.6: no Dictionary allocation, no extra
+            // branches taken — zero overhead on the default ordering mode.
+            if (_options.OrderingMode == OrderingMode.PerKey && nackedIds.Count > 0)
+            {
+                // Rebuild confirmedIds and releaseIds applying per-key head-of-line blocking.
+                // Keyless entries (OrderingKey == null) are handled in a separate pre-pass so
+                // that the keyed dictionary uses non-nullable string keys (satisfying the
+                // notnull TKey constraint and avoiding any nullable-analysis noise).
+                confirmedIds = new List<long>(pending.Count);
+                List<long> releaseIds = [];
+                int blockedCount = 0;
+
+                // Pre-pass: keyless entries are always independent — route them directly.
+                for (int i = 0; i < pending.Count; i++)
+                {
+                    if (pending[i].OrderingKey is null)
+                    {
+                        if (results[i].IsConfirmed) confirmedIds.Add(ids[i]);
+                        else releaseIds.Add(ids[i]);
+                    }
+                }
+
+                // Group keyed entries by OrderingKey, tracking per-entry confirmation outcome.
+                var groups = new Dictionary<string, List<(long Id, bool Confirmed)>>(StringComparer.Ordinal);
+
+                for (int i = 0; i < pending.Count; i++)
+                {
+                    string? key = pending[i].OrderingKey;
+                    if (key is null) continue; // already handled above
+
+                    if (!groups.TryGetValue(key, out List<(long, bool)>? list))
+                    {
+                        list = [];
+                        groups[key] = list;
+                    }
+
+                    list.Add((ids[i], results[i].IsConfirmed));
+                }
+
+                foreach (List<(long Id, bool Confirmed)> group in groups.Values)
+                {
+                    // Find the minimum Id among nacked entries in this key group.
+                    // By definition all entries with Id < firstNackedId are confirmed — if any
+                    // were nacked they would themselves be the minimum.
+                    long firstNackedId = long.MaxValue;
+                    foreach ((long id, bool confirmed) in group)
+                    {
+                        if (!confirmed && id < firstNackedId) firstNackedId = id;
+                    }
+
+                    if (firstNackedId == long.MaxValue)
+                    {
+                        // No nack in this group — all entries confirmed, no barrier.
+                        foreach ((long id, bool _) in group) confirmedIds.Add(id);
+                    }
+                    else
+                    {
+                        // Barrier at firstNackedId: entries strictly before it are confirmed;
+                        // entries at or after it are released (nacked head + blocked siblings).
+                        foreach ((long id, bool _) in group)
+                        {
+                            if (id < firstNackedId)
+                            {
+                                confirmedIds.Add(id);
+                            }
+                            else
+                            {
+                                releaseIds.Add(id);
+                                blockedCount++;
+                            }
+                        }
+
+                        // The nacked head itself is not a "blocked sibling" — exclude it from
+                        // the count so the log reflects only the held-back confirmed siblings.
+                        blockedCount--;
+                    }
+                }
+
+                nackedIds = releaseIds;
+
+                if (blockedCount > 0)
+                {
+                    LogPerKeyBarrierApplied(_logger, blockedCount);
+                }
+            }
+
             if (confirmedIds.Count > 0)
             {
                 await store.MarkDeliveredAsync(confirmedIds, ct).ConfigureAwait(false);
@@ -215,4 +308,9 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         Level = LogLevel.Warning,
         Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker; their locks were released for retry on the next poll cycle.")]
     private static partial void LogPartialSendFailure(ILogger logger, int nackedCount, int totalCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Debug,
+        Message = "Per-key ordering barrier applied: {BlockedCount} confirmed sibling(s) were held back due to a nacked head-of-line entry in their key group and will retry on the next poll cycle.")]
+    private static partial void LogPerKeyBarrierApplied(ILogger logger, int blockedCount);
 }

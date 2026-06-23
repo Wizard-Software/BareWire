@@ -17,6 +17,8 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     private TimeSpan _outboxLockTimeout = OutboxOptions.Default.OutboxLockTimeout;
     private TimeSpan _cleanupInterval = OutboxOptions.Default.CleanupInterval;
     private bool _autoCreateSchema = OutboxOptions.Default.AutoCreateSchema;
+    private OrderingMode _orderingMode = OutboxOptions.Default.OrderingMode;
+    private string _orderingKeyHeaderName = OutboxOptions.Default.OrderingKeyHeaderName ?? string.Empty;
 
     /// <inheritdoc />
     public TimeSpan PollingInterval
@@ -74,6 +76,20 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
         set => _autoCreateSchema = value;
     }
 
+    /// <inheritdoc />
+    public OrderingMode OrderingMode
+    {
+        get => _orderingMode;
+        set => _orderingMode = value;
+    }
+
+    /// <inheritdoc />
+    public string OrderingKeyHeaderName
+    {
+        get => _orderingKeyHeaderName;
+        set => _orderingKeyHeaderName = value;
+    }
+
     /// <summary>
     /// Builds and validates the <see cref="OutboxOptions"/> from the accumulated configuration.
     /// </summary>
@@ -92,6 +108,8 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
             OutboxLockTimeout = _outboxLockTimeout,
             CleanupInterval = _cleanupInterval,
             AutoCreateSchema = _autoCreateSchema,
+            OrderingMode = _orderingMode,
+            OrderingKeyHeaderName = string.IsNullOrEmpty(_orderingKeyHeaderName) ? null : _orderingKeyHeaderName,
         };
 
         options.Validate();

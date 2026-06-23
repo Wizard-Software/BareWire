@@ -1,4 +1,5 @@
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Outbox;
 
 namespace BareWire.Outbox;
 
@@ -14,6 +15,8 @@ internal sealed record OutboxOptions
     public TimeSpan OutboxLockTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan CleanupInterval { get; init; } = TimeSpan.FromHours(1);
     public bool AutoCreateSchema { get; init; }
+    public OrderingMode OrderingMode { get; init; } = OrderingMode.None;
+    public string? OrderingKeyHeaderName { get; init; }
 
     internal void Validate()
     {
@@ -80,6 +83,12 @@ internal sealed record OutboxOptions
         {
             throw new BareWireConfigurationException(
                 $"{nameof(CleanupInterval)} must be greater than zero. Got: {CleanupInterval}");
+        }
+
+        if (OrderingMode == OrderingMode.PerKey && string.IsNullOrWhiteSpace(OrderingKeyHeaderName))
+        {
+            throw new BareWireConfigurationException(
+                "OrderingKeyHeaderName must be set to a non-empty header name when OrderingMode is PerKey.");
         }
     }
 }

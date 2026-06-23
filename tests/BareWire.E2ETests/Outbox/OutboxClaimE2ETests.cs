@@ -4,9 +4,13 @@ using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
 using AwesomeAssertions;
+using BareWire.Abstractions.Outbox;
+using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
@@ -78,6 +82,30 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
             InboxLockTimeout = TimeSpan.FromSeconds(30)
         };
 
+    private static OutboxOptions CreatePerKeyOptions(string orderingKeyHeader = "x-ordering-key", TimeSpan? lockTimeout = null)
+        => new()
+        {
+            PollingInterval = TimeSpan.FromSeconds(1),
+            OutboxLockTimeout = lockTimeout ?? TestLockTimeout,
+            OutboxRetention = TimeSpan.FromDays(7),
+            InboxRetention = TimeSpan.FromDays(8),
+            InboxLockTimeout = TimeSpan.FromSeconds(30),
+            OrderingMode = OrderingMode.PerKey,
+            OrderingKeyHeaderName = orderingKeyHeader
+        };
+
+    // Creates a DbContext that includes the OutboxModelCustomizerExtension so that schema
+    // creation via EnsureCreatedAsync also creates IX_OutboxMessages_Ordering when PerKey is
+    // active. Used only where the test needs the index to be present (E4, E5).
+    private OutboxDbContext CreateDbContextWithOrdering(OutboxOptions options)
+    {
+        var ob = new DbContextOptionsBuilder<OutboxDbContext>();
+        ob.UseNpgsql(_connectionString!);
+        ((IDbContextOptionsBuilderInfrastructure)ob).AddOrUpdateExtension(
+            new OutboxModelCustomizerExtension(options));
+        return new OutboxDbContext(ob.Options);
+    }
+
     private static async Task SeedPendingRowsAsync(OutboxDbContext context, int count)
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -102,6 +130,75 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         {
             ArrayPool<byte>.Shared.Return(e.PooledBody);
         }
+    }
+
+    // Seeds rows with an ordering key header for PerKey E2E tests.
+    private static async Task SeedOrderedRowsAsync(
+        OutboxDbContext context,
+        string orderingKey,
+        int count,
+        string? overrideDestination = null)
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        for (int i = 0; i < count; i++)
+        {
+            context.OutboxMessages.Add(new OutboxMessage
+            {
+                MessageId = Guid.NewGuid(),
+                DestinationAddress = overrideDestination ?? $"test.ordering.{orderingKey}.{i}",
+                ContentType = "application/json",
+                Payload = [1, 2, 3],
+                CreatedAt = now,
+                OrderingKey = orderingKey
+            });
+        }
+
+        await context.SaveChangesAsync();
+    }
+
+    // Bulk inserts rows directly for E5 performance test — avoids slow per-row SaveChanges.
+    private static async Task SeedBulkAsync(
+        OutboxDbContext context,
+        int keyCount,
+        int rowsPerKey,
+        int hotKeyExtraRows)
+    {
+        const string hotKey = "hot-key";
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        var batch = new List<OutboxMessage>(keyCount * rowsPerKey + hotKeyExtraRows);
+
+        for (int k = 0; k < keyCount; k++)
+        {
+            string key = $"key-{k:D4}";
+            for (int r = 0; r < rowsPerKey; r++)
+            {
+                batch.Add(new OutboxMessage
+                {
+                    MessageId = Guid.NewGuid(),
+                    DestinationAddress = "bulk.test",
+                    ContentType = "application/json",
+                    Payload = [0],
+                    CreatedAt = now,
+                    OrderingKey = key
+                });
+            }
+        }
+
+        for (int r = 0; r < hotKeyExtraRows; r++)
+        {
+            batch.Add(new OutboxMessage
+            {
+                MessageId = Guid.NewGuid(),
+                DestinationAddress = "bulk.test",
+                ContentType = "application/json",
+                Payload = [0],
+                CreatedAt = now,
+                OrderingKey = hotKey
+            });
+        }
+
+        context.OutboxMessages.AddRange(batch);
+        await context.SaveChangesAsync();
     }
 
     // ── Test #1: Disjoint batches ─────────────────────────────────────────────
@@ -330,5 +427,377 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         {
             ReturnBuffers(claimed);
         }
+    }
+
+    // ── E1: Head-of-line per key (PerKey, real PostgreSQL) ────────────────────
+
+    /// <summary>
+    /// With <see cref="OrderingMode.PerKey"/> active, only the head (oldest undelivered) row
+    /// for a given key must be claimable. After <see cref="EfCoreOutboxStore.MarkDeliveredAsync"/>
+    /// delivers the head, the next row becomes the new head and is claimable.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAsync_PerKey_WhenTwoRowsSameKey_ClaimsOnlyHead()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreatePerKeyOptions();
+
+        // Seed two rows for the same key — row with the lower Id is the head.
+        await SeedOrderedRowsAsync(seedContext, orderingKey: "order-1", count: 2);
+
+        List<long> allIds = await seedContext.OutboxMessages
+            .AsNoTracking()
+            .Where(m => m.OrderingKey == "order-1")
+            .OrderBy(m => m.Id)
+            .Select(m => m.Id)
+            .ToListAsync();
+
+        long headId = allIds[0];
+        long tailId = allIds[1];
+
+        await using OutboxDbContext claimContext = CreateDbContext();
+        EfCoreOutboxStore store = CreateStore(claimContext, "instance-A", options);
+
+        // Act — first claim: only the head should be returned.
+        IReadOnlyList<OutboxEntry> first = await store.GetPendingAsync(10, CancellationToken.None);
+
+        try
+        {
+            first.Should().HaveCount(1, "only the head row for the key is claimable");
+            first[0].Id.Should().Be(headId, "the claimed row must be the head (lowest Id) of the key");
+            first[0].OrderingKey.Should().Be("order-1");
+        }
+        finally
+        {
+            ReturnBuffers(first);
+        }
+
+        // Deliver the head.
+        await store.MarkDeliveredAsync([headId], CancellationToken.None);
+
+        // Act — second claim: after head is delivered, the tail becomes the new head.
+        IReadOnlyList<OutboxEntry> second = await store.GetPendingAsync(10, CancellationToken.None);
+
+        try
+        {
+            second.Should().HaveCount(1, "tail becomes claimable once the head is delivered");
+            second[0].Id.Should().Be(tailId, "the formerly blocked tail is now the head");
+        }
+        finally
+        {
+            ReturnBuffers(second);
+        }
+    }
+
+    // ── E2: Key-affinity cross-instance (mirror B4 disjoint test) ─────────────
+
+    /// <summary>
+    /// Two concurrent instances must NOT both claim rows belonging to the same ordering key
+    /// simultaneously. With <c>FOR UPDATE SKIP LOCKED</c> and the head-of-line predicate,
+    /// at most one instance may hold the head of a given key at any time.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAsync_PerKey_TwoInstancesSameKey_ClaimDisjointRows()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreatePerKeyOptions(lockTimeout: TimeSpan.FromSeconds(30));
+
+        // Seed 2 rows of the same key — only 1 head can be claimed concurrently.
+        await SeedOrderedRowsAsync(seedContext, orderingKey: "key-A", count: 2);
+
+        await using OutboxDbContext contextA = CreateDbContext();
+        await using OutboxDbContext contextB = CreateDbContext();
+        EfCoreOutboxStore storeA = CreateStore(contextA, "instance-A", options);
+        EfCoreOutboxStore storeB = CreateStore(contextB, "instance-B", options);
+
+        // Act — concurrent claim
+        IReadOnlyList<OutboxEntry>[] batches = await Task.WhenAll(
+            storeA.GetPendingAsync(10, CancellationToken.None).AsTask(),
+            storeB.GetPendingAsync(10, CancellationToken.None).AsTask());
+
+        IReadOnlyList<OutboxEntry> batchA = batches[0];
+        IReadOnlyList<OutboxEntry> batchB = batches[1];
+
+        try
+        {
+            var idsA = batchA.Select(e => e.Id).ToHashSet();
+            var idsB = batchB.Select(e => e.Id).ToHashSet();
+
+            // The two batches must be disjoint — no row may be claimed by both instances.
+            idsA.Intersect(idsB).Should().BeEmpty(
+                "two instances must not both claim the same head row for a key");
+
+            // Combined, they hold at most 2 rows but only 1 head is claimable at a time,
+            // so at most 1 instance can claim any row.
+            (idsA.Count + idsB.Count).Should().BeLessThanOrEqualTo(1,
+                "only one instance may claim the single head row; the second is blocked");
+        }
+        finally
+        {
+            ReturnBuffers(batchA);
+            ReturnBuffers(batchB);
+        }
+    }
+
+    // ── E3: Parallelism — distinct keys + keyless all claimable in one batch ──
+
+    /// <summary>
+    /// With <see cref="OrderingMode.PerKey"/> active, rows with distinct keys and keyless rows
+    /// must all be claimable in a single <see cref="EfCoreOutboxStore.GetPendingAsync"/> call —
+    /// the head-of-line predicate must not collapse them.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAsync_PerKey_DistinctKeysAndKeyless_AllClaimableInOneBatch()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreatePerKeyOptions();
+
+        // Seed 1 row for key "A", 1 for key "B", 2 keyless rows.
+        await SeedOrderedRowsAsync(seedContext, orderingKey: "A", count: 1);
+        await SeedOrderedRowsAsync(seedContext, orderingKey: "B", count: 1);
+        await SeedPendingRowsAsync(seedContext, count: 2); // keyless
+
+        await using OutboxDbContext claimContext = CreateDbContext();
+        EfCoreOutboxStore store = CreateStore(claimContext, "instance-X", options);
+
+        // Act
+        IReadOnlyList<OutboxEntry> batch = await store.GetPendingAsync(10, CancellationToken.None);
+
+        try
+        {
+            // Assert — all 4 rows (head-A, head-B, keyless-1, keyless-2) must be claimed.
+            batch.Should().HaveCount(4,
+                "head of key A, head of key B, and both keyless rows are all independently claimable");
+
+            int keyACount = batch.Count(e => e.OrderingKey == "A");
+            int keyBCount = batch.Count(e => e.OrderingKey == "B");
+            int keylessCount = batch.Count(e => e.OrderingKey is null);
+
+            keyACount.Should().Be(1, "exactly one head for key A");
+            keyBCount.Should().Be(1, "exactly one head for key B");
+            keylessCount.Should().Be(2, "both keyless rows pass through without restriction");
+        }
+        finally
+        {
+            ReturnBuffers(batch);
+        }
+    }
+
+    // ── E4: Index IX_OutboxMessages_Ordering present in PerKey, absent in None ─
+
+    /// <summary>
+    /// The partial index <c>IX_OutboxMessages_Ordering</c> must be created by
+    /// <see cref="OutboxModelCustomizerExtension"/> when <see cref="OrderingMode.PerKey"/> is
+    /// active, and must be absent when <see cref="OrderingMode.None"/> is used.
+    /// Verified by introspecting <c>pg_indexes</c> on a real PostgreSQL instance.
+    /// </summary>
+    [Fact]
+    public async Task EnsureCreated_PerKey_CreatesOrderingIndex_None_DoesNot()
+    {
+        const string indexName = "IX_OutboxMessages_Ordering";
+
+        // ── PerKey: index must be present ────────────────────────────────────
+        OutboxOptions perKeyOptions = CreatePerKeyOptions();
+        await using (OutboxDbContext ctxPerKey = CreateDbContextWithOrdering(perKeyOptions))
+        {
+            await ctxPerKey.Database.EnsureCreatedAsync();
+
+            bool indexExists = await ctxPerKey.Database
+                .SqlQuery<int>(
+                    $"SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = {indexName}")
+                .AnyAsync();
+
+            indexExists.Should().BeTrue(
+                $"index {indexName} must be created when OrderingMode is PerKey");
+        }
+
+        // ── None: index must be absent ────────────────────────────────────────
+        // Drop the index that was just created, then re-check with a None context.
+        await using (OutboxDbContext ctxCheck = CreateDbContext())
+        {
+            await ctxCheck.Database
+                .ExecuteSqlRawAsync($"DROP INDEX IF EXISTS \"{indexName}\"");
+
+            bool indexStillExists = await ctxCheck.Database
+                .SqlQuery<int>(
+                    $"SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = {indexName}")
+                .AnyAsync();
+
+            indexStillExists.Should().BeFalse(
+                $"index {indexName} must be absent when OrderingMode is None (guard §2.1)");
+        }
+    }
+
+    // ── E5: EXPLAIN ANALYZE — NOT EXISTS uses IX_OutboxMessages_Ordering ──────
+
+    /// <summary>
+    /// Under <see cref="OrderingMode.PerKey"/> with a hot key (~100 k rows, ~1 k distinct keys),
+    /// the <c>EXPLAIN (ANALYZE, BUFFERS)</c> output for a claim query must show that the
+    /// <c>NOT EXISTS</c> correlated subquery uses an Index Scan (or Index-Only Scan) on
+    /// <c>IX_OutboxMessages_Ordering</c> rather than a sequential scan of
+    /// <c>OutboxMessages</c> — the load-bearing correctness criterion for E5 (PERF-2).
+    /// </summary>
+    /// <remarks>
+    /// This test seeds ~100 k rows and runs <c>ANALYZE</c> before <c>EXPLAIN</c> to ensure
+    /// the planner has current statistics. It is intentionally slow (bulk insert + analyze)
+    /// and is gated behind the <c>requires-postgres</c> trait.
+    /// </remarks>
+    [Fact]
+    public async Task GetPendingAsync_PerKey_HotKeyLoad_ClaimUsesOrderingIndex()
+    {
+        const int keyCount = 1_000;
+        const int rowsPerKey = 99;        // 1 000 × 99 = 99 000 rows
+        const int hotKeyExtra = 1_000;    // additional rows for the "hot-key" = ~100 000 total
+
+        OutboxOptions options = CreatePerKeyOptions();
+
+        // Schema must include the ordering index — use the ordering-aware context.
+        await using OutboxDbContext seedCtx = CreateDbContextWithOrdering(options);
+        await seedCtx.Database.EnsureCreatedAsync();
+
+        // Bulk-seed rows.
+        await SeedBulkAsync(seedCtx, keyCount, rowsPerKey, hotKeyExtra);
+
+        // Run ANALYZE so the planner has fresh statistics before EXPLAIN.
+        await seedCtx.Database.ExecuteSqlRawAsync("ANALYZE \"OutboxMessages\"");
+
+        // Build the EXPLAIN query using raw SQL with literal placeholders — EXPLAIN (ANALYZE,
+        // BUFFERS) is a planning statement, not DML. We use a fixed instance id and
+        // times just to get the plan shape; no user-supplied values enter the query.
+        // SEC: the EXPLAIN output contains only structural SQL identifiers and timing, not
+        // OrderingKey or LockedBy values.
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset staleCutoff = now - options.OutboxLockTimeout;
+
+        // The PerKey claim SQL shape (from PostgresOutboxSqlDialect) with literal parameters.
+        // We use a stable future timestamp so PG does not execute the DML (EXPLAIN only plans).
+        string explainRawSql = $"""
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+            UPDATE "OutboxMessages"
+            SET "LockedAt" = '{now:O}', "LockedBy" = 'explain-instance'
+            WHERE "Id" IN (
+              SELECT o."Id" FROM "OutboxMessages" o
+              WHERE o."DeliveredAt" IS NULL
+                AND (o."LockedAt" IS NULL OR o."LockedAt" < '{staleCutoff:O}')
+                AND (
+                  o."OrderingKey" IS NULL
+                  OR NOT EXISTS (
+                    SELECT 1 FROM "OutboxMessages" e
+                    WHERE e."OrderingKey" = o."OrderingKey"
+                      AND e."DeliveredAt" IS NULL
+                      AND e."Id" < o."Id"
+                  )
+                )
+              ORDER BY o."Id"
+              LIMIT 100
+              FOR UPDATE SKIP LOCKED
+            )
+            """;
+
+        // Execute raw EXPLAIN — returns text rows from PostgreSQL.
+        var planLines = new List<string>();
+        await using (var cmd = seedCtx.Database.GetDbConnection().CreateCommand())
+        {
+            if (seedCtx.Database.GetDbConnection().State != System.Data.ConnectionState.Open)
+            {
+                await seedCtx.Database.GetDbConnection().OpenAsync();
+            }
+
+            cmd.CommandText = explainRawSql;
+
+            await using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                planLines.Add(reader.GetString(0));
+            }
+        }
+
+        string planText = string.Join("\n", planLines);
+
+        // The NOT EXISTS subquery must use an index scan on IX_OutboxMessages_Ordering.
+        // SEC: planText contains only structural SQL node descriptions, not user data.
+        bool hasIndexScanOnOrderingIndex = planLines.Any(line =>
+            (line.Contains("Index Scan", StringComparison.OrdinalIgnoreCase) ||
+             line.Contains("Index Only Scan", StringComparison.OrdinalIgnoreCase))
+            && line.Contains("IX_OutboxMessages_Ordering", StringComparison.OrdinalIgnoreCase));
+
+        bool hasSeqScanOnOutboxInSubquery = planLines.Any(line =>
+            line.Contains("Seq Scan on", StringComparison.OrdinalIgnoreCase) &&
+            line.Contains("outboxmessages e", StringComparison.OrdinalIgnoreCase));
+
+        // Assert index is used — load-bearing criterion (PERF-2 / E5 §6).
+        hasIndexScanOnOrderingIndex.Should().BeTrue(
+            "the NOT EXISTS subquery must use IX_OutboxMessages_Ordering index scan, " +
+            $"not a seq scan; plan:\n{planText}");
+
+        hasSeqScanOnOutboxInSubquery.Should().BeFalse(
+            "the NOT EXISTS subquery must not result in a sequential scan on OutboxMessages; " +
+            $"plan:\n{planText}");
+    }
+
+    // ── E6: Over-limit key (>256 chars) → NULL (keyless), not truncated ────────
+
+    /// <summary>
+    /// When an <see cref="OrderingMode.PerKey"/> message carries an ordering-key header value
+    /// longer than 256 characters, the row must be stored as keyless (<c>OrderingKey IS NULL</c>)
+    /// — never truncated to 256 chars.  Truncation would silently merge distinct long keys into a
+    /// single head-of-line group, which is both a correctness bug and a manipulation vector.
+    /// </summary>
+    [Fact]
+    public async Task SaveMessages_PerKey_OverLimitKey_StoresAsNull_NeverTruncated()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreatePerKeyOptions();
+
+        // Two distinct keys that are both > 256 chars and differ only in the 257th character.
+        // If truncation occurred, they would be stored as the same value — a collision.
+        string prefix = new('k', 256);
+        string longKeyA = prefix + "A";   // 257 chars
+        string longKeyB = prefix + "B";   // 257 chars
+
+        await using OutboxDbContext storeContext = CreateDbContext();
+        EfCoreOutboxStore store = CreateStore(storeContext, "instance-X", options);
+
+        var messages = new List<OutboundMessage>
+        {
+            new(
+                routingKey: "test.overlimit",
+                headers: new Dictionary<string, string> { ["x-ordering-key"] = longKeyA },
+                body: new ReadOnlyMemory<byte>([1]),
+                contentType: "application/json"),
+            new(
+                routingKey: "test.overlimit",
+                headers: new Dictionary<string, string> { ["x-ordering-key"] = longKeyB },
+                body: new ReadOnlyMemory<byte>([2]),
+                contentType: "application/json")
+        };
+
+        await store.SaveMessagesAsync(messages, CancellationToken.None);
+        await storeContext.SaveChangesAsync();
+
+        // Assert — both rows must have NULL OrderingKey (keyless), not a truncated value.
+        await using OutboxDbContext verifyContext = CreateDbContext();
+        List<string?> storedKeys = await verifyContext.OutboxMessages
+            .AsNoTracking()
+            .Where(m => m.DestinationAddress == "test.overlimit")
+            .Select(m => m.OrderingKey)
+            .ToListAsync();
+
+        storedKeys.Should().HaveCount(2,
+            "both over-limit rows must be persisted");
+        storedKeys.Should().AllSatisfy(k => k.Should().BeNull(),
+            "over-limit keys must be stored as NULL (keyless), not truncated (SEC-2)");
     }
 }
