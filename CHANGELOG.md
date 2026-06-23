@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] - 2026-06-23
+
+### Fixed
+
+- Added the missing `BareWire.Saga.Redis` package `README.md` that caused `dotnet pack` to fail with `NU5019` during the v1.5.0 release
+- Added a ContractTests guard asserting every packable `src/` package ships a `README.md`, so a missing readme fails in CI before tagging
+
 ## [1.5.0] - 2026-06-23
 
 ### Added
@@ -127,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Enhanced unit tests for service collection extensions and pipeline components
 
+[1.5.1]: https://github.com/Wizard-Software/BareWire/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/Wizard-Software/BareWire/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/Wizard-Software/BareWire/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Wizard-Software/BareWire/compare/v1.3.0...v1.3.1
