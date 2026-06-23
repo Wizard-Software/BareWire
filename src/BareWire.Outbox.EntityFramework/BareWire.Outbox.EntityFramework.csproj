@@ -18,6 +18,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="BareWire.UnitTests" />
     <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+    <InternalsVisibleTo Include="BareWire.E2ETests" />
     <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
   </ItemGroup>
 

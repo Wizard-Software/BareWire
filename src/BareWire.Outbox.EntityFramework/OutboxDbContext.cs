@@ -53,5 +53,18 @@ public class OutboxDbContext : DbContext
 
         modelBuilder.ApplyConfiguration(new OutboxMessageEntityTypeConfiguration());
         modelBuilder.ApplyConfiguration(new InboxMessageEntityTypeConfiguration());
+
+        // PostgreSQL supports partial (filtered) indexes using provider-specific quoting.
+        // For SQLite and other providers the composite index without a filter is already
+        // configured in OutboxMessageEntityTypeConfiguration — which is sufficient for correctness.
+        // ProviderName is a base EF Core API, so this package stays provider-agnostic (no hard
+        // dependency on Npgsql.EntityFrameworkCore.PostgreSQL).
+        if (string.Equals(Database.ProviderName, "Npgsql.EntityFrameworkCore.PostgreSQL", StringComparison.Ordinal))
+        {
+            modelBuilder.Entity<OutboxMessage>()
+                .HasIndex(m => new { m.DeliveredAt, m.LockedAt, m.Id })
+                .HasDatabaseName("IX_OutboxMessages_Claim")
+                .HasFilter("\"DeliveredAt\" IS NULL");
+        }
     }
 }

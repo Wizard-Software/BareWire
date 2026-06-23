@@ -360,6 +360,7 @@ namespace BareWire.Abstractions.Outbox
         int DispatchBatchSize { get; set; }
         System.TimeSpan InboxLockTimeout { get; set; }
         System.TimeSpan InboxRetention { get; set; }
+        System.TimeSpan OutboxLockTimeout { get; set; }
         System.TimeSpan OutboxRetention { get; set; }
         System.TimeSpan PollingInterval { get; set; }
     }

@@ -11,6 +11,7 @@ internal sealed record OutboxOptions
     public TimeSpan InboxRetention { get; init; } = TimeSpan.FromDays(7);
     public TimeSpan OutboxRetention { get; init; } = TimeSpan.FromDays(7);
     public TimeSpan InboxLockTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan OutboxLockTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan CleanupInterval { get; init; } = TimeSpan.FromHours(1);
     public bool AutoCreateSchema { get; init; }
 
@@ -51,6 +52,28 @@ internal sealed record OutboxOptions
             throw new BareWireConfigurationException(
                 $"{nameof(InboxRetention)} ({InboxRetention}) must be greater than " +
                 $"{nameof(InboxLockTimeout)} ({InboxLockTimeout}) to prevent locks from expiring before cleanup.");
+        }
+
+        if (OutboxLockTimeout <= TimeSpan.Zero)
+        {
+            throw new BareWireConfigurationException(
+                $"{nameof(OutboxLockTimeout)} must be greater than zero. Got: {OutboxLockTimeout}");
+        }
+
+        if (OutboxRetention <= OutboxLockTimeout)
+        {
+            throw new BareWireConfigurationException(
+                $"{nameof(OutboxRetention)} ({OutboxRetention}) must be greater than " +
+                $"{nameof(OutboxLockTimeout)} ({OutboxLockTimeout}) to prevent stale locks surviving cleanup.");
+        }
+
+        TimeSpan minLockTimeout = TimeSpan.FromTicks(3 * PollingInterval.Ticks);
+        if (OutboxLockTimeout < minLockTimeout)
+        {
+            throw new BareWireConfigurationException(
+                $"{nameof(OutboxLockTimeout)} ({OutboxLockTimeout}) must be >= 3 * PollingInterval " +
+                $"({PollingInterval}) = {minLockTimeout} to survive at least one full poll-publish-confirm cycle. " +
+                $"Got: {OutboxLockTimeout}");
         }
 
         if (CleanupInterval <= TimeSpan.Zero)

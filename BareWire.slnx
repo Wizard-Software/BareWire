@@ -45,6 +45,7 @@
     <Project Path="tests/BareWire.Benchmarks/BareWire.Benchmarks.csproj" />
     <Project Path="tests/BareWire.ContractTests/BareWire.ContractTests.csproj" />
     <Project Path="tests/BareWire.IntegrationTests/BareWire.IntegrationTests.csproj" />
+    <Project Path="tests/BareWire.OutboxE2EAppHost/BareWire.OutboxE2EAppHost.csproj" />
     <Project Path="tests/BareWire.UnitTests/BareWire.UnitTests.csproj" />
     <Project Path="tests/BareWire.E2ETests/BareWire.E2ETests.csproj" />
   </Folder>

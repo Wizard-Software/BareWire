@@ -29,6 +29,7 @@ public interface IOutboxConfigurator
 
     /// <summary>
     /// Gets or sets how long delivered outbox entries are retained before cleanup removes them.
+    /// Must be greater than <see cref="OutboxLockTimeout"/> to prevent stale locks surviving cleanup.
     /// Defaults to <c>7 days</c>.
     /// </summary>
     TimeSpan OutboxRetention { get; set; }
@@ -39,6 +40,30 @@ public interface IOutboxConfigurator
     /// Defaults to <c>30 seconds</c>.
     /// </summary>
     TimeSpan InboxLockTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long an outbox dispatcher holds an exclusive claim on a row before
+    /// the claim is considered stale and another dispatcher instance may re-claim the row.
+    /// This enables crash-recovery: if a dispatcher crashes between claiming and delivering
+    /// a row, another instance reclaims it after this timeout expires.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Must be greater than <c>3 * PollingInterval</c> to survive at least one full
+    /// poll-publish-confirm cycle. Setting it too low re-introduces duplicate delivery.
+    /// </para>
+    /// <para>
+    /// Must be less than <see cref="OutboxRetention"/> so that stale locks expire well
+    /// before the cleanup service removes the row.
+    /// </para>
+    /// <para>
+    /// Nacked rows (partial send failures) are not explicitly unlocked. They become
+    /// eligible for re-delivery once this timeout elapses. To minimize retry latency,
+    /// set this value conservatively relative to your broker's worst-case publish-confirm time.
+    /// </para>
+    /// Defaults to <c>30 seconds</c>.
+    /// </remarks>
+    TimeSpan OutboxLockTimeout { get; set; }
 
     /// <summary>
     /// Gets or sets how frequently the cleanup service removes expired outbox and inbox entries.
