@@ -49,11 +49,31 @@ public static class ServiceCollectionExtensions
         // Register the EF Core DbContext.
         services.AddDbContext<OutboxDbContext>(configureDbContext);
 
+        // Generate a stable per-process instance identifier — unique across restarts and hosts.
+        // MachineName:PID ensures readability; Guid suffix prevents PID-reuse collisions.
+        var instanceId = new OutboxInstanceId(
+            $"{Environment.MachineName}:{Environment.ProcessId}:{Guid.NewGuid():N}");
+
+        services.AddSingleton(instanceId);
+
+        // Default outbox claim dialect: PostgreSQL (FOR UPDATE SKIP LOCKED). The store invokes a
+        // dialect only when its IOutboxSqlDialect.ProviderName matches the active EF Core provider,
+        // so this default is used on PostgreSQL and is inert elsewhere. To get an atomic claim on
+        // another provider (e.g. SQL Server), register a custom IOutboxSqlDialect with the matching
+        // ProviderName BEFORE calling AddBareWireOutbox (TryAdd keeps your registration). Providers
+        // without a matching dialect use a non-atomic client-side fallback (single-instance/testing).
+        services.TryAddSingleton<IOutboxSqlDialect, PostgresOutboxSqlDialect>();
+
         // Register the EF Core store implementations as scoped — they depend on the
         // scoped OutboxDbContext and must not outlive it.
         // Factory lambdas are required because the implementation classes have internal constructors.
         services.AddScoped<IOutboxStore>(sp =>
-            new EfCoreOutboxStore(sp.GetRequiredService<OutboxDbContext>()));
+            new EfCoreOutboxStore(
+                sp.GetRequiredService<OutboxDbContext>(),
+                sp.GetRequiredService<OutboxInstanceId>(),
+                sp.GetRequiredService<IOutboxSqlDialect>(),
+                sp.GetRequiredService<OutboxOptions>()));
+
         // Register the default SQL dialect for inbox upserts (PostgreSQL).
         // Users can replace this with a custom implementation for other database providers.
         services.TryAddSingleton<IInboxSqlDialect, PostgresInboxSqlDialect>();

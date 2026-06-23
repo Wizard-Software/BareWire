@@ -9,12 +9,16 @@
     <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
     <PackageReference Include="RabbitMQ.Client" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
     <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
     <PackageReference Include="MessagePack" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\samples\BareWire.Samples.AppHost\BareWire.Samples.AppHost.csproj" />
+    <ProjectReference Include="..\BareWire.OutboxE2EAppHost\BareWire.OutboxE2EAppHost.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Outbox.EntityFramework\BareWire.Outbox.EntityFramework.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Outbox\BareWire.Outbox.csproj" />
   </ItemGroup>
 
 </Project>

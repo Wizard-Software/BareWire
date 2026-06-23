@@ -12,6 +12,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="BareWire.UnitTests" />
     <InternalsVisibleTo Include="BareWire.IntegrationTests" />
+    <InternalsVisibleTo Include="BareWire.E2ETests" />
     <InternalsVisibleTo Include="BareWire.Outbox.EntityFramework" />
     <!-- Required for NSubstitute/Castle DynamicProxy to mock internal interfaces in tests -->
     <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />

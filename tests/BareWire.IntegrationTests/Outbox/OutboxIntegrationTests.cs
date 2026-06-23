@@ -44,7 +44,11 @@ public sealed class EfCoreOutboxStoreTests : IAsyncLifetime
         _dbContext = new OutboxDbContext(options);
         await _dbContext.Database.EnsureCreatedAsync();
 
-        _store = new EfCoreOutboxStore(_dbContext);
+        _store = new EfCoreOutboxStore(
+            _dbContext,
+            new OutboxInstanceId("test-instance"),
+            new PostgresOutboxSqlDialect(),
+            new OutboxOptions());
     }
 
     public async ValueTask DisposeAsync()
@@ -532,7 +536,11 @@ public sealed class TransactionalOutboxMiddlewareTests : IAsyncLifetime
 
     private void RebuildComponents()
     {
-        _outboxStore = new EfCoreOutboxStore(_dbContext);
+        _outboxStore = new EfCoreOutboxStore(
+            _dbContext,
+            new OutboxInstanceId("test-instance"),
+            new PostgresOutboxSqlDialect(),
+            new OutboxOptions());
         _inboxStore = new EfCoreInboxStore(_dbContext, new PostgresInboxSqlDialect());
 
         var outboxOptions = new OutboxOptions

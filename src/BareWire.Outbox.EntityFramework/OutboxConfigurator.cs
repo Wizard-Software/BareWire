@@ -14,6 +14,7 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     private TimeSpan _inboxRetention = OutboxOptions.Default.InboxRetention;
     private TimeSpan _outboxRetention = OutboxOptions.Default.OutboxRetention;
     private TimeSpan _inboxLockTimeout = OutboxOptions.Default.InboxLockTimeout;
+    private TimeSpan _outboxLockTimeout = OutboxOptions.Default.OutboxLockTimeout;
     private TimeSpan _cleanupInterval = OutboxOptions.Default.CleanupInterval;
     private bool _autoCreateSchema = OutboxOptions.Default.AutoCreateSchema;
 
@@ -53,6 +54,13 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     }
 
     /// <inheritdoc />
+    public TimeSpan OutboxLockTimeout
+    {
+        get => _outboxLockTimeout;
+        set => _outboxLockTimeout = value;
+    }
+
+    /// <inheritdoc />
     public TimeSpan CleanupInterval
     {
         get => _cleanupInterval;
@@ -81,6 +89,7 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
             InboxRetention = _inboxRetention,
             OutboxRetention = _outboxRetention,
             InboxLockTimeout = _inboxLockTimeout,
+            OutboxLockTimeout = _outboxLockTimeout,
             CleanupInterval = _cleanupInterval,
             AutoCreateSchema = _autoCreateSchema,
         };

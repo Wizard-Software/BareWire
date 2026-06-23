@@ -18,6 +18,7 @@ builder.Services.AddBareWireOutbox(
     {
         outbox.PollingInterval = TimeSpan.FromSeconds(1);
         outbox.DispatchBatchSize = 100;
+        outbox.OutboxLockTimeout = TimeSpan.FromSeconds(30); // must be >= 3 x PollingInterval
     });
 ```
 
@@ -64,9 +65,18 @@ The `TransactionalOutboxMiddleware` automatically deduplicates messages on the c
 
 > See: [Inbox Deduplication](inbox.md) for full details on configuration, composite keys, and multi-consumer patterns
 
+## Horizontal Scaling
+
+When you run more than one instance of the dispatcher (multiple pods/processes), each `GetPendingAsync` poll **atomically claims** its batch so two instances never pick the same rows. On PostgreSQL the claim uses `FOR UPDATE SKIP LOCKED`; a claimed row carries a `LockedAt`/`LockedBy` marker and is invisible to other instances until the claim expires.
+
+- **Claim expiry (`OutboxLockTimeout`, default 30s):** if an instance crashes between claiming and publishing, its rows become re-claimable by another instance once `OutboxLockTimeout` elapses — no message is lost. Set it conservatively above your broker's worst-case publish-confirm time; it is validated to be at least `3 × PollingInterval`.
+- **Delivery guarantee:** each row is claimed by exactly one instance per cycle (exactly-once-claim), but end-to-end delivery remains **at-least-once** — keep consumers idempotent (the inbox handles this).
+- **Ordering:** with parallel instances claiming disjoint batches, global send order across instances is **not** guaranteed. If you need ordered delivery, run a single dispatcher instance, or partition by key.
+- **Provider note:** the atomic claim requires PostgreSQL. SQLite is for testing/development only and is not suitable for multi-instance production use. Other providers can supply a custom `IOutboxSqlDialect`.
+
 ## Resilience
 
-If RabbitMQ is unavailable, messages accumulate in the outbox table. The `OutboxDispatcher` retries on each polling interval. Once the broker recovers, all pending messages are dispatched in order.
+If RabbitMQ is unavailable, messages accumulate in the outbox table. The `OutboxDispatcher` retries on each polling interval. Once the broker recovers, the pending backlog is dispatched (oldest first within each instance's claimed batch).
 
 You can inspect pending messages:
 

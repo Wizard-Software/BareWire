@@ -29,10 +29,28 @@ internal sealed class OutboxMessageEntityTypeConfiguration : IEntityTypeConfigur
         builder.Property(m => m.CreatedAt)
             .IsRequired();
 
+        builder.Property(m => m.LockedBy)
+            .HasMaxLength(256);
+
         builder.HasIndex(m => m.MessageId);
 
         builder.HasIndex(m => m.CreatedAt);
 
         builder.HasIndex(m => m.DeliveredAt);
+
+        // Composite index used by the claim query: (DeliveredAt, LockedAt, Id).
+        // Filtered variant for PostgreSQL is configured in OutboxDbContext.OnModelCreating
+        // based on the active provider, since HasFilter uses PG-specific quoting that
+        // breaks the SQLite schema path.
+        builder.HasIndex(m => new { m.DeliveredAt, m.LockedAt, m.Id })
+            .HasDatabaseName("IX_OutboxMessages_Claim");
+
+        // Supports the post-claim SELECT in GetPendingAsync
+        // (WHERE LockedBy = {instanceId} AND DeliveredAt IS NULL ORDER BY Id).
+        // LockedBy is the lead column so each instance reads only its own claimed-undelivered
+        // rows without a heap post-filter on LockedBy. Unfiltered so it is valid on every
+        // provider (SQLite + PostgreSQL).
+        builder.HasIndex(m => new { m.LockedBy, m.DeliveredAt, m.Id })
+            .HasDatabaseName("IX_OutboxMessages_LockedBy");
     }
 }
