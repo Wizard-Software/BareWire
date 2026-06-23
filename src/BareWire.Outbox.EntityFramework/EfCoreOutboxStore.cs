@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Frozen;
 using System.Text.Json;
 using BareWire.Abstractions.Transport;
 using Microsoft.EntityFrameworkCore;
@@ -191,6 +192,35 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 s => s.SetProperty(m => m.DeliveredAt, DateTimeOffset.UtcNow),
                 cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+        IReadOnlyList<long> ids,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+
+        if (ids.Count == 0)
+        {
+            return FrozenSet<long>.Empty;
+        }
+
+        // Zero the lock on rows this instance still owns and has not yet delivered, so the next
+        // poll cycle re-claims them immediately. The LockedBy == _instanceId filter ensures an
+        // instance never releases another instance's claim (preserves the B4 no-double-delivery
+        // guarantee); DeliveredAt == null guards against a race with MarkDeliveredAsync.
+        await _dbContext.Set<OutboxMessage>()
+            .Where(m => ids.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .ExecuteUpdateAsync(
+                s => s
+                    .SetProperty(m => m.LockedAt, (DateTimeOffset?)null)
+                    .SetProperty(m => m.LockedBy, (string?)null),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // GetPendingAsync copies each row into a fresh per-cycle pooled buffer, so this store
+        // retains no caller buffers — the dispatcher must return all of them.
+        return FrozenSet<long>.Empty;
     }
 
     public async ValueTask CleanupAsync(

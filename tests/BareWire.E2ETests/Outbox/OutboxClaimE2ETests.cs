@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
@@ -214,6 +215,120 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         finally
         {
             ReturnBuffers(result);
+        }
+    }
+
+    // ── Test #3: Explicit release re-claims immediately (R7.6) ─────────────────
+
+    /// <summary>
+    /// After a nack, <see cref="EfCoreOutboxStore.ReleaseLockAsync"/> must clear the row's lock so a
+    /// different instance re-claims it on the very next poll — without waiting for
+    /// <c>OutboxLockTimeout</c> to expire (R7.6, low-latency retry).
+    /// </summary>
+    [Fact]
+    public async Task ReleaseLockAsync_AfterNack_RowReClaimedNextCycleWithoutWaitingForLockTimeout()
+    {
+        // Arrange — a deliberately large lock timeout so a re-claim can only succeed via the explicit
+        // release, never via lock expiry within the test window.
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreateOptions(lockTimeout: TimeSpan.FromSeconds(30));
+        await SeedPendingRowsAsync(seedContext, count: 1);
+
+        await using OutboxDbContext contextA = CreateDbContext();
+        await using OutboxDbContext contextB = CreateDbContext();
+        EfCoreOutboxStore storeA = CreateStore(contextA, "instance-A", options);
+        EfCoreOutboxStore storeB = CreateStore(contextB, "instance-B", options);
+
+        // Act — instance A claims the row (a dispatch cycle), then releases it after a simulated nack.
+        IReadOnlyList<OutboxEntry> claimed = await storeA.GetPendingAsync(10, CancellationToken.None);
+        claimed.Should().HaveCount(1, "the seeded row must be claimable");
+        long claimedId = claimed[0].Id;
+
+        var stopwatch = Stopwatch.StartNew();
+        IReadOnlySet<long> retained = await storeA.ReleaseLockAsync([claimedId], CancellationToken.None);
+
+        IReadOnlyList<OutboxEntry> reClaimed = Array.Empty<OutboxEntry>();
+        try
+        {
+            // EF Core copies each row into a fresh per-cycle buffer, so it retains none.
+            retained.Should().BeEmpty("EF Core retains no caller buffers");
+
+            // The lock must be cleared in the database.
+            await using (OutboxDbContext verifyContext = CreateDbContext())
+            {
+                OutboxMessage row = await verifyContext.OutboxMessages
+                    .AsNoTracking()
+                    .SingleAsync(m => m.Id == claimedId);
+                row.LockedAt.Should().BeNull("ReleaseLockAsync must zero LockedAt");
+                row.LockedBy.Should().BeNull("ReleaseLockAsync must zero LockedBy");
+                row.DeliveredAt.Should().BeNull("a nacked row must not be marked delivered");
+            }
+
+            // A *different* instance must re-claim the row immediately — far below OutboxLockTimeout.
+            // Without the explicit release, instance B would see instance A's fresh (non-stale) lock
+            // and claim nothing until the 30 s timeout elapsed.
+            reClaimed = await storeB.GetPendingAsync(10, CancellationToken.None);
+            stopwatch.Stop();
+
+            reClaimed.Should().HaveCount(1,
+                "the released row must be re-claimable by another instance on the next poll");
+            reClaimed[0].Id.Should().Be(claimedId);
+            stopwatch.Elapsed.Should().BeLessThan(options.OutboxLockTimeout,
+                "the row is re-claimed via explicit release, not by waiting for OutboxLockTimeout");
+        }
+        finally
+        {
+            ReturnBuffers(claimed);
+            ReturnBuffers(reClaimed);
+        }
+    }
+
+    // ── Test #4: Release respects instance ownership (cross-instance guard) ────
+
+    /// <summary>
+    /// <see cref="EfCoreOutboxStore.ReleaseLockAsync"/> must only release locks owned by the calling
+    /// instance — an attempt to release another instance's claim is a no-op, preserving the B4
+    /// no-double-delivery guarantee.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseLockAsync_ForRowLockedByAnotherInstance_DoesNotReleaseLock()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreateOptions(lockTimeout: TimeSpan.FromSeconds(30));
+        await SeedPendingRowsAsync(seedContext, count: 1);
+
+        await using OutboxDbContext contextA = CreateDbContext();
+        await using OutboxDbContext contextB = CreateDbContext();
+        EfCoreOutboxStore storeA = CreateStore(contextA, "instance-A", options);
+        EfCoreOutboxStore storeB = CreateStore(contextB, "instance-B", options);
+
+        // instance A claims the row.
+        IReadOnlyList<OutboxEntry> claimed = await storeA.GetPendingAsync(10, CancellationToken.None);
+        claimed.Should().HaveCount(1);
+        long claimedId = claimed[0].Id;
+
+        try
+        {
+            // Act — instance B (NOT the owner) attempts to release A's lock.
+            IReadOnlySet<long> retained = await storeB.ReleaseLockAsync([claimedId], CancellationToken.None);
+            retained.Should().BeEmpty();
+
+            // Assert — the lock must remain held by instance A (cross-instance filter rejected B).
+            await using OutboxDbContext verifyContext = CreateDbContext();
+            OutboxMessage row = await verifyContext.OutboxMessages
+                .AsNoTracking()
+                .SingleAsync(m => m.Id == claimedId);
+            row.LockedBy.Should().Be("instance-A", "an instance must not release another instance's lock");
+            row.LockedAt.Should().NotBeNull("the original lock timestamp must be preserved");
+        }
+        finally
+        {
+            ReturnBuffers(claimed);
         }
     }
 }
