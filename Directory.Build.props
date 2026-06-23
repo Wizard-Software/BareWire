@@ -29,6 +29,10 @@
 
   <ItemGroup Condition="$(MSBuildProjectDirectory.Contains('$([System.IO.Path]::DirectorySeparatorChar)src$([System.IO.Path]::DirectorySeparatorChar)'))">
     <None Include="$(MSBuildThisFileDirectory)build/icon.png" Pack="true" PackagePath="\" Visible="false" />
+    <!-- Every packable src/ project MUST ship its own README.md next to the .csproj.
+         PackageReadmeFile (above) packs it, so a missing README.md fails `dotnet pack`
+         with NU5019 at release time (after the tag is pushed; packages are not published).
+         Enforced by PackageReadmeTests in BareWire.ContractTests, which runs in CI before tagging. -->
     <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
