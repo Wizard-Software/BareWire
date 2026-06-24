@@ -155,7 +155,7 @@ internal sealed partial class ReceiveEndpointRunner
         // holds across parallel lanes).
         bool orderingEnabled = _binding.Ordering is not null;
         OrderedDispatchStage? orderedStage = orderingEnabled
-            ? new OrderedDispatchStage(this, creditManager, ResolveLaneCount(), cancellationToken)
+            ? new OrderedDispatchStage(this, creditManager, ResolveLaneCount(), _binding.Ordering!, cancellationToken)
             : null;
 
         // Monotonic arrival sequence — assigned in this single reader, in channel-read order, BEFORE any
@@ -598,10 +598,11 @@ internal sealed partial class ReceiveEndpointRunner
     /// lane owns credit release, message disposal, and the health-check for the messages it runs.
     /// </summary>
     /// <remarks>
-    /// R8.5 scope is the concurrency skeleton + arrival-sequence anchor: the message→lane assignment is an
-    /// interim round-robin over the arrival sequence and does NOT yet hash the ordering key — fixed-lane key
-    /// hashing (so the same key always lands on the same lane, the actual per-key ordering guarantee) is
-    /// R8.6. Lane queues are unbounded here; a separate bounded lane-depth dimension with a no-deadlock
+    /// The message→lane assignment is fixed-lane key hashing (R8.6): the ordering key is resolved in the
+    /// single reader and hashed to one of the fixed lanes via <see cref="OrderingKeyResolver"/>, so the SAME
+    /// key always lands on the SAME lane (the per-key ordering guarantee — ADR-026 §6, P3). Different keys may
+    /// share a lane (partitioned model); keyless messages fall back to round-robin over the arrival sequence.
+    /// Lane queues are still unbounded here; a separate bounded lane-depth dimension with a no-deadlock
     /// invariant is R8.7. Poison/anti-starvation per key is R8.12.
     /// </remarks>
     private sealed class OrderedDispatchStage
@@ -610,16 +611,19 @@ internal sealed partial class ReceiveEndpointRunner
         private readonly CreditManager _creditManager;
         private readonly CancellationToken _cancellationToken;
         private readonly Lane[] _lanes;
+        private readonly IConsumerOrderingConfiguration _ordering;
 
         internal OrderedDispatchStage(
             ReceiveEndpointRunner runner,
             CreditManager creditManager,
             int laneCount,
+            IConsumerOrderingConfiguration ordering,
             CancellationToken cancellationToken)
         {
             _runner = runner;
             _creditManager = creditManager;
             _cancellationToken = cancellationToken;
+            _ordering = ordering;
             _lanes = new Lane[laneCount];
             for (int i = 0; i < laneCount; i++)
             {
@@ -628,15 +632,35 @@ internal sealed partial class ReceiveEndpointRunner
         }
 
         /// <summary>
-        /// Routes a message to its lane and hands off ownership of credit release / disposal to that lane.
-        /// Returns when the item is accepted by the lane channel (not when processing completes) — this is
-        /// what enables cross-key parallelism while keeping per-lane order.
+        /// Routes a message to its fixed lane (R8.6 fixed-lane key hashing) and hands off ownership of
+        /// credit release / disposal to that lane. Returns when the item is accepted by the lane channel
+        /// (not when processing completes) — this is what enables cross-key parallelism while keeping
+        /// per-lane FIFO order.
         /// </summary>
+        /// <remarks>
+        /// The ordering key is resolved from the message headers via <see cref="OrderingKeyResolver.Resolve"/>
+        /// using the configured key source (header name / correlation-id / keyless). The key is then mapped
+        /// to a stable lane index via <see cref="OrderingKeyResolver.ResolveLaneIndex"/>: the same key always
+        /// maps to the same lane (fixed-lane affinity), ensuring that all messages sharing a key are processed
+        /// sequentially by one lane worker.
+        /// <para>
+        /// Keyless messages (no resolved key) fall back to round-robin over the arrival sequence — they are
+        /// distributed across lanes without ordering guarantees, preserving pre-per-key-ordering parallel
+        /// throughput for unkeyed traffic.
+        /// </para>
+        /// <para>
+        /// Lane queues remain unbounded <see cref="System.Threading.Channels.Channel{T}"/> (R8.7 adds bounded
+        /// depth + no-deadlock invariant). Poison-message anti-starvation is R8.12.
+        /// </para>
+        /// </remarks>
         internal async ValueTask EnqueueAsync(InboundMessage message, long arrivalSequence, long bodyLength)
         {
-            // Interim lane assignment (R8.5): round-robin over the arrival sequence. R8.6 replaces this with
-            // fixed-lane key hashing so the SAME key always maps to the SAME lane.
-            int laneIndex = (int)((ulong)arrivalSequence % (ulong)_lanes.Length);
+            // R8.6: resolve the ordering key from headers and map to a FIXED lane.
+            // The same key always maps to the same lane (key→lane affinity), so messages sharing a key
+            // are queued into one lane channel and processed sequentially — preserving per-key FIFO order.
+            // Key value is NOT logged or thrown (SEC S1/S2 discipline — full enforcement R8.8).
+            string? key = OrderingKeyResolver.Resolve(_ordering, message.Headers);
+            int laneIndex = OrderingKeyResolver.ResolveLaneIndex(key, arrivalSequence, _lanes.Length);
             Lane lane = _lanes[laneIndex];
             await lane.Channel.Writer
                 .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken)
