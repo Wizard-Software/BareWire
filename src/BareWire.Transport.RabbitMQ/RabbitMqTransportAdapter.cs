@@ -509,10 +509,11 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     private static string ToRabbitMqExchangeType(BwExchangeType exchangeType) =>
         exchangeType switch
         {
-            BwExchangeType.Direct  => "direct",
-            BwExchangeType.Fanout  => "fanout",
-            BwExchangeType.Topic   => "topic",
-            BwExchangeType.Headers => "headers",
+            BwExchangeType.Direct         => "direct",
+            BwExchangeType.Fanout         => "fanout",
+            BwExchangeType.Topic          => "topic",
+            BwExchangeType.Headers        => "headers",
+            BwExchangeType.ConsistentHash => "x-consistent-hash",
             _ => throw new ArgumentOutOfRangeException(nameof(exchangeType), exchangeType, "Unknown exchange type."),
         };
 

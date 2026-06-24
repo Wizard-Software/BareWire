@@ -58,6 +58,7 @@ namespace BareWire.Abstractions
         Fanout = 1,
         Topic = 2,
         Headers = 3,
+        ConsistentHash = 4,
     }
     public sealed class FlowControlOptions
     {
