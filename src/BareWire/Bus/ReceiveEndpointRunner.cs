@@ -602,8 +602,13 @@ internal sealed partial class ReceiveEndpointRunner
     /// single reader and hashed to one of the fixed lanes via <see cref="OrderingKeyResolver"/>, so the SAME
     /// key always lands on the SAME lane (the per-key ordering guarantee — ADR-026 §6, P3). Different keys may
     /// share a lane (partitioned model); keyless messages fall back to round-robin over the arrival sequence.
-    /// Lane queues are still unbounded here; a separate bounded lane-depth dimension with a no-deadlock
-    /// invariant is R8.7. Poison/anti-starvation per key is R8.12.
+    /// Lane queues are bounded (axis 2 — ADR-026 §7, P2): each lane's channel has a depth of
+    /// <c>ceil(PrefetchCount / laneCount)</c>, minimum 1. Lane workers drain independently of the
+    /// single reader, so a full lane or exhausted credit (axis 1) causes a transient stall of the
+    /// reader — not a deadlock, not permanent isolation loss. This is the accepted trade-off for
+    /// ordering-ON (opt-in, default-OFF). The bound is on message count only, NOT bytes
+    /// (<c>MaxInFlightBytes</c> does not gate intake — ADR-026 §7). Poison/anti-starvation per
+    /// partition is R8.12.
     /// </remarks>
     private sealed class OrderedDispatchStage
     {
@@ -624,10 +629,16 @@ internal sealed partial class ReceiveEndpointRunner
             _creditManager = creditManager;
             _cancellationToken = cancellationToken;
             _ordering = ordering;
+
+            int laneDepth = OrderedDispatchLaneDepth.Resolve(
+                laneCount,
+                runner._binding.PrefetchCount,
+                configuredDepth: null);
+
             _lanes = new Lane[laneCount];
             for (int i = 0; i < laneCount; i++)
             {
-                _lanes[i] = new Lane(this);
+                _lanes[i] = new Lane(this, laneDepth);
             }
         }
 
@@ -649,8 +660,12 @@ internal sealed partial class ReceiveEndpointRunner
         /// throughput for unkeyed traffic.
         /// </para>
         /// <para>
-        /// Lane queues remain unbounded <see cref="System.Threading.Channels.Channel{T}"/> (R8.7 adds bounded
-        /// depth + no-deadlock invariant). Poison-message anti-starvation is R8.12.
+        /// Lane channels are bounded (<c>BoundedChannelFullMode.Wait</c>). When a lane is full the
+        /// single reader stalls on <c>WriteAsync</c> until a lane worker drains the head — backpressure
+        /// that is transient, not a deadlock (workers drain independently of the reader). Under hot-key
+        /// skew this causes a brief cross-lane head-of-line delay for other lanes while the reader is
+        /// blocked writing to the full lane. The bound is on message count only, NOT bytes.
+        /// Poison-message anti-starvation is R8.12.
         /// </para>
         /// </remarks>
         internal async ValueTask EnqueueAsync(InboundMessage message, long arrivalSequence, long bodyLength)
@@ -688,11 +703,20 @@ internal sealed partial class ReceiveEndpointRunner
             // safe and keeps allocation at O(laneCount), not O(messages) — ADR-003 (no per-message alloc).
             private readonly TerminatorState _terminatorState = new();
 
-            internal Lane(OrderedDispatchStage stage)
+            internal Lane(OrderedDispatchStage stage, int laneDepth)
             {
                 _stage = stage;
-                Channel = System.Threading.Channels.Channel.CreateUnbounded<WorkItem>(
-                    new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+                // BoundedChannelFullMode.Wait is the only correct mode: Drop* modes would lose messages,
+                // breaking per-lane FIFO order and at-least-once delivery. The single reader stalls on
+                // WriteAsync when the lane is full; a lane worker draining the head unblocks the reader
+                // (workers run on Task.Run independently — no deadlock; see OrderedDispatchLaneDepth).
+                Channel = System.Threading.Channels.Channel.CreateBounded<WorkItem>(
+                    new BoundedChannelOptions(laneDepth)
+                    {
+                        FullMode = BoundedChannelFullMode.Wait,
+                        SingleReader = true,
+                        SingleWriter = true,
+                    });
                 Worker = Task.Run(RunAsync);
             }
 

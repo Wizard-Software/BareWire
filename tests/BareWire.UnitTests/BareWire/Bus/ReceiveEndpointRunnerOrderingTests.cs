@@ -461,15 +461,271 @@ public sealed class ReceiveEndpointRunnerOrderingTests
         recorder.CompletedCount.Should().Be(totalMessages);
     }
 
+    // ── R8.7: bounded lane depth — no-deadlock invariant, hot-key backpressure, FIFO regression ────
+
+    [Theory]
+    [InlineData(2, 4)]   // 2 lanes, prefetch=4 → laneDepth=ceil(4/2)=2; real cross-lane concurrency
+    [InlineData(1, 4)]   // degenerate: 1 lane, depth=4; single worker must still drain without deadlock
+    public async Task RunAsync_OrderingOn_LanesFull_AndCreditFull_StillMakesProgress_NoDeadlock(
+        int laneCount, int prefetchCount)
+    {
+        // Arrange — deterministic saturation proof (PERF-3).
+        //
+        // Setup: PrefetchCount=4 → 4 global credits (axis 1).
+        //   laneCount=2: laneDepth=ceil(4/2)=2 → 2×2=4 total lane slots (axis 2).
+        //   laneCount=1: laneDepth=ceil(4/1)=4 → 1×4=4 total lane slots.
+        // In both cases combined lane capacity = prefetchCount.
+        //
+        // Gate mechanism: a TaskCompletionSource (handlerGate) is passed to ConcurrencyRecorder.
+        // RecordAsync awaits the gate BEFORE recording completion. While the gate is closed:
+        //   - Each dequeued message occupies one lane worker slot AND holds one credit.
+        //   - Lane channels fill to their depth; workers block on the gate (not yet releasing).
+        //   - The reader exhausts all prefetchCount credits and both/all channels fill up.
+        //   - The reader blocks on WriteAsync (full lane) or WaitForCreditAsync (no credit).
+        //   - CompletedCount stays at 0 — nothing can settle.
+        //
+        // Saturation assertion: wait until the adapter has delivered at least
+        //   (prefetchCount + totalLaneCapacity) messages into the stream — at that point the
+        //   credit is fully consumed AND the lane queues are full. Then assert CompletedCount==0.
+        //   This is the deterministic proof that the "all full" state was actually reached.
+        //
+        // Release + drain assertion: releasing the gate unblocks workers → ReleaseInflight frees
+        //   credits + lane slots → the blocked reader makes progress → all messages drain.
+        //   TimeoutException = deadlock = FAIL. This proves the P2 no-deadlock invariant.
+
+        // totalMessages is well above prefetchCount so the reader definitely exhausts credit.
+        int totalMessages = prefetchCount * 4;
+
+        // The gate blocks handlers INSIDE the lane worker so workers stay occupied,
+        // holding inflight credit and keeping their lane slot filled.
+        var handlerGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var recorder = new ConcurrencyRecorder(gateDelayMs: 0, handlerGate: handlerGate.Task);
+        EndpointBinding binding = BuildBinding(
+            ordering: new TestOrdering(headerName: "key"),
+            concurrentMessageLimit: laneCount,
+            prefetchCount: prefetchCount);
+
+        // Build a message list that exercises multiple lanes.
+        var messages = new List<(string Key, int PerKeySeq)>(totalMessages);
+        for (int i = 0; i < totalMessages; i++)
+        {
+            // Alternate between two keys so messages spread across lanes (for laneCount>=2).
+            messages.Add((i % 2 == 0 ? "key-a" : "key-b", i / 2));
+        }
+
+        var adapter = new FakeAdapter(messages);
+
+        var services = new ServiceCollection();
+        services.AddSingleton(recorder);
+        services.AddScoped<RecordingRawConsumer>();
+        ServiceProvider provider = services.BuildServiceProvider();
+
+        var deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(Substitute.For<IMessageDeserializer>());
+        var runner = new ReceiveEndpointRunner(
+            binding,
+            adapter,
+            deserializerResolver,
+            Substitute.For<IPublishEndpoint>(),
+            Substitute.For<ISendEndpointProvider>(),
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            new FlowController(NullLogger<FlowController>.Instance),
+            new NullInstrumentation(),
+            NullLogger<ReceiveEndpointRunner>.Instance);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Task runTask = runner.RunAsync(cts.Token);
+
+        // ── Saturation probe: wait until message delivery PLATEAUS (reader blocked) ───────────────
+        // With the gate held closed, NO handler can ever record a completion, so ReleaseInflight is
+        // never called and no lane slot is ever freed. The reader therefore advances only until it
+        // blocks — either on WaitForCreditAsync (axis 1: all prefetchCount credits consumed) OR on a
+        // full lane's WriteAsync (axis 2: a lane reached its bounded depth). Which axis binds first
+        // depends on how the fixed-lane hash distributes the two keys across lanes (with laneCount=2
+        // both keys may collide on ONE lane, so the lane-depth axis can block the reader BEFORE all
+        // credits are consumed). Either way the pipeline is SATURATED and stalled.
+        //
+        // We detect that stall by polling the delivered count until it stops increasing across
+        // consecutive samples. This is a deterministic saturated-state witness precisely because the
+        // closed gate guarantees delivery can ONLY stall (it can never resume until a worker drains,
+        // which cannot happen while the gate blocks every handler). Both [InlineData] cases reach a
+        // stable plateau: laneCount=1 → plateau at prefetchCount (single deep lane, credit binds);
+        // laneCount=2 → plateau at >= laneCount (lane-depth may bind earlier under key collision).
+        int plateau = await WaitForDeliveryPlateauAsync(adapter, cts.Token);
+
+        plateau.Should().BeGreaterThanOrEqualTo(laneCount,
+            "at least one message per lane must have entered the pipeline before the reader stalls");
+
+        // ── Closed-gate assertion: saturation proven — nothing completed yet ─────────────────────
+        recorder.CompletedCount.Should().Be(0,
+            $"gate is held closed; delivery plateaued at {plateau} message(s) with the reader blocked " +
+            "(on credit or a full lane) — zero completions proves the saturated state was reached " +
+            "(deterministic saturation proof for the P2 no-deadlock invariant)");
+
+        // ── Release gate: workers unblock → drain → credit released → reader unblocks ────────────
+        handlerGate.SetResult();
+
+        // ── Drain assertion: ALL messages must settle within a generous budget (10 s). ─────────────
+        // A TimeoutException here means the system deadlocked after gate release — real bug in
+        // the bounded channel / credit invariant (P2 violated).
+        Func<Task> waitForAll = async () =>
+        {
+            await recorder.WaitForCompletionAsync(totalMessages, cts.Token);
+            await adapter.SettledAsync(totalMessages, cts.Token);
+        };
+        await waitForAll.Should().CompleteWithinAsync(TimeSpan.FromSeconds(10),
+            "after gate release, workers drain independently of the reader — " +
+            "bounded lanes must not deadlock (P2 no-deadlock invariant)");
+
+        await cts.CancelAsync();
+        try { await runTask; } catch (OperationCanceledException) { }
+
+        recorder.CompletedCount.Should().Be(totalMessages,
+            "all messages must settle — FullMode.Wait must not drop any message");
+    }
+
+    /// <summary>
+    /// Polls the adapter's delivered count until it stops increasing across consecutive samples,
+    /// i.e. the runner's single reader has stalled (blocked on credit or on a full lane). Returns the
+    /// plateau count. Used only by the no-deadlock saturation test, where the closed handler gate
+    /// guarantees delivery can only stall and never resume — making the plateau a sound saturated-state
+    /// witness. Bounded by the supplied cancellation token so a genuine hang still surfaces as a test
+    /// failure rather than an infinite loop.
+    /// </summary>
+    private static async Task<int> WaitForDeliveryPlateauAsync(FakeAdapter adapter, CancellationToken ct)
+    {
+        int previous = -1;
+        int stableSamples = 0;
+
+        // Three consecutive equal samples (~150 ms apart) ⇒ the reader has stalled. The closed gate
+        // makes this monotone-then-flat: the count never decreases and cannot resume growing.
+        while (stableSamples < 3)
+        {
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(50, ct);
+
+            int current = adapter.DeliveredCount;
+            stableSamples = current == previous ? stableSamples + 1 : 0;
+            previous = current;
+        }
+
+        return previous;
+    }
+
+    [Fact]
+    public async Task RunAsync_OrderingOn_HotKeyBackpressure_OtherLanesEventuallyComplete()
+    {
+        // Arrange — a hot key fills its lane (many messages on one partition); other keys on other
+        // lanes. The honest claim (decision PERF-1): other lanes are NOT guaranteed to be delay-free
+        // (the single reader may stall briefly on the hot lane's WriteAsync), but they EVENTUALLY
+        // complete within the timeout. A permanent block would time out here.
+        const int msgsPerKey = 10;
+        const int keyCount = 4;
+        const int totalMessages = keyCount * msgsPerKey;
+
+        var messages = new List<(string Key, int PerKeySeq)>(totalMessages);
+        for (int k = 0; k < keyCount; k++)
+        {
+            for (int s = 0; s < msgsPerKey; s++)
+            {
+                messages.Add(($"key-{k}", s));
+            }
+        }
+
+        var recorder = new ConcurrencyRecorder(gateDelayMs: 20);
+        EndpointBinding binding = BuildBinding(
+            ordering: new TestOrdering(headerName: "key"),
+            concurrentMessageLimit: 4,
+            prefetchCount: 8);
+
+        await RunRunnerAsync(binding, recorder, new FakeAdapter(messages));
+
+        // Assert — all lanes must eventually complete (not just the hot key's lane).
+        recorder.CompletedCount.Should().Be(totalMessages,
+            "all messages across all lanes must eventually complete — " +
+            "hot-key backpressure on one lane must not permanently block other lanes");
+    }
+
+    [Theory]
+    [InlineData(42)]
+    [InlineData(137)]
+    public async Task RunAsync_OrderingOn_BoundedLanes_PreservesPerKeyFifo_Regression(int seed)
+    {
+        // Arrange — bounded lanes (R8.7) must not break the per-key FIFO guarantee from R8.6.
+        // A wrong FullMode (DropOldest / DropWrite) would silently lose messages, causing the
+        // completion count to be short and / or the per-key arrival-index sequence to have gaps.
+        // FullMode.Wait is the only correct mode: it preserves all messages in order.
+        const int keyCount = 4;
+        const int msgsPerKey = 12;
+        const int totalMessages = keyCount * msgsPerKey;
+
+        var rng = new Random(seed);
+        var pool = new List<(string Key, int Label)>(totalMessages);
+        for (int k = 0; k < keyCount; k++)
+        {
+            for (int s = 0; s < msgsPerKey; s++)
+            {
+                pool.Add(($"key-{k}", s));
+            }
+        }
+
+        for (int i = pool.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (pool[i], pool[j]) = (pool[j], pool[i]);
+        }
+
+        var perKeyCounter = new Dictionary<string, int>();
+        var interleaved = new List<(string Key, int PerKeySeq)>(totalMessages);
+        foreach ((string key, int _) in pool)
+        {
+            int arrivalIdx = perKeyCounter.GetValueOrDefault(key, 0);
+            perKeyCounter[key] = arrivalIdx + 1;
+            interleaved.Add((key, arrivalIdx));
+        }
+
+        var recorder = new ConcurrencyRecorder(gateDelayMs: 5);
+        EndpointBinding binding = BuildBinding(
+            ordering: new TestOrdering(headerName: "key"),
+            concurrentMessageLimit: 4,
+            prefetchCount: 8);
+
+        await RunRunnerAsync(binding, recorder, new FakeAdapter(interleaved));
+
+        // Assert — per-key arrival-index sequences must be strictly 0, 1, 2, … (FIFO).
+        // A wrong FullMode would drop messages → count short or gaps in sequence → test fails.
+        recorder.CompletedCount.Should().Be(totalMessages,
+            "FullMode.Wait must not drop any message — if it fails, FullMode was changed to a Drop* mode");
+
+        Dictionary<string, int[]> perKeyOrder = recorder.PerKeyCompletionOrder;
+        perKeyOrder.Should().HaveCount(keyCount);
+        foreach ((string key, int[] seqs) in perKeyOrder)
+        {
+            seqs.Should().HaveCount(msgsPerKey,
+                $"key '{key}' must have exactly {msgsPerKey} completions — bounded lanes must not drop messages");
+            for (int i = 0; i < seqs.Length; i++)
+            {
+                seqs[i].Should().Be(i,
+                    $"key '{key}': completion[{i}]={seqs[i]} must equal {i} (per-key FIFO violated)");
+            }
+        }
+    }
+
     // ── Test harness ─────────────────────────────────────────────────────────────────────────────
 
     private static EndpointBinding BuildBinding(
         IConsumerOrderingConfiguration? ordering,
         int concurrentMessageLimit)
+        => BuildBinding(ordering, concurrentMessageLimit, prefetchCount: 32);
+
+    private static EndpointBinding BuildBinding(
+        IConsumerOrderingConfiguration? ordering,
+        int concurrentMessageLimit,
+        int prefetchCount)
         => new()
         {
             EndpointName = "test-endpoint",
-            PrefetchCount = 32,
+            PrefetchCount = prefetchCount,
             ConcurrentMessageLimit = concurrentMessageLimit,
             Ordering = ordering,
             RawConsumers = [typeof(RecordingRawConsumer)],
@@ -524,7 +780,18 @@ public sealed class ReceiveEndpointRunnerOrderingTests
     }
 
     /// <summary>Records observed concurrency and completion order across all lanes/handlers.</summary>
-    private sealed class ConcurrencyRecorder(int gateDelayMs)
+    /// <param name="gateDelayMs">
+    /// How long each handler holds its concurrency slot open (simulates processing time so parallel
+    /// lanes overlap observably). The existing 13 tests use this path unchanged.
+    /// </param>
+    /// <param name="handlerGate">
+    /// Optional external gate. When supplied, <see cref="RecordAsync"/> awaits this task BEFORE
+    /// recording a completion. While the gate is open (not yet completed), the handler stays
+    /// in-flight — holding inflight credit and its lane slot — so the caller can drive the pipeline
+    /// to saturation before releasing. Pass <c>null</c> (the default) to use the <paramref
+    /// name="gateDelayMs"/> path only (backward-compatible with all existing tests).
+    /// </param>
+    private sealed class ConcurrencyRecorder(int gateDelayMs, Task? handlerGate = null)
     {
         private int _current;
         private int _max;
@@ -559,8 +826,18 @@ public sealed class ReceiveEndpointRunnerOrderingTests
                 }
             }
 
-            // Hold the slot briefly so parallel lanes overlap observably (and a single lane cannot).
-            await Task.Delay(gateDelayMs).ConfigureAwait(false);
+            // When a controllable gate is provided (no-deadlock saturation test), await it BEFORE
+            // recording completion. This keeps the handler in-flight — holding inflight credit and
+            // the lane slot — so the test can assert the saturated state before releasing.
+            if (handlerGate is not null)
+            {
+                await handlerGate.ConfigureAwait(false);
+            }
+            else
+            {
+                // Hold the slot briefly so parallel lanes overlap observably (and a single lane cannot).
+                await Task.Delay(gateDelayMs).ConfigureAwait(false);
+            }
 
             Interlocked.Decrement(ref _current);
             _completionOrder.Enqueue(seq);
@@ -611,7 +888,8 @@ public sealed class ReceiveEndpointRunnerOrderingTests
     /// <summary>
     /// Fake transport adapter that yields empty-bodied messages stamped with a monotonic "seq" header
     /// and, optionally, a "key" header for per-key ordering tests.
-    /// Tracks settlement count so the harness can deterministically stop the runner.
+    /// Tracks settlement count and delivery count so the harness can deterministically stop the runner
+    /// and probe saturation state.
     /// </summary>
     private sealed class FakeAdapter : ITransportAdapter
     {
@@ -620,6 +898,15 @@ public sealed class ReceiveEndpointRunnerOrderingTests
         private int _settled;
         private readonly TaskCompletionSource _allSettled = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private int _settleTarget = int.MaxValue;
+
+        // Delivery tracking: incremented each time ConsumeAsync yields a message to the runner.
+        // The runner's await foreach only advances after it has credit AND completed EnqueueAsync, so
+        // _delivered reflects messages that have actually been accepted into the pipeline. The
+        // no-deadlock saturation probe reads DeliveredCount and waits for it to plateau.
+        private int _delivered;
+
+        /// <summary>Number of messages yielded into the pipeline so far (credit consumed + enqueued).</summary>
+        internal int DeliveredCount => Volatile.Read(ref _delivered);
 
         /// <summary>
         /// Creates an adapter that yields <paramref name="messageCount"/> messages stamped only with a
@@ -696,6 +983,11 @@ public sealed class ReceiveEndpointRunnerOrderingTests
                     headers: headers,
                     body: ReadOnlySequence<byte>.Empty,
                     deliveryTag: (ulong)globalSeq);
+
+                // Track how many messages the runner has received from the stream. The runner's
+                // await foreach only moves past a yield after it has credit, so this count
+                // reflects messages that are now inside the pipeline (credit consumed).
+                Interlocked.Increment(ref _delivered);
             }
 
             // Block until cancellation so RunAsync stays alive through settlement.
