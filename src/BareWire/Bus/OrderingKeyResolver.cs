@@ -1,4 +1,5 @@
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Pipeline;
 
 namespace BareWire.Bus;
@@ -47,12 +48,15 @@ namespace BareWire.Bus;
 /// Enforced by the <c>OrderingSecurityTests</c> contract suite.
 /// </para>
 /// <para>
-/// <strong>Typed selector (Selector property) deferred to R8.13:</strong> Fan-out runs on the raw
-/// <see cref="BareWire.Abstractions.Transport.InboundMessage"/> before deserialization; resolving
-/// a CLR-property selector here would require premature deserialization that violates ADR-003
-/// (zero-copy). If <see cref="IConsumerOrderingConfiguration.Selector"/> is set but no
-/// <see cref="IConsumerOrderingConfiguration.HeaderName"/> is configured, R8.6 treats the message
-/// as keyless (round-robin lane assignment) until R8.13 delivers the full key-source chain.
+/// <strong>Typed selector — delivered by <see cref="ResolveTyped"/> (R8.13 seam):</strong> The hot
+/// fan-out path (<c>ReceiveEndpointRunner.EnqueueAsync</c>) runs on the raw
+/// <see cref="BareWire.Abstractions.Transport.InboundMessage"/> BEFORE deserialization and calls
+/// <see cref="Resolve"/> (header / correlation-id only — both readable from raw headers without
+/// deserialization, preserving ADR-003 zero-copy). The typed selector reads a CLR property that
+/// only exists AFTER deserialization, so it is resolved by <see cref="ResolveTyped"/>, a documented
+/// seam with <strong>no runtime caller until R8.15+</strong> (R8.6 keeps the fan-out before
+/// deserialization). Until then, an endpoint configured with only <c>By&lt;TMessage&gt;(selector)</c>
+/// (no header) is treated by <see cref="Resolve"/> as keyless on the fan-out path.
 /// </para>
 /// </remarks>
 internal static class OrderingKeyResolver
@@ -86,13 +90,125 @@ internal static class OrderingKeyResolver
             return headerValue; // may be null if header absent → keyless
         }
 
-        // (b) Typed selector — DEFERRED to R8.13.
-        // Fan-out operates on raw InboundMessage BEFORE deserialization; resolving a CLR-property
-        // selector here requires premature deserialization, violating ADR-003 (zero-copy).
-        // When only a selector is configured (no HeaderName), fall through to keyless in R8.6.
-        // R8.13 delivers the full key-source chain including cross-instance M3 semantics.
+        // (b) Typed selector — resolved by ResolveTyped (R8.13), NOT here.
+        // This method runs on the raw InboundMessage BEFORE deserialization, where the CLR property the
+        // selector reads does not yet exist. Resolving it here would force premature deserialization,
+        // violating ADR-003 (zero-copy). When only a selector is configured (no HeaderName), the fan-out
+        // path treats the message as keyless; the typed selector is delivered by the ResolveTyped seam,
+        // which has no runtime caller until R8.15+ (R8.6 keeps fan-out before deserialization).
 
         // (c) Correlation-id source.
+        if (ordering.UseCorrelationId)
+        {
+            headers.TryGetValue(CorrelationIdHeader, out string? correlationId);
+            return correlationId; // may be null if header absent → keyless
+        }
+
+        // (d) Keyless — no configured key source resolved a value.
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves the ordering key over the full key-source chain INCLUDING the typed selector (R8.13, M3):
+    /// explicit header → typed selector (over the deserialized message) → correlation-id → keyless.
+    /// </summary>
+    /// <param name="ordering">The ordering configuration for the endpoint.</param>
+    /// <param name="selectorAdapter">
+    /// The configuration-time adapter (<c>o =&gt; selector((TMessage)o)</c>) built by
+    /// <see cref="Configuration.ConsumerOrderingConfiguration.By{TMessage}"/> (D2 — no
+    /// <c>DynamicInvoke</c>, <c>object[]</c>, or reflection). <see langword="null"/> when no selector is
+    /// configured. Passed explicitly because the public <see cref="IConsumerOrderingConfiguration"/> view
+    /// does not expose the adapter (D2 — public API unchanged); the caller reads it from the concrete
+    /// internal carrier.
+    /// </param>
+    /// <param name="deserializedMessage">
+    /// The deserialized message instance, or <see langword="null"/> when no deserialized object is
+    /// available (the selector member then falls through to the correlation-id / keyless tail).
+    /// </param>
+    /// <param name="headers">The message headers.</param>
+    /// <returns>
+    /// The resolved key string, or <see langword="null"/> for keyless messages (round-robin lane
+    /// assignment — no ordering guarantee).
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// <strong>Seam — no runtime caller until R8.15+ (D1).</strong> R8.6 hashes lanes on the raw
+    /// <see cref="BareWire.Abstractions.Transport.InboundMessage"/> BEFORE deserialization, so there is no
+    /// post-deserialization execution point to call this method on the dispatch path yet. R8.13 delivers
+    /// the method and its unit tests; runtime wiring (a post-deserialization caller that supplies the
+    /// deserialized message) is R8.15+.
+    /// </para>
+    /// <para>
+    /// <strong>Heterogeneous streams.</strong> When the configured selector's message type
+    /// (<see cref="IConsumerOrderingConfiguration.SelectorMessageType"/>) does not match
+    /// <paramref name="deserializedMessage"/>, or the selector returns <see langword="null"/>, the message
+    /// is keyless — never an exception (documented allowed behaviour).
+    /// </para>
+    /// <para>
+    /// <strong>SEC (S1 — ADR-026 §NIE WOLNO, D3).</strong> The user selector and the stringification of its
+    /// result are the only points where caller code runs; both are wrapped in a single guard. Any throw is
+    /// re-thrown as a key-free <see cref="BareWireException"/> whose message is composed exclusively from the
+    /// constant <see cref="OrderingKeyDiagnostics.SelectorPlaceholder"/> and the message type NAME (safe —
+    /// configuration, not data). The original exception is NOT attached as <c>InnerException</c> — its
+    /// <c>Message</c> / <c>StackTrace</c> could carry the projected key value or message payload.
+    /// </para>
+    /// </remarks>
+    internal static string? ResolveTyped(
+        IConsumerOrderingConfiguration ordering,
+        Func<object, object?>? selectorAdapter,
+        object? deserializedMessage,
+        IReadOnlyDictionary<string, string> headers)
+    {
+        // (a) Header source — explicit header name takes highest precedence (cross-instance-safe, symmetric
+        // to the producer side). Identical to Resolve's (a) — header wins over a configured selector.
+        if (ordering.HeaderName is not null)
+        {
+            headers.TryGetValue(ordering.HeaderName, out string? headerValue);
+            return headerValue; // may be null if header absent → keyless
+        }
+
+        // (b) Typed selector — the active R8.13 member. Requires both an adapter and a deserialized message.
+        if (selectorAdapter is not null && deserializedMessage is not null)
+        {
+            // Heterogeneous stream: if the deserialized message is not an instance of the selector's
+            // message type, treat it as keyless rather than invoking the adapter (which would throw
+            // InvalidCastException on the (TMessage) cast). This is documented, allowed behaviour.
+            if (ordering.SelectorMessageType is { } selectorType
+                && !selectorType.IsInstanceOfType(deserializedMessage))
+            {
+                return null; // keyless — selector does not apply to this message type
+            }
+
+            // SEC GUARD (D3 + V1): both the selector invocation AND value.ToString() run under one
+            // try/catch. A user selector — or a custom ToString() on its result — may throw an exception
+            // whose Message/StackTrace carries the projected key value or message payload (PII). That throw
+            // MUST NOT escape as-is: re-throw a key-free BareWireException with NO inner exception.
+            string? projectedKey;
+            try
+            {
+                object? projected = selectorAdapter(deserializedMessage);
+                projectedKey = projected?.ToString(); // V1: ToString() is INSIDE the guard (may throw PII)
+            }
+            catch (Exception ex)
+            {
+                // Defensive unwrap of TargetInvocationException (the adapter uses no reflection, but a
+                // future caller might). We intentionally do NOT pass the original/unwrapped exception as
+                // innerException — its Message/StackTrace are a PII vector (S1). The key-free message is
+                // built only from the constant selector placeholder and the message type NAME (safe config).
+                _ = ex is System.Reflection.TargetInvocationException { InnerException: not null } ? ex.InnerException : ex;
+                throw new BareWireException(
+                    $"Ordering key selector {OrderingKeyDiagnostics.SelectorPlaceholder} threw while projecting "
+                    + $"the ordering key for message type '{ordering.SelectorMessageType?.Name ?? "<unknown>"}'. "
+                    + "The selector must not throw; the projected value and message payload are intentionally omitted.");
+            }
+
+            return projectedKey; // may be null → keyless (heterogeneous stream)
+        }
+
+        // (c) Correlation-id source. M3: limited to LocalPartitioned semantics — this method returns the
+        // correlation-id value only as a LOCAL key candidate; it never silently promotes it to a transport
+        // routing key. Strategy-level enforcement (no correlation-id fallback under TransportNative
+        // cross-instance) lives in the strategy resolver (R8.11).
         if (ordering.UseCorrelationId)
         {
             headers.TryGetValue(CorrelationIdHeader, out string? correlationId);

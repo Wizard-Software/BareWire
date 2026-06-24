@@ -128,25 +128,28 @@ public sealed class OrderingSecurityTests
     // ── Regression guard: raw key never exposed to a logging surface by the resolver ─────────────
 
     [Fact]
-    public void OrderingKeyResolver_ExposesExactlyOneKeyReturningMember_Resolve()
+    public void OrderingKeyResolver_ExposesExactlyTwoKeyReturningMembers_ResolveAndResolveTyped()
     {
         // The only sanctioned diagnostic representation of a key is OrderingKeyDiagnostics.ToOpaqueToken.
-        // OrderingKeyResolver.Resolve returns the raw key (string?) for the SOLE purpose of immediate
-        // hashing (ResolveLaneIndex consumes it and returns an int lane index). This guard pins the
-        // resolver's string-returning surface to EXACTLY { Resolve } — so a future caller (R8.9–R8.13)
-        // that adds a second string-returning member (a diagnostic key accessor that could be logged
-        // directly) fails this test loudly.
-        MethodInfo[] keyReturningMembers = typeof(OrderingKeyResolver)
+        // OrderingKeyResolver exposes exactly TWO string-returning key members (D4 — R8.13):
+        //   - Resolve      : header / correlation-id chain over the RAW InboundMessage (pre-deserialization).
+        //   - ResolveTyped : full chain incl. the typed selector over a deserialized message (R8.13 seam).
+        // Both return the raw key (string?) for the SOLE purpose of immediate hashing (ResolveLaneIndex
+        // consumes it and returns an int lane index). This guard pins the resolver's string-returning surface
+        // to EXACTLY { Resolve, ResolveTyped } — preserving the original anti-leak intent: a future member
+        // (a THIRD string-returning method, e.g. a diagnostic key accessor that could be logged directly)
+        // fails this test loudly.
+        string[] keyReturningMembers = typeof(OrderingKeyResolver)
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance)
             .Where(m => m.DeclaringType == typeof(OrderingKeyResolver)
                 && m.ReturnType == typeof(string))
+            .Select(m => m.Name)
             .ToArray();
 
-        keyReturningMembers.Should().ContainSingle(
-            "the resolver must expose exactly one key-returning member (Resolve); a second "
-            + "string-returning member would be a PII-leak vector for R8.9–R8.13")
-            .Which.Name.Should().Be(nameof(OrderingKeyResolver.Resolve),
-            "the sole key-returning member is Resolve; the sole diagnostic key representation is "
-            + "OrderingKeyDiagnostics.ToOpaqueToken");
+        keyReturningMembers.Should().BeEquivalentTo(
+            [nameof(OrderingKeyResolver.Resolve), nameof(OrderingKeyResolver.ResolveTyped)],
+            "the resolver must expose EXACTLY the two key-returning members Resolve and ResolveTyped; "
+            + "an unexpected THIRD string-returning member would be a PII-leak vector (S2 — ADR-026 §NIE WOLNO). "
+            + "The sole diagnostic key representation remains OrderingKeyDiagnostics.ToOpaqueToken.");
     }
 }

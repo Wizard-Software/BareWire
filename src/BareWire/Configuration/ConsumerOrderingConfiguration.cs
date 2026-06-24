@@ -26,6 +26,16 @@ internal sealed class ConsumerOrderingConfiguration : IConsumerOrderingConfigura
     /// <summary>Gets the message type the <see cref="Selector"/> reads, when a selector is configured.</summary>
     internal Type? SelectorMessageType { get; private set; }
 
+    /// <summary>
+    /// Gets the typed-selector adapter built at configuration time (R8.13, D2): a closure
+    /// <c>o =&gt; selector((TMessage)o)</c> that lets <see cref="Bus.OrderingKeyResolver.ResolveTyped"/>
+    /// invoke the user selector over a deserialized message WITHOUT <c>DynamicInvoke</c>, an
+    /// <c>object[]</c> argument array, or reflection. Internal-only — never exposed on the public
+    /// <see cref="IConsumerOrderingConfiguration"/> interface, so the public API surface is unchanged
+    /// (no <c>approved.txt</c> regeneration). <see langword="null"/> when no selector is configured.
+    /// </summary>
+    internal Func<object, object?>? SelectorAdapter { get; private set; }
+
     /// <summary>Gets a value indicating whether the correlation-id is used as the ordering key.</summary>
     internal bool UseCorrelationId { get; private set; }
 
@@ -56,6 +66,12 @@ internal sealed class ConsumerOrderingConfiguration : IConsumerOrderingConfigura
         ArgumentNullException.ThrowIfNull(selector);
         Selector = selector;
         SelectorMessageType = typeof(TMessage);
+        // D2 (R8.13): build the typed adapter at configuration time so ResolveTyped invokes the
+        // user selector with no DynamicInvoke / object[] / reflection on the post-deserialization path.
+        // The (TMessage) cast is safe because ResolveTyped only invokes the adapter after confirming the
+        // deserialized message is an instance of SelectorMessageType (heterogeneous streams fall through
+        // to keyless without invoking the adapter).
+        SelectorAdapter = o => selector((TMessage)o);
         return this;
     }
 
