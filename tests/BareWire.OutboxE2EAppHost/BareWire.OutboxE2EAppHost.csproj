@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Aspire.Hosting.PostgreSQL" />
+    <PackageReference Include="Aspire.Hosting.RabbitMQ" />
     <!-- Pin bezpieczeństwa: tranzytywny MessagePack (Aspire) — GHSA-hv8m-jj95-wg3x (NU1903) -->
     <PackageReference Include="MessagePack" />
   </ItemGroup>
