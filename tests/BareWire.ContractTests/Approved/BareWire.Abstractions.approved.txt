@@ -587,6 +587,7 @@ namespace BareWire.Abstractions.Topology
         BareWire.Abstractions.Topology.IQueueConfigurator MessageTtl(System.TimeSpan ttl);
         BareWire.Abstractions.Topology.IQueueConfigurator Overflow(BareWire.Abstractions.Topology.OverflowStrategy strategy);
         BareWire.Abstractions.Topology.IQueueConfigurator SetQueueType(BareWire.Abstractions.Topology.QueueType type);
+        BareWire.Abstractions.Topology.IQueueConfigurator SingleActiveConsumer(bool enabled = true);
     }
     public interface ITopologyConfigurator
     {

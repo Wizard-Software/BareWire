@@ -90,6 +90,13 @@ internal sealed class QueueConfigurator : IQueueConfigurator
     }
 
     /// <inheritdoc />
+    public IQueueConfigurator SingleActiveConsumer(bool enabled = true)
+    {
+        _arguments["x-single-active-consumer"] = enabled;
+        return this;
+    }
+
+    /// <inheritdoc />
     public IQueueConfigurator Argument(string key, object value)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);

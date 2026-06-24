@@ -75,6 +75,20 @@ public interface IQueueConfigurator
     IQueueConfigurator Overflow(OverflowStrategy strategy);
 
     /// <summary>
+    /// Enables single-active-consumer mode on the queue: at most one consumer is active at any time,
+    /// so messages are delivered to a single consumer in order even when multiple consumers are
+    /// attached (competing consumers). The broker promotes a waiting consumer only when the active
+    /// one disconnects. This is the per-key consumer ordering affinity for RabbitMQ — ordered
+    /// delivery with no in-queue parallelism. Maps to <c>x-single-active-consumer</c>.
+    /// </summary>
+    /// <param name="enabled">
+    /// <see langword="true"/> (default) to enable single-active-consumer mode; <see langword="false"/>
+    /// to explicitly declare it disabled.
+    /// </param>
+    /// <returns>The same configurator instance for fluent chaining.</returns>
+    IQueueConfigurator SingleActiveConsumer(bool enabled = true);
+
+    /// <summary>
     /// Sets an arbitrary broker-specific queue argument not covered by convenience methods.
     /// Use for <c>x-expires</c>, <c>x-max-priority</c>, etc.
     /// </summary>
