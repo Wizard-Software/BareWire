@@ -185,6 +185,12 @@ namespace BareWire.Abstractions
 }
 namespace BareWire.Abstractions.Configuration
 {
+    public enum ConsumerOrderingStrategy
+    {
+        Auto = 0,
+        LocalPartitioned = 1,
+        TransportNative = 2,
+    }
     public sealed class ConsumerRegistration : System.IEquatable<BareWire.Abstractions.Configuration.ConsumerRegistration>
     {
         public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType) { }
@@ -217,6 +223,17 @@ namespace BareWire.Abstractions.Configuration
         void UseSerializer<T>()
             where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
     }
+    public interface IConsumerOrderingConfigurator
+    {
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator By<TMessage>(System.Func<TMessage, object?> selector)
+            where TMessage :  class;
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator ByCorrelationId();
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator ByHeader(string headerName);
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator Concurrency(int degree);
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator MaxDeliveryAttempts(int attempts);
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator Strategy(BareWire.Abstractions.Configuration.ConsumerOrderingStrategy strategy);
+        BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator TransportAffinity(BareWire.Abstractions.Configuration.TransportAffinity affinity);
+    }
     public interface IHostConfigurator
     {
         void Password(string password);
@@ -247,6 +264,10 @@ namespace BareWire.Abstractions.Configuration
         void Consumer<TConsumer, TMessage>()
             where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
             where TMessage :  class;
+        void OrderedBy(System.Action<BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator> configure);
+        void OrderedBy<TMessage>(System.Func<TMessage, object?> selector)
+            where TMessage :  class;
+        void OrderedByHeader(string headerName);
         void RawConsumer<T>()
             where T :  class, BareWire.Abstractions.IRawConsumer;
         void StateMachineSaga<TSaga>()
@@ -261,6 +282,12 @@ namespace BareWire.Abstractions.Configuration
         BareWire.Abstractions.Configuration.ITlsConfigurator WithCertificate(string path, string? password = null);
         BareWire.Abstractions.Configuration.ITlsConfigurator WithMutualAuthentication();
         BareWire.Abstractions.Configuration.ITlsConfigurator WithServerValidation(System.Net.Security.SslPolicyErrors acceptablePolicyErrors);
+    }
+    public enum TransportAffinity
+    {
+        None = 0,
+        SingleActiveConsumer = 1,
+        ConsistentHash = 2,
     }
 }
 namespace BareWire.Abstractions.Exceptions

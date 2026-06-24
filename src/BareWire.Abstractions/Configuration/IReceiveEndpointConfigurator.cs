@@ -93,4 +93,58 @@ public interface IReceiveEndpointConfigurator
     /// </summary>
     /// <typeparam name="TDeserializer">The deserializer type to use for this endpoint.</typeparam>
     void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer;
+
+    /// <summary>
+    /// Enables per-key consumer ordering for this endpoint, deriving the ordering key from a typed
+    /// selector over the deserialized message (one-liner form). Opt-in and additive — per-key ordering
+    /// is OFF by default and endpoints without an <c>OrderedBy</c> call are unaffected.
+    /// </summary>
+    /// <typeparam name="TMessage">The message type the selector reads. Must be a reference type.</typeparam>
+    /// <param name="selector">Projects a message to its ordering key; may return <see langword="null"/> for
+    /// messages that should pass through without ordering.</param>
+    /// <remarks>
+    /// Cross-instance caveat (M3): a CLR-property selector is safe across competing consumer instances only
+    /// under <see cref="ConsumerOrderingStrategy.LocalPartitioned"/> or when the selector equals the routing
+    /// key; for cross-instance transport-native ordering, prefer <see cref="OrderedByHeader"/>.
+    /// Security (S1/S2): the projected key value is potential PII and MUST NOT reach any of these sinks —
+    /// (1) <c>BareWireConfigurationException.OptionValue</c>; (2) the exception <c>Message</c> (which embeds
+    /// <c>Supplied value: '{optionValue}'</c>); (3) logs or a per-key metric dimension. Diagnostics refer
+    /// only to the selector placeholder <c>&lt;selector&gt;</c>, the strategy, or the endpoint
+    /// (see <see cref="IConsumerOrderingConfigurator"/> remarks).
+    /// </remarks>
+    void OrderedBy<TMessage>(Func<TMessage, object?> selector) where TMessage : class;
+
+    /// <summary>
+    /// Enables per-key consumer ordering for this endpoint, deriving the ordering key from a message
+    /// header (one-liner form, raw / cross-language). The header name is symmetric to the producer-side
+    /// ordering-key header (ADR-025). Opt-in and additive — per-key ordering is OFF by default.
+    /// </summary>
+    /// <param name="headerName">The header carrying the ordering key.</param>
+    /// <remarks>
+    /// Security (S1/S2): pass only a constant header <em>name</em>; the resolved header <em>value</em> is
+    /// potential PII and MUST NOT reach any of these sinks — (1) <c>BareWireConfigurationException.OptionValue</c>;
+    /// (2) the exception <c>Message</c> (which embeds <c>Supplied value: '{optionValue}'</c>); (3) logs or a
+    /// per-key metric dimension. Diagnostics refer only to the header name, strategy, or endpoint
+    /// (see <see cref="IConsumerOrderingConfigurator"/> remarks).
+    /// </remarks>
+    void OrderedByHeader(string headerName);
+
+    /// <summary>
+    /// Enables per-key consumer ordering for this endpoint using the advanced block form, exposing
+    /// <see cref="IConsumerOrderingConfigurator"/> to tune the key source, strategy, transport affinity,
+    /// cross-key concurrency, and poison policy. Opt-in and additive — per-key ordering is OFF by default.
+    /// </summary>
+    /// <param name="configure">Configures the per-key ordering options.</param>
+    /// <remarks>
+    /// The one-liner <see cref="OrderedBy{TMessage}"/> and the block member
+    /// <see cref="IConsumerOrderingConfigurator.By{TMessage}"/> both take the same
+    /// <c>Func&lt;TMessage, object?&gt;</c>; the verb differs intentionally (one is the feature entry point,
+    /// the other is a block member).
+    /// Security (S1/S2): ordering-key values are potential PII and MUST NOT reach any of these sinks —
+    /// (1) <c>BareWireConfigurationException.OptionValue</c>; (2) the exception <c>Message</c> (which embeds
+    /// <c>Supplied value: '{optionValue}'</c>); (3) logs or a per-key metric dimension. Diagnostics refer
+    /// only to the header name, the selector placeholder <c>&lt;selector&gt;</c>, the strategy, or the
+    /// endpoint (see <see cref="IConsumerOrderingConfigurator"/> remarks).
+    /// </remarks>
+    void OrderedBy(Action<IConsumerOrderingConfigurator> configure);
 }
