@@ -673,7 +673,10 @@ internal sealed partial class ReceiveEndpointRunner
             // R8.6: resolve the ordering key from headers and map to a FIXED lane.
             // The same key always maps to the same lane (key→lane affinity), so messages sharing a key
             // are queued into one lane channel and processed sequentially — preserving per-key FIFO order.
-            // Key value is NOT logged or thrown (SEC S1/S2 discipline — full enforcement R8.8).
+            // Key value is NOT logged or thrown (SEC S1/S2 discipline — ADR-026 §NIE WOLNO).
+            // The raw key never leaves this method except to ResolveLaneIndex (hash); the only
+            // sanctioned diagnostic key representation is OrderingKeyDiagnostics.ToOpaqueToken.
+            // Enforced by OrderingSecurityTests.
             string? key = OrderingKeyResolver.Resolve(_ordering, message.Headers);
             int laneIndex = OrderingKeyResolver.ResolveLaneIndex(key, arrivalSequence, _lanes.Length);
             Lane lane = _lanes[laneIndex];

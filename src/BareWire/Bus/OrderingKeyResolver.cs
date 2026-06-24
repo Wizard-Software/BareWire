@@ -36,9 +36,15 @@ namespace BareWire.Bus;
 /// is a separate concern.
 /// </para>
 /// <para>
-/// <strong>SEC discipline:</strong> Key values are never logged, thrown, or included in
-/// diagnostic strings. The key is hashed immediately in <see cref="ResolveLaneIndex"/> and the
-/// raw string value does not survive past that point (S1/S2 intent — full enforcement in R8.8).
+/// <strong>SEC discipline (S1/S2 — ADR-026 §NIE WOLNO):</strong> Key values are never logged,
+/// thrown, or included in diagnostic strings. The key is hashed immediately in
+/// <see cref="ResolveLaneIndex"/> and the raw string value does not survive past that point.
+/// The only sanctioned diagnostic representation of a key is the opaque correlation token from
+/// <see cref="OrderingKeyDiagnostics.ToOpaqueToken"/> (correlation-only, not a cryptographic
+/// anonymizer); fail-fast ordering-configuration errors are built via
+/// <see cref="OrderingKeyDiagnostics.OrderingConfigError"/>, which forces
+/// <c>OptionValue</c> to <see langword="null"/>. No per-key metric dimension is emitted.
+/// Enforced by the <c>OrderingSecurityTests</c> contract suite.
 /// </para>
 /// <para>
 /// <strong>Typed selector (Selector property) deferred to R8.13:</strong> Fan-out runs on the raw
