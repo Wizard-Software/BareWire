@@ -10,9 +10,10 @@ namespace BareWire.Samples.MultiConsumerPartitioning.Consumers;
 /// <see cref="ProcessingLogEntry"/> to PostgreSQL.
 /// </summary>
 /// <remarks>
-/// Resolved from DI per-message (transient lifetime). PartitionerMiddleware ensures that
-/// all messages sharing the same CorrelationId are processed sequentially, regardless of
-/// ConcurrentMessageLimit, enabling per-correlation ordering guarantees.
+/// Resolved from DI per-message (transient lifetime). Per-endpoint
+/// <c>OrderedByHeader("ordering-key")</c> ensures that all messages sharing the same ordering key
+/// are processed sequentially on a fixed lane, regardless of ConcurrentMessageLimit, enabling
+/// per-correlation ordering guarantees.
 /// </remarks>
 public sealed partial class OrderEventConsumer(
     ILogger<OrderEventConsumer> logger,

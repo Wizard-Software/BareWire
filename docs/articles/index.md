@@ -47,5 +47,5 @@ dotnet run --project samples/BareWire.Samples.AppHost/
 | `TransactionalOutbox` | Exactly-once delivery via transactional outbox with EF Core |
 | `InboxDeduplication` | Inbox deduplication across multiple consumers (Email + Audit) |
 | `ObservabilityShowcase` | 3-hop distributed tracing (order → payment → shipment) with OTel |
-| `MultiConsumerPartitioning` | Per-correlation ordering with 64-partition partitioner |
+| `MultiConsumerPartitioning` | Per-key consumer ordering via per-endpoint `OrderedByHeader("ordering-key")` (fixed-lane) |
 | `MassTransitInterop` | Coexistence of BareWire and MassTransit producers on shared RabbitMQ |

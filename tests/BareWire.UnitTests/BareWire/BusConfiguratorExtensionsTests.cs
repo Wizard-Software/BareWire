@@ -6,6 +6,10 @@ using NSubstitute;
 
 namespace BareWire.UnitTests.BusConfiguratorExtensions;
 
+// AddPartitionerMiddleware is [Obsolete] (R8.14 — superseded by per-endpoint OrderedByHeader/OrderedBy,
+// retained for one coexistence release). These tests still cover the deprecated method during the
+// coexistence period, so CS0618 is suppressed for the whole class.
+#pragma warning disable CS0618 // Type or member is obsolete
 public sealed class BusConfiguratorExtensionsTests
 {
     [Fact]
@@ -82,3 +86,4 @@ public sealed class BusConfiguratorExtensionsTests
         result.Should().BeSameAs(services);
     }
 }
+#pragma warning restore CS0618 // Type or member is obsolete

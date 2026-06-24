@@ -2,6 +2,9 @@ namespace BareWire
 {
     public static class BusConfiguratorExtensions
     {
+        [System.Obsolete("AddPartitionerMiddleware (DI-level) is superseded by per-endpoint consumer orderi" +
+            "ng: IReceiveEndpointConfigurator.OrderedByHeader(\"ordering-key\") or OrderedBy<TM" +
+            "essage>(selector). It will be removed in a future release.")]
         public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddPartitionerMiddleware(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, BareWire.Abstractions.Configuration.IBusConfigurator busConfigurator, int partitionCount, System.Func<BareWire.Abstractions.Pipeline.MessageContext, System.Guid>? keySelector = null) { }
     }
     public static class ServiceCollectionExtensions
