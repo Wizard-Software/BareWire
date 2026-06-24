@@ -83,6 +83,8 @@ public static class ServiceCollectionExtensions
             {
                 EndpointName = e.QueueName,
                 PrefetchCount = e.PrefetchCount,
+                ConcurrentMessageLimit = e.ConcurrentMessageLimit,
+                Ordering = e.Ordering,
                 Consumers = e.ConsumerRegistrations,
                 RawConsumers = e.RawConsumerTypes,
                 SagaTypes = e.SagaTypes,

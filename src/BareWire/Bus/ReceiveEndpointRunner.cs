@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Observability;
@@ -146,6 +147,23 @@ internal sealed partial class ReceiveEndpointRunner
         // in-flight settlements are complete (normal cleanup path post-ConsumeAsync).
         string? consumerChannelId = null;
 
+        // Per-key ordering (ADR-026): OFF by default. When _binding.Ordering is null the pump stays
+        // strictly sequential and the [ThreadStatic] terminator pooling is used unchanged (byte-for-byte
+        // identical to pre-per-key-ordering behavior). When non-null, ConcurrentMessageLimit becomes
+        // load-bearing (C1) and a monotonic arrival sequence is assigned in this single reader before any
+        // fan-out (C2); each lane carries its own TerminatorState (the [ThreadStatic] invariant no longer
+        // holds across parallel lanes).
+        bool orderingEnabled = _binding.Ordering is not null;
+        OrderedDispatchStage? orderedStage = orderingEnabled
+            ? new OrderedDispatchStage(this, creditManager, ResolveLaneCount(), cancellationToken)
+            : null;
+
+        // Monotonic arrival sequence — assigned in this single reader, in channel-read order, BEFORE any
+        // fan-out. This is the only point with guaranteed ordering and is the FIFO anchor the local
+        // partitioned layer (R8.6) builds per-key ordering on. A plain local long is correct because this
+        // loop is the sole writer (single-reader invariant); no Interlocked needed.
+        long arrivalSequence = 0;
+
         try
         {
             await foreach (InboundMessage message in _adapter
@@ -167,128 +185,27 @@ internal sealed partial class ReceiveEndpointRunner
                 long bodyLength = message.Body.Length;
                 creditManager.TrackInflightBytes(bodyLength);
 
+                // Assign the arrival sequence AFTER credit and BEFORE fan-out (ADR-026 §1c). Snapshot it
+                // into a local so the ordered path never closes over the mutating loop variable.
+                long sequence = arrivalSequence++;
+
+                if (orderedStage is not null)
+                {
+                    // Ordered path: fan out to a fixed lane. The lane owns its TerminatorState and runs its
+                    // messages sequentially, so credit release / dispose / health-check happen on the lane
+                    // when the message completes — not here. (R8.5 lane assignment is interim; fixed-lane
+                    // key hashing lands in R8.6.)
+                    await orderedStage.EnqueueAsync(message, sequence, bodyLength).ConfigureAwait(false);
+                    continue;
+                }
+
+                // Sequential path (per-key ordering OFF): unchanged pre-per-key-ordering behavior, using the
+                // [ThreadStatic] terminator pool. Fully awaited before the next message is read.
+                TerminatorState terminatorState = t_terminatorState ??= new TerminatorState();
                 try
                 {
-                    SettlementAction action = SettlementAction.Nack;
-                    string messageType = "unknown";
-                    long startTimestamp = Stopwatch.GetTimestamp();
-                    Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
-
-                    // Activity is started AFTER messageType is resolved to avoid "unknown" leaking
-                    // to streaming exporters before dispatch completes.
-                    Activity? activity = null;
-
-                    try
-                    {
-                        var terminatorState = t_terminatorState ??= new TerminatorState();
-                        terminatorState.Reset(this, cancellationToken);
-                        NextMiddleware terminator = terminatorState.InvokeAsync;
-
-                        // Build MessageContext for the middleware pipeline.
-                        await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
-                        MessageContext context = new(
-                            messageId: msgId,
-                            headers: message.Headers,
-                            rawBody: message.Body,
-                            serviceProvider: scope.ServiceProvider,
-                            endpointName: _binding.EndpointName,
-                            cancellationToken: cancellationToken);
-
-                        // Resolve DI-registered middleware (e.g. TransactionalOutboxMiddleware).
-                        // DI middleware is scoped — must be resolved per-message from the current scope.
-                        // NOTE: TransactionalOutboxMiddleware wraps the entire processing including
-                        // retry, so DI middleware is placed BEFORE the static chain (Retry → DLQ).
-                        // This ensures the ambient TransactionScope from the outbox middleware is
-                        // active during both the initial attempt and any retry attempts.
-                        // Skip GetServices + ToArray when no DI middleware is registered (common case).
-                        IMessageMiddleware[] diMiddlewares = _hasDiMiddleware
-                            ? scope.ServiceProvider.GetServices<IMessageMiddleware>().ToArray()
-                            : [];
-
-                        // Build the full pipeline: DI middleware → static chain (Retry → DLQ) → terminator.
-                        // If no DI middleware is registered (typical case), invoke the static chain directly
-                        // to avoid per-message delegate allocations.
-                        if (diMiddlewares.Length == 0)
-                        {
-                            // Fast path: no DI middleware registered — no intermediate delegate.
-                            await _staticChain.InvokeAsync(context, terminator).ConfigureAwait(false);
-                        }
-                        else
-                        {
-                            // Wrap DI middleware around the static chain in FIFO order
-                            // (first registered = outermost = first to execute).
-                            NextMiddleware pipeline = WrapDiMiddleware(diMiddlewares, _staticChain, terminator);
-                            await pipeline(context).ConfigureAwait(false);
-                        }
-
-                        // Check inbox filter BEFORE "no consumer matched" logic.
-                        // HasItems checks null without triggering lazy dictionary allocation.
-                        bool inboxFiltered = context.HasItems
-                            && context.Items.TryGetValue(
-                                Abstractions.Pipeline.WellKnownItemKeys.InboxFiltered, out object? filtered)
-                            && filtered is true;
-
-                        if (!terminatorState.Dispatched && !inboxFiltered)
-                        {
-                            LogNoConsumerMatched(_binding.EndpointName, message.MessageId);
-                        }
-
-                        action = (terminatorState.Dispatched || inboxFiltered)
-                            ? SettlementAction.Ack
-                            : SettlementAction.Reject;
-                        messageType = terminatorState.MessageType;
-
-                        // Start the activity now that messageType is fully resolved.
-                        activity = _instrumentation.StartConsumeActivity(
-                            messageType, _binding.EndpointName, msgId, message.Headers);
-
-                        // Record successful consume metrics.
-                        if (terminatorState.Dispatched)
-                        {
-                            double durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
-                            _instrumentation.RecordConsume(
-                                _binding.EndpointName, messageType, durationMs, (int)bodyLength);
-                        }
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                    {
-                        action = SettlementAction.Requeue;
-                    }
-                    catch (Exception ex)
-                    {
-                        // Start an error activity if one hasn't been created yet — messageType may
-                        // still be "unknown" here if the exception occurred before dispatch completed.
-                        activity ??= _instrumentation.StartConsumeActivity(
-                            messageType, _binding.EndpointName, msgId, message.Headers);
-                        LogConsumerError(_binding.EndpointName, message.MessageId, ex);
-                        _instrumentation.RecordFailure(
-                            _binding.EndpointName, messageType, ex.GetType().Name);
-                        activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
-                        action = SettlementAction.Nack;
-
-                        if (!_binding.HasDeadLetterExchange)
-                        {
-                            LogMessageLostNoDlx(_binding.EndpointName, message.MessageId);
-                        }
-                    }
-                    finally
-                    {
-                        activity?.Dispose();
-                    }
-
-                    try
-                    {
-                        // Use CancellationToken.None for requeue during cancellation — the requeue
-                        // itself must not be cancelled, otherwise the message is silently lost.
-                        CancellationToken settleCt = action == SettlementAction.Requeue
-                            ? CancellationToken.None
-                            : cancellationToken;
-                        await _adapter.SettleAsync(action, message, settleCt).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
-                    }
+                    await ProcessMessageAsync(message, terminatorState, sequence, bodyLength, cancellationToken)
+                        .ConfigureAwait(false);
                 }
                 finally
                 {
@@ -303,6 +220,7 @@ internal sealed partial class ReceiveEndpointRunner
                     }
                 }
             }
+
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -315,6 +233,17 @@ internal sealed partial class ReceiveEndpointRunner
         }
         finally
         {
+            // Drain in-flight lanes ALWAYS — on normal completion AND on cancellation/fault. CompleteAsync
+            // completes the lane writers, so each lane's reader (which intentionally reads with
+            // CancellationToken.None — see Lane.RunAsync) finishes draining its already-enqueued items
+            // (settling + disposing them) and then exits; Task.WhenAll joins all lane workers. Skipping this
+            // on cancellation would leak laneCount background tasks per endpoint and orphan in-flight
+            // messages (never settled / disposed → pooled-buffer leak).
+            if (orderedStage is not null)
+            {
+                await orderedStage.CompleteAsync().ConfigureAwait(false);
+            }
+
             // Release the consumer channel so the broker can reclaim it.
             // CancellationToken.None is intentional — by the time we get here the original
             // cancellationToken is likely already cancelled (shutdown scenario), but the
@@ -325,6 +254,160 @@ internal sealed partial class ReceiveEndpointRunner
                     .ReleaseConsumerChannelAsync(consumerChannelId, CancellationToken.None)
                     .ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>
+    /// Resolves the number of parallel dispatch lanes for the ordered path. Explicit
+    /// <see cref="Abstractions.Configuration.IConsumerOrderingConfiguration.Concurrency"/> wins; otherwise
+    /// falls back to the endpoint <see cref="EndpointBinding.ConcurrentMessageLimit"/> (C1 — the limit
+    /// becomes load-bearing only on this path). Clamped to at least 1.
+    /// </summary>
+    private int ResolveLaneCount()
+    {
+        int configured = _binding.Ordering?.Concurrency ?? _binding.ConcurrentMessageLimit;
+        return configured < 1 ? 1 : configured;
+    }
+
+    /// <summary>
+    /// Processes and settles a single message through the middleware pipeline using the supplied
+    /// terminator state. Shared by the sequential path (per-key ordering OFF, <see cref="t_terminatorState"/>)
+    /// and the ordered path (per-key ordering ON, per-lane terminator state). The caller owns credit release,
+    /// message disposal, and the health-check; this method owns dispatch, metrics/activity, and settlement.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="arrivalSequence"/> is the monotonic FIFO sequence assigned in the single reader before
+    /// fan-out (ADR-026 §1c / C2). R8.5 propagates it to the dispatch stage; the local partitioned layer
+    /// (R8.6) consumes it to order messages within a lane. It is not surfaced on the public
+    /// <see cref="MessageContext"/> — it is an implementation detail of the local ordering layer.
+    /// </remarks>
+    private async Task ProcessMessageAsync(
+        InboundMessage message,
+        TerminatorState terminatorState,
+        long arrivalSequence,
+        long bodyLength,
+        CancellationToken cancellationToken)
+    {
+        _ = arrivalSequence; // Consumed by the local partitioned ordering layer (R8.6); see remarks.
+
+        SettlementAction action = SettlementAction.Nack;
+        string messageType = "unknown";
+        long startTimestamp = Stopwatch.GetTimestamp();
+        Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
+
+        // Activity is started AFTER messageType is resolved to avoid "unknown" leaking
+        // to streaming exporters before dispatch completes.
+        Activity? activity = null;
+
+        try
+        {
+            terminatorState.Reset(this, cancellationToken);
+            NextMiddleware terminator = terminatorState.InvokeAsync;
+
+            // Build MessageContext for the middleware pipeline.
+            await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
+            MessageContext context = new(
+                messageId: msgId,
+                headers: message.Headers,
+                rawBody: message.Body,
+                serviceProvider: scope.ServiceProvider,
+                endpointName: _binding.EndpointName,
+                cancellationToken: cancellationToken);
+
+            // Resolve DI-registered middleware (e.g. TransactionalOutboxMiddleware).
+            // DI middleware is scoped — must be resolved per-message from the current scope.
+            // NOTE: TransactionalOutboxMiddleware wraps the entire processing including
+            // retry, so DI middleware is placed BEFORE the static chain (Retry → DLQ).
+            // This ensures the ambient TransactionScope from the outbox middleware is
+            // active during both the initial attempt and any retry attempts.
+            // Skip GetServices + ToArray when no DI middleware is registered (common case).
+            IMessageMiddleware[] diMiddlewares = _hasDiMiddleware
+                ? scope.ServiceProvider.GetServices<IMessageMiddleware>().ToArray()
+                : [];
+
+            // Build the full pipeline: DI middleware → static chain (Retry → DLQ) → terminator.
+            // If no DI middleware is registered (typical case), invoke the static chain directly
+            // to avoid per-message delegate allocations.
+            if (diMiddlewares.Length == 0)
+            {
+                // Fast path: no DI middleware registered — no intermediate delegate.
+                await _staticChain.InvokeAsync(context, terminator).ConfigureAwait(false);
+            }
+            else
+            {
+                // Wrap DI middleware around the static chain in FIFO order
+                // (first registered = outermost = first to execute).
+                NextMiddleware pipeline = WrapDiMiddleware(diMiddlewares, _staticChain, terminator);
+                await pipeline(context).ConfigureAwait(false);
+            }
+
+            // Check inbox filter BEFORE "no consumer matched" logic.
+            // HasItems checks null without triggering lazy dictionary allocation.
+            bool inboxFiltered = context.HasItems
+                && context.Items.TryGetValue(
+                    Abstractions.Pipeline.WellKnownItemKeys.InboxFiltered, out object? filtered)
+                && filtered is true;
+
+            if (!terminatorState.Dispatched && !inboxFiltered)
+            {
+                LogNoConsumerMatched(_binding.EndpointName, message.MessageId);
+            }
+
+            action = (terminatorState.Dispatched || inboxFiltered)
+                ? SettlementAction.Ack
+                : SettlementAction.Reject;
+            messageType = terminatorState.MessageType;
+
+            // Start the activity now that messageType is fully resolved.
+            activity = _instrumentation.StartConsumeActivity(
+                messageType, _binding.EndpointName, msgId, message.Headers);
+
+            // Record successful consume metrics.
+            if (terminatorState.Dispatched)
+            {
+                double durationMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+                _instrumentation.RecordConsume(
+                    _binding.EndpointName, messageType, durationMs, (int)bodyLength);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            action = SettlementAction.Requeue;
+        }
+        catch (Exception ex)
+        {
+            // Start an error activity if one hasn't been created yet — messageType may
+            // still be "unknown" here if the exception occurred before dispatch completed.
+            activity ??= _instrumentation.StartConsumeActivity(
+                messageType, _binding.EndpointName, msgId, message.Headers);
+            LogConsumerError(_binding.EndpointName, message.MessageId, ex);
+            _instrumentation.RecordFailure(
+                _binding.EndpointName, messageType, ex.GetType().Name);
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            action = SettlementAction.Nack;
+
+            if (!_binding.HasDeadLetterExchange)
+            {
+                LogMessageLostNoDlx(_binding.EndpointName, message.MessageId);
+            }
+        }
+        finally
+        {
+            activity?.Dispose();
+        }
+
+        try
+        {
+            // Use CancellationToken.None for requeue during cancellation — the requeue
+            // itself must not be cancelled, otherwise the message is silently lost.
+            CancellationToken settleCt = action == SettlementAction.Requeue
+                ? CancellationToken.None
+                : cancellationToken;
+            await _adapter.SettleAsync(action, message, settleCt).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
         }
     }
 
@@ -476,7 +559,10 @@ internal sealed partial class ReceiveEndpointRunner
     }
 
     // Thread-local pooling avoids ~40 B per-message allocation.
-    // Safe because each endpoint has a single-reader consume loop, fully awaited before next message.
+    // Safe on the SEQUENTIAL path (per-key ordering OFF) because that path is a single-reader consume loop
+    // fully awaited before the next message. The ORDERED path (ADR-026) does NOT use this [ThreadStatic] —
+    // parallel lanes would interleave it — and instead gives each lane its own TerminatorState
+    // (see OrderedDispatchStage). The default-OFF invariant keeps this field byte-for-byte unchanged.
     [ThreadStatic]
     private static TerminatorState? t_terminatorState;
 
@@ -500,6 +586,134 @@ internal sealed partial class ReceiveEndpointRunner
         {
             (Dispatched, MessageType) = await _runner.DispatchMessageAsync(ctx, _ct)
                 .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Bounded keyed-concurrency dispatch stage for the per-key ordering ON path (ADR-026 §1 — local layer).
+    /// Holds a fixed set of <c>laneCount</c> lanes (C1: <c>laneCount</c> derives from
+    /// <see cref="ResolveLaneCount"/>); the single reader fans a message out to one lane (this stage), and
+    /// each lane processes its messages strictly sequentially with its OWN terminator state (so the
+    /// <see cref="t_terminatorState"/> single-reader invariant is not violated across parallel lanes). The
+    /// lane owns credit release, message disposal, and the health-check for the messages it runs.
+    /// </summary>
+    /// <remarks>
+    /// R8.5 scope is the concurrency skeleton + arrival-sequence anchor: the message→lane assignment is an
+    /// interim round-robin over the arrival sequence and does NOT yet hash the ordering key — fixed-lane key
+    /// hashing (so the same key always lands on the same lane, the actual per-key ordering guarantee) is
+    /// R8.6. Lane queues are unbounded here; a separate bounded lane-depth dimension with a no-deadlock
+    /// invariant is R8.7. Poison/anti-starvation per key is R8.12.
+    /// </remarks>
+    private sealed class OrderedDispatchStage
+    {
+        private readonly ReceiveEndpointRunner _runner;
+        private readonly CreditManager _creditManager;
+        private readonly CancellationToken _cancellationToken;
+        private readonly Lane[] _lanes;
+
+        internal OrderedDispatchStage(
+            ReceiveEndpointRunner runner,
+            CreditManager creditManager,
+            int laneCount,
+            CancellationToken cancellationToken)
+        {
+            _runner = runner;
+            _creditManager = creditManager;
+            _cancellationToken = cancellationToken;
+            _lanes = new Lane[laneCount];
+            for (int i = 0; i < laneCount; i++)
+            {
+                _lanes[i] = new Lane(this);
+            }
+        }
+
+        /// <summary>
+        /// Routes a message to its lane and hands off ownership of credit release / disposal to that lane.
+        /// Returns when the item is accepted by the lane channel (not when processing completes) — this is
+        /// what enables cross-key parallelism while keeping per-lane order.
+        /// </summary>
+        internal async ValueTask EnqueueAsync(InboundMessage message, long arrivalSequence, long bodyLength)
+        {
+            // Interim lane assignment (R8.5): round-robin over the arrival sequence. R8.6 replaces this with
+            // fixed-lane key hashing so the SAME key always maps to the SAME lane.
+            int laneIndex = (int)((ulong)arrivalSequence % (ulong)_lanes.Length);
+            Lane lane = _lanes[laneIndex];
+            await lane.Channel.Writer
+                .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        /// <summary>Completes all lane channels and awaits in-flight lane drain.</summary>
+        internal async Task CompleteAsync()
+        {
+            foreach (Lane lane in _lanes)
+            {
+                lane.Channel.Writer.Complete();
+            }
+
+            await Task.WhenAll(Array.ConvertAll(_lanes, static l => l.Worker)).ConfigureAwait(false);
+        }
+
+        private readonly record struct WorkItem(InboundMessage Message, long ArrivalSequence, long BodyLength);
+
+        private sealed class Lane
+        {
+            private readonly OrderedDispatchStage _stage;
+
+            // Per-lane terminator state: each lane runs its items sequentially, so one instance per lane is
+            // safe and keeps allocation at O(laneCount), not O(messages) — ADR-003 (no per-message alloc).
+            private readonly TerminatorState _terminatorState = new();
+
+            internal Lane(OrderedDispatchStage stage)
+            {
+                _stage = stage;
+                Channel = System.Threading.Channels.Channel.CreateUnbounded<WorkItem>(
+                    new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+                Worker = Task.Run(RunAsync);
+            }
+
+            internal Channel<WorkItem> Channel { get; }
+
+            internal Task Worker { get; }
+
+            private async Task RunAsync()
+            {
+                ReceiveEndpointRunner runner = _stage._runner;
+                CreditManager creditManager = _stage._creditManager;
+                CancellationToken ct = _stage._cancellationToken;
+
+                try
+                {
+                    await foreach (WorkItem item in Channel.Reader.ReadAllAsync(CancellationToken.None)
+                        .ConfigureAwait(false))
+                    {
+                        try
+                        {
+                            await runner.ProcessMessageAsync(
+                                    item.Message, _terminatorState, item.ArrivalSequence, item.BodyLength, ct)
+                                .ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            creditManager.ReleaseInflight(1, item.BodyLength);
+
+                            item.Message.Dispose();
+
+                            BusStatus healthStatus = runner._flowController.CheckHealth(runner._binding.EndpointName);
+                            if (healthStatus == BusStatus.Degraded)
+                            {
+                                runner.LogFlowControlDegraded(runner._binding.EndpointName);
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // A lane worker must never fault silently — log and let CompleteAsync observe completion.
+                    runner.LogConsumeLoopFaulted(runner._binding.EndpointName, ex);
+                    throw;
+                }
+            }
         }
     }
 

@@ -200,10 +200,12 @@ namespace BareWire.Abstractions.Configuration
     public sealed class EndpointBinding
     {
         public EndpointBinding() { }
+        public int ConcurrentMessageLimit { get; init; }
         public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Configuration.ConsumerRegistration> Consumers { get; init; }
         public System.Type? DeserializerOverrideType { get; init; }
         public required string EndpointName { get; init; }
         public bool HasDeadLetterExchange { get; init; }
+        public BareWire.Abstractions.Configuration.IConsumerOrderingConfiguration? Ordering { get; init; }
         public int PrefetchCount { get; init; }
         public System.Collections.Generic.IReadOnlyList<System.Type> RawConsumers { get; init; }
         public int RetryCount { get; init; }
@@ -222,6 +224,17 @@ namespace BareWire.Abstractions.Configuration
         void UseRabbitMQ(System.Action<BareWire.Abstractions.Configuration.IRabbitMqConfigurator> configure);
         void UseSerializer<T>()
             where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
+    }
+    public interface IConsumerOrderingConfiguration
+    {
+        int? Concurrency { get; }
+        string? HeaderName { get; }
+        int MaxDeliveryAttempts { get; }
+        System.Delegate? Selector { get; }
+        System.Type? SelectorMessageType { get; }
+        BareWire.Abstractions.Configuration.ConsumerOrderingStrategy Strategy { get; }
+        BareWire.Abstractions.Configuration.TransportAffinity TransportAffinity { get; }
+        bool UseCorrelationId { get; }
     }
     public interface IConsumerOrderingConfigurator
     {

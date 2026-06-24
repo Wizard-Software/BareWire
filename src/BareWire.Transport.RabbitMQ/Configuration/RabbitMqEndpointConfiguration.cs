@@ -115,7 +115,13 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     /// carrier (package dependency rule: Transport.RabbitMQ depends on Abstractions only), so the storage
     /// is duplicated minimally here.
     /// </summary>
-    internal sealed class OrderingConfiguration : IConsumerOrderingConfigurator
+    /// <remarks>
+    /// Implements the read-only <see cref="IConsumerOrderingConfiguration"/> (via explicit interface
+    /// implementation) so the transport-agnostic dispatch engine reads the settings from
+    /// <see cref="EndpointBinding.Ordering"/> without downcasting to this package-local type — the carrier
+    /// the engine sees is the shared Abstractions interface, never this concrete class.
+    /// </remarks>
+    internal sealed class OrderingConfiguration : IConsumerOrderingConfigurator, IConsumerOrderingConfiguration
     {
         internal string? HeaderName { get; private set; }
 
@@ -179,5 +185,23 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
             MaxDeliveryAttempts_ = attempts;
             return this;
         }
+
+        // ── IConsumerOrderingConfiguration (read-only view; explicit to avoid name clashes) ──────
+
+        string? IConsumerOrderingConfiguration.HeaderName => HeaderName;
+
+        Delegate? IConsumerOrderingConfiguration.Selector => Selector;
+
+        Type? IConsumerOrderingConfiguration.SelectorMessageType => SelectorMessageType;
+
+        bool IConsumerOrderingConfiguration.UseCorrelationId => UseCorrelationId;
+
+        int? IConsumerOrderingConfiguration.Concurrency => Concurrency_;
+
+        ConsumerOrderingStrategy IConsumerOrderingConfiguration.Strategy => Strategy_;
+
+        Abstractions.Configuration.TransportAffinity IConsumerOrderingConfiguration.TransportAffinity => TransportAffinity_;
+
+        int IConsumerOrderingConfiguration.MaxDeliveryAttempts => MaxDeliveryAttempts_;
     }
 }

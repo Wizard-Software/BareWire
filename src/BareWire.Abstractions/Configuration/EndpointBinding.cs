@@ -13,6 +13,22 @@ public sealed class EndpointBinding
     /// <summary>Gets the prefetch count that maps to <see cref="FlowControlOptions.MaxInFlightMessages"/>.</summary>
     public int PrefetchCount { get; init; } = 16;
 
+    /// <summary>
+    /// Gets the cross-key concurrency cap (number of parallel dispatch lanes) for the local partitioned
+    /// dispatch layer. This becomes load-bearing only when <see cref="Ordering"/> is non-null (per-key
+    /// ordering ON); with per-key ordering OFF the consume pump stays strictly sequential and this value
+    /// has no effect (pre-per-key-ordering behavior is preserved byte-for-byte).
+    /// </summary>
+    public int ConcurrentMessageLimit { get; init; } = 8;
+
+    /// <summary>
+    /// Gets the per-key consumer-ordering configuration for this endpoint, or <see langword="null"/> when
+    /// no <c>OrderedBy</c> call was made (per-key ordering OFF — the default). Exposed as the shared
+    /// read-only <see cref="IConsumerOrderingConfiguration"/> so the transport-agnostic dispatch engine
+    /// reads it without downcasting to a transport-local carrier type.
+    /// </summary>
+    public IConsumerOrderingConfiguration? Ordering { get; init; }
+
     /// <summary>Gets the consumer registrations for this endpoint.</summary>
     public IReadOnlyList<ConsumerRegistration> Consumers { get; init; } = [];
 

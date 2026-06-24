@@ -9,7 +9,13 @@ namespace BareWire.Configuration;
 /// later tasks of the per-key ordering feature). The collected settings are exposed as internal properties
 /// for the dispatch engine to consume.
 /// </summary>
-internal sealed class ConsumerOrderingConfiguration : IConsumerOrderingConfigurator
+/// <remarks>
+/// Implements the read-only <see cref="IConsumerOrderingConfiguration"/> (via explicit interface
+/// implementation, because the read-side property names collide with the write-side fluent method names
+/// such as <see cref="Concurrency(int)"/>) so the transport-agnostic dispatch engine can read the settings
+/// from <see cref="EndpointBinding.Ordering"/> without downcasting to this concrete type.
+/// </remarks>
+internal sealed class ConsumerOrderingConfiguration : IConsumerOrderingConfigurator, IConsumerOrderingConfiguration
 {
     /// <summary>Gets the header name to read the ordering key from, when configured via header.</summary>
     internal string? HeaderName { get; private set; }
@@ -87,4 +93,22 @@ internal sealed class ConsumerOrderingConfiguration : IConsumerOrderingConfigura
         MaxDeliveryAttempts_ = attempts;
         return this;
     }
+
+    // ── IConsumerOrderingConfiguration (read-only view; explicit to avoid name clashes) ──────────
+
+    string? IConsumerOrderingConfiguration.HeaderName => HeaderName;
+
+    Delegate? IConsumerOrderingConfiguration.Selector => Selector;
+
+    Type? IConsumerOrderingConfiguration.SelectorMessageType => SelectorMessageType;
+
+    bool IConsumerOrderingConfiguration.UseCorrelationId => UseCorrelationId;
+
+    int? IConsumerOrderingConfiguration.Concurrency => Concurrency_;
+
+    ConsumerOrderingStrategy IConsumerOrderingConfiguration.Strategy => Strategy_;
+
+    TransportAffinity IConsumerOrderingConfiguration.TransportAffinity => TransportAffinity_;
+
+    int IConsumerOrderingConfiguration.MaxDeliveryAttempts => MaxDeliveryAttempts_;
 }
