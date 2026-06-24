@@ -15,7 +15,7 @@ using BwExchangeType = BareWire.Abstractions.ExchangeType;
 
 namespace BareWire.Transport.RabbitMQ;
 
-internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IAsyncDisposable
+internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IDurableParkSettlement, IAsyncDisposable
 {
     private readonly RabbitMqTransportOptions _options;
     private readonly ILogger<RabbitMqTransportAdapter> _logger;

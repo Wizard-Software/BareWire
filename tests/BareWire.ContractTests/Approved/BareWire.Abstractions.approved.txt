@@ -630,6 +630,12 @@ namespace BareWire.Abstractions.Topology
 }
 namespace BareWire.Abstractions.Transport
 {
+    public sealed class DurableSettlementResult : System.IEquatable<BareWire.Abstractions.Transport.DurableSettlementResult>
+    {
+        public DurableSettlementResult(bool IsDurablyConfirmed, string? FailureReason) { }
+        public string? FailureReason { get; init; }
+        public bool IsDurablyConfirmed { get; init; }
+    }
     public interface INativeMessageScheduler
     {
         System.Threading.Tasks.Task CancelScheduledAsync(BareWire.Abstractions.Transport.ScheduledMessageToken token, System.Threading.CancellationToken cancellationToken = default);
