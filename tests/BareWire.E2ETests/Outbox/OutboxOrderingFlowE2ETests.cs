@@ -175,6 +175,169 @@ public sealed class OutboxOrderingFlowE2ETests : IAsyncLifetime
         }
     }
 
+    // ── E2E-012: Competing consumers — completeness + distribution ────────────
+
+    /// <summary>
+    /// Verifies that N=3 competing consumers sharing ONE RabbitMQ queue collectively receive
+    /// every message published through the PostgreSQL outbox (completeness), and that at least
+    /// 2 of the 3 consumers receive at least one message each (distribution).
+    ///
+    /// <para>
+    /// <b>Mechanism:</b> Three independent in-process <see cref="IHost"/> instances are started,
+    /// each opening its own AMQP connection and subscribing to the same queue
+    /// <c>ordering-multi.consumer</c>. This is the canonical RabbitMQ competing-consumer pattern:
+    /// the broker round-robins deliveries across all connected consumers. Only the first host
+    /// runs the <see cref="OutboxDispatcher"/> to avoid duplicate dispatch; the other two hosts
+    /// are consumer-only.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Order NOT guaranteed:</b> Per-key ordering is explicitly out of scope with competing
+    /// consumers (see ADR-025 transport caveat). The broker delivers messages round-robin, so
+    /// reordering across keys is expected and allowed. This test asserts only:
+    /// <list type="number">
+    ///   <item>Completeness — every (OrderingKey, SequenceNumber) pair is received exactly once
+    ///   (deduplicated to tolerate at-least-once redelivery).</item>
+    ///   <item>Distribution — at least 2 of the 3 consumers received at least one message,
+    ///   proving that work was genuinely distributed and not handled by a single consumer.</item>
+    /// </list>
+    /// Contrast with <see cref="PerKeyOrdering_FullCircuit_ConsumerReceivesInPublishedOrder"/>
+    /// which enforces strict per-key ordering under a single-consumer, PrefetchCount=1 setup.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CompetingConsumers_FullCircuit_AllMessagesReceivedAndWorkDistributed()
+    {
+        // ── Constants ──────────────────────────────────────────────────────────
+        // Different exchange + queue names from the single-consumer test to avoid
+        // RabbitMQ topology clashes (xunit runs tests in the same class sequentially,
+        // but the queues remain on the broker between tests).
+        const string exchange = "ordering-multi.events";
+        const string queue = "ordering-multi.consumer";
+        const string orderingKeyHeader = "x-ordering-key";
+        const string keyA = "multi-key-A";
+        const string keyB = "multi-key-B";
+        const string keyC = "multi-key-C";
+        const int messagesPerKey = 4;   // 3 keys × 4 messages = 12 total
+        const int consumerCount = 3;
+        int expectedTotal = messagesPerKey * 3; // 12
+
+        // (consumerId, OrderingKey, SequenceNumber) — records which consumer handled each message.
+        var received = new ConcurrentQueue<(int ConsumerId, string Key, int Seq)>();
+        int receivedCount = 0;
+        using var allConsumed = new SemaphoreSlim(0);
+
+        // ── Schema ────────────────────────────────────────────────────────────
+        OutboxOptions outboxOptions = BuildPerKeyOptions(orderingKeyHeader);
+
+        await using OutboxDbContext schemaCtx = CreateDbContextWithOrdering(_pgConnectionString!, outboxOptions);
+        await schemaCtx.Database.EnsureCreatedAsync();
+
+        // ── Build 3 competing consumer hosts ──────────────────────────────────
+        // Each host opens its own AMQP connection to the broker and subscribes to the
+        // SAME queue — this is the RabbitMQ competing-consumer pattern. The broker
+        // round-robins deliveries across all connected consumers.
+        //
+        // Only consumerId=0 (the first host) runs the OutboxDispatcher so that exactly
+        // one dispatcher claims and delivers messages. The other two hosts are consumer-only.
+        IHost[] hosts = new IHost[consumerCount];
+
+        for (int i = 0; i < consumerCount; i++)
+        {
+            int consumerId = i;     // capture for closure
+
+            Action<string, int> onReceived = (key, seq) =>
+            {
+                received.Enqueue((consumerId, key, seq));
+                if (Interlocked.Increment(ref receivedCount) >= expectedTotal)
+                {
+                    allConsumed.Release();
+                }
+            };
+
+            bool includeDispatcher = consumerId == 0;
+
+            hosts[i] = BuildCompetingConsumerHost(
+                rabbitMqUri: _rabbitMqConnectionString!,
+                pgConnectionString: _pgConnectionString!,
+                exchange: exchange,
+                queue: queue,
+                orderingKeyHeader: orderingKeyHeader,
+                outboxOptions: outboxOptions,
+                onMessageReceived: onReceived,
+                includeOutboxDispatcher: includeDispatcher);
+        }
+
+        // Start all hosts before seeding so all 3 consumers are registered on the queue
+        // before the dispatcher begins delivering messages.
+        foreach (IHost host in hosts)
+        {
+            await host.StartAsync();
+        }
+
+        try
+        {
+            // ── Seed 12 outbox rows (3 keys × 4 sequence numbers) ────────────
+            await using OutboxDbContext seedCtx = CreateDbContextWithOrdering(_pgConnectionString!, outboxOptions);
+            await SeedThreeKeyOrderedRowsAsync(
+                seedCtx, exchange, orderingKeyHeader, keyA, keyB, keyC, messagesPerKey);
+
+            // ── Wait for all 12 messages to be received (bounded: 30 s) ──────
+            bool consumed = await allConsumed.WaitAsync(TimeSpan.FromSeconds(30));
+
+            // ── Snapshot received items ───────────────────────────────────────
+            var allReceived = received.ToList();
+
+            // ── Assert 1: Completeness — every (key, seq) pair arrived ────────
+            // Deduplicate to tolerate at-least-once redelivery (nack + redeliver edge cases).
+            // NOTE: per-key ORDER is NOT asserted here. Competing consumers round-robin
+            // deliveries, so reordering across consumers is expected and allowed.
+            // This test verifies only completeness + distribution (see ADR-025 caveat).
+            HashSet<(string Key, int Seq)> distinctReceived = allReceived
+                .Select(r => (r.Key, r.Seq))
+                .ToHashSet();
+
+            HashSet<(string Key, int Seq)> expectedSet = [
+                ..Enumerable.Range(0, messagesPerKey).Select(seq => (keyA, seq)),
+                ..Enumerable.Range(0, messagesPerKey).Select(seq => (keyB, seq)),
+                ..Enumerable.Range(0, messagesPerKey).Select(seq => (keyC, seq)),
+            ];
+
+            consumed.Should().BeTrue(
+                $"all {expectedTotal} messages should be received within 30 s; " +
+                $"received so far: {allReceived.Count} (distinct: {distinctReceived.Count}). " +
+                $"Missing: [{string.Join(", ", expectedSet.Except(distinctReceived).Select(p => $"{p.Key}:{p.Seq}"))}]");
+
+            distinctReceived.Should().BeEquivalentTo(
+                expectedSet,
+                $"every (key, seq) pair must be delivered to some consumer; " +
+                $"missing: [{string.Join(", ", expectedSet.Except(distinctReceived).Select(p => $"{p.Key}:{p.Seq}"))}]");
+
+            // ── Assert 2: Distribution — at least 2 consumers received ≥ 1 msg ─
+            // Counts per consumer. With 12 messages spread across 3 consumers the broker
+            // round-robins, so a degenerate single-consumer result (all 12 to one) would
+            // be a configuration bug (all competing consumers not connected).
+            Dictionary<int, int> countByConsumer = allReceived
+                .GroupBy(r => r.ConsumerId)
+                .ToDictionary(g => g.Key, g => g.Select(r => (r.Key, r.Seq)).Distinct().Count());
+
+            int activeConsumers = countByConsumer.Count(kvp => kvp.Value >= 1);
+            activeConsumers.Should().BeGreaterThanOrEqualTo(
+                2,
+                $"at least 2 of the {consumerCount} competing consumers must receive at least 1 message " +
+                $"to prove genuine distribution; per-consumer counts: " +
+                $"[{string.Join(", ", countByConsumer.OrderBy(kvp => kvp.Key).Select(kvp => $"C{kvp.Key}={kvp.Value}"))}]");
+        }
+        finally
+        {
+            foreach (IHost host in hosts)
+            {
+                await host.StopAsync();
+                host.Dispose();
+            }
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private static OutboxOptions BuildPerKeyOptions(string orderingKeyHeader) => new()
@@ -240,6 +403,43 @@ public sealed class OutboxOrderingFlowE2ETests : IAsyncLifetime
                 CreatedAt = now,
                 OrderingKey = keyB,
             });
+        }
+
+        await context.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Seeds rows interleaved across three keys: A0, B0, C0, A1, B1, C1, … so all three keys
+    /// appear in the same claim batch. The sequence number is embedded in the JSON payload so
+    /// the consumer can verify completeness without needing a separate sequence header.
+    /// </summary>
+    private static async Task SeedThreeKeyOrderedRowsAsync(
+        OutboxDbContext context,
+        string exchangeName,
+        string orderingKeyHeader,
+        string keyA,
+        string keyB,
+        string keyC,
+        int countPerKey)
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        string routingKey = string.Empty; // fanout — routing key is ignored
+
+        for (int i = 0; i < countPerKey; i++)
+        {
+            foreach (string key in new[] { keyA, keyB, keyC })
+            {
+                context.OutboxMessages.Add(new OutboxMessage
+                {
+                    MessageId = Guid.NewGuid(),
+                    DestinationAddress = routingKey,
+                    ContentType = "application/json",
+                    Payload = SerializePayload(key, i),
+                    Headers = SerializeHeaders(exchangeName, orderingKeyHeader, key),
+                    CreatedAt = now,
+                    OrderingKey = key,
+                });
+            }
         }
 
         await context.SaveChangesAsync();
@@ -324,6 +524,90 @@ public sealed class OutboxOrderingFlowE2ETests : IAsyncLifetime
                         outbox.OrderingMode = OrderingMode.PerKey;
                         outbox.OrderingKeyHeaderName = orderingKeyHeader;
                     });
+            })
+            .Build();
+    }
+
+    /// <summary>
+    /// Builds a competing-consumer host. Each call produces an independent in-process
+    /// <see cref="IHost"/> with its own DI container and AMQP connection, subscribed to
+    /// <paramref name="queue"/>. Running multiple such hosts against the same queue implements
+    /// the RabbitMQ competing-consumer pattern.
+    ///
+    /// <para>
+    /// When <paramref name="includeOutboxDispatcher"/> is <see langword="true"/>, the host also
+    /// runs the <see cref="OutboxDispatcher"/> background service. At most one host in the pool
+    /// should set this flag to avoid duplicate dispatch.
+    /// </para>
+    /// </summary>
+    private static IHost BuildCompetingConsumerHost(
+        string rabbitMqUri,
+        string pgConnectionString,
+        string exchange,
+        string queue,
+        string orderingKeyHeader,
+        OutboxOptions outboxOptions,
+        Action<string, int> onMessageReceived,
+        bool includeOutboxDispatcher)
+    {
+        return Host.CreateDefaultBuilder()
+            .ConfigureServices(services =>
+            {
+                // JSON serializer (ADR-001 raw-first)
+                services.AddBareWireJsonSerializer();
+
+                // Register the consumer — resolved by DI per message delivery.
+                services.AddTransient(_ => new OrderedEventConsumer(onMessageReceived));
+                services.AddTransient<IConsumer<OrderedEvent>>(sp =>
+                    sp.GetRequiredService<OrderedEventConsumer>());
+
+                // RabbitMQ transport — PrefetchCount=4 so each competing consumer can
+                // pipeline multiple messages. Topology is idempotent: re-declaring the
+                // same durable exchange/queue across multiple hosts is safe in RabbitMQ.
+                Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
+                {
+                    rmq.Host(rabbitMqUri);
+                    rmq.DefaultExchange(exchange);
+
+                    rmq.ConfigureTopology(t =>
+                    {
+                        t.DeclareExchange(exchange, ExchangeType.Fanout, durable: true);
+                        t.DeclareQueue(queue, durable: true);
+                        t.BindExchangeToQueue(exchange, queue, routingKey: "#");
+                    });
+
+                    rmq.ReceiveEndpoint(queue, e =>
+                    {
+                        // PrefetchCount=4 per connection allows each consumer to pipeline
+                        // messages without waiting for acks from other consumers.
+                        // Order is NOT guaranteed here — see ADR-025 transport caveat.
+                        e.PrefetchCount = 4;
+                        e.Consumer<OrderedEventConsumer, OrderedEvent>();
+                    });
+                };
+
+                services.AddBareWireRabbitMq(configureRabbitMq);
+                services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+
+                if (includeOutboxDispatcher)
+                {
+                    // Only the first host runs the OutboxDispatcher to avoid duplicate claim
+                    // races. All three hosts are competing consumers; only one dispatches.
+                    services.AddBareWireOutbox(
+                        configureDbContext: options => options.UseNpgsql(pgConnectionString),
+                        configureOutbox: outbox =>
+                        {
+                            outbox.PollingInterval = outboxOptions.PollingInterval;
+                            outbox.DispatchBatchSize = outboxOptions.DispatchBatchSize;
+                            outbox.OutboxLockTimeout = outboxOptions.OutboxLockTimeout;
+                            outbox.OutboxRetention = outboxOptions.OutboxRetention;
+                            outbox.InboxLockTimeout = outboxOptions.InboxLockTimeout;
+                            outbox.InboxRetention = outboxOptions.InboxRetention;
+                            outbox.AutoCreateSchema = false;
+                            outbox.OrderingMode = OrderingMode.PerKey;
+                            outbox.OrderingKeyHeaderName = orderingKeyHeader;
+                        });
+                }
             })
             .Build();
     }
