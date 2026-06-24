@@ -492,6 +492,79 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// Deep-backlog head-of-line: with 4 rows of a single key, the store must yield them
+    /// strictly one at a time in ascending Id order — each row only becomes claimable after
+    /// its predecessor is delivered. Proves per-key ordering holds across a backlog deeper
+    /// than the 2-row head/tail case (E1), i.e. the full delivery sequence is ordered, not
+    /// just the first pair.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAsync_PerKey_DeepBacklog_DeliversInStrictIdOrder()
+    {
+        // Arrange
+        await using OutboxDbContext seedContext = CreateDbContext();
+        await seedContext.Database.EnsureCreatedAsync();
+
+        OutboxOptions options = CreatePerKeyOptions();
+
+        const int depth = 4;
+        await SeedOrderedRowsAsync(seedContext, orderingKey: "seq-key", count: depth);
+
+        long[] expectedOrder = await seedContext.OutboxMessages
+            .AsNoTracking()
+            .Where(m => m.OrderingKey == "seq-key")
+            .OrderBy(m => m.Id)
+            .Select(m => m.Id)
+            .ToArrayAsync();
+
+        expectedOrder.Should().HaveCount(depth, "the deep backlog must seed exactly {0} rows", depth);
+
+        await using OutboxDbContext claimContext = CreateDbContext();
+        EfCoreOutboxStore store = CreateStore(claimContext, "instance-seq", options);
+
+        // Act + Assert — walk the whole chain; each claim must yield exactly the next-oldest row.
+        var observedOrder = new List<long>(depth);
+        for (int step = 0; step < depth; step++)
+        {
+            IReadOnlyList<OutboxEntry> claimed = await store.GetPendingAsync(10, CancellationToken.None);
+            try
+            {
+                claimed.Should().ContainSingle(
+                    "only the current head of the key is claimable while earlier rows are undelivered (step {0})",
+                    step);
+                claimed[0].OrderingKey.Should().Be("seq-key");
+                observedOrder.Add(claimed[0].Id);
+            }
+            finally
+            {
+                ReturnBuffers(claimed);
+            }
+
+            // Deliver the head so the next-oldest row becomes the new head.
+            await store.MarkDeliveredAsync([observedOrder[step]], CancellationToken.None);
+        }
+
+        // The observed delivery sequence must equal the ascending-Id order — strict per-key ordering.
+        observedOrder.Should().Equal(
+            expectedOrder,
+            "the {0} rows of the key must be delivered strictly in ascending Id order, one at a time",
+            depth);
+
+        // After the backlog is drained, no row of the key remains claimable.
+        IReadOnlyList<OutboxEntry> drained = await store.GetPendingAsync(10, CancellationToken.None);
+        try
+        {
+            drained.Should().NotContain(
+                e => e.OrderingKey == "seq-key",
+                "every row of the key has been delivered — none should remain claimable");
+        }
+        finally
+        {
+            ReturnBuffers(drained);
+        }
+    }
+
     // ── E2: Key-affinity cross-instance (mirror B4 disjoint test) ─────────────
 
     /// <summary>
