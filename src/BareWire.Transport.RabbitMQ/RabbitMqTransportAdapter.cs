@@ -47,7 +47,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     /// signal that lets a consumer detect a re-map of the consistent-hash key space; it is
     /// NOT a security-authenticated or integrity field. Value type: <see cref="long"/>.
     /// </summary>
-    private const string MappingEpochHeaderName = "BW-MappingEpoch";
+    internal const string MappingEpochHeaderName = "BW-MappingEpoch";
 
     public RabbitMqTransportAdapter(
         RabbitMqTransportOptions options,

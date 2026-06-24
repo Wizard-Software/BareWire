@@ -50,7 +50,26 @@ public sealed class EndpointBinding
     /// This value is set by the transport based on declared topology and may not reflect
     /// broker-side configuration made outside the application.
     /// </summary>
-    public bool HasDeadLetterExchange { get; init; }
+    /// <remarks>
+    /// Derived from <see cref="DeadLetterExchange"/>: <see langword="true"/> when
+    /// <see cref="DeadLetterExchange"/> is non-null and non-empty. Kept for backward compatibility.
+    /// </remarks>
+    public bool HasDeadLetterExchange => DeadLetterExchange is { Length: > 0 };
+
+    /// <summary>
+    /// Gets the name of the dead-letter exchange configured on the underlying queue via the
+    /// <c>x-dead-letter-exchange</c> queue argument, or <see langword="null"/> when no DLX is
+    /// configured. Used by the per-key poison contract (R8.12) to route parked messages durably.
+    /// </summary>
+    public string? DeadLetterExchange { get; init; }
+
+    /// <summary>
+    /// Gets the routing key used when publishing to <see cref="DeadLetterExchange"/>, derived from
+    /// the <c>x-dead-letter-routing-key</c> queue argument. When <see langword="null"/>, the
+    /// endpoint name (queue name) is used as the routing key — matching RabbitMQ DLX default
+    /// semantics (the original routing key is preserved when no explicit DLX routing key is set).
+    /// </summary>
+    public string? DeadLetterRoutingKey { get; init; }
 
     /// <summary>Gets the optional per-endpoint serializer type override. Null means use global.</summary>
     public Type? SerializerOverrideType { get; init; }

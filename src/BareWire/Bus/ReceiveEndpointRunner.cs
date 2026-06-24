@@ -201,11 +201,34 @@ internal sealed partial class ReceiveEndpointRunner
 
                 // Sequential path (per-key ordering OFF): unchanged pre-per-key-ordering behavior, using the
                 // [ThreadStatic] terminator pool. Fully awaited before the next message is read.
+                // ProcessMessageAsync now returns SettlementOutcome; settlement is performed here
+                // (same semantics as before — byte-for-byte identical to pre-R8.12 behavior).
                 TerminatorState terminatorState = t_terminatorState ??= new TerminatorState();
                 try
                 {
-                    await ProcessMessageAsync(message, terminatorState, sequence, bodyLength, cancellationToken)
+                    SettlementOutcome outcome = await ProcessMessageAsync(
+                            message, terminatorState, sequence, bodyLength, cancellationToken)
                         .ConfigureAwait(false);
+
+                    // Sequential path: settle immediately (same as pre-R8.12).
+                    // Log message-lost warning when NACKing with no DLX configured
+                    // (same as pre-R8.12: the message will be permanently lost by the broker).
+                    if (outcome.Action == SettlementAction.Nack && !_binding.HasDeadLetterExchange)
+                    {
+                        LogMessageLostNoDlx(_binding.EndpointName, message.MessageId);
+                    }
+
+                    try
+                    {
+                        CancellationToken settleCt = outcome.Action == SettlementAction.Requeue
+                            ? CancellationToken.None
+                            : cancellationToken;
+                        await _adapter.SettleAsync(outcome.Action, message, settleCt).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        LogSettlementError(_binding.EndpointName, message.MessageId, outcome.Action, ex);
+                    }
                 }
                 finally
                 {
@@ -281,7 +304,18 @@ internal sealed partial class ReceiveEndpointRunner
     /// (R8.6) consumes it to order messages within a lane. It is not surfaced on the public
     /// <see cref="MessageContext"/> — it is an implementation detail of the local ordering layer.
     /// </remarks>
-    private async Task ProcessMessageAsync(
+    /// <summary>
+    /// Returns the settlement decision after dispatching. Settlement itself (calling
+    /// <see cref="ITransportAdapter.SettleAsync"/>) is the CALLER's responsibility:
+    /// <list type="bullet">
+    /// <item>Sequential path (ordering OFF): the caller settles immediately after receiving the
+    /// outcome — semantics byte-for-byte identical to pre-R8.12.</item>
+    /// <item>Ordered path (ordering ON): <c>Lane.RunAsync</c> routes the outcome through
+    /// <see cref="PoisonContract.HandleOutcomeAsync"/>, which owns settlement and the
+    /// poison/anti-starvation contract.</item>
+    /// </list>
+    /// </summary>
+    private async ValueTask<SettlementOutcome> ProcessMessageAsync(
         InboundMessage message,
         TerminatorState terminatorState,
         long arrivalSequence,
@@ -385,30 +419,13 @@ internal sealed partial class ReceiveEndpointRunner
                 _binding.EndpointName, messageType, ex.GetType().Name);
             activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             action = SettlementAction.Nack;
-
-            if (!_binding.HasDeadLetterExchange)
-            {
-                LogMessageLostNoDlx(_binding.EndpointName, message.MessageId);
-            }
         }
         finally
         {
             activity?.Dispose();
         }
 
-        try
-        {
-            // Use CancellationToken.None for requeue during cancellation — the requeue
-            // itself must not be cancelled, otherwise the message is silently lost.
-            CancellationToken settleCt = action == SettlementAction.Requeue
-                ? CancellationToken.None
-                : cancellationToken;
-            await _adapter.SettleAsync(action, message, settleCt).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
-        }
+        return new SettlementOutcome(action, messageType);
     }
 
     private async Task<(bool Dispatched, string MessageType)> DispatchMessageAsync(
@@ -566,6 +583,14 @@ internal sealed partial class ReceiveEndpointRunner
     [ThreadStatic]
     private static TerminatorState? t_terminatorState;
 
+    /// <summary>
+    /// The settlement decision returned by <see cref="ProcessMessageAsync"/>. A
+    /// <see langword="readonly record struct"/> (no allocation per-message — ADR-003, PERF-2).
+    /// Settlement (calling <see cref="ITransportAdapter.SettleAsync"/>) is the caller's
+    /// responsibility; this type is the transport of the decision only.
+    /// </summary>
+    private readonly record struct SettlementOutcome(SettlementAction Action, string MessageType);
+
     private sealed class TerminatorState
     {
         private ReceiveEndpointRunner _runner = null!;
@@ -617,6 +642,7 @@ internal sealed partial class ReceiveEndpointRunner
         private readonly CancellationToken _cancellationToken;
         private readonly Lane[] _lanes;
         private readonly IConsumerOrderingConfiguration _ordering;
+        private readonly MappingEpochTracker _epochTracker;
 
         internal OrderedDispatchStage(
             ReceiveEndpointRunner runner,
@@ -640,6 +666,8 @@ internal sealed partial class ReceiveEndpointRunner
             {
                 _lanes[i] = new Lane(this, laneDepth);
             }
+
+            _epochTracker = new MappingEpochTracker(laneCount, runner._binding.EndpointName, runner._logger);
         }
 
         /// <summary>
@@ -667,6 +695,11 @@ internal sealed partial class ReceiveEndpointRunner
         /// blocked writing to the full lane. The bound is on message count only, NOT bytes.
         /// Poison-message anti-starvation is R8.12.
         /// </para>
+        /// <para>
+        /// C4 re-map detection (R8.12): if the message carries a <c>BW-MappingEpoch</c> header, the
+        /// resolved epoch is observed by <see cref="MappingEpochTracker"/> for the target lane. An epoch
+        /// change triggers a Warning log (opaque token only — S2). No header = no detection (D2).
+        /// </para>
         /// </remarks>
         internal async ValueTask EnqueueAsync(InboundMessage message, long arrivalSequence, long bodyLength)
         {
@@ -674,11 +707,23 @@ internal sealed partial class ReceiveEndpointRunner
             // The same key always maps to the same lane (key→lane affinity), so messages sharing a key
             // are queued into one lane channel and processed sequentially — preserving per-key FIFO order.
             // Key value is NOT logged or thrown (SEC S1/S2 discipline — ADR-026 §NIE WOLNO).
-            // The raw key never leaves this method except to ResolveLaneIndex (hash); the only
-            // sanctioned diagnostic key representation is OrderingKeyDiagnostics.ToOpaqueToken.
+            // The raw key never leaves this method except to ResolveLaneIndex (hash) and, on a re-map
+            // change, to MappingEpochTracker.Observe where it is immediately converted to an opaque token.
             // Enforced by OrderingSecurityTests.
             string? key = OrderingKeyResolver.Resolve(_ordering, message.Headers);
             int laneIndex = OrderingKeyResolver.ResolveLaneIndex(key, arrivalSequence, _lanes.Length);
+
+            // C4 (R8.12): observe mapping epoch for the resolved lane — detect consistent-hash re-maps.
+            // Resolving key once here satisfies PERF-2/SEC-dedup: the key lives in ONE place on this
+            // guaranteed-order path and is never stored beyond this call (OpaqueToken on change only).
+            // Non-allocating hot path: TryGetValue on Dictionary<string,string> + long.TryParse(string).
+            // ToOpaqueToken is called only on the cold re-map-change path.
+            if (message.Headers.TryGetValue(MappingEpochTracker.MappingEpochHeaderName, out string? epochStr)
+                && long.TryParse(epochStr, out long epoch))
+            {
+                _epochTracker.Observe(laneIndex, epoch, key);
+            }
+
             Lane lane = _lanes[laneIndex];
             await lane.Channel.Writer
                 .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken)
@@ -698,6 +743,7 @@ internal sealed partial class ReceiveEndpointRunner
 
         private readonly record struct WorkItem(InboundMessage Message, long ArrivalSequence, long BodyLength);
 
+
         private sealed class Lane
         {
             private readonly OrderedDispatchStage _stage;
@@ -706,9 +752,18 @@ internal sealed partial class ReceiveEndpointRunner
             // safe and keeps allocation at O(laneCount), not O(messages) — ADR-003 (no per-message alloc).
             private readonly TerminatorState _terminatorState = new();
 
+            // Per-lane poison contract (R8.12). Allocation is O(laneCount). State is per-head within
+            // this lane — reset when the head MessageId changes or when a non-Nack outcome is received.
+            private readonly PoisonContract _poisonContract;
+
             internal Lane(OrderedDispatchStage stage, int laneDepth)
             {
                 _stage = stage;
+                _poisonContract = new PoisonContract(
+                    stage._runner._binding,
+                    stage._runner._adapter,
+                    stage._runner._logger);
+
                 // BoundedChannelFullMode.Wait is the only correct mode: Drop* modes would lose messages,
                 // breaking per-lane FIFO order and at-least-once delivery. The single reader stalls on
                 // WriteAsync when the lane is full; a lane worker draining the head unblocks the reader
@@ -723,8 +778,7 @@ internal sealed partial class ReceiveEndpointRunner
                 Worker = Task.Run(RunAsync);
             }
 
-            internal Channel<WorkItem> Channel { get; }
-
+            internal System.Threading.Channels.Channel<WorkItem> Channel { get; }
             internal Task Worker { get; }
 
             private async Task RunAsync()
@@ -740,9 +794,40 @@ internal sealed partial class ReceiveEndpointRunner
                     {
                         try
                         {
-                            await runner.ProcessMessageAsync(
+                            SettlementOutcome outcome = await runner.ProcessMessageAsync(
                                     item.Message, _terminatorState, item.ArrivalSequence, item.BodyLength, ct)
                                 .ConfigureAwait(false);
+
+                            // Ordered path: delegate settlement + poison contract to PoisonContract.
+                            // Returns true = advance (release); false = C3 head retained (do not advance).
+                            //
+                            // C3 invariant (ADR-026 §7): the lane MUST NOT advance to the next WorkItem
+                            // until IsDurablyConfirmed == true. When HandleOutcomeAsync returns false
+                            // (all park-retry attempts exhausted without confirmation), the lane loops
+                            // here, retrying HandleOutcomeAsync on the SAME message until either:
+                            //   (a) the park eventually succeeds (IsDurablyConfirmed == true) → advance; or
+                            //   (b) cancellation is requested → the outer loop exits and the lane drains.
+                            //
+                            // Credit is NOT released in the C3 loop — it is released in the outer finally
+                            // only after the loop exits. Broker re-delivery credits are not involved here
+                            // because this is a park-retry loop (not a broker re-delivery cycle). The
+                            // in-flight message is intentionally held: releasing credit prematurely would
+                            // allow the reader to fetch the next message and enqueue it, at which point the
+                            // lane would advance to it — violating the C3 head-of-line ordering guarantee.
+                            bool advance = await _poisonContract.HandleOutcomeAsync(
+                                    outcome.Action, item.Message, runner._adapter, ct)
+                                .ConfigureAwait(false);
+
+                            // C3 loop: park failed — retry on the same head until confirmed or cancelled.
+                            // A small delay prevents hot-spin when the park endpoint is persistently down
+                            // and ParkDurablyAsync completes synchronously (e.g. in-memory test doubles).
+                            while (!advance && !ct.IsCancellationRequested)
+                            {
+                                await Task.Delay(PoisonContract.C3RetryDelay, ct).ConfigureAwait(false);
+                                advance = await _poisonContract.HandleOutcomeAsync(
+                                        outcome.Action, item.Message, runner._adapter, ct)
+                                    .ConfigureAwait(false);
+                            }
                         }
                         finally
                         {

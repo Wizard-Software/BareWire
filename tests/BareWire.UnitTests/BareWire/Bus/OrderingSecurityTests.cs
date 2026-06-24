@@ -1,6 +1,7 @@
 using System.Reflection;
 using AwesomeAssertions;
 using BareWire.Bus;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace BareWire.UnitTests.Core.Bus;
@@ -49,6 +50,79 @@ public sealed class OrderingSecurityTests
 
         token.Should().NotContain(SecretKeyValue,
             "a future gap-log (R8.12) must correlate on the opaque token, never the raw key (S2)");
+    }
+
+    // ── S2: PoisonContract gap-logs use opaque token, never raw key value (R8.12) ──────────────────
+
+    /// <summary>
+    /// Guards that <c>PoisonContract</c>'s <see cref="LoggerMessageAttribute"/>-generated log message
+    /// templates do NOT include structured-log parameter names that could carry raw ordering-key or
+    /// message-body data. The allowed parameter names are: EndpointName, OpaqueToken, FailureCategory,
+    /// MessageId. Any other string parameter name on a gap-log or failed-settle method is a PII-leak vector.
+    /// </summary>
+    [Fact]
+    public void PoisonContract_LoggerMessages_DoNotContainRawKeyOrBodyParameters()
+    {
+        // Collect all [LoggerMessage] attribute instances on PoisonContract.
+        // LoggerMessage attribute stores the Message template as a named argument.
+        var logMethods = typeof(PoisonContract)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .Where(m => m.GetCustomAttribute<LoggerMessageAttribute>() is not null)
+            .ToArray();
+
+        logMethods.Should().NotBeEmpty("PoisonContract must have LoggerMessage-decorated methods");
+
+        // Forbidden parameter name substrings that indicate a raw key, routing key, or body value
+        // could be embedded. The log methods may only carry safe structural parameters.
+        string[] forbiddenSubstrings = ["Key", "Routing", "Header", "Body", "Value"];
+
+        foreach (MethodInfo method in logMethods)
+        {
+            var attr = method.GetCustomAttribute<LoggerMessageAttribute>()!;
+            string template = attr.Message ?? string.Empty;
+
+            foreach (string forbidden in forbiddenSubstrings)
+            {
+                template.Should().NotContain(forbidden,
+                    $"PoisonContract log message on '{method.Name}' must not contain '{forbidden}' — " +
+                    "raw ordering-key and body values are forbidden in log templates (S2 — ADR-026 §NIE WOLNO)");
+            }
+        }
+    }
+
+    // ── S2: MappingEpochTracker re-map log uses opaque token, never raw key value (R8.12 C4) ────────
+
+    /// <summary>
+    /// Guards that <c>MappingEpochTracker</c>'s <see cref="LoggerMessageAttribute"/>-generated log
+    /// message templates do NOT include structured-log parameter names that could carry raw ordering-key
+    /// or message-body data. Mirrors the PoisonContract guard for the C4 re-map detection path.
+    /// </summary>
+    [Fact]
+    public void MappingEpochTracker_LoggerMessages_DoNotContainRawKeyOrBodyParameters()
+    {
+        // Collect all [LoggerMessage] attribute instances on MappingEpochTracker.
+        var logMethods = typeof(MappingEpochTracker)
+            .GetMethods(BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .Where(m => m.GetCustomAttribute<LoggerMessageAttribute>() is not null)
+            .ToArray();
+
+        logMethods.Should().NotBeEmpty("MappingEpochTracker must have LoggerMessage-decorated methods");
+
+        // Forbidden parameter name substrings that indicate a raw key or body value.
+        string[] forbiddenSubstrings = ["Key", "Routing", "Header", "Body", "Value"];
+
+        foreach (MethodInfo method in logMethods)
+        {
+            var attr = method.GetCustomAttribute<LoggerMessageAttribute>()!;
+            string template = attr.Message ?? string.Empty;
+
+            foreach (string forbidden in forbiddenSubstrings)
+            {
+                template.Should().NotContain(forbidden,
+                    $"MappingEpochTracker log message on '{method.Name}' must not contain '{forbidden}' — " +
+                    "raw ordering-key values are forbidden in log templates (S2 — ADR-026 §NIE WOLNO)");
+            }
+        }
     }
 
     // ── Regression guard: raw key never exposed to a logging surface by the resolver ─────────────

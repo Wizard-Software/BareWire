@@ -202,9 +202,11 @@ namespace BareWire.Abstractions.Configuration
         public EndpointBinding() { }
         public int ConcurrentMessageLimit { get; init; }
         public System.Collections.Generic.IReadOnlyList<BareWire.Abstractions.Configuration.ConsumerRegistration> Consumers { get; init; }
+        public string? DeadLetterExchange { get; init; }
+        public string? DeadLetterRoutingKey { get; init; }
         public System.Type? DeserializerOverrideType { get; init; }
         public required string EndpointName { get; init; }
-        public bool HasDeadLetterExchange { get; init; }
+        public bool HasDeadLetterExchange { get; }
         public BareWire.Abstractions.Configuration.IConsumerOrderingConfiguration? Ordering { get; init; }
         public int PrefetchCount { get; init; }
         public System.Collections.Generic.IReadOnlyList<System.Type> RawConsumers { get; init; }
