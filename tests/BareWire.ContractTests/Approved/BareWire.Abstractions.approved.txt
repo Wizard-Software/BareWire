@@ -360,9 +360,16 @@ namespace BareWire.Abstractions.Outbox
         int DispatchBatchSize { get; set; }
         System.TimeSpan InboxLockTimeout { get; set; }
         System.TimeSpan InboxRetention { get; set; }
+        string OrderingKeyHeaderName { get; set; }
+        BareWire.Abstractions.Outbox.OrderingMode OrderingMode { get; set; }
         System.TimeSpan OutboxLockTimeout { get; set; }
         System.TimeSpan OutboxRetention { get; set; }
         System.TimeSpan PollingInterval { get; set; }
+    }
+    public enum OrderingMode
+    {
+        None = 0,
+        PerKey = 1,
     }
 }
 namespace BareWire.Abstractions.Pipeline

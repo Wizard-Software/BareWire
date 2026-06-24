@@ -448,6 +448,38 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
+    // Rule 8b: Outbox.EntityFramework must stay provider-agnostic — no Npgsql
+    // ASSEMBLY reference. PostgreSQL specifics (the FOR UPDATE SKIP LOCKED claim
+    // and the PerKey NOT EXISTS predicate) live only in PostgresOutboxSqlDialect,
+    // which selects the provider by the "Npgsql.EntityFrameworkCore.PostgreSQL"
+    // string literal (ProviderName) — never by referencing an Npgsql type. This
+    // guards against leaking a provider implementation into a general class (R7.7).
+    //
+    // The check is on the assembly-reference graph, NOT NetArchTest's
+    // HaveDependencyOn("Npgsql"): the latter matches the ldstr provider-name string
+    // constant (a false positive on the legitimate provider-agnostic pattern), while
+    // GetReferencedAssemblies sees only real binary dependencies.
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void OutboxEf_ShouldNotReference_NpgsqlAssembly()
+    {
+        var assembly = typeof(BareWire.Outbox.EntityFramework.OutboxDbContext).Assembly;
+
+        var npgsqlReferences = assembly.GetReferencedAssemblies()
+            .Where(a => a.Name is not null
+                && a.Name.StartsWith("Npgsql", StringComparison.OrdinalIgnoreCase))
+            .Select(a => a.Name!)
+            .ToArray();
+
+        npgsqlReferences.Should().BeEmpty(
+            "Outbox.EntityFramework must stay provider-agnostic — PostgreSQL specifics belong only in "
+            + "PostgresOutboxSqlDialect (selected by the ProviderName string), not via an Npgsql binary "
+            + "dependency; found: {0}",
+            string.Join(", ", npgsqlReferences));
+    }
+
+    // -------------------------------------------------------------------------
     // Rule 9: Observability must NOT depend on Core or Transport
     // -------------------------------------------------------------------------
 

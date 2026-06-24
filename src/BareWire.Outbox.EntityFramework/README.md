@@ -112,6 +112,129 @@ CREATE INDEX IF NOT EXISTS "IX_OutboxMessages_LockedBy"
   ON "OutboxMessages" ("LockedBy", "DeliveredAt", "Id");
 ```
 
+## Ordering (PerKey)
+
+By default, outbox rows are dispatched in arbitrary order (`OrderingMode.None`).
+The `OrderingMode.PerKey` mode enforces **head-of-line ordering per key**: within a key group,
+only the oldest undelivered row may be claimed in each polling cycle.
+Rows without a key (`OrderingKey IS NULL`) always pass through in parallel without ordering.
+
+### Configuration
+
+```csharp
+services.AddBareWireOutbox(
+    options => options.UseNpgsql(connectionString),
+    outbox =>
+    {
+        outbox.OrderingMode = OrderingMode.PerKey;
+
+        // REQUIRED when PerKey is active — no implicit default.
+        // Choose a header that is stable per aggregate/stream (e.g. aggregate-id).
+        // Omitting this throws BareWireConfigurationException at startup.
+        outbox.OrderingKeyHeaderName = "aggregate-id";
+    });
+```
+
+`OrderingKeyHeaderName` must be set explicitly — there is no default value.
+At startup, if `OrderingMode` is `PerKey` and `OrderingKeyHeaderName` is null, empty, or
+whitespace, `BareWireConfigurationException` is thrown.
+Keys longer than 256 characters are stored as keyless (`NULL`) — they are never truncated, because
+truncation would silently merge distinct long keys into a single head-of-line group.
+
+### Choosing a key header
+
+`correlation-id` is only an example, not the recommended default.
+It orders correctly **only when it is stable per aggregate** and the same value is set on every
+message in the stream.
+When `correlation-id` is unique per message (the common case for request correlation), each row
+forms its own group: ordering adds no benefit and the `IX_OutboxMessages_Ordering` index grows
+to one entry per row (maximum size and write amplification, zero gain).
+
+### Additive migration for existing databases
+
+When enabling `PerKey` on a database that already has the outbox schema, apply the following
+additive, no-backfill DDL.
+The new `OrderingKey` column is `NULL`-able, so existing rows remain valid (they become keyless /
+passthrough) — no downtime or backfill is required.
+
+```sql
+-- Add the nullable OrderingKey column (existing rows become keyless, no backfill needed):
+ALTER TABLE "OutboxMessages" ADD COLUMN "OrderingKey" varchar(256) NULL;
+
+-- PostgreSQL only — partial index for the NOT EXISTS claim predicate performance:
+CREATE INDEX IF NOT EXISTS "IX_OutboxMessages_Ordering"
+  ON "OutboxMessages" ("OrderingKey", "Id")
+  WHERE "DeliveredAt" IS NULL;
+```
+
+For SQLite (testing/development) no additional index is needed for `PerKey` — the store applies
+a client-side head-of-line filter before the `LIMIT`.
+
+### Per-transport end-to-end condition
+
+The outbox guarantees only **ordered hand-off to the broker per key**.
+End-to-end ordering at the consumer requires **additional transport configuration**:
+
+| Transport | Required configuration |
+|-----------|----------------------|
+| Kafka | Route messages with the same key to the same partition (partition key = ordering key). |
+| SQS FIFO | Set `MessageGroupId` = ordering key. |
+| Azure Service Bus | Use sessions (`SessionId` = ordering key). |
+| Google Pub/Sub | Enable `enable_message_ordering`; set `ordering_key` on each message. |
+| RabbitMQ | Single-active-consumer per queue, or careful requeue policy. |
+
+A transport that does not declare `TransportCapabilities.OrderingKeys` (or the equivalent native
+ordering primitive) will **not** honor end-to-end order even when the outbox emits rows in order.
+
+### Custom SQL dialects and PerKey
+
+If you implement a custom `IOutboxSqlDialect` (e.g. for SQL Server), you must **override the
+5-argument `GetClaimSql` overload** to emit a head-of-line predicate for `PerKey`.
+The default interface implementation delegates to the 4-argument overload (passthrough —
+no ordering), and the outbox logs a startup warning when `PerKey` is active but the dialect
+appears to ignore it (the claim SQL for `PerKey` and `None` are identical).
+
+```csharp
+public sealed class SqlServerOutboxSqlDialect : IOutboxSqlDialect
+{
+    public string ProviderName => "Microsoft.EntityFrameworkCore.SqlServer";
+
+    // 4-arg: used by None mode — bit-identical to pre-PerKey behavior.
+    public FormattableString GetClaimSql(
+        string instanceId, DateTimeOffset now, DateTimeOffset staleCutoff, int batchSize)
+        => /* ... */;
+
+    // 5-arg: MUST be overridden for PerKey head-of-line ordering.
+    public FormattableString GetClaimSql(
+        string instanceId, DateTimeOffset now, DateTimeOffset staleCutoff, int batchSize,
+        BareWire.Abstractions.Outbox.OrderingMode orderingMode)
+        => orderingMode == BareWire.Abstractions.Outbox.OrderingMode.PerKey
+            ? /* head-of-line SQL */
+            : GetClaimSql(instanceId, now, staleCutoff, batchSize);
+}
+```
+
+### SECURITY WARNING — Head-of-line denial of service (SEC-1)
+
+> **MUST read before enabling `PerKey` with untrusted key sources.**
+
+When `OrderingKeyHeaderName` points to a header that an external message producer controls,
+an attacker can send **one permanently undeliverable message** with a chosen key.
+That message becomes the head of its key stream and **permanently stalls all ordered delivery
+for that key**.
+The blocked head is retried on every polling cycle at frequency `1 / PollingInterval`,
+consuming CPU and database write load proportional to the number of blocked keys.
+
+**Recommendation:** Do **not** enable `OrderingMode.PerKey` in production with keys from
+untrusted sources until bounded-retry with park/dead-letter (`MaxDeliveryAttempts`, R7.8)
+is available.
+R7.8 will cap the retry count per head and park permanently stuck rows, bounding the blast
+radius of a head-of-line attack to a configurable number of retries.
+
+Until R7.8 lands, restrict `PerKey` to scenarios where the ordering-key header is set by
+**trusted, internal code** only (e.g. your own domain event publisher, not a message gateway
+that forwards headers from external clients).
+
 ## Custom SQL Dialect
 
 By default, the PostgreSQL dialect (`PostgresOutboxSqlDialect`) uses `FOR UPDATE SKIP LOCKED`.

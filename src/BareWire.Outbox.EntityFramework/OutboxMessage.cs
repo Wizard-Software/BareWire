@@ -32,4 +32,13 @@ internal sealed class OutboxMessage
     /// Maximum length 256 characters.
     /// </summary>
     public string? LockedBy { get; set; }
+
+    /// <summary>
+    /// Optional key that groups related messages for head-of-line ordering within a key stream.
+    /// <see langword="null"/> when the message is keyless (passthrough — no ordering guarantee).
+    /// Promoted from the header named by <c>OutboxOptions.OrderingKeyHeaderName</c> at save time
+    /// only when <c>OrderingMode.PerKey</c> is active.
+    /// Maximum length 256 characters.
+    /// </summary>
+    public string? OrderingKey { get; set; }
 }

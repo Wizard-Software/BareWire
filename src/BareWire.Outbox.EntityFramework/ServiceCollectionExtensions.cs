@@ -1,7 +1,9 @@
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Outbox;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -45,9 +47,6 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configureDbContext);
-
-        // Register the EF Core DbContext.
-        services.AddDbContext<OutboxDbContext>(configureDbContext);
 
         // Generate a stable per-process instance identifier — unique across restarts and hosts.
         // MachineName:PID ensures readability; Guid suffix prevents PID-reuse collisions.
@@ -117,10 +116,33 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton(options);
 
+        // R7.7.7 — When PerKey ordering is active, register a startup checker that warns if the
+        // active dialect does not override the 5-arg GetClaimSql (DIM passthrough silently disables
+        // per-key head-of-line ordering). Registered only when needed — zero overhead for None mode.
+        if (options.OrderingMode == OrderingMode.PerKey)
+        {
+            services.AddHostedService(sp => new OutboxDialectMismatchChecker(
+                sp.GetRequiredService<IOutboxSqlDialect>(),
+                sp.GetRequiredService<ILogger<OutboxDialectMismatchChecker>>()));
+        }
+
         if (options.AutoCreateSchema)
         {
             services.AddHostedService<OutboxSchemaInitializer>();
         }
+
+        // Register the EF Core DbContext together with the ordering model customizer extension.
+        // OutboxModelCustomizerExtension.ApplyServices registers OutboxModelCustomizer into EF
+        // Core's internal service provider, which conditionally adds the partial index
+        // IX_OutboxMessages_Ordering when OrderingMode == PerKey on a PostgreSQL provider.
+        // OutboxOptions is captured in the closure above — no static state, no changes to
+        // OutboxDbContext's constructor (variant B of OQ-1, R7.7 plan §2.9).
+        var customizationExtension = new OutboxModelCustomizerExtension(options);
+        services.AddDbContext<OutboxDbContext>((_, ob) =>
+        {
+            configureDbContext(ob);
+            ((IDbContextOptionsBuilderInfrastructure)ob).AddOrUpdateExtension(customizationExtension);
+        });
 
         return services;
     }
