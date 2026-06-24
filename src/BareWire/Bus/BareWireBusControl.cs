@@ -110,6 +110,19 @@ internal sealed partial class BareWireBusControl : IBusControl
                 endpointResolver = new SingleDeserializerResolver(perEndpointDeserializer);
             }
 
+            // Validate consumer ordering configuration at startup (fail-fast, R8.11).
+            // Throws BareWireConfigurationException when no guaranteed ordering path is declared.
+            // Resolver is validate-only — the returned struct is discarded (OQ2: runner reads
+            // binding.Ordering directly; ResolvedConsumerOrdering is not threaded into the runner).
+            if (binding.Ordering is not null)
+            {
+                ConsumerOrderingStrategyResolver.Resolve(
+                    binding.Ordering,
+                    _adapter.Capabilities,
+                    _adapter.TransportName,
+                    binding.EndpointName);
+            }
+
             var runner = new ReceiveEndpointRunner(
                 binding,
                 _adapter,
