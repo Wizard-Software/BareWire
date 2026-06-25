@@ -216,6 +216,16 @@ public sealed class ReceiveEndpointRunnerOrderingTests
     [InlineData(42)]
     [InlineData(137)]
     [InlineData(999)]
+    // ADR-026 §8 — widened seed space for CI reproducibility (R8.15 strengthening).
+    [InlineData(7)]
+    [InlineData(13)]
+    [InlineData(271)]
+    [InlineData(314)]
+    [InlineData(1618)]
+    [InlineData(2024)]
+    [InlineData(31337)]
+    [InlineData(65535)]
+    [InlineData(99991)]
     public async Task RunAsync_OrderingOn_MultipleLanes_PreservesStrictPerKeyOrder_PropertyTest(int seed)
     {
         // Arrange — random interleave of 6 keys × 20 messages/key, PrefetchCount=32,
@@ -232,6 +242,10 @@ public sealed class ReceiveEndpointRunnerOrderingTests
         //
         // With the R8.5 round-robin interim this test fails: different messages of the same key land on
         // different lanes and run in parallel → completion order scrambled → assertion violated.
+        //
+        // ADR-026 §8 invariant (R8.15 — C2 arrival-sequence capture): 100%, 0 violations across ALL
+        // seeds. A failure here indicates a regression in the non-FIFO SemaphoreSlim defect (R6) or in
+        // the C2 arrival-index capture point of the fixed-lane dispatch stage.
         const int keyCount = 6;
         const int msgsPerKey = 20;
         const int totalMessages = keyCount * msgsPerKey;
@@ -283,8 +297,89 @@ public sealed class ReceiveEndpointRunnerOrderingTests
             for (int i = 0; i < seqs.Length; i++)
             {
                 seqs[i].Should().Be(i,
-                    $"key '{key}': completion[{i}]={seqs[i]} must equal {i} " +
-                    $"(strict per-key FIFO order violated — fixed-lane hashing not active)");
+                    $"seed={seed} key='{key}' completion[{i}]={seqs[i]} must equal {i} — " +
+                    $"strict per-key FIFO order violated (R6 non-FIFO regression / C2 arrival-sequence capture)");
+            }
+        }
+
+        recorder.CompletedCount.Should().Be(totalMessages);
+    }
+
+    // ── R8.15 ADR-026 §8: high-cardinality property test (12 keys × 40 msgs, real cross-lane concurrency C2) ──
+
+    [Theory]
+    [InlineData(17)]
+    [InlineData(503)]
+    [InlineData(7919)]
+    [InlineData(104729)]
+    [InlineData(999983)]
+    [InlineData(1000003)]
+    public async Task RunAsync_OrderingOn_HighCardinality_PreservesStrictPerKeyOrder_PropertyTest(int seed)
+    {
+        // Arrange — random interleave of 12 keys × 40 messages/key (480 total).
+        // PrefetchCount=32 (BuildBinding default), ConcurrentMessageLimit=8 (real cross-lane concurrency).
+        //
+        // Pattern mirrors RunAsync_OrderingOn_MultipleLanes_PreservesStrictPerKeyOrder_PropertyTest:
+        //   1. Build the full pool and Fisher-Yates shuffle with new Random(seed).
+        //   2. Assign per-key arrival indices AFTER shuffling (C2 capture point).
+        //   3. Assert seqs[i] == i for every key (0 violations).
+        //
+        // ADR-026 §8 invariant (R8.15 — C2 arrival-sequence capture): 100%, 0 violations across ALL
+        // seeds under REAL cross-lane concurrency (ConcurrentMessageLimit=8 > 1). A failure here
+        // indicates a regression in the non-FIFO SemaphoreSlim defect (R6) or in the C2 arrival-index
+        // capture point of the fixed-lane dispatch stage.
+        const int keyCount = 12;
+        const int msgsPerKey = 40;
+        const int totalMessages = keyCount * msgsPerKey;
+
+        var rng = new Random(seed);
+
+        // 1. Build pool and Fisher-Yates shuffle.
+        var pool = new List<(string Key, int Label)>(totalMessages);
+        for (int k = 0; k < keyCount; k++)
+        {
+            for (int s = 0; s < msgsPerKey; s++)
+            {
+                pool.Add(($"hc-key-{k}", s));
+            }
+        }
+
+        for (int i = pool.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (pool[i], pool[j]) = (pool[j], pool[i]);
+        }
+
+        // 2. Assign per-key arrival indices in the shuffled order (C2 capture point).
+        var perKeyCounter = new Dictionary<string, int>();
+        var interleaved = new List<(string Key, int PerKeySeq)>(totalMessages);
+        foreach ((string key, int _) in pool)
+        {
+            int arrivalIdx = perKeyCounter.GetValueOrDefault(key, 0);
+            perKeyCounter[key] = arrivalIdx + 1;
+            interleaved.Add((key, arrivalIdx));
+        }
+
+        // ConcurrentMessageLimit=8 > 1: real cross-lane concurrency (C2).
+        var recorder = new ConcurrencyRecorder(gateDelayMs: 5);
+        EndpointBinding binding = BuildBinding(
+            ordering: new TestOrdering(headerName: "key"), concurrentMessageLimit: 8);
+
+        await RunRunnerAsync(binding, recorder, new FakeAdapter(interleaved));
+
+        // Assert — per-key arrival-index sequences must be strictly 0, 1, 2, … (0 violations).
+        Dictionary<string, int[]> perKeyOrder = recorder.PerKeyCompletionOrder;
+        perKeyOrder.Should().HaveCount(keyCount, "all keys must appear in the completion log");
+
+        foreach ((string key, int[] seqs) in perKeyOrder)
+        {
+            seqs.Should().HaveCount(msgsPerKey, $"key '{key}' must have exactly {msgsPerKey} completions");
+
+            for (int i = 0; i < seqs.Length; i++)
+            {
+                seqs[i].Should().Be(i,
+                    $"seed={seed} key='{key}' completion[{i}]={seqs[i]} must equal {i} — " +
+                    $"strict per-key FIFO order violated (R6 non-FIFO regression / C2 arrival-sequence capture)");
             }
         }
 

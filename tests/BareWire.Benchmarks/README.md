@@ -45,9 +45,42 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*' --exp
 |-------|-------------|---------|
 | `PublishBenchmarks` | Typed and raw publish through in-memory transport | 500K–1M msgs/s |
 | `ConsumeBenchmarks` | Consume + ack loop via InMemoryTransportAdapter | > 300K msgs/s |
+| `OrderedConsumeBenchmarks` | Ordered consume path (`OrderedBy` ON vs OFF) — N×L params sweep; per-lane overhead constant (ADR-026 R8.15) | < 512 B/op |
 | `SagaBenchmarks` | State machine transitions with InMemorySagaRepository | > 100K msgs/s |
 | `SerializationBenchmarks` | JSON serialize/deserialize with System.Text.Json | < 1 μs |
 | `JsonVsMessagePackBenchmarks` | JSON vs MessagePack serialize/deserialize/on-wire size, same object graph, 100 B – 100 KB | MessagePack ~2-5x fewer allocations |
+
+## OrderedConsume Benchmark (R8.15)
+
+`OrderedConsumeBenchmarks` measures the per-key ordered consume path introduced by ADR-026 (R8.15).
+
+### Goals
+
+- Allocation ceiling: `< 512 B/op` on the `OrderedBy_On` path (ADR-003).
+- Per-lane overhead is CONSTANT — not per-message: the `Allocated/op` column must be flat across
+  `MessageCount` values for a fixed `LaneCount`. A rising value as N grows indicates a per-message
+  allocation regression (violates ADR-003 zero-copy intent).
+- The N×L `[Params]` sweep (`MessageCount ∈ {500, 2000}` × `LaneCount ∈ {1, 4, 8}`) makes this
+  claim derivable from the output table without a separate slope test.
+
+### Running
+
+```bash
+# Smoke-check registration (no full run)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --list flat
+
+# Short run (faster, wider CI)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*OrderedConsume*' --job short
+
+# Full run
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*OrderedConsume*'
+```
+
+### Throughput-floor (SAC vs consistent-hash) — DEFERRED to R8.16
+
+The X% throughput advantage and K minimum absolute throughput for `OrderedBy` vs baseline are
+**deferred** to R8.16 (ADR-026 §8). No acceptance threshold is defined in R8.15. See the
+skeleton in `OrderedConsumeBenchmarks.cs` for the deferred placeholder.
 
 ## Cross-transport header mapping (R7.2)
 
