@@ -1,20 +1,20 @@
 # Per-Key Consumer Ordering
 
-Konsumenci konkurujący (ang. *competing consumers* — wiele instancji czytających z tej samej kolejki) dają poziomą skalowalność, ale rozbijają kolejność: wiadomości tej samej encji mogą trafić do różnych instancji i zostać przetworzone równolegle, a więc **nie po kolei**. BareWire pozwala odzyskać kolejność **w obrębie klucza** zachowując równoległość **między kluczami** — wzorzec „równoległość MIĘDZY kluczami, kolejność W kluczu".
+Competing consumers (multiple instances reading from the same queue) give you horizontal scalability, but they break ordering: messages for the same entity can land on different instances and be processed concurrently — that is, **out of order**. BareWire lets you recover ordering **within a key** while keeping parallelism **across keys** — the "parallel ACROSS keys, ordered WITHIN a key" pattern.
 
-Funkcja jest **domyślnie wyłączona**. Bez `OrderedBy`/`OrderedByHeader` na endpoincie ścieżka konsumpcji jest bit-identyczna z czystym competing-consumers — zero regresji dla istniejących wdrożeń.
+The feature is **off by default**. Without `OrderedBy`/`OrderedByHeader` on the endpoint, the consume path is bit-for-bit identical to plain competing-consumers — zero regression for existing deployments.
 
 ## Why per-key ordering
 
-Rozważ zdarzenia zamówienia: `OrderPlaced`, `OrderShipped`, `OrderDelivered` dla tego samego zamówienia MUSZĄ zostać przetworzone w kolejności. Przy wielu instancjach konsumenta bez afinicji klucza dwie instancje mogą jednocześnie przetwarzać dwa zdarzenia tego samego zamówienia — i zapisać stan w złej kolejności.
+Consider order events: `OrderPlaced`, `OrderShipped`, `OrderDelivered` for the same order MUST be processed in order. With multiple consumer instances and no key affinity, two instances can process two events of the same order at the same time — and persist state in the wrong order.
 
-Rozwiązanie polega na **przypięciu wszystkich wiadomości danego klucza do tej samej, sekwencyjnej ścieżki przetwarzania**, podczas gdy różne klucze nadal płyną równolegle. „Klucz" to zwykle identyfikator encji, agregatu albo sagi (np. `OrderId`, `CustomerId`, `AccountId`).
+The solution is to **pin every message of a given key to the same sequential processing path**, while different keys still flow in parallel. The "key" is usually an entity, aggregate, or saga identifier (e.g. `OrderId`, `CustomerId`, `AccountId`).
 
 ## Quick start (one-liner)
 
-Najprostsza forma to jeden z dwóch one-linerów na `IReceiveEndpointConfigurator`.
+The simplest form is one of two one-liners on `IReceiveEndpointConfigurator`.
 
-Wariant nagłówkowy (raw / cross-language) — klucz pobierany z nagłówka transportowego:
+Header variant (raw / cross-language) — the key is read from a transport header:
 
 ```csharp
 rmq.ReceiveEndpoint("ordered-processing", e =>
@@ -24,7 +24,7 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 });
 ```
 
-Wariant typowany — klucz pobierany z właściwości zdeserializowanej wiadomości:
+Typed variant — the key is read from a property of the deserialized message:
 
 ```csharp
 rmq.ReceiveEndpoint("ordered-processing", e =>
@@ -34,11 +34,11 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 });
 ```
 
-Oba one-linery ustawiają wyłącznie **źródło klucza** i zostawiają strategię na `Auto`. Strategia `Auto` jest *capability-driven*: na RabbitMQ wymaga zadeklarowania afinicji transportowej (zob. [Transport affinity](#transport-affinity-rabbitmq)) dla kolejności między instancjami, w przeciwnym razie kończy się fail-fast przy starcie. Dla porządku w obrębie jednej instancji wybierz strategię `LocalPartitioned` w bloku konfiguratora (poniżej).
+Both one-liners set only the **key source** and leave the strategy at `Auto`. The `Auto` strategy is capability-driven: on RabbitMQ it requires a declared transport affinity (see [Transport affinity](#transport-affinity-rabbitmq)) for cross-instance ordering, otherwise it fails fast at startup. For ordering within a single instance, choose the `LocalPartitioned` strategy in the configurator block (below).
 
 ## The configurator block
 
-Przeciążenie `OrderedBy(Action<IConsumerOrderingConfigurator>)` udostępnia pełną kontrolę: źródło klucza, równoległość, strategię, afinicję transportową i politykę poison.
+The `OrderedBy(Action<IConsumerOrderingConfigurator>)` overload gives you full control: key source, concurrency, strategy, transport affinity, and poison policy.
 
 ```csharp
 rmq.ReceiveEndpoint("ordered-processing", e =>
@@ -55,37 +55,37 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 });
 ```
 
-Metody bloku `IConsumerOrderingConfigurator`:
+Methods on the `IConsumerOrderingConfigurator` block:
 
-| Metoda | Działanie |
-|--------|-----------|
-| `ByHeader(string)` | Źródło klucza: nagłówek transportowy (raw / cross-language). |
-| `By<TMessage>(Func<TMessage, object?>)` | Źródło klucza: selektor po zdeserializowanej wiadomości. |
-| `ByCorrelationId()` | Źródło klucza: automatycznie stemplowany correlation-id (fallback w łańcuchu). |
-| `Concurrency(int)` | Równoległość między kluczami w warstwie lokalnej (liczba pasów). |
-| `Strategy(ConsumerOrderingStrategy)` | Wybór strategii. Domyślnie `Auto`. |
-| `TransportAffinity(TransportAffinity)` | Deklaracja afinicji transportowej (czytana przy starcie; bez round-tripu do brokera). |
-| `MaxDeliveryAttempts(int)` | Próg prób przed zaparkowaniem trującego heada i zwolnieniem klucza. Domyślnie `0` (wyłączone). |
+| Method | Effect |
+|--------|--------|
+| `ByHeader(string)` | Key source: transport header (raw / cross-language). |
+| `By<TMessage>(Func<TMessage, object?>)` | Key source: a selector over the deserialized message. |
+| `ByCorrelationId()` | Key source: the auto-stamped correlation-id (fallback in the chain). |
+| `Concurrency(int)` | Parallelism across keys in the local layer (the lane count). |
+| `Strategy(ConsumerOrderingStrategy)` | Strategy selection. Defaults to `Auto`. |
+| `TransportAffinity(TransportAffinity)` | Declares the transport affinity (read at startup; no broker round-trip). |
+| `MaxDeliveryAttempts(int)` | Attempt threshold before the poison head is parked and the key released. Defaults to `0` (disabled). |
 
 ## Strategies
 
-`ConsumerOrderingStrategy` wybiera, jak egzekwowana jest kolejność:
+`ConsumerOrderingStrategy` selects how ordering is enforced:
 
-| Strategia | Co robi | Gwarancja |
-|-----------|---------|-----------|
-| `Auto` (domyślna) | Czyta zdolności transportu oraz zadeklarowaną `TransportAffinity`; wybiera ścieżkę transport-native gdy jest zadeklarowana, w przeciwnym razie **rzuca przy starcie** | Intra + inter-instance (gdy ścieżka zadeklarowana) |
-| `LocalPartitioned` | **Wyłącznie** kluczowany dispatch w obrębie procesu (fixed-lane hashing) | **Tylko intra-instance** — jawnie „single-instance only"; nie zachowuje kolejności między konkurującymi instancjami |
-| `TransportNative` | Wymusza afinicję klucz→konsument na poziomie transportu (RabbitMQ SAC lub consistent-hash) | Intra + inter-instance |
+| Strategy | What it does | Guarantee |
+|----------|--------------|-----------|
+| `Auto` (default) | Reads the transport's capabilities and the declared `TransportAffinity`; picks the transport-native path when one is declared, otherwise **throws at startup** | Intra + inter-instance (when a path is declared) |
+| `LocalPartitioned` | **Only** keyed in-process dispatch (fixed-lane hashing) | **Intra-instance only** — explicitly "single-instance only"; does not preserve ordering across competing instances |
+| `TransportNative` | Enforces key→consumer affinity at the transport level (RabbitMQ SAC or consistent-hash) | Intra + inter-instance |
 
-`LocalPartitioned` MUSI być wybrany jawnie — `Auto` nigdy go nie wybierze samoczynnie, bo nie daje gwarancji między instancjami. Wybór `LocalPartitioned` to świadoma akceptacja braku afinicji cross-process.
+`LocalPartitioned` MUST be selected explicitly — `Auto` will never pick it on its own, because it gives no cross-instance guarantee. Choosing `LocalPartitioned` is a deliberate acceptance of no cross-process affinity.
 
 ## Transport affinity (RabbitMQ)
 
-Dla kolejności **między instancjami** trzeba przypiąć każdy klucz do jednej instancji na poziomie brokera. RabbitMQ oferuje dwie ścieżki, obie **opt-in** w jawnie deklarowanej topologii (BareWire używa manualnej topologii domyślnie):
+For ordering **across instances** you must pin every key to a single instance at the broker level. RabbitMQ offers two paths, both **opt-in** in an explicitly declared topology (BareWire uses manual topology by default):
 
-### Single-active-consumer (rekomendowane)
+### Single-active-consumer (recommended)
 
-`x-single-active-consumer` promuje dokładnie jednego aktywnego konsumenta na kolejkę — uporządkowane przetwarzanie, zero równoległości w obrębie kolejki. To **rekomendowana, domyślna best-practice ścieżka**. Zadeklaruj argument kolejki przez `IQueueConfigurator.SingleActiveConsumer()` i zadeklaruj zamiar na endpoincie przez `TransportAffinity.SingleActiveConsumer`:
+`x-single-active-consumer` promotes exactly one active consumer per queue — ordered processing, zero parallelism within the queue. This is the **recommended, default best-practice path**. Declare the queue argument via `IQueueConfigurator.SingleActiveConsumer()` and declare the intent on the endpoint via `TransportAffinity.SingleActiveConsumer`:
 
 ```csharp
 rmq.ConfigureTopology(t =>
@@ -109,34 +109,34 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 
 ### Consistent-hash exchange (opt-in)
 
-`ExchangeType.ConsistentHash` rozdziela klucze na wiele związanych kolejek (ten sam klucz → ta sama kolejka), dając równoległość po kluczach przy zachowaniu kolejności w kluczu. Wymaga włączonego pluginu brokera `rabbitmq_consistent_hash_exchange`. Wybierz tę ścieżkę gdy potrzebujesz maksymalnej równoległości po kluczach i akceptujesz **okno utraty kolejności przy re-mapie**: dodanie/usunięcie związanej kolejki lub restart węzła re-hashuje klucze i chwilowo łamie kolejność per-klucz. Okno jest udokumentowane i wykrywalne (warstwa transportowa znakuje strumień epoką mapowania, więc konsument może wykryć i zalogować re-map), ale jest realne — dlatego SAC pozostaje ścieżką domyślną.
+`ExchangeType.ConsistentHash` spreads keys across several bound queues (the same key → the same queue), giving parallelism across keys while preserving ordering within a key. It requires the broker's `rabbitmq_consistent_hash_exchange` plugin to be enabled. Choose this path when you need maximum across-key parallelism and accept an **ordering-loss window on re-map**: adding/removing a bound queue or a node restart re-hashes keys and momentarily breaks per-key ordering. The window is documented and detectable (the transport layer stamps the stream with a mapping epoch, so the consumer can detect and log a re-map), but it is real — which is why SAC remains the default path.
 
 ## The two-tier model
 
-BareWire składa kolejność per klucz z dwóch warstw, które działają razem:
+BareWire composes per-key ordering from two layers that work together:
 
-- **Warstwa lokalna (intra-instance).** Kluczowany dispatch w obrębie procesu: wiadomości tego samego klucza biegną sekwencyjnie po jednym pasie (FIFO wg kolejności przybycia), różne klucze biegną równolegle po różnych pasach. Liczbą pasów steruje `Concurrency(n)` (a w braku — `ConcurrentMessageLimit`). Klucze mapowane są na **stałą liczbę N pasów** (fixed-lane hashing) — różne klucze mogą dzielić pas, jak partycje w modelu partycyjnym brokerów. To trwale ogranicza pamięć (N pasów, nie jeden pas na klucz). Bufory pasów są bounded **liczbą wiadomości** (głębokość pasa × N pasów) — nie ma nieograniczonych buforów.
-- **Warstwa transportowa (inter-instance).** Afinicja klucz→instancja tak, by ten sam klucz docierał do tej samej instancji (RabbitMQ SAC albo consistent-hash, zob. wyżej).
+- **Local layer (intra-instance).** Keyed in-process dispatch: messages of the same key run sequentially down a single lane (FIFO by arrival order), different keys run in parallel down different lanes. The lane count is controlled by `Concurrency(n)` (falling back to `ConcurrentMessageLimit`). Keys are mapped to a **fixed number of N lanes** (fixed-lane hashing) — different keys may share a lane, like partitions in a broker's partition model. This bounds memory permanently (N lanes, not one lane per key). Lane buffers are bounded **by message count** (lane depth × N lanes) — there are no unbounded buffers.
+- **Transport layer (inter-instance).** Key→instance affinity so the same key reaches the same instance (RabbitMQ SAC or consistent-hash, see above).
 
-Globalny kredyt inflight (`MaxInFlightMessages`) i głębokość pasa per-klucz to **dwa odrębne wymiary ograniczeń** — globalny kredyt bramkuje pobór z brokera, głębokość pasa chroni przed zdominowaniem budżetu przez jeden gorący klucz.
+The global inflight credit (`MaxInFlightMessages`) and the per-key lane depth are **two distinct constraint dimensions** — the global credit gates the pull from the broker, the lane depth protects against a single hot key dominating the budget.
 
 ## Fail-fast
 
-Gdy ordering jest włączony, ale ani transport, ani zadeklarowana topologia nie gwarantują kolejności (np. RabbitMQ bez SAC i bez consistent-hash), BareWire **rzuca `BareWireConfigurationException` przy starcie** — nigdy nie degraduje po cichu, przepuszczając nieuporządkowane wiadomości. Zasada: domyślnie OFF; gdy ON — pełna gwarancja albo fail-fast. Decyzja zapada deterministycznie przy starcie, na podstawie konfiguracji (bez odpytywania brokera).
+When ordering is enabled but neither the transport nor the declared topology guarantees ordering (e.g. RabbitMQ without SAC and without consistent-hash), BareWire **throws `BareWireConfigurationException` at startup** — it never degrades silently and lets unordered messages through. The principle: off by default; when on — a full guarantee or fail-fast. The decision is made deterministically at startup, from configuration alone (no broker query).
 
-In-process partitioner bez gwarancji cross-process jest dostępny **wyłącznie** jako jawny `Strategy(ConsumerOrderingStrategy.LocalPartitioned)`.
+An in-process partitioner without a cross-process guarantee is available **only** as an explicit `Strategy(ConsumerOrderingStrategy.LocalPartitioned)`.
 
 ## Poison handling / key release
 
-Kolejność per klucz niesie ryzyko head-of-line: trująca wiadomość na czele klucza mogłaby zablokować cały strumień tego klucza. Kontrakt anty-starvation: **ograniczone ponawianie → park/DLQ → zwolnienie klucza**.
+Per-key ordering carries a head-of-line risk: a poison message at the head of a key could block that key's entire stream. The anti-starvation contract: **bounded retry → park/DLQ → key release**.
 
-- Wiadomość na czele jest ponawiana do `MaxDeliveryAttempts` (z reużyciem `RetryCount`/`RetryInterval` endpointu).
-- Po przekroczeniu progu wiadomość trafia do dead-letter (zob. [Retry and Dead Letter Queues](retry-and-dlq.md)) i **schodzi z czoła** klucza.
-- Strumień klucza **wznawia się** — kolejne wiadomości są dostarczane. Pominięcie zaparkowanej wiadomości (gap kolejności) jest **logowane**; nie ma ścieżki „blokady na zawsze".
+- The head message is retried up to `MaxDeliveryAttempts` (reusing the endpoint's `RetryCount`/`RetryInterval`).
+- Once the threshold is exceeded, the message is dead-lettered (see [Retry and Dead Letter Queues](retry-and-dlq.md)) and **leaves the head** of the key.
+- The key's stream **resumes** — subsequent messages are delivered. Skipping the parked message (an ordering gap) is **logged**; there is no "blocked forever" path.
 
-Zwolnienie klucza następuje **dopiero po trwałym potwierdzeniu** odłożenia heada przez brokera — gdy settlement zawiedzie, klucz nie jest zwalniany (head zostaje na czole, porządek niezłamany), a niepowodzenie jest ponawiane.
+The key is released **only after the broker durably confirms** the head has been parked — if settlement fails, the key is not released (the head stays at the front, ordering unbroken) and the failure is retried.
 
-> **Bezpieczeństwo:** kod konsumenta NIE powinien umieszczać wartości klucza porządkującego w komunikatach wyjątków ani logach. Trzymaj stały komunikat:
+> **Security:** consumer code should NOT place the ordering-key value in exception messages or logs. Keep a constant message:
 >
 > ```csharp
 > if (context.Headers.TryGetValue("poison-head-demo", out string? flag) && flag == "true")
@@ -149,22 +149,22 @@ Zwolnienie klucza następuje **dopiero po trwałym potwierdzeniu** odłożenia h
 
 ## Key source and caveats
 
-Łańcuch źródła klucza: jawny selektor/nagłówek (`OrderedBy`/`OrderedByHeader`/`By`/`ByHeader`) → fallback na correlation-id (`ByCorrelationId()` lub domyślnie) → brak klucza (wiadomość keyless, przetwarzana równolegle bez gwarancji porządku).
+The key-source chain: an explicit selector/header (`OrderedBy`/`OrderedByHeader`/`By`/`ByHeader`) → fallback to correlation-id (`ByCorrelationId()` or by default) → no key (a keyless message, processed in parallel with no ordering guarantee).
 
-Fallback na correlation-id jest **świadomym ustępstwem na rzecz ergonomii** (one-liner ma „po prostu działać"), ale wymaga ostrożności:
+The correlation-id fallback is a **deliberate concession to ergonomics** (a one-liner should "just work"), but it calls for care:
 
-- **Kardynalność.** Zbyt mała kardynalność (jedna wartość dla całego ruchu) tworzy gorący klucz, który dusi równoległość; nadmiernie zmienny klucz (inna wartość per wiadomość) daje brak realnej afinicji — każda wiadomość to osobna „grupa" i kolejność niczego nie wnosi.
-- **Stabilność.** Klucz ma sens tylko, gdy jest stabilny per agregat/encja przez cały cykl życia.
-- **Dostępność.** Correlation-id NIE jest stemplowany dla zwykłego `PublishAsync`/`SendAsync` — przy takim ruchu fallback daje brak klucza, więc wiadomość płynie bez orderingu (passthrough).
+- **Cardinality.** Too low a cardinality (one value for all traffic) creates a hot key that chokes parallelism; an over-volatile key (a different value per message) gives no real affinity — every message is its own "group" and ordering adds nothing.
+- **Stability.** A key only makes sense if it is stable per aggregate/entity across its whole lifetime.
+- **Availability.** Correlation-id is NOT stamped for a plain `PublishAsync`/`SendAsync` — for that traffic the fallback yields no key, so the message flows without ordering (passthrough).
 
-**Selektor typowany a kolejność między instancjami.** Selektor `OrderedBy(m => m.X)` czyta właściwość CLR **po deserializacji**, która może różnić się od klucza, po którym transport routował wiadomość do instancji. Dlatego:
+**The typed selector vs. cross-instance ordering.** The `OrderedBy(m => m.X)` selector reads a CLR property **after deserialization**, which may differ from the key the transport used to route the message to the instance. Therefore:
 
-- selektor typowany jest **bezpieczny dla `LocalPartitioned`** (afinicja czysto lokalna) albo gdy selektor zwraca dokładnie wartość użytą do routingu;
-- dla `TransportNative`/`Auto` między instancjami **preferuj `OrderedByHeader(name)`** z nazwą nagłówka symetryczną do strony producenta — to jedyna ścieżka z gwarancją „klucz konsumenta == klucz routingu".
+- the typed selector is **safe for `LocalPartitioned`** (purely local affinity) or when the selector returns exactly the value used for routing;
+- for `TransportNative`/`Auto` across instances, **prefer `OrderedByHeader(name)`** with a header name symmetric to the producer side — that is the only path with a "consumer key == routing key" guarantee.
 
 ## End-to-end with the outbox
 
-Klucz porządkujący po stronie konsumenta domyka się z producenckim outboxem. Outbox w trybie `OrderingMode.PerKey` gwarantuje uporządkowane przekazanie do brokera per klucz, a konsument z `OrderedByHeader` zachowuje tę kolejność przy przetwarzaniu. **Symetryczna nazwa nagłówka** spina obie strony w jedną historię:
+The consumer-side ordering key closes the loop with the producer-side outbox. The outbox in `OrderingMode.PerKey` guarantees ordered hand-off to the broker per key, and a consumer with `OrderedByHeader` preserves that order during processing. A **symmetric header name** ties both sides into one story:
 
 ```csharp
 // Producer — the outbox stamps and orders by the "ordering-key" header
@@ -188,11 +188,11 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 });
 ```
 
-Wynik: uporządkowane przekazanie do brokera **i** uporządkowane przetwarzanie u konsumenta — pełna kolejność per klucz end-to-end. Zob. [Transactional Outbox](outbox.md) po stronę producencką.
+The result: ordered hand-off to the broker **and** ordered processing at the consumer — full end-to-end per-key ordering. See [Transactional Outbox](outbox.md) for the producer side.
 
 ## Running the sample
 
-Działający pokaz end-to-end (wiele konkurujących instancji przez Aspire `WithReplicas(2)`, outbox `OrderingMode.PerKey`, parkowanie trującego heada przez DLX, oba warianty strategii) znajduje się w katalogu sampla:
+A working end-to-end demo (multiple competing instances via Aspire `WithReplicas(2)`, outbox `OrderingMode.PerKey`, poison-head parking via DLX, both strategy variants) lives in the sample directory:
 
 ```bash
 dotnet run --project samples/BareWire.Samples.AppHost/
