@@ -265,6 +265,73 @@ public sealed class QueueConfiguratorTests
         result!["x-overflow"].Should().Be("drop-head");
     }
 
+    // ── SingleActiveConsumer ──────────────────────────────────────────────────
+
+    [Fact]
+    public void SingleActiveConsumer_Enabled_SetsArgumentTrue()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        sut.SingleActiveConsumer(true);
+        IReadOnlyDictionary<string, object>? result = sut.Build();
+
+        // Assert
+        result.Should().NotBeNull();
+        result!["x-single-active-consumer"].Should().Be(true);
+    }
+
+    [Fact]
+    public void SingleActiveConsumer_Default_SetsArgumentTrue()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        sut.SingleActiveConsumer();
+        IReadOnlyDictionary<string, object>? result = sut.Build();
+
+        // Assert
+        result.Should().NotBeNull();
+        result!["x-single-active-consumer"].Should().Be(true);
+    }
+
+    [Fact]
+    public void SingleActiveConsumer_Disabled_SetsArgumentFalse()
+    {
+        // Arrange
+        var sut = CreateConfigurator();
+
+        // Act
+        sut.SingleActiveConsumer(false);
+        IReadOnlyDictionary<string, object>? result = sut.Build();
+
+        // Assert
+        result.Should().NotBeNull();
+        result!["x-single-active-consumer"].Should().Be(false);
+    }
+
+    [Fact]
+    public void SingleActiveConsumer_ParityWithGenericArgument_ProducesSameEntry()
+    {
+        // Arrange
+        var convenience = CreateConfigurator();
+        var generic = CreateConfigurator();
+
+        // Act
+        convenience.SingleActiveConsumer(true);
+        generic.Argument("x-single-active-consumer", true);
+
+        // Assert
+        IReadOnlyDictionary<string, object>? convenienceResult = convenience.Build();
+        IReadOnlyDictionary<string, object>? genericResult = generic.Build();
+        convenienceResult.Should().NotBeNull();
+        genericResult.Should().NotBeNull();
+        convenienceResult!["x-single-active-consumer"]
+            .Should().Be(genericResult!["x-single-active-consumer"]);
+    }
+
     // ── Argument ──────────────────────────────────────────────────────────────
 
     [Fact]
@@ -324,6 +391,7 @@ public sealed class QueueConfiguratorTests
         IQueueConfigurator afterMaxLengthBytes = sut.MaxLengthBytes(1024);
         IQueueConfigurator afterSetQueueType = sut.SetQueueType(QueueType.Quorum);
         IQueueConfigurator afterOverflow = sut.Overflow(OverflowStrategy.RejectPublish);
+        IQueueConfigurator afterSingleActiveConsumer = sut.SingleActiveConsumer();
         IQueueConfigurator afterArgument = sut.Argument("x-max-priority", 5);
 
         // Assert
@@ -334,6 +402,7 @@ public sealed class QueueConfiguratorTests
         afterMaxLengthBytes.Should().BeSameAs(sut);
         afterSetQueueType.Should().BeSameAs(sut);
         afterOverflow.Should().BeSameAs(sut);
+        afterSingleActiveConsumer.Should().BeSameAs(sut);
         afterArgument.Should().BeSameAs(sut);
     }
 

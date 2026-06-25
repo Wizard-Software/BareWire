@@ -32,6 +32,12 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
     internal Type? SerializerOverrideType { get; private set; }
     internal Type? DeserializerOverrideType { get; private set; }
 
+    /// <summary>
+    /// Gets the per-key consumer-ordering configuration for this endpoint, or <see langword="null"/>
+    /// when no <c>OrderedBy</c> call was made (per-key ordering OFF — the default).
+    /// </summary>
+    internal ConsumerOrderingConfiguration? Ordering { get; private set; }
+
     internal bool HasAnyConsumer =>
         _consumerTypes.Count > 0 || _rawConsumerTypes.Count > 0 || _sagaTypes.Count > 0;
 
@@ -88,5 +94,32 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
     public void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer
     {
         DeserializerOverrideType = typeof(TDeserializer);
+    }
+
+    /// <inheritdoc />
+    public void OrderedBy<TMessage>(Func<TMessage, object?> selector) where TMessage : class
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        var configuration = new ConsumerOrderingConfiguration();
+        configuration.By(selector);
+        Ordering = configuration;
+    }
+
+    /// <inheritdoc />
+    public void OrderedByHeader(string headerName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(headerName);
+        var configuration = new ConsumerOrderingConfiguration();
+        configuration.ByHeader(headerName);
+        Ordering = configuration;
+    }
+
+    /// <inheritdoc />
+    public void OrderedBy(Action<IConsumerOrderingConfigurator> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        var configuration = new ConsumerOrderingConfiguration();
+        configure(configuration);
+        Ordering = configuration;
     }
 }

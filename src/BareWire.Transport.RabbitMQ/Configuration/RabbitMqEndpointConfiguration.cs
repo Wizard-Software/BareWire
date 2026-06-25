@@ -27,6 +27,14 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     internal Type? SerializerOverrideType { get; private set; }
     internal Type? DeserializerOverrideType { get; private set; }
 
+    /// <summary>
+    /// Gets the per-key consumer-ordering configuration for this endpoint, or <see langword="null"/>
+    /// when no <c>OrderedBy</c> call was made (per-key ordering OFF — the default). Captured here only to
+    /// satisfy the <see cref="IReceiveEndpointConfigurator"/> contract; the RabbitMQ transport-native
+    /// ordering layer consumes it in a later task of the per-key ordering feature.
+    /// </summary>
+    internal OrderingConfiguration? Ordering { get; private set; }
+
     // ── IReceiveEndpointConfigurator ───────────────────────────────────────────
 
     public int PrefetchCount { get; set; } = 16;
@@ -71,5 +79,129 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     public void UseDeserializer<TDeserializer>() where TDeserializer : class, IMessageDeserializer
     {
         DeserializerOverrideType = typeof(TDeserializer);
+    }
+
+    /// <inheritdoc />
+    public void OrderedBy<TMessage>(Func<TMessage, object?> selector) where TMessage : class
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+        var configuration = new OrderingConfiguration();
+        configuration.By(selector);
+        Ordering = configuration;
+    }
+
+    /// <inheritdoc />
+    public void OrderedByHeader(string headerName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(headerName);
+        var configuration = new OrderingConfiguration();
+        configuration.ByHeader(headerName);
+        Ordering = configuration;
+    }
+
+    /// <inheritdoc />
+    public void OrderedBy(Action<IConsumerOrderingConfigurator> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        var configuration = new OrderingConfiguration();
+        configure(configuration);
+        Ordering = configuration;
+    }
+
+    /// <summary>
+    /// Minimal package-local carrier capturing per-key ordering settings declared on a RabbitMQ endpoint.
+    /// Required only to satisfy the <see cref="IConsumerOrderingConfigurator"/> block overload (CS0535);
+    /// it performs no runtime dispatch or key resolution. The RabbitMQ package cannot reference the Core
+    /// carrier (package dependency rule: Transport.RabbitMQ depends on Abstractions only), so the storage
+    /// is duplicated minimally here.
+    /// </summary>
+    /// <remarks>
+    /// Implements the read-only <see cref="IConsumerOrderingConfiguration"/> (via explicit interface
+    /// implementation) so the transport-agnostic dispatch engine reads the settings from
+    /// <see cref="EndpointBinding.Ordering"/> without downcasting to this package-local type — the carrier
+    /// the engine sees is the shared Abstractions interface, never this concrete class.
+    /// </remarks>
+    internal sealed class OrderingConfiguration : IConsumerOrderingConfigurator, IConsumerOrderingConfiguration
+    {
+        internal string? HeaderName { get; private set; }
+
+        internal Delegate? Selector { get; private set; }
+
+        internal Type? SelectorMessageType { get; private set; }
+
+        internal bool UseCorrelationId { get; private set; }
+
+        internal int? Concurrency_ { get; private set; }
+
+        internal ConsumerOrderingStrategy Strategy_ { get; private set; } = ConsumerOrderingStrategy.Auto;
+
+        internal Abstractions.Configuration.TransportAffinity TransportAffinity_ { get; private set; }
+            = Abstractions.Configuration.TransportAffinity.None;
+
+        internal int MaxDeliveryAttempts_ { get; private set; }
+
+        public IConsumerOrderingConfigurator ByHeader(string headerName)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(headerName);
+            HeaderName = headerName;
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator By<TMessage>(Func<TMessage, object?> selector)
+            where TMessage : class
+        {
+            ArgumentNullException.ThrowIfNull(selector);
+            Selector = selector;
+            SelectorMessageType = typeof(TMessage);
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator ByCorrelationId()
+        {
+            UseCorrelationId = true;
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator Concurrency(int degree)
+        {
+            Concurrency_ = degree;
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator Strategy(ConsumerOrderingStrategy strategy)
+        {
+            Strategy_ = strategy;
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator TransportAffinity(TransportAffinity affinity)
+        {
+            TransportAffinity_ = affinity;
+            return this;
+        }
+
+        public IConsumerOrderingConfigurator MaxDeliveryAttempts(int attempts)
+        {
+            MaxDeliveryAttempts_ = attempts;
+            return this;
+        }
+
+        // ── IConsumerOrderingConfiguration (read-only view; explicit to avoid name clashes) ──────
+
+        string? IConsumerOrderingConfiguration.HeaderName => HeaderName;
+
+        Delegate? IConsumerOrderingConfiguration.Selector => Selector;
+
+        Type? IConsumerOrderingConfiguration.SelectorMessageType => SelectorMessageType;
+
+        bool IConsumerOrderingConfiguration.UseCorrelationId => UseCorrelationId;
+
+        int? IConsumerOrderingConfiguration.Concurrency => Concurrency_;
+
+        ConsumerOrderingStrategy IConsumerOrderingConfiguration.Strategy => Strategy_;
+
+        Abstractions.Configuration.TransportAffinity IConsumerOrderingConfiguration.TransportAffinity => TransportAffinity_;
+
+        int IConsumerOrderingConfiguration.MaxDeliveryAttempts => MaxDeliveryAttempts_;
     }
 }

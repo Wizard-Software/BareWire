@@ -6,6 +6,8 @@
   href: publishing-and-consuming.md
 - name: Topology
   href: topology.md
+- name: Per-Key Consumer Ordering
+  href: per-key-ordering.md
 - name: Flow Control
   href: flow-control.md
 - name: Retry and DLQ

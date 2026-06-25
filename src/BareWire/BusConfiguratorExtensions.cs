@@ -59,6 +59,19 @@ public static class BusConfiguratorExtensions
     /// <exception cref="ArgumentOutOfRangeException">
     /// Thrown when <paramref name="partitionCount"/> is less than 1.
     /// </exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Deprecated.</b> This DI-level registration is superseded by per-endpoint consumer ordering:
+    /// <see cref="IReceiveEndpointConfigurator.OrderedByHeader(string)"/> (raw / cross-language) or
+    /// <see cref="IReceiveEndpointConfigurator.OrderedBy{TMessage}(Func{TMessage, object})"/> (typed selector),
+    /// configured directly on the receive endpoint. Per-key ordering remains OFF by default; opt in
+    /// per endpoint. The DI-level overload is retained for one coexistence release and will be removed.
+    /// </para>
+    /// </remarks>
+    [Obsolete(
+        "AddPartitionerMiddleware (DI-level) is superseded by per-endpoint consumer ordering: " +
+        "IReceiveEndpointConfigurator.OrderedByHeader(\"ordering-key\") or OrderedBy<TMessage>(selector). " +
+        "It will be removed in a future release.")]
     public static IServiceCollection AddPartitionerMiddleware(
         this IServiceCollection services,
         IBusConfigurator busConfigurator,

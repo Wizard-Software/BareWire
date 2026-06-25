@@ -2,28 +2,44 @@
 
 ## Multi-Consumer Partitioning
 
-When multiple consumer types share a single endpoint, you can ensure per-correlation ordering using the `PartitionerMiddleware`.
+When multiple consumer types share a single endpoint, you can ensure per-key ordering with per-endpoint consumer ordering: `OrderedByHeader(...)` (raw / cross-language) or `OrderedBy<TMessage>(selector)` (typed). Per-key ordering is OFF by default — opt in per endpoint.
+
+> See: [Per-Key Consumer Ordering](per-key-ordering.md) for the full picture — strategies (`Auto` / `LocalPartitioned` / `TransportNative`), transport affinity (SAC / consistent-hash), fail-fast, poison handling, and the end-to-end story with the outbox.
+
+> The DI-level `AddPartitionerMiddleware(...)` is deprecated and retained for one coexistence release. Migrate to per-endpoint `OrderedByHeader`/`OrderedBy`.
 
 ### Setup
 
-```csharp
-builder.Services.AddPartitionerMiddleware(cfg, partitionCount: 64);
+The producer stamps the ordering key on the `ordering-key` transport header; the endpoint opts in with `OrderedBy(...)`. For a single-instance consumer, declare the `LocalPartitioned` strategy explicitly (the default `Auto` strategy is capability-driven and fails fast on RabbitMQ unless a transport affinity is declared for cross-instance ordering):
 
+```csharp
+// Consumer endpoint — opt in to per-key ordering (single-instance, in-process fixed lanes)
 rmq.ReceiveEndpoint("event-processing", e =>
 {
     e.ConcurrentMessageLimit = 16;
+    e.OrderedBy(o => o
+        .ByHeader("ordering-key")
+        .Strategy(ConsumerOrderingStrategy.LocalPartitioned));
     e.Consumer<OrderEventConsumer, OrderEvent>();
     e.Consumer<PaymentEventConsumer, PaymentEvent>();
     e.Consumer<ShipmentEventConsumer, ShipmentEvent>();
 });
+
+// Producer — stamp the ordering key on the transport header
+var headers = new Dictionary<string, string> { ["ordering-key"] = correlationId };
+await bus.PublishAsync(new OrderEvent(/* ... */), headers, cancellationToken);
 ```
+
+> The `OrderedByHeader("ordering-key")` one-liner sets only the key source and leaves the strategy at `Auto`. On RabbitMQ that requires a declared `TransportAffinity` (SAC / ConsistentHash) for cross-instance ordering; for single-instance ordering use the block form with `LocalPartitioned` as shown above.
 
 ### How It Works
 
-- Messages are hashed by `CorrelationId` into one of 64 partitions
-- Messages within the same partition are processed sequentially
-- Messages in different partitions are processed in parallel
-- This guarantees ordering per correlation while maximizing throughput
+- The inbound runner reads the `ordering-key` header **before deserialization** and hashes it to a fixed lane (fixed-lane hashing)
+- Messages sharing the same key are processed sequentially within their lane
+- Messages with different keys are processed in parallel across lanes (lane count = `ConcurrentMessageLimit`)
+- This guarantees ordering per key while maximizing throughput
+
+> Ordering keys should be reasonably high-cardinality. Many distinct keys spread across the lanes maximize parallelism; a few hot keys serialize most traffic onto a small number of lanes.
 
 ### Verifying Order
 

@@ -307,7 +307,7 @@ public sealed class ReceiveEndpointRunnerTests
             RawConsumers = [typeof(ThrowingRawConsumer)],
             RetryCount = 0,
             RetryInterval = TimeSpan.Zero,
-            HasDeadLetterExchange = hasDeadLetterExchange,
+            DeadLetterExchange = hasDeadLetterExchange ? "test-dlx" : null,
         };
 
         ILogger logger = Substitute.For<ILogger>();

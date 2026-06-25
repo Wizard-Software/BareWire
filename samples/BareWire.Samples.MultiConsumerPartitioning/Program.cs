@@ -5,22 +5,27 @@
 //   - ADR-001  Raw-first: System.Text.Json serializer, no envelope by default.
 //   - ADR-002  Manual topology: topic exchange with a single queue receiving all event types.
 //   - ADR-004  Credit-based flow control: ConcurrentMessageLimit = 16 allows high throughput,
-//              while PartitionerMiddleware (64 partitions) guarantees sequential processing per
-//              CorrelationId. Messages with different CorrelationIds run fully in parallel;
-//              messages sharing a CorrelationId are serialized within their partition.
+//              while per-endpoint OrderedByHeader("ordering-key") guarantees sequential processing
+//              per key. The inbound runner reads the "ordering-key" header before deserialization
+//              and maps it to a fixed lane (fixed-lane hashing); messages with different keys run
+//              fully in parallel across lanes, messages sharing a key are serialized within their lane.
 //   - Multiple typed consumers (OrderEventConsumer, PaymentEventConsumer, ShipmentEventConsumer)
 //     registered on a single endpoint — ConsumerDispatcher routes by message CLR type.
 //   - PostgreSQL persistence: ProcessingLogEntry records timestamp and ThreadId per message,
 //     enabling offline verification that per-CorrelationId ordering was maintained.
 //
+// Per-key consumer ordering (ADR-026) replaces the deprecated DI-level AddPartitionerMiddleware.
+// The producer stamps the key in the "ordering-key" transport header; the endpoint opts in with
+// OrderedByHeader("ordering-key"). Per-key ordering is OFF by default.
+//
 // Architecture:
-//   POST /events/generate (1000 events, 10 CorrelationIds)
-//       └→ IBus.PublishAsync → RabbitMQ exchange "events" (topic, durable)
+//   POST /events/generate (1000 events, 10 CorrelationIds, "ordering-key" header per message)
+//       └→ IBus.PublishAsync(msg, headers) → RabbitMQ exchange "events" (topic, durable)
 //               └→ queue "event-processing" (binding: #)
-//                       ├→ OrderEventConsumer    (message type: OrderEvent)
-//                       ├→ PaymentEventConsumer  (message type: PaymentEvent)
-//                       └→ ShipmentEventConsumer (message type: ShipmentEvent)
-//                              └→ PartitionerMiddleware (64 partitions, key: CorrelationId header)
+//                       └→ OrderedByHeader("ordering-key") → fixed-lane hashing (lanes = 16)
+//                              ├→ OrderEventConsumer    (message type: OrderEvent)
+//                              ├→ PaymentEventConsumer  (message type: PaymentEvent)
+//                              └→ ShipmentEventConsumer (message type: ShipmentEvent)
 //                                     └→ ProcessingLogEntry → PostgreSQL
 //
 // Topic exchange + routing keys:
@@ -106,12 +111,23 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     // Single endpoint — three consumers registered side-by-side.
     // ConsumerDispatcher dispatches each inbound message to the matching IConsumer<T>
     // based on the deserialized CLR type.
-    // ConcurrentMessageLimit = 16: up to 16 messages are in-flight simultaneously;
-    // PartitionerMiddleware further serializes messages within the same CorrelationId
-    // partition so that per-correlation ordering is preserved even under high concurrency.
+    // ConcurrentMessageLimit = 16: up to 16 messages are in-flight simultaneously.
+    // Per-key consumer ordering: the inbound runner reads the "ordering-key" header BEFORE
+    // deserialization, hashes it to a fixed lane, and processes each lane sequentially. Messages
+    // sharing an ordering key are serialized within their lane; messages with different keys run in
+    // parallel across lanes (up to the lane count = ConcurrentMessageLimit). Per-key ordering is OFF
+    // by default — this opt-in call replaces the deprecated DI-level AddPartitionerMiddleware.
+    //
+    // This sample is single-instance (one consumer process), so it declares the LocalPartitioned
+    // strategy explicitly. The default strategy (Auto) is capability-driven and fails fast on
+    // RabbitMQ unless a TransportAffinity (SAC / ConsistentHash) is declared for cross-instance
+    // ordering — that multi-instance scenario is out of scope here (see R8.15/R8.17).
     rmq.ReceiveEndpoint("event-processing", e =>
     {
         e.ConcurrentMessageLimit = 16;
+        e.OrderedBy(o => o
+            .ByHeader("ordering-key")
+            .Strategy(ConsumerOrderingStrategy.LocalPartitioned));
         e.Consumer<OrderEventConsumer, OrderEvent>();
         e.Consumer<PaymentEventConsumer, PaymentEvent>();
         e.Consumer<ShipmentEventConsumer, ShipmentEvent>();
@@ -121,12 +137,10 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 builder.Services.AddBareWireRabbitMq(configureRabbitMq);
 builder.Services.AddBareWire(cfg =>
 {
-    // PartitionerMiddleware: 64 partitions, default key selector (reads CorrelationId header,
-    // falls back to MessageId). Registered in DI with a factory so the custom partitionCount
-    // is honoured. ServiceCollectionExtensions.RegisterMiddleware uses TryAddSingleton, so
-    // this factory registration is not overwritten.
-    builder.Services.AddPartitionerMiddleware(cfg, partitionCount: 64);
-
+    // Per-key consumer ordering is configured per endpoint via e.OrderedByHeader("ordering-key")
+    // above (see the ReceiveEndpoint block). The deprecated DI-level AddPartitionerMiddleware is
+    // no longer used — the inbound runner derives the ordering key from the "ordering-key" header
+    // and serializes processing on a fixed lane.
     cfg.UseRabbitMQ(configureRabbitMq);
 });
 
@@ -162,9 +176,10 @@ using (IServiceScope scope = app.Services.CreateScope())
 app.MapServiceDefaults();
 
 // POST /events/generate — publishes a burst of 1000 events distributed across 10 CorrelationIds.
-// The mix of OrderEvent, PaymentEvent, and ShipmentEvent messages demonstrates that
-// PartitionerMiddleware serializes processing per CorrelationId while allowing full parallelism
-// across different CorrelationIds.
+// Each message carries the CorrelationId in the "ordering-key" transport header. The mix of
+// OrderEvent, PaymentEvent, and ShipmentEvent messages demonstrates that per-endpoint
+// OrderedByHeader("ordering-key") serializes processing per key (fixed-lane) while allowing full
+// parallelism across different keys.
 app.MapPost("/events/generate", async (
     IPublishEndpoint bus,
     CancellationToken cancellationToken) =>
@@ -183,6 +198,11 @@ app.MapPost("/events/generate", async (
         string correlationId = correlationIds[i % correlationIdCount].ToString();
         DateTime now = DateTime.UtcNow;
 
+        // Stamp the ordering key on the transport header. The consumer endpoint is configured with
+        // OrderedByHeader("ordering-key"): the inbound runner reads this header before deserialization
+        // and serializes processing per key on a fixed lane, preserving per-correlation order at runtime.
+        var headers = new Dictionary<string, string> { ["ordering-key"] = correlationId };
+
         // Round-robin across the three event types.
         int eventKind = i % 3;
         switch (eventKind)
@@ -190,17 +210,17 @@ app.MapPost("/events/generate", async (
             case 0:
                 await bus.PublishAsync(
                     new OrderEvent($"ORD-{i:D6}", correlationId, now),
-                    cancellationToken).ConfigureAwait(false);
+                    headers, cancellationToken).ConfigureAwait(false);
                 break;
             case 1:
                 await bus.PublishAsync(
                     new PaymentEvent($"PAY-{i:D6}", correlationId, now),
-                    cancellationToken).ConfigureAwait(false);
+                    headers, cancellationToken).ConfigureAwait(false);
                 break;
             default:
                 await bus.PublishAsync(
                     new ShipmentEvent($"SHP-{i:D6}", correlationId, now),
-                    cancellationToken).ConfigureAwait(false);
+                    headers, cancellationToken).ConfigureAwait(false);
                 break;
         }
 

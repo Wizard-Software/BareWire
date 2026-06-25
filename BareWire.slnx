@@ -17,6 +17,7 @@
     <Project Path="samples/BareWire.Samples.MassTransitRequestResponse/BareWire.Samples.MassTransitRequestResponse.csproj" />
     <Project Path="samples/BareWire.Samples.MassTransitToBareWire/BareWire.Samples.MassTransitToBareWire.csproj" />
     <Project Path="samples/BareWire.Samples.CloudEventsInterop/BareWire.Samples.CloudEventsInterop.csproj" />
+    <Project Path="samples/BareWire.Samples.OrderedConsumers/BareWire.Samples.OrderedConsumers.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/BareWire.Analyzers/BareWire.Analyzers.csproj" />

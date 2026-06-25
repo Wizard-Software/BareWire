@@ -71,7 +71,7 @@ When you run more than one instance of the dispatcher (multiple pods/processes),
 
 - **Claim expiry (`OutboxLockTimeout`, default 30s):** if an instance crashes between claiming and publishing, its rows become re-claimable by another instance once `OutboxLockTimeout` elapses — no message is lost. Set it conservatively above your broker's worst-case publish-confirm time; it is validated to be at least `3 × PollingInterval`.
 - **Delivery guarantee:** each row is claimed by exactly one instance per cycle (exactly-once-claim), but end-to-end delivery remains **at-least-once** — keep consumers idempotent (the inbox handles this).
-- **Ordering:** with parallel instances claiming disjoint batches, global send order across instances is **not** guaranteed. If you need ordered delivery, run a single dispatcher instance, or partition by key.
+- **Ordering:** with parallel instances claiming disjoint batches, global send order across instances is **not** guaranteed. If you need ordered delivery, run a single dispatcher instance, or partition by key. Set `OrderingMode.PerKey` (with `OrderingKeyHeaderName`) to guarantee head-of-line ordering per key group at dispatch time; pair it with a consumer endpoint using `OrderedBy`/`OrderedByHeader` on the **same header name** to preserve order end-to-end. See [Per-Key Consumer Ordering](per-key-ordering.md).
 - **Provider note:** the atomic claim requires PostgreSQL. SQLite is for testing/development only and is not suitable for multi-instance production use. Other providers can supply a custom `IOutboxSqlDialect`.
 
 ## Resilience

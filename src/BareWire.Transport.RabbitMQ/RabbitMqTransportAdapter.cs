@@ -15,7 +15,7 @@ using BwExchangeType = BareWire.Abstractions.ExchangeType;
 
 namespace BareWire.Transport.RabbitMQ;
 
-internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IAsyncDisposable
+internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IDurableParkSettlement, IAsyncDisposable
 {
     private readonly RabbitMqTransportOptions _options;
     private readonly ILogger<RabbitMqTransportAdapter> _logger;
@@ -31,6 +31,23 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     private long _deliveryTagCounter;
     private IConnection? _connection;
     private bool _disposed;
+
+    // Mapping-epoch memoization — keyed on topology reference (O(1) ReferenceEquals per batch).
+    // Recomputed only when the configured topology reference is reassigned (re-map scenario).
+    // Pre-boxing the epoch as object eliminates per-message boxing allocation in the publish loop.
+    // These fields are written in SendBatchAsync without synchronization; correctness relies on the
+    // single-writer publish-loop contract documented on SendBatchAsync (no concurrent send batches).
+    private TopologyDeclaration? _cachedEpochTopology;
+    private long? _cachedEpoch;
+    private object? _cachedEpochBoxed;
+
+    /// <summary>
+    /// AMQP header carrying the topology-derived mapping epoch (FNV-1a of the sorted set of
+    /// consistent-hash bound queue names). A best-effort, topology-derived change-detection
+    /// signal that lets a consumer detect a re-map of the consistent-hash key space; it is
+    /// NOT a security-authenticated or integrity field. Value type: <see cref="long"/>.
+    /// </summary>
+    internal const string MappingEpochHeaderName = "BW-MappingEpoch";
 
     public RabbitMqTransportAdapter(
         RabbitMqTransportOptions options,
@@ -54,6 +71,11 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         TransportCapabilities.DlqNative |
         TransportCapabilities.FlowControl;
 
+    /// <remarks>
+    /// Assumes a single-writer caller (the bus publisher loop): batches are not sent concurrently.
+    /// The mapping-epoch memoization fields are read/written here without synchronization and rely
+    /// on that contract.
+    /// </remarks>
     public async Task<IReadOnlyList<SendResult>> SendBatchAsync(
         IReadOnlyList<OutboundMessage> messages,
         CancellationToken cancellationToken = default)
@@ -84,6 +106,17 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
         var results = new SendResult[messages.Count];
 
+        // Memoize the mapping epoch keyed on the topology reference.
+        // ReferenceEquals is O(1) — recompute only when _options.Topology is reassigned.
+        // The pre-boxed object reference is reused for every message in the batch → zero
+        // per-message boxing allocation (the box is created once per topology change).
+        if (!ReferenceEquals(_cachedEpochTopology, _options.Topology))
+        {
+            _cachedEpochTopology = _options.Topology;
+            _cachedEpoch = MappingEpochCalculator.Compute(_options.Topology);
+            _cachedEpochBoxed = _cachedEpoch is { } e ? (object)e : null;
+        }
+
         try
         {
             for (int i = 0; i < messages.Count; i++)
@@ -112,6 +145,15 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
                 (BasicProperties props, Dictionary<string, object?> amqpHeaders) =
                     _headerMapper.MapOutbound(outbound.Headers);
+
+                // Stamp the mapping epoch directly into the AMQP header dictionary (not into
+                // outbound.Headers) because RabbitMqHeaderMapper.MapOutbound deliberately drops
+                // all "BW-" prefixed canonical headers. The pre-boxed reference is reused for
+                // every message in the batch — zero per-message allocation when topology is stable.
+                if (_cachedEpochBoxed is not null)
+                {
+                    amqpHeaders[MappingEpochHeaderName] = _cachedEpochBoxed;
+                }
 
                 // ContentType is always set from the OutboundMessage's dedicated field
                 // (takes precedence over any "content-type" header in the dictionary).
@@ -509,10 +551,11 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     private static string ToRabbitMqExchangeType(BwExchangeType exchangeType) =>
         exchangeType switch
         {
-            BwExchangeType.Direct  => "direct",
-            BwExchangeType.Fanout  => "fanout",
-            BwExchangeType.Topic   => "topic",
-            BwExchangeType.Headers => "headers",
+            BwExchangeType.Direct         => "direct",
+            BwExchangeType.Fanout         => "fanout",
+            BwExchangeType.Topic          => "topic",
+            BwExchangeType.Headers        => "headers",
+            BwExchangeType.ConsistentHash => "x-consistent-hash",
             _ => throw new ArgumentOutOfRangeException(nameof(exchangeType), exchangeType, "Unknown exchange type."),
         };
 

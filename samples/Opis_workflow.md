@@ -791,25 +791,25 @@ GET http://localhost:5107/health
 
 ### Cel
 
-Demonstracja wielu konsumentów na jednym endpointcie z PartitionerMiddleware — gwarancja sekwencyjnego przetwarzania per CorrelationId przy zachowaniu pełnej równoległości między różnymi CorrelationId.
+Demonstracja wielu konsumentów na jednym endpointcie z per-endpointowym uporządkowaniem konsumenta `OrderedByHeader("ordering-key")` — gwarancja sekwencyjnego przetwarzania per klucz przy zachowaniu pełnej równoległości między różnymi kluczami.
 
 ### Demonstrowane funkcjonalności
 
 - **Wielu konsumentów na jednym endpointcie** — `OrderEventConsumer`, `PaymentEventConsumer`, `ShipmentEventConsumer` zarejestrowane na jednej kolejce.
-- **PartitionerMiddleware** (64 partycje) — gwarancja sekwencyjności per CorrelationId.
-- **ConcurrentMessageLimit = 16** — wysoka przepustowość z zachowaniem porządku.
+- **`OrderedByHeader("ordering-key")`** — per-pas (fixed-lane): klucz odczytywany z nagłówka PRZED deserializacją i mapowany na stały pas, gwarancja sekwencyjności per klucz. Zastępuje wycofany (`[Obsolete]`) DI-level `AddPartitionerMiddleware`.
+- **ConcurrentMessageLimit = 16** — wysoka przepustowość z zachowaniem porządku (liczba pasów = `ConcurrentMessageLimit`).
 - Persystencja logów przetwarzania do PostgreSQL (weryfikacja porządku).
 
 ### Architektura przepływu
 
 ```
-POST /events/generate (1000 eventów, 10 CorrelationId)
-    └→ IBus.PublishAsync → events (topic exchange)
+POST /events/generate (1000 eventów, 10 CorrelationId, nagłówek "ordering-key" per wiadomość)
+    └→ IBus.PublishAsync(msg, headers) → events (topic exchange)
             └→ event-processing (queue, binding: #)
-                    ├→ OrderEventConsumer    (typ: OrderEvent)
-                    ├→ PaymentEventConsumer  (typ: PaymentEvent)
-                    └→ ShipmentEventConsumer (typ: ShipmentEvent)
-                           └→ PartitionerMiddleware (64 partycje, klucz: CorrelationId)
+                    └→ OrderedByHeader("ordering-key") → per-pas fixed-lane (pasów = 16)
+                           ├→ OrderEventConsumer    (typ: OrderEvent)
+                           ├→ PaymentEventConsumer  (typ: PaymentEvent)
+                           └→ ShipmentEventConsumer (typ: ShipmentEvent)
                                   └→ ProcessingLogEntry → PostgreSQL
 ```
 
@@ -837,9 +837,10 @@ Co się dzieje w tle:
 1. Generowane jest 1000 eventów rozłożonych na 10 CorrelationId.
 2. Eventy są mieszanką trzech typów: `OrderEvent`, `PaymentEvent`, `ShipmentEvent` (round-robin).
 3. Wszystkie trafiają na topic exchange `events` → kolejkę `event-processing`.
-4. `ConsumerDispatcher` routuje każdą wiadomość do odpowiedniego konsumenta na podstawie typu CLR.
-5. **PartitionerMiddleware** gwarantuje, że wiadomości z tym samym CorrelationId są przetwarzane sekwencyjnie (w ramach jednej partycji), natomiast wiadomości z różnymi CorrelationId — w pełni równolegle.
-6. Każde przetworzenie zapisywane jest jako `ProcessingLogEntry` w PostgreSQL (z timestampem i ThreadId).
+4. Producent stempluje `CorrelationId` w nagłówku transportowym `ordering-key` przy każdym `PublishAsync(msg, headers, ct)`.
+5. `ConsumerDispatcher` routuje każdą wiadomość do odpowiedniego konsumenta na podstawie typu CLR.
+6. **`OrderedByHeader("ordering-key")`** gwarantuje, że wiadomości z tym samym kluczem są przetwarzane sekwencyjnie (w ramach jednego stałego pasa), natomiast wiadomości z różnymi kluczami — w pełni równolegle (między pasami).
+7. Każde przetworzenie zapisywane jest jako `ProcessingLogEntry` w PostgreSQL (z timestampem i ThreadId).
 
 **Krok 2: Zweryfikuj porządek przetwarzania**
 

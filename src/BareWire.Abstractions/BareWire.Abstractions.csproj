@@ -12,6 +12,8 @@
     <InternalsVisibleTo Include="BareWire.Testing" />
     <InternalsVisibleTo Include="BareWire.Saga" />
     <InternalsVisibleTo Include="BareWire.Benchmarks" />
+    <!-- Required for NSubstitute (Castle.DynamicProxy) to substitute internal interfaces in tests -->
+    <InternalsVisibleTo Include="DynamicProxyGenAssembly2" />
   </ItemGroup>
 
 </Project>

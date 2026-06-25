@@ -56,6 +56,18 @@ await bus.PublishAsync(new DemoOrderCreated(...), routingKey: "order.created", c
 
 > See: `samples/BareWire.Samples.ObservabilityShowcase/Program.cs`
 
+### Consistent Hash
+
+Routes each message to one of several bound queues by hashing a key, so the same key always lands on the same queue. Use for per-key consumer ordering with parallelism across keys (one active consumer per queue):
+
+```csharp
+topology.DeclareExchange("ordered-events", ExchangeType.ConsistentHash, durable: true);
+```
+
+`ExchangeType.ConsistentHash` requires the broker plugin `rabbitmq_consistent_hash_exchange` to be enabled. It is an opt-in alternative to single-active-consumer; note that re-mapping (adding/removing a bound queue or a node restart) re-hashes keys and briefly breaks per-key order, which is why single-active-consumer is the recommended default.
+
+> See: [Per-Key Consumer Ordering](per-key-ordering.md) for the two transport-affinity paths and their trade-offs.
+
 ## Queue Configuration (IQueueConfigurator)
 
 `IQueueConfigurator` provides a typed, fluent API for common RabbitMQ queue arguments. It eliminates error-prone string keys like `"x-dead-letter-exchange"` or `"x-message-ttl"`.
@@ -108,6 +120,7 @@ topology.DeclareQueue("payments", durable: true, arguments: new Dictionary<strin
 | `MaxLengthBytes(long)` | `x-max-length-bytes` | Maximum total bytes in the queue |
 | `SetQueueType(QueueType)` | `x-queue-type` | Classic, Quorum, or Stream |
 | `Overflow(OverflowStrategy)` | `x-overflow` | What happens when max length is reached |
+| `SingleActiveConsumer(bool)` | `x-single-active-consumer` | Promotes exactly one active consumer per queue — the transport-native affinity for per-key consumer ordering |
 | `Argument(string, object)` | Any | Escape hatch for any queue argument |
 
 ### RabbitMQ Defaults Reference

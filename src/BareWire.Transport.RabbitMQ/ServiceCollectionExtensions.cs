@@ -83,14 +83,23 @@ public static class ServiceCollectionExtensions
             {
                 EndpointName = e.QueueName,
                 PrefetchCount = e.PrefetchCount,
+                ConcurrentMessageLimit = e.ConcurrentMessageLimit,
+                Ordering = e.Ordering,
                 Consumers = e.ConsumerRegistrations,
                 RawConsumers = e.RawConsumerTypes,
                 SagaTypes = e.SagaTypes,
                 RetryCount = e.RetryCount,
                 RetryInterval = e.RetryInterval,
-                HasDeadLetterExchange = options.Topology?.Queues
+                DeadLetterExchange = options.Topology?.Queues
                     .FirstOrDefault(q => q.Name == e.QueueName)
-                    ?.Arguments?.ContainsKey("x-dead-letter-exchange") ?? false,
+                    ?.Arguments?.TryGetValue("x-dead-letter-exchange", out object? dlxObj) == true
+                    ? dlxObj as string
+                    : null,
+                DeadLetterRoutingKey = options.Topology?.Queues
+                    .FirstOrDefault(q => q.Name == e.QueueName)
+                    ?.Arguments?.TryGetValue("x-dead-letter-routing-key", out object? dlxRkObj) == true
+                    ? dlxRkObj as string
+                    : null,
                 SerializerOverrideType = e.SerializerOverrideType,
                 DeserializerOverrideType = e.DeserializerOverrideType,
             })
