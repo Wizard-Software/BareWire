@@ -148,6 +148,13 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
         // Destination address: use the explicit exchange when set, else fall back to the routing key.
         // This is best-effort/diagnostic — real routing uses the targetExchange + routingKey AMQP fields.
+        //
+        // D9 / ADR-027: under publish-style routing (Feature 14), the factory's ResolveDispatch<T>
+        // sets _targetExchange to the per-type fanout exchange name ("Namespace:TypeName") and leaves
+        // _routingKey empty. The fallback above therefore resolves _destinationAddress to the fanout
+        // exchange URI (rabbitmq://host[/vhost]/Namespace:TypeName), matching MassTransit Publish
+        // semantics — a MT responder reads destinationAddress as "where this was published to".
+        // The response routing does NOT rely on this field; it uses responseAddress / AMQP ReplyTo.
         string destinationName = !string.IsNullOrEmpty(_targetExchange)
             ? _targetExchange
             : _routingKey;
