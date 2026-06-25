@@ -111,11 +111,20 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             return;
         }
 
+        // 14.9 / C2 (SECONDARY first-in-wins mechanism): serialise consumer dispatch on the response
+        // channel so deliveries are processed one-at-a-time. Set EXPLICITLY — do not rely on the
+        // library/connection-factory default; a future RabbitMQ.Client release or a changed
+        // IConnectionFactory.ConsumerDispatchConcurrency could silently enable concurrent dispatch
+        // and introduce a parallel race on the same TCS. The PRIMARY mechanism (TrySetResult
+        // idempotency below) already guarantees first-in-wins regardless of concurrency, but
+        // pinning consumerDispatchConcurrency: 1 here removes the race entirely and self-documents
+        // the intent. (Enforcement C2, ADR-027.)
         _responseChannel = await _connection
             .CreateChannelAsync(
                 new CreateChannelOptions(
                     publisherConfirmationsEnabled: false,
-                    publisherConfirmationTrackingEnabled: false),
+                    publisherConfirmationTrackingEnabled: false,
+                    consumerDispatchConcurrency: 1),
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -468,6 +477,10 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             body: bodySequence,
             deliveryTag: args.DeliveryTag);
 
+        // 14.9 / PRIMARY first-in-wins mechanism: the first responder wins. A second (or subsequent)
+        // TrySetResult on an already-completed TCS returns false and is a no-op — race-tolerant with
+        // a duplicate that read _pending before the entry was removed in GetResponseAsync's finally
+        // block. The ignored return value is intentional (idempotency), not a bug.
         tcs!.TrySetResult(inbound);
 
         return Task.CompletedTask;
