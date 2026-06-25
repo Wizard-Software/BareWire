@@ -9,6 +9,7 @@ using BareWire.Transport.RabbitMQ.Internal;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace BareWire.Transport.RabbitMQ;
 
@@ -38,6 +39,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     private readonly RabbitMqHeaderMapper _headerMapper;
     private readonly Uri _connectionUri;
     private readonly string? _vhost;
+    private readonly bool _strict;
 
     // ADR-004: bounded — limits concurrent in-flight requests.
     private readonly SemaphoreSlim _pendingGate;
@@ -69,6 +71,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         TimeSpan timeout,
         Uri connectionUri,
         string? vhost,
+        bool strict = false,
         int maxPendingRequests = DefaultMaxPendingRequests,
         RabbitMqHeaderMapper? headerMapper = null)
     {
@@ -90,6 +93,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         _timeout = timeout;
         _connectionUri = connectionUri;
         _vhost = vhost;
+        _strict = strict;
         _pendingGate = new SemaphoreSlim(maxPendingRequests, maxPendingRequests);
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
     }
@@ -515,10 +519,21 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             await publishChannel.BasicPublishAsync<BasicProperties>(
                 exchange: _targetExchange,
                 routingKey: _routingKey,
-                mandatory: false,
+                mandatory: _strict,
                 basicProperties: props,
                 body: new ReadOnlyMemory<byte>(rentedBuffer, 0, length),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (PublishException ex) when (ex.IsReturn)
+        {
+            // Strict opt-in (14.10, ADR-027 D3): broker returned the message — no responder queue
+            // is bound to the fanout exchange. SEC S1: message contains only the exchange name,
+            // never correlation-id, body, or headers.
+            throw new BareWireTransportException(
+                message: $"Publish-style request returned: no responder is bound to exchange '{_targetExchange}'.",
+                transportName: TransportName,
+                endpointAddress: null,
+                innerException: ex);
         }
         finally
         {

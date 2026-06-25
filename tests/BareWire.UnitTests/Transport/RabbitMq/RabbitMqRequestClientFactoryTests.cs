@@ -66,7 +66,7 @@ public sealed class RabbitMqRequestClientFactoryTests
             defaultExchange: "default-ex");
 
         // Act
-        (_, string targetExchange, _) = factory.ResolveDispatch<TestMessage>();
+        (_, string targetExchange, _, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — the request client must target the mapped exchange, not the transport default.
         targetExchange.Should().Be("custom-exchange");
@@ -84,7 +84,7 @@ public sealed class RabbitMqRequestClientFactoryTests
             defaultExchange: "default-ex");
 
         // Act
-        (_, string targetExchange, _) = factory.ResolveDispatch<TestMessage>();
+        (_, string targetExchange, _, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — falls back to the transport DefaultExchange, mirroring the publish precedence.
         targetExchange.Should().Be("default-ex");
@@ -101,7 +101,7 @@ public sealed class RabbitMqRequestClientFactoryTests
         await using var factory = CreateFactory(serializerResolver: serializerResolver);
 
         // Act
-        (IMessageSerializer serializer, _, _) = factory.ResolveDispatch<TestMessage>();
+        (IMessageSerializer serializer, _, _, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — the request client must serialize with the per-type serializer, not the default.
         serializer.Should().BeSameAs(mappedSerializer);
@@ -117,7 +117,7 @@ public sealed class RabbitMqRequestClientFactoryTests
         await using var factory = CreateFactory(routingKeyResolver: routingKeyResolver);
 
         // Act
-        (_, _, string routingKey) = factory.ResolveDispatch<TestMessage>();
+        (_, _, string routingKey, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert
         routingKey.Should().Be("test.routing.key");
@@ -140,7 +140,7 @@ public sealed class RabbitMqRequestClientFactoryTests
             defaultExchange: "default-ex");
 
         // Act
-        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+        (_, string targetExchange, string routingKey, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — publish-style branch: per-type fanout exchange, empty routing key.
         targetExchange.Should().Be("OrderSystem.Events:OrderSubmitted");
@@ -169,7 +169,7 @@ public sealed class RabbitMqRequestClientFactoryTests
             publishRequestMappings: mappings);
 
         // Act
-        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+        (_, string targetExchange, string routingKey, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — publish-style wins; send-style exchange and routing key are NOT used.
         targetExchange.Should().Be("FanoutExchange:TestMessage");
@@ -193,11 +193,58 @@ public sealed class RabbitMqRequestClientFactoryTests
             publishRequestMappings: null);
 
         // Act
-        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+        (_, string targetExchange, string routingKey, _) = factory.ResolveDispatch<TestMessage>();
 
         // Assert — send-style: mapped exchange and routing key are used as-is.
         targetExchange.Should().Be("send-style-exchange");
         routingKey.Should().Be("send-routing-key");
+    }
+
+    // ── ResolveDispatch — strict flag (Feature 14 / 14.10) ───────────────────
+
+    /// <summary>
+    /// T5: <see cref="RabbitMqRequestClientFactory.ResolveDispatch{T}"/> must return
+    /// <c>Strict = true</c> when the publish-style registration carries <c>Strict: true</c>.
+    /// </summary>
+    [Fact]
+    public async Task ResolveDispatch_WhenPublishStyleStrict_ReturnsStrictTrue()
+    {
+        // Arrange — registration with Strict: true.
+        var mappings = new Dictionary<Type, PublishRequestRegistration>
+        {
+            [typeof(TestMessage)] = new PublishRequestRegistration("OrderSystem.Events:OrderSubmitted", Strict: true, AutoDeclare: false),
+        };
+
+        await using var factory = CreateFactory(publishRequestMappings: mappings);
+
+        // Act
+        (_, _, _, bool strict) = factory.ResolveDispatch<TestMessage>();
+
+        // Assert — strict flag must be forwarded from the registration.
+        strict.Should().BeTrue("the publish-style registration has Strict: true");
+    }
+
+    /// <summary>
+    /// T6: <see cref="RabbitMqRequestClientFactory.ResolveDispatch{T}"/> must return
+    /// <c>Strict = false</c> for the send-style path (no publish-style registration).
+    /// NF1: send-style routing is always bit-identical — never strict.
+    /// </summary>
+    [Fact]
+    public async Task ResolveDispatch_WhenSendStyle_ReturnsStrictFalse()
+    {
+        // Arrange — no publish-style mappings; send-style path.
+        var exchangeResolver = Substitute.For<IExchangeResolver>();
+        exchangeResolver.Resolve<TestMessage>().Returns("send-style-exchange");
+
+        await using var factory = CreateFactory(
+            exchangeResolver: exchangeResolver,
+            publishRequestMappings: null);
+
+        // Act
+        (_, _, _, bool strict) = factory.ResolveDispatch<TestMessage>();
+
+        // Assert — send-style must never set strict (NF1 bit-identity).
+        strict.Should().BeFalse("send-style routing must always have strict = false (NF1)");
     }
 
     // ── Dispose tests ─────────────────────────────────────────────────────────
