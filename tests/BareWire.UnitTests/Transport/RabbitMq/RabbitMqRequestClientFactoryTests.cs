@@ -2,6 +2,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Transport.RabbitMQ;
+using BareWire.Transport.RabbitMQ.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 
@@ -9,8 +10,8 @@ namespace BareWire.UnitTests.Transport.RabbitMq;
 
 /// <summary>
 /// Unit tests for <see cref="RabbitMqRequestClientFactory"/> that do not require a running broker.
-/// Tests verify per-type dispatch resolution (issue #13), dispose behaviour, cancellation
-/// propagation, and thread-safety under concurrent load.
+/// Tests verify per-type dispatch resolution (issue #13 and Feature 14 publish-style),
+/// dispose behaviour, cancellation propagation, and thread-safety under concurrent load.
 /// </summary>
 public sealed class RabbitMqRequestClientFactoryTests
 {
@@ -25,13 +26,15 @@ public sealed class RabbitMqRequestClientFactoryTests
         IDeserializerResolver? deserializerResolver = null,
         IExchangeResolver? exchangeResolver = null,
         IRoutingKeyResolver? routingKeyResolver = null,
-        string defaultExchange = "")
+        string defaultExchange = "",
+        IReadOnlyDictionary<Type, PublishRequestRegistration>? publishRequestMappings = null)
     {
         var options = new RabbitMqTransportOptions
         {
             ConnectionString = "amqp://guest:guest@localhost:59999",
             ConnectionTimeout = TimeSpan.FromSeconds(5),
             DefaultExchange = defaultExchange,
+            PublishRequestMappings = publishRequestMappings,
         };
 
         serializerResolver ??= Substitute.For<ISerializerResolver>();
@@ -118,6 +121,83 @@ public sealed class RabbitMqRequestClientFactoryTests
 
         // Assert
         routingKey.Should().Be("test.routing.key");
+    }
+
+    // ── ResolveDispatch — publish-style branch (Feature 14) ───────────────────
+
+    [Fact]
+    public async Task ResolveDispatch_WhenPublishStyleRegisteredForRequestType_ReturnsFanoutExchangeAndEmptyRoutingKey()
+    {
+        // Arrange — PublishRequest<TestMessage>() has been configured: per-type fanout exchange,
+        // no Strict mode, no AutoDeclare.
+        var mappings = new Dictionary<Type, PublishRequestRegistration>
+        {
+            [typeof(TestMessage)] = new PublishRequestRegistration("OrderSystem.Events:OrderSubmitted", Strict: false, AutoDeclare: false),
+        };
+
+        await using var factory = CreateFactory(
+            publishRequestMappings: mappings,
+            defaultExchange: "default-ex");
+
+        // Act
+        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+
+        // Assert — publish-style branch: per-type fanout exchange, empty routing key.
+        targetExchange.Should().Be("OrderSystem.Events:OrderSubmitted");
+        routingKey.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ResolveDispatch_WhenBothPublishStyleAndMapExchangeConfigured_PublishStyleWins()
+    {
+        // Arrange — both a MapExchange<T> send-style mapping AND a publish-style registration exist.
+        // Publish-style must take precedence (Feature 14, ADR-027).
+        var exchangeResolver = Substitute.For<IExchangeResolver>();
+        exchangeResolver.Resolve<TestMessage>().Returns("send-style-exchange");
+
+        var routingKeyResolver = Substitute.For<IRoutingKeyResolver>();
+        routingKeyResolver.Resolve<TestMessage>().Returns("send-routing-key");
+
+        var mappings = new Dictionary<Type, PublishRequestRegistration>
+        {
+            [typeof(TestMessage)] = new PublishRequestRegistration("FanoutExchange:TestMessage", Strict: false, AutoDeclare: false),
+        };
+
+        await using var factory = CreateFactory(
+            exchangeResolver: exchangeResolver,
+            routingKeyResolver: routingKeyResolver,
+            publishRequestMappings: mappings);
+
+        // Act
+        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+
+        // Assert — publish-style wins; send-style exchange and routing key are NOT used.
+        targetExchange.Should().Be("FanoutExchange:TestMessage");
+        routingKey.Should().BeEmpty("publish-style routing key must be empty so the fanout ignores it");
+    }
+
+    [Fact]
+    public async Task ResolveDispatch_WhenNoPublishStyleRegistration_UsesSendStylePath()
+    {
+        // Arrange — no publish-style mappings (null); default-OFF (NF1/F6).
+        var exchangeResolver = Substitute.For<IExchangeResolver>();
+        exchangeResolver.Resolve<TestMessage>().Returns("send-style-exchange");
+
+        var routingKeyResolver = Substitute.For<IRoutingKeyResolver>();
+        routingKeyResolver.Resolve<TestMessage>().Returns("send-routing-key");
+
+        // publishRequestMappings = null (default) → send-style path must be bit-identical to today.
+        await using var factory = CreateFactory(
+            exchangeResolver: exchangeResolver,
+            routingKeyResolver: routingKeyResolver,
+            publishRequestMappings: null);
+
+        // Act
+        (_, string targetExchange, string routingKey) = factory.ResolveDispatch<TestMessage>();
+
+        // Assert — send-style: mapped exchange and routing key are used as-is.
+        targetExchange.Should().Be("send-style-exchange");
+        routingKey.Should().Be("send-routing-key");
     }
 
     // ── Dispose tests ─────────────────────────────────────────────────────────
