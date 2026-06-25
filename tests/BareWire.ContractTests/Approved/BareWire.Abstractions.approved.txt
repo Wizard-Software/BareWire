@@ -255,6 +255,12 @@ namespace BareWire.Abstractions.Configuration
         void UseTls(System.Action<BareWire.Abstractions.Configuration.ITlsConfigurator> configure);
         void Username(string username);
     }
+    public interface IPublishRequestOptions
+    {
+        bool AutoDeclare { get; set; }
+        string? ExchangeName { get; set; }
+        bool Strict { get; set; }
+    }
     public interface IRabbitMqConfigurator
     {
         void ConfigureHeaderMapping(System.Action<BareWire.Abstractions.Headers.IHeaderMappingConfigurator> configure);
@@ -264,6 +270,10 @@ namespace BareWire.Abstractions.Configuration
         void MapExchange<T>(string exchangeName)
             where T :  class;
         void MapRoutingKey<T>(string routingKey)
+            where T :  class;
+        void PublishRequest<T>()
+            where T :  class;
+        void PublishRequest<T>(System.Action<BareWire.Abstractions.Configuration.IPublishRequestOptions> configure)
             where T :  class;
         void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
     }
