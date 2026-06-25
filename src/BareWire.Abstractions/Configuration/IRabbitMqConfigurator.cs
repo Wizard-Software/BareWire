@@ -138,4 +138,68 @@ public interface IRabbitMqConfigurator
     /// correspond to an exchange declared via <see cref="ConfigureTopology"/>.
     /// </exception>
     void MapExchange<T>(string exchangeName) where T : class;
+
+    /// <summary>
+    /// Enables publish-style request/response for message type <typeparamref name="T"/> using
+    /// the default <c>Namespace:TypeName</c> exchange name formatter, with <c>Strict</c> and
+    /// <c>AutoDeclare</c> both set to <see langword="false"/>.
+    /// This mode is OFF by default — without an explicit <c>PublishRequest&lt;T&gt;</c> call
+    /// the publish path for <typeparamref name="T"/> is bit-identical to a plain <c>PublishAsync</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The per-type exchange name is derived by the default <c>Namespace:TypeName</c> formatter
+    /// (e.g., <c>MyApp.Messages:OrderRequest</c>). To override the name or enable strict / auto-declare
+    /// behavior, use the <see cref="PublishRequest{T}(System.Action{IPublishRequestOptions})"/> overload.
+    /// </para>
+    /// <para>
+    /// <strong>Last-call-wins.</strong> Calling this method (or its overload) multiple times for the
+    /// same <typeparamref name="T"/> is allowed; the last call takes effect, discarding any previous
+    /// registration for that type (same precedence rule as <see cref="MapExchange{T}"/>).
+    /// </para>
+    /// <para>
+    /// <strong>Topology requirement.</strong> The resolved per-type fanout exchange must be declared in
+    /// the topology via <see cref="ConfigureTopology"/>. Fail-fast validation is performed at bus startup
+    /// (<c>Build()</c>) and throws <see cref="Exceptions.BareWireConfigurationException"/> when the
+    /// exchange is absent from the declared topology.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">The request message type to enable publish-style routing for. Must be a reference type.</typeparam>
+    void PublishRequest<T>() where T : class;
+
+    /// <summary>
+    /// Enables publish-style request/response for message type <typeparamref name="T"/> and applies
+    /// additional options via the <paramref name="configure"/> delegate.
+    /// This mode is OFF by default — without an explicit <c>PublishRequest&lt;T&gt;</c> call
+    /// the publish path for <typeparamref name="T"/> is bit-identical to a plain <c>PublishAsync</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The per-type exchange name defaults to the <c>Namespace:TypeName</c> formatter
+    /// (e.g., <c>MyApp.Messages:OrderRequest</c>). Set <see cref="IPublishRequestOptions.ExchangeName"/>
+    /// in the <paramref name="configure"/> delegate to override it.
+    /// </para>
+    /// <para>
+    /// <strong>Last-call-wins.</strong> Calling this method (or its parameterless overload) multiple times
+    /// for the same <typeparamref name="T"/> is allowed; the last call takes effect, discarding any previous
+    /// registration for that type (same precedence rule as <see cref="MapExchange{T}"/>).
+    /// </para>
+    /// <para>
+    /// <strong>Topology requirement.</strong> The resolved per-type fanout exchange must be declared in
+    /// the topology via <see cref="ConfigureTopology"/>. Fail-fast validation is performed at bus startup
+    /// (<c>Build()</c>) and throws <see cref="Exceptions.BareWireConfigurationException"/> when the
+    /// exchange is absent from the declared topology (unless <see cref="IPublishRequestOptions.AutoDeclare"/>
+    /// is <see langword="true"/>, in which case the exchange is declared automatically during topology
+    /// deployment).
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">The request message type to enable publish-style routing for. Must be a reference type.</typeparam>
+    /// <param name="configure">
+    /// A delegate that receives an <see cref="IPublishRequestOptions"/> and applies the desired
+    /// options (exchange name override, strict mode, auto-declare). Must not be <see langword="null"/>.
+    /// </param>
+    /// <exception cref="System.ArgumentNullException">
+    /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
+    /// </exception>
+    void PublishRequest<T>(Action<IPublishRequestOptions> configure) where T : class;
 }

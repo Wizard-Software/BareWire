@@ -70,6 +70,17 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         _exchangeMappings[typeof(T)] = exchangeName;
     }
 
+    // Compile-bridge: the interface members are declared here so the assembly builds;
+    // publish-style request/response accumulation is wired up in a follow-up change.
+    public void PublishRequest<T>() where T : class =>
+        throw new NotImplementedException("Publish-style request routing is not yet wired up.");
+
+    public void PublishRequest<T>(Action<IPublishRequestOptions> configure) where T : class
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        throw new NotImplementedException("Publish-style request routing is not yet wired up.");
+    }
+
     internal RabbitMqTransportOptions Build()
     {
         ValidateUri(_hostUri);
