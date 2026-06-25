@@ -157,6 +157,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
 
         if (_publishRequestMappings.Count > 0)
         {
+            options.Topology = MergeAutoDeclareExchanges(options.Topology, _publishRequestMappings.Values);
             ValidatePublishRequestMappings(options.Topology);
             options.PublishRequestMappings =
                 new Dictionary<Type, PublishRequestRegistration>(_publishRequestMappings);
@@ -264,6 +265,54 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
                                    "competing responders.");
             }
         }
+    }
+
+    // Merges per-type fanout exchange declarations for all AutoDeclare==true publish-request
+    // registrations into the topology snapshot. Returns a NEW TopologyDeclaration (init-only record)
+    // or creates one from scratch when topology is null. Exchanges already present by name are
+    // skipped to guarantee idempotency (user may declare the exchange explicitly via the helper
+    // AND set AutoDeclare=true).
+    private static TopologyDeclaration MergeAutoDeclareExchanges(
+        TopologyDeclaration? topology,
+        IEnumerable<PublishRequestRegistration> registrations)
+    {
+        List<ExchangeDeclaration>? toAdd = null;
+
+        HashSet<string> existing = topology is not null
+            ? [..topology.Exchanges.Select(e => e.Name)]
+            : [];
+
+        foreach (PublishRequestRegistration registration in registrations)
+        {
+            if (!registration.AutoDeclare)
+            {
+                continue;
+            }
+
+            if (!existing.Add(registration.ExchangeName))
+            {
+                // Exchange already declared (either from topology or a prior iteration); skip.
+                continue;
+            }
+
+            toAdd ??= [];
+            toAdd.Add(new ExchangeDeclaration(registration.ExchangeName, ExchangeType.Fanout,
+                Durable: true, AutoDelete: false));
+        }
+
+        if (toAdd is null)
+        {
+            // Nothing to merge — return the original snapshot (or an empty one if topology was null).
+            return topology ?? new TopologyDeclaration();
+        }
+
+        IReadOnlyList<ExchangeDeclaration> mergedExchanges = topology is not null
+            ? [..topology.Exchanges, ..toAdd]
+            : [..toAdd];
+
+        return topology is not null
+            ? topology with { Exchanges = mergedExchanges }
+            : new TopologyDeclaration { Exchanges = mergedExchanges };
     }
 
     private static void ValidateUri(string? uri)

@@ -81,4 +81,34 @@ public interface ITopologyConfigurator
     /// <param name="destination">The name of the destination exchange.</param>
     /// <param name="routingKey">The routing key pattern to match against.</param>
     void BindExchangeToExchange(string source, string destination, string routingKey);
+
+    /// <summary>
+    /// Declares the per-type fanout exchange used for publish-style request/response.
+    /// The exchange name is derived from the message type using the <c>Namespace:TypeName</c>
+    /// convention (e.g. <c>MyApp.Messages:PaymentRequested</c>).
+    /// The exchange is declared as durable, non-auto-delete, and of type <see cref="ExchangeType.Fanout"/>
+    /// so that all bound responder queues receive every request.
+    /// </summary>
+    /// <typeparam name="T">
+    /// The request message type. Must be a reference type. The type's CLR namespace and name
+    /// determine the exchange name.
+    /// </typeparam>
+    void DeclareRequestExchange<T>() where T : class;
+
+    /// <summary>
+    /// Binds a responder queue to the per-type fanout request exchange with an empty routing key.
+    /// Fanout exchanges ignore the routing key; it is set to <see cref="string.Empty"/> to satisfy
+    /// the AMQP binding contract while making the intent explicit.
+    /// </summary>
+    /// <typeparam name="T">
+    /// The request message type. Must be a reference type. The type's CLR namespace and name
+    /// determine the exchange name via the <c>Namespace:TypeName</c> convention.
+    /// </typeparam>
+    /// <param name="queue">
+    /// The name of the responder queue to bind. Must be non-null and non-empty.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="queue"/> is <see langword="null"/> or empty.
+    /// </exception>
+    void BindRequestExchangeToQueue<T>(string queue) where T : class;
 }

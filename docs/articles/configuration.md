@@ -110,6 +110,27 @@ The default exchange name follows the MassTransit convention `Namespace:TypeName
 with a **literal colon** — it must match the responder's exchange exactly, or the
 request publishes to an exchange no responder listens on and times out.
 
+To declare the per-type fanout exchange and bind a responder queue without
+spelling out the `Namespace:TypeName` name by hand, `ITopologyConfigurator`
+offers two opt-in convenience helpers — sugar over `DeclareExchange` +
+`BindExchangeToQueue`:
+
+```csharp
+rmq.ConfigureTopology(t =>
+{
+    t.DeclareRequestExchange<CheckOrderStatus>();              // fanout Namespace:TypeName, durable
+    t.BindRequestExchangeToQueue<CheckOrderStatus>("orders");  // bind a responder queue, no routing key
+});
+```
+
+`DeclareRequestExchange<T>()` declares the fanout exchange (`durable: true`,
+`autoDelete: false`); `BindRequestExchangeToQueue<T>(queue)` binds the queue with
+an empty routing key (fanout ignores the key). They change nothing else — the same
+fail-fast validation and default-OFF posture apply. When `AutoDeclare = true` is
+set on `PublishRequest<T>`, the per-type fanout exchange is declared automatically
+at topology deploy (idempotently — declaring it explicitly with the helper as well
+does not create a duplicate).
+
 > See: [Publishing and Consuming](publishing-and-consuming.md#publish-style-competing-responders-first-in-wins) for the full competing-responders scenario, topology, and the first-in-wins caveats.
 
 ## Topology Configuration

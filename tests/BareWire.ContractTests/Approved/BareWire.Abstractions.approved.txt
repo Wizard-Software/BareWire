@@ -646,9 +646,13 @@ namespace BareWire.Abstractions.Topology
     {
         void BindExchangeToExchange(string source, string destination, string routingKey);
         void BindExchangeToQueue(string exchange, string queue, string routingKey);
+        void BindRequestExchangeToQueue<T>(string queue)
+            where T :  class;
         void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
         void DeclareQueue(string name, bool durable, bool autoDelete, System.Action<BareWire.Abstractions.Topology.IQueueConfigurator> configure);
         void DeclareQueue(string name, bool durable = true, bool autoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? arguments = null);
+        void DeclareRequestExchange<T>()
+            where T :  class;
     }
     public enum OverflowStrategy
     {
