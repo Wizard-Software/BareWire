@@ -119,6 +119,38 @@ POST /events/generate        — publish 1000 events across 10 CorrelationIds
 GET  /events/processing-log  — verify per-correlation ordering
 ```
 
+### OrderedConsumers
+
+End-to-end per-key consumer ordering with competing consumer instances (Aspire `WithReplicas(2)`),
+transactional outbox (`OrderingMode.PerKey`), and poison-head parking via DLX.
+
+Demonstrates two ordering tiers (ADR-026):
+
+1. **Cross-instance (SAC)** — `ordered-processing` queue with `x-single-active-consumer`. RabbitMQ
+   promotes exactly one active consumer across replicas; ordered delivery is guaranteed per key
+   across process boundaries. `MaxDeliveryAttempts(2)` parks a poison head via DLX and releases
+   the key stream.
+2. **Single-instance (LocalPartitioned)** — `local-partitioned-processing` queue with a typed
+   selector `m => m.AccountId` and fixed-lane hashing (`Concurrency(8)`). Cross-instance safe only
+   under `LocalPartitioned` (M3 caveat documented in source).
+
+Run via Aspire AppHost (recommended — starts RabbitMQ + PostgreSQL + 2 replicas automatically):
+
+```bash
+dotnet run --project BareWire.Samples.AppHost/
+```
+
+```
+POST /events/generate?withPoison=false  — publish 3 healthy accounts × 5 sequences via outbox
+POST /events/generate?withPoison=true   — same + inject a synthetic poison key (seq=0 parked, 1..4 resume)
+GET  /events/processing-log             — verify strict per-key ordering across competing replicas
+GET  /health                            — health check
+```
+
+**Non-PII note:** ordering keys in this sample (`acct-A`, `acct-B`, `acct-C`) are synthetic
+demonstration values and do not identify natural persons. The poison key is a generated Guid
+fragment and never appears in query strings or response bodies.
+
 ## Shared Projects
 
 - **BareWire.Samples.AppHost** — Aspire orchestrator for all samples (RabbitMQ + PostgreSQL + Dashboard)

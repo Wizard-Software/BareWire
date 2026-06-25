@@ -89,4 +89,16 @@ builder.AddProject<Projects.BareWire_Samples_CloudEventsInterop>("cloudevents-in
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+// Replica count for the ordered-consumers sample. Set to 2 for CI (fastest startup while
+// still demonstrating competing consumers + SAC failover). Raise to 3 locally for a more
+// vivid multi-replica showcase.
+const int OrderedConsumersReplicaCount = 2;
+
+builder.AddProject<Projects.BareWire_Samples_OrderedConsumers>("ordered-consumers")
+    .WithReplicas(OrderedConsumersReplicaCount)
+    .WithReference(rabbitmq)
+    .WithReference(postgres)
+    .WaitFor(rabbitmq)
+    .WaitFor(postgres);
+
 builder.Build().Run();

@@ -1,0 +1,13 @@
+@host = http://localhost:5114
+
+### Generate events (healthy keys only)
+POST {{host}}/events/generate?withPoison=false
+
+### Generate events with poison key injection
+POST {{host}}/events/generate?withPoison=true
+
+### Get processing log (verify per-key strict ordering)
+GET {{host}}/events/processing-log
+
+### Health check
+GET {{host}}/health
