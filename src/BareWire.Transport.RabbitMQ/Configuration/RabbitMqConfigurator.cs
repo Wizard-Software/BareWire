@@ -1,3 +1,4 @@
+using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Headers;
@@ -156,6 +157,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
 
         if (_publishRequestMappings.Count > 0)
         {
+            ValidatePublishRequestMappings(options.Topology);
             options.PublishRequestMappings =
                 new Dictionary<Type, PublishRequestRegistration>(_publishRequestMappings);
         }
@@ -194,6 +196,73 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
                 optionValue: missingList,
                 expectedValue: "All exchanges referenced in MapExchange<T> must be declared via ConfigureTopology. " +
                                $"Missing exchanges: {missingList}.");
+        }
+    }
+
+    // Fail-fast validation for publish-style request mappings. Called unconditionally from Build()
+    // whenever the publish-request map is non-empty, independent of _exchangeMappings.Count
+    // (ValidateExchangeMappings only runs inside `if (_exchangeMappings.Count > 0)` and never covers
+    // this map). Entries with AutoDeclare == true are skipped: their exchange is declared on the deploy
+    // path, so its absence from the explicit topology is expected. For every other entry the per-type
+    // exchange must (1) be declared in the topology and (2) be of type Fanout — a Direct/Topic exchange
+    // of the same name would silently break the broadcast to competing responders.
+    private void ValidatePublishRequestMappings(TopologyDeclaration? topology)
+    {
+        // Only AutoDeclare == false entries require a pre-declared topology exchange.
+        var requiresTopology = false;
+        foreach (PublishRequestRegistration registration in _publishRequestMappings.Values)
+        {
+            if (!registration.AutoDeclare)
+            {
+                requiresTopology = true;
+                break;
+            }
+        }
+
+        if (!requiresTopology)
+        {
+            return;
+        }
+
+        if (topology is null)
+        {
+            throw new BareWireConfigurationException(
+                optionName: "PublishRequest",
+                optionValue: null,
+                expectedValue: "ConfigureTopology must be called before PublishRequest<T>. " +
+                               "Declare the per-type fanout exchange via ConfigureTopology, " +
+                               "or set AutoDeclare = true to declare it on the deploy path.");
+        }
+
+        foreach (PublishRequestRegistration registration in _publishRequestMappings.Values)
+        {
+            if (registration.AutoDeclare)
+            {
+                continue;
+            }
+
+            string exchangeName = registration.ExchangeName;
+            ExchangeDeclaration? declaration =
+                topology.Exchanges.FirstOrDefault(e => e.Name == exchangeName);
+
+            if (declaration is null)
+            {
+                throw new BareWireConfigurationException(
+                    optionName: "PublishRequest",
+                    optionValue: exchangeName,
+                    expectedValue: "The per-type exchange referenced by PublishRequest<T> must be " +
+                                   "declared via ConfigureTopology (or set AutoDeclare = true).");
+            }
+
+            if (declaration.Type != ExchangeType.Fanout)
+            {
+                throw new BareWireConfigurationException(
+                    optionName: "PublishRequest",
+                    optionValue: exchangeName,
+                    expectedValue: $"The per-type exchange must be declared as ExchangeType.Fanout; " +
+                                   $"'{declaration.Type}' would silently break the broadcast to " +
+                                   "competing responders.");
+            }
         }
     }
 

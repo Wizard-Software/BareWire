@@ -1,4 +1,5 @@
 using AwesomeAssertions;
+using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Transport.RabbitMQ.Configuration;
@@ -22,10 +23,19 @@ public sealed class RabbitMqConfiguratorPublishRequestTests
     [Fact]
     public void PublishRequest_CalledTwiceForSameType_LastWins()
     {
-        // Arrange
+        // Arrange — AutoDeclare = true skips topology validation (this test targets last-call-wins,
+        // not the ValidatePublishRequestMappings fail-fast path).
         RabbitMqConfigurator configurator = CreateConfigurator();
-        configurator.PublishRequest<PaymentRequested>(o => o.ExchangeName = "first");
-        configurator.PublishRequest<PaymentRequested>(o => o.ExchangeName = "second");
+        configurator.PublishRequest<PaymentRequested>(o =>
+        {
+            o.ExchangeName = "first";
+            o.AutoDeclare = true;
+        });
+        configurator.PublishRequest<PaymentRequested>(o =>
+        {
+            o.ExchangeName = "second";
+            o.AutoDeclare = true;
+        });
 
         // Act
         RabbitMqTransportOptions options = configurator.Build();
@@ -40,9 +50,14 @@ public sealed class RabbitMqConfiguratorPublishRequestTests
     [Fact]
     public void PublishRequest_WithExchangeNameOverride_StoresOverride()
     {
-        // Arrange
+        // Arrange — AutoDeclare = true skips topology validation (this test targets the ExchangeName
+        // override being stored, not the ValidatePublishRequestMappings fail-fast path).
         RabbitMqConfigurator configurator = CreateConfigurator();
-        configurator.PublishRequest<PaymentRequested>(o => o.ExchangeName = "custom.fanout");
+        configurator.PublishRequest<PaymentRequested>(o =>
+        {
+            o.ExchangeName = "custom.fanout";
+            o.AutoDeclare = true;
+        });
 
         // Act
         RabbitMqTransportOptions options = configurator.Build();
@@ -57,15 +72,17 @@ public sealed class RabbitMqConfiguratorPublishRequestTests
     [Fact]
     public void PublishRequest_WithoutExchangeName_StoresFormatterName()
     {
-        // Arrange
+        // Arrange — declare the matching Fanout exchange so the bare overload (AutoDeclare = false)
+        // passes ValidatePublishRequestMappings; this test targets the stored formatter name.
+        string expected = RequestExchangeNameFormatter.Format<PaymentRequested>();
         RabbitMqConfigurator configurator = CreateConfigurator();
+        configurator.ConfigureTopology(t => t.DeclareExchange(expected, ExchangeType.Fanout));
         configurator.PublishRequest<PaymentRequested>();
 
         // Act
         RabbitMqTransportOptions options = configurator.Build();
 
         // Assert
-        string expected = RequestExchangeNameFormatter.Format<PaymentRequested>();
         options.PublishRequestMappings.Should().NotBeNull();
         options.PublishRequestMappings![typeof(PaymentRequested)].ExchangeName.Should().Be(expected);
     }
@@ -75,8 +92,11 @@ public sealed class RabbitMqConfiguratorPublishRequestTests
     [Fact]
     public void PublishRequest_BareOverload_DefaultsFlagsFalse()
     {
-        // Arrange
+        // Arrange — declare the matching Fanout exchange so the bare overload (AutoDeclare = false)
+        // passes ValidatePublishRequestMappings; this test targets the default flag values.
+        string exchange = RequestExchangeNameFormatter.Format<PaymentRequested>();
         RabbitMqConfigurator configurator = CreateConfigurator();
+        configurator.ConfigureTopology(t => t.DeclareExchange(exchange, ExchangeType.Fanout));
         configurator.PublishRequest<PaymentRequested>();
 
         // Act
