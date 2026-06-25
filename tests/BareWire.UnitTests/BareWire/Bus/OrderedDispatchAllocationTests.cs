@@ -14,6 +14,19 @@ using Xunit;
 namespace BareWire.UnitTests.Core.Bus;
 
 /// <summary>
+/// Dedicated non-parallel collection for the ordered-dispatch allocation gate
+/// (<see cref="OrderedDispatchAllocationTests"/>). <c>DisableParallelization = true</c> stops
+/// any other test collection from running concurrently, keeping the process-wide
+/// <see cref="GC.GetTotalAllocatedBytes"/> counter quiet during the slope measurement.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class AllocationGateIsolation
+{
+    /// <summary>Collection name shared between the definition and the test class.</summary>
+    public const string Name = "OrderedDispatchAllocationGate";
+}
+
+/// <summary>
 /// R8.15 — deterministic CI gate for ordered-dispatch allocation regression (ADR-026 §8).
 ///
 /// <para>
@@ -59,6 +72,22 @@ namespace BareWire.UnitTests.Core.Bus;
 /// The unordered handler is unchanged. This proves the measurement is live (not vacuous).
 /// </para>
 /// </summary>
+///
+/// <remarks>
+/// <para><strong>Why this class runs non-parallel (<see cref="AllocationGateIsolation"/>):</strong></para>
+/// <para>
+/// The slope method reads the <b>process-wide</b> <see cref="GC.GetTotalAllocatedBytes"/>
+/// counter — it counts allocations from <em>every</em> thread in the process. xUnit runs
+/// test collections in parallel by default, so allocations from other test classes executing
+/// concurrently land inside this gate's measured window and corrupt the baseline (observed as a
+/// physically-impossible negative marginal, e.g. −25 KB/msg). Assigning this class to a
+/// collection with <c>DisableParallelization = true</c> guarantees no other test allocates
+/// concurrently during measurement, so the process-wide counter reflects only this gate's work.
+/// The test passes deterministically in isolation; this attribute makes the full-suite run
+/// behave like the isolated run.
+/// </para>
+/// </remarks>
+[Collection(AllocationGateIsolation.Name)]
 public sealed class OrderedDispatchAllocationTests
 {
     private const string KeyHeader = "x-ordering-key";
