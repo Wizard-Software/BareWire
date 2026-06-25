@@ -1,0 +1,10 @@
+@host = http://localhost:5121
+
+### Ask — send a ping request; competing responders race to answer (first-in-wins)
+POST {{host}}/ask?payload=hello
+
+### Ask — another payload
+POST {{host}}/ask?payload=world
+
+### Health
+GET {{host}}/health
