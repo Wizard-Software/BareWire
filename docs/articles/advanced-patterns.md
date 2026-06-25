@@ -4,6 +4,8 @@
 
 When multiple consumer types share a single endpoint, you can ensure per-key ordering with per-endpoint consumer ordering: `OrderedByHeader(...)` (raw / cross-language) or `OrderedBy<TMessage>(selector)` (typed). Per-key ordering is OFF by default — opt in per endpoint.
 
+> See: [Per-Key Consumer Ordering](per-key-ordering.md) for the full picture — strategies (`Auto` / `LocalPartitioned` / `TransportNative`), transport affinity (SAC / consistent-hash), fail-fast, poison handling, and the end-to-end story with the outbox.
+
 > The DI-level `AddPartitionerMiddleware(...)` is deprecated and retained for one coexistence release. Migrate to per-endpoint `OrderedByHeader`/`OrderedBy`.
 
 ### Setup

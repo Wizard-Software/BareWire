@@ -76,6 +76,30 @@ rmq.ReceiveEndpoint("payments-dlq", e =>
 
 > See: `samples/BareWire.Samples.RetryAndDlq/`
 
+## Per-Key Poison Handling
+
+When an endpoint enables [per-key consumer ordering](per-key-ordering.md), a poison message at the head of a key would otherwise block that key's entire stream (head-of-line blocking). The anti-starvation contract resolves this: **bounded retry → park/DLQ → key release**.
+
+```csharp
+rmq.ReceiveEndpoint("ordered-processing", e =>
+{
+    e.OrderedBy(o =>
+    {
+        o.ByHeader("ordering-key");
+        o.TransportAffinity(TransportAffinity.SingleActiveConsumer);
+        o.MaxDeliveryAttempts(2);   // park the poison head after 2 attempts
+    });
+    e.Consumer<OrderShippedConsumer, OrderShipped>();
+});
+```
+
+- The head message is retried up to `MaxDeliveryAttempts` (reusing the endpoint `RetryCount`/`RetryInterval`).
+- After the threshold, the message is dead-lettered (wire a DLX on the queue) and leaves the head of the key.
+- The key stream then **resumes** for subsequent messages. The skipped (parked) message is an ordering gap, which is logged — there is no permanent block.
+- Key release happens only **after the broker durably confirms** the parking of the head; if settlement fails, the key is not released (the head stays at the front and the operation is retried).
+
+`MaxDeliveryAttempts` defaults to `0` (disabled — plain at-least-once without parking).
+
 ## Message Loss Protection
 
 If a queue has no Dead Letter Exchange configured and a message is rejected after retry exhaustion, it is **permanently lost**. BareWire logs a warning in this situation:

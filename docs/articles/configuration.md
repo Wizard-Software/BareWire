@@ -55,6 +55,32 @@ rmq.ReceiveEndpoint("my-queue", e =>
 });
 ```
 
+### Per-Key Consumer Ordering
+
+A receive endpoint can preserve message order **within a key** while processing different keys in parallel. It is OFF by default — opt in per endpoint with one of:
+
+```csharp
+rmq.ReceiveEndpoint("ordered-processing", e =>
+{
+    // Header-based (raw / cross-language) — leaves strategy at Auto
+    e.OrderedByHeader("ordering-key");
+
+    // Or the configurator block for full control
+    e.OrderedBy(o =>
+    {
+        o.ByHeader("ordering-key");
+        o.TransportAffinity(TransportAffinity.SingleActiveConsumer);
+        o.MaxDeliveryAttempts(2);
+    });
+
+    e.Consumer<MyConsumer, MyMessage>();
+});
+```
+
+> **Correlation-id key caveat.** When no explicit key source is given, the ordering key falls back to the auto-stamped correlation-id. This only works when the correlation-id is **stable per aggregate/entity** and has **appropriate cardinality**: too few distinct values create a hot key that throttles parallelism; a value that changes per message gives no real affinity (each message is its own group); and the correlation-id is **not** stamped for plain `PublishAsync`/`SendAsync`, so under that traffic the message flows keyless (no ordering). Prefer an explicit `ByHeader`/`By` key source for predictable behavior.
+
+> See: [Per-Key Consumer Ordering](per-key-ordering.md) for strategies, transport affinity, fail-fast, and the end-to-end story.
+
 ## Topology Configuration
 
 Use `ConfigureTopology` to declare exchanges, queues, and bindings. Queue arguments can be configured using the fluent `IQueueConfigurator` API:

@@ -204,6 +204,17 @@ Framework headers (`BW-MessageType`, trace context) take precedence over custom 
 
 > See: `samples/BareWire.Samples.InboxDeduplication/Program.cs`
 
+### Ordered consumption
+
+A custom header can also carry an **ordering key** so a receive endpoint processes messages of the same key in order while running different keys in parallel. Stamp the key on publish (or let the transactional outbox stamp it in `OrderingMode.PerKey`), and opt the endpoint in with `OrderedByHeader("ordering-key")`:
+
+```csharp
+var headers = new Dictionary<string, string> { ["ordering-key"] = customerId };
+await bus.PublishAsync(new OrderShipped(/* ... */), headers, ct);
+```
+
+> See: [Per-Key Consumer Ordering](per-key-ordering.md) for the consumer-side configuration.
+
 ## MessageContext.EndpointName
 
 Inside middleware, the `MessageContext.EndpointName` property contains the name of the receive endpoint (queue) processing the current message. This enables endpoint-aware logic such as routing, logging, or inbox deduplication keys:

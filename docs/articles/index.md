@@ -8,16 +8,17 @@ Welcome to the BareWire documentation. BareWire is a high-performance async mess
 2. [Configuration](configuration.md) — bus setup, RabbitMQ transport, DI registration
 3. [Publishing and Consuming](publishing-and-consuming.md) — publish/subscribe, request-response, raw messages
 4. [Topology](topology.md) — exchanges, queues, bindings, routing keys
-5. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
-6. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
-7. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
-8. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
-9. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
-10. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
-11. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
-12. [Observability](observability.md) — OpenTelemetry, metrics, health checks
-13. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
-14. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
+5. [Per-Key Consumer Ordering](per-key-ordering.md) — ordered consumption per key across competing consumers
+6. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
+7. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
+8. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
+9. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
+10. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
+11. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
+12. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
+13. [Observability](observability.md) — OpenTelemetry, metrics, health checks
+14. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
+15. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
 
 ## Allocation Characteristics
 
@@ -47,5 +48,6 @@ dotnet run --project samples/BareWire.Samples.AppHost/
 | `TransactionalOutbox` | Exactly-once delivery via transactional outbox with EF Core |
 | `InboxDeduplication` | Inbox deduplication across multiple consumers (Email + Audit) |
 | `ObservabilityShowcase` | 3-hop distributed tracing (order → payment → shipment) with OTel |
-| `MultiConsumerPartitioning` | Per-key consumer ordering via per-endpoint `OrderedByHeader("ordering-key")` (fixed-lane) |
+| `MultiConsumerPartitioning` | Single-instance per-key ordering via `OrderedByHeader("ordering-key")` (fixed-lane) |
+| `OrderedConsumers` | End-to-end per-key consumer ordering across competing instances (SAC + LocalPartitioned), outbox `PerKey`, poison-head parking — see [Per-Key Consumer Ordering](per-key-ordering.md) |
 | `MassTransitInterop` | Coexistence of BareWire and MassTransit producers on shared RabbitMQ |
