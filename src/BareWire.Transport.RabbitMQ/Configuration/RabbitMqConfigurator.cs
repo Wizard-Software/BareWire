@@ -2,6 +2,7 @@ using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Headers;
 using BareWire.Abstractions.Topology;
+using BareWire.Transport.RabbitMQ.Internal;
 
 namespace BareWire.Transport.RabbitMQ.Configuration;
 
@@ -15,6 +16,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     private readonly List<RabbitMqEndpointConfiguration> _endpoints = [];
     private readonly Dictionary<Type, string> _routingKeyMappings = [];
     private readonly Dictionary<Type, string> _exchangeMappings = [];
+    private readonly Dictionary<Type, PublishRequestRegistration> _publishRequestMappings = [];
 
     public void Host(string uri, Action<IHostConfigurator>? configure = null)
     {
@@ -70,15 +72,32 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         _exchangeMappings[typeof(T)] = exchangeName;
     }
 
-    // Compile-bridge: the interface members are declared here so the assembly builds;
-    // publish-style request/response accumulation is wired up in a follow-up change.
     public void PublishRequest<T>() where T : class =>
-        throw new NotImplementedException("Publish-style request routing is not yet wired up.");
+        _publishRequestMappings[typeof(T)] = new PublishRequestRegistration(
+            ExchangeName: RequestExchangeNameFormatter.Format<T>(),
+            Strict: false,
+            AutoDeclare: false);
 
     public void PublishRequest<T>(Action<IPublishRequestOptions> configure) where T : class
     {
         ArgumentNullException.ThrowIfNull(configure);
-        throw new NotImplementedException("Publish-style request routing is not yet wired up.");
+
+        var options = new PublishRequestOptions();
+        configure(options);
+
+        string resolvedExchange = options.ExchangeName ?? RequestExchangeNameFormatter.Format<T>();
+
+        _publishRequestMappings[typeof(T)] = new PublishRequestRegistration(
+            ExchangeName: resolvedExchange,
+            Strict: options.Strict,
+            AutoDeclare: options.AutoDeclare);
+    }
+
+    private sealed class PublishRequestOptions : IPublishRequestOptions
+    {
+        public string? ExchangeName { get; set; }
+        public bool Strict { get; set; }
+        public bool AutoDeclare { get; set; }
     }
 
     internal RabbitMqTransportOptions Build()
@@ -133,6 +152,12 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         {
             ValidateExchangeMappings(options.Topology);
             options.ExchangeMappings = new Dictionary<Type, string>(_exchangeMappings);
+        }
+
+        if (_publishRequestMappings.Count > 0)
+        {
+            options.PublishRequestMappings =
+                new Dictionary<Type, PublishRequestRegistration>(_publishRequestMappings);
         }
 
         return options;
