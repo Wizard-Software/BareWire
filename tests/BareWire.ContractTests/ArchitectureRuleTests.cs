@@ -480,6 +480,40 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
+    // Rule 8c: Transport.RabbitMQ must reproduce the MassTransit Namespace:TypeName
+    // exchange-naming convention ITSELF (via its own RequestExchangeNameFormatter)
+    // and must NOT take a binary reference on the BareWire.Interop.MassTransit
+    // ASSEMBLY. The publish-style request/response routing reuses the MassTransit
+    // urn:message: / colon convention purely as string constants — never by linking
+    // the interop package, which would leak the envelope/convention implementation
+    // into the transport (Feature 14, task 14.1 + 14.15).
+    //
+    // The check is on the assembly-reference graph, NOT NetArchTest's
+    // HaveDependencyOn("MassTransit"): the latter matches the ldstr "urn:message:" /
+    // colon-convention string constants (a false positive on the legitimate
+    // self-reproduced convention), while GetReferencedAssemblies sees only real
+    // binary dependencies.
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void TransportRabbitMq_ShouldNotReference_InteropMassTransitAssembly()
+    {
+        var assembly = typeof(BareWire.Transport.RabbitMQ.ServiceCollectionExtensions).Assembly;
+
+        var interopReferences = assembly.GetReferencedAssemblies()
+            .Where(a => a.Name is not null
+                && a.Name.Equals("BareWire.Interop.MassTransit", StringComparison.OrdinalIgnoreCase))
+            .Select(a => a.Name!)
+            .ToArray();
+
+        interopReferences.Should().BeEmpty(
+            "Transport.RabbitMQ must reproduce the MassTransit Namespace:TypeName convention itself "
+            + "(via its own RequestExchangeNameFormatter, task 14.1) without a binary reference to "
+            + "BareWire.Interop.MassTransit; found: {0}",
+            string.Join(", ", interopReferences));
+    }
+
+    // -------------------------------------------------------------------------
     // Rule 9: Observability must NOT depend on Core or Transport
     // -------------------------------------------------------------------------
 
