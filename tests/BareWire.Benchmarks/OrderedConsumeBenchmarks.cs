@@ -40,18 +40,14 @@ namespace BareWire.Benchmarks;
 /// No new byte[] per message (ADR-003): verify Gen0 stays close to the baseline across the sweep.
 /// </para>
 ///
-/// <para><strong>Throughput-floor (SAC vs consistent-hash, ADR-026 §8) — DEFERRED to R8.16:</strong></para>
+/// <para><strong>Throughput-floor (SAC vs consistent-hash, ADR-026 §8) — zmierzone w R8.16:</strong></para>
 /// <para>
-/// The X% throughput advantage and K minimum absolute throughput for ordered vs baseline are deferred.
-/// No acceptance threshold is defined in this package. See R8.16 (ADR-026 §8) for the throughput-floor
-/// benchmark and its acceptance criteria. The skeleton method below is intentionally commented out.
+/// The RabbitMQ throughput-floor measurement (competing-consumers vs SAC vs consistent-hash)
+/// lives in <c>tests/BareWire.IntegrationTests/Transport/RabbitMqThroughputFloorTests.cs</c>
+/// and requires a live broker (provisioned by <c>AspireFixture</c>). Measured constants:
+/// K = 16 (key cardinality), X% = 87% (conservative p20 threshold, consistent-hash/competing).
+/// This benchmark class measures local ordered-dispatch allocation overhead only (no broker, in-memory).
 /// </para>
-/// <code>
-/// // THROUGHPUT-FLOOR (SAC vs consistent-hash): X% and K are DEFERRED — see R8.16 (ADR-026 §8).
-/// // No acceptance threshold in this package.
-/// // [Benchmark]
-/// // public async Task ThroughputFloor_SAC_vs_ConsistentHash() { ... }
-/// </code>
 /// </summary>
 [MemoryDiagnoser(displayGenColumns: true)]
 #pragma warning disable CA1001 // BenchmarkDotNet lifecycle: disposal is handled by [GlobalCleanup].

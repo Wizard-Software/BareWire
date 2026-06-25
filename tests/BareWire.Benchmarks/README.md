@@ -76,11 +76,48 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Ordered
 dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*OrderedConsume*'
 ```
 
-### Throughput-floor (SAC vs consistent-hash) — DEFERRED to R8.16
+### Throughput-floor (SAC vs consistent-hash) — zmierzone w R8.16
 
-The X% throughput advantage and K minimum absolute throughput for `OrderedBy` vs baseline are
-**deferred** to R8.16 (ADR-026 §8). No acceptance threshold is defined in R8.15. See the
-skeleton in `OrderedConsumeBenchmarks.cs` for the deferred placeholder.
+Pomiar trzech ścieżek RabbitMQ (competing-consumers, SAC, consistent-hash) zrealizowany
+przez harness integracyjny R8.16. Wyniki poniżej.
+
+#### Wyniki pomiaru (środowisko: lokalny Docker, RabbitMQ 4.x via Aspire, .NET 10, 2026-06-25)
+
+| Ścieżka | Mediana [msgs/s] | Uwagi |
+|---------|-----------------|-------|
+| Competing-consumers (4 konsumentów, 1 kolejka) | ≈ 1 846 | baseline (mianownik) |
+| SAC (4 podłączonych, 1 aktywny) | ≈ 1 950 | floor = 1 konsument; broker-bottlenecked ≈ competing |
+| Consistent-hash (K=16 kolejek, 4 konsumentów) | ≈ 1 792 (P20) | 97.1% baseline; próg= 87% |
+
+**Wyznaczone stałe (ADR-026 §8):**
+- **K = 16** — liczba per-key queues bound do consistent-hash exchange
+- **X% = 87%** — minimalny próg stosunku consistent-hash/competing-consumers (p20 − 10 p.p. margines)
+
+**Interpretacja:**
+- **SAC** = „uporządkowane, zero równoległości w kolejce" — w środowisku Docker-bottlenecked osiąga
+  przepustowość podobną do competing-consumers (broker/sieć, nie ConsumerInstances, jest wąskim gardłem
+  przy 5 000 msgs). Jest to poprawne zachowanie: SAC floor = przepustowość 1 aktywnego konsumenta,
+  ale gdy broker bottleneck dominuje, 4 consumers nie dają 4× throughput.
+- **Consistent-hash + per-key queues** = równoległość po kluczach, afinicja klucz→kolejka,
+  okno re-mapy przy zmianie liczby kolejek/restart węzła. P20 = 97.1% competing-consumers
+  przy K=16 (plateau; sweep K∈{8,16,32} pokazał brak istotnych różnic między K).
+- **Re-map window**: przy zmianie liczby bound queues (lub restarcie węzła) consistent-hash
+  re-mapy klucze; przez okno re-mapu możliwe chwilowe złamanie afinicji per-klucz.
+
+**Uruchomienie harnessu RabbitMQ:**
+```bash
+dotnet test tests/BareWire.IntegrationTests/ --filter "Category=Throughput"
+```
+
+**Sweep exploracyjny K∈{8,16,32}:**
+```bash
+dotnet test tests/BareWire.IntegrationTests/ --filter "Category=ThroughputSweep"
+```
+
+`OrderedConsumeBenchmarks` (BenchmarkDotNet, ten plik) mierzy narzut alokacyjny warstwy
+ordered-dispatch (local ordered lanes vs sequential baseline, in-memory, bez brokera) —
+NIE jest pomiarem floor RabbitMQ. Pomiar RabbitMQ żyje w
+`tests/BareWire.IntegrationTests/Transport/RabbitMqThroughputFloorTests.cs`.
 
 ## Cross-transport header mapping (R7.2)
 
@@ -250,5 +287,8 @@ Key metrics to watch:
 - `[EventPipeProfiler]` is intentionally omitted due to BenchmarkDotNet bug with .NET 10
   ([dotnet/BenchmarkDotNet#2699](https://github.com/dotnet/BenchmarkDotNet/issues/2699)).
   Re-enable after the fix ships.
-- RabbitMQ benchmarks are deferred to post-MVP. In-memory benchmarks validate the core pipeline.
+- Pomiar przepustowości na realnym brokerze RabbitMQ żyje w harnessie integracyjnym
+  (`RabbitMqThroughputFloorTests`, sekcja „Throughput-floor SAC vs consistent-hash" powyżej) —
+  uruchamiany lokalnie/nightly przez Aspire, NIE w BenchmarkDotNet. Benchmarki BenchmarkDotNet
+  in-memory walidują rdzeń pipeline'u bez żywego brokera.
 - CI runs benchmarks with `continue-on-error: true` — results are uploaded as artifacts for manual review.
