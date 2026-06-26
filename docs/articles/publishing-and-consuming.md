@@ -54,6 +54,10 @@ rmq.ReceiveEndpoint("messages", e =>
 });
 ```
 
+> **See also:** when several consumers share one queue and each should handle only a slice of the
+> traffic, the dispatcher can select the consumer by the delivery's routing key. See
+> [Consumer Routing Keys](consumer-routing-keys.md).
+
 ### Publishing from a Consumer
 
 Use `context.PublishAsync()` to publish follow-up events from within a consumer:
