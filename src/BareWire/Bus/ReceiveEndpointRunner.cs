@@ -436,6 +436,12 @@ internal sealed partial class ReceiveEndpointRunner
             if (!terminatorState.Dispatched && !inboxFiltered)
             {
                 LogNoConsumerMatched(_binding.EndpointName, message.MessageId);
+
+                // 17.10: record the silently-unhandled delivery as a metric instead of leaving it invisible.
+                // Raw BW-RoutingKey is NEVER passed (ADR-030 §Security / routing-key-in-logs decision);
+                // messageType for an unhandled delivery is intrinsically "unknown" (terminatorState.MessageType).
+                _instrumentation.RecordFailure(
+                    _binding.EndpointName, terminatorState.MessageType, UnhandledDeliveryReason);
             }
 
             action = (terminatorState.Dispatched || inboxFiltered)
@@ -803,6 +809,11 @@ internal sealed partial class ReceiveEndpointRunner
     /// Per-endpoint configurability is deferred to 17.11 (trust-boundary type-less gate).
     /// </summary>
     private const long MaxUntypedPayloadBytes = 1L * 1024 * 1024; // 1 MiB
+
+    // 17.10 (ADR-030 D4 layer 4): error_type tag category for the silently-unhandled-delivery metric.
+    // Reuses the existing failed-message counter via IBareWireInstrumentation.RecordFailure — no new
+    // public API / approved.txt change. Stable metric-tag contract (locked by tests).
+    private const string UnhandledDeliveryReason = "UnhandledDelivery";
 
     /// <summary>
     /// Layer 3 type-less raw-first dispatch (ADR-030 D4 §3, 17.9). Reached only when
