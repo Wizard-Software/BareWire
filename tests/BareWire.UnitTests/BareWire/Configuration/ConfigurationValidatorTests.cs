@@ -67,7 +67,12 @@ public sealed class ConfigurationValidatorTests
     {
         // Arrange
         BusConfigurator configurator = new();
-        configurator.UseRabbitMQ(_ => { }); // Sets RabbitMqConfigurator
+        // Coexistence smoke (Feature 15, ADR-028 D4): UseRabbitMQ is now a deprecated no-op and no longer
+        // sets the RabbitMqConfigurator marker. Validation passes here purely because transportRegistered
+        // is true (D5 — based on the actual ITransportAdapter registration, not the dead marker).
+#pragma warning disable CS0618 // Type or member is obsolete
+        configurator.UseRabbitMQ(_ => { });
+#pragma warning restore CS0618 // Type or member is obsolete
 
         // Act — no endpoints, only transport check
         Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);

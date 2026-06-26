@@ -108,7 +108,11 @@ IHost bwHost = Host.CreateDefaultBuilder()
         services.AddBareWireRabbitMq(configureRabbitMq);
         services.AddBareWire(cfg =>
         {
+            // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
+            // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
+#pragma warning disable CS0618 // Type or member is obsolete
             cfg.UseRabbitMQ(configureRabbitMq);
+#pragma warning restore CS0618 // Type or member is obsolete
         });
     })
     .Build();

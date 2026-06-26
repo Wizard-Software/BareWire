@@ -20,7 +20,7 @@ internal sealed partial class BareWireBus : IBus
     private static readonly IReadOnlyDictionary<string, string> s_emptyHeaders =
         new Dictionary<string, string>();
 
-    private readonly ITransportAdapter _adapter;
+    private readonly ITransportAdapter? _adapter;
     private readonly ISerializerResolver _serializerResolver;
     private readonly MessagePipeline _pipeline;
     private readonly FlowController _flowController;
@@ -40,7 +40,7 @@ internal sealed partial class BareWireBus : IBus
     private bool _disposed;
 
     internal BareWireBus(
-        ITransportAdapter adapter,
+        ITransportAdapter? adapter,
         ISerializerResolver serializerResolver,
         MessagePipeline pipeline,
         FlowController flowController,
@@ -51,7 +51,11 @@ internal sealed partial class BareWireBus : IBus
         IRequestClientFactory? requestClientFactory = null,
         IExchangeResolver? exchangeResolver = null)
     {
-        _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+        // The adapter is intentionally nullable here (15.3 / C1): when no transport is registered,
+        // construction must still succeed so that BareWireBusControl.StartAsync can raise the friendly
+        // BareWireConfigurationException FIRST, instead of a raw NRE/InvalidOperationException leaking
+        // out during DI graph construction.
+        _adapter = adapter;
         _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         _flowController = flowController ?? throw new ArgumentNullException(nameof(flowController));
@@ -63,7 +67,12 @@ internal sealed partial class BareWireBus : IBus
         _requestClientFactory = requestClientFactory;
 
         BusId = Guid.NewGuid();
-        Address = new Uri($"barewire://{adapter.TransportName.ToLowerInvariant()}/bus/{BusId:N}");
+
+        // R3: the adapter may be null when no transport is registered. Fall back to "none" for the
+        // address so construction does not throw before StartAsync raises the friendly configuration
+        // exception. The actual missing-transport validation happens in BareWireBusControl.StartAsync.
+        string transportName = adapter?.TransportName ?? "none";
+        Address = new Uri($"barewire://{transportName.ToLowerInvariant()}/bus/{BusId:N}");
 
         _outgoingChannel = Channel.CreateBounded<OutboundMessage>(
             new BoundedChannelOptions(publishFlowControl.MaxPendingPublishes)
@@ -252,6 +261,12 @@ internal sealed partial class BareWireBus : IBus
 
     private async Task RunPublisherLoopAsync(CancellationToken ct)
     {
+        // The publisher loop is only started by BareWireBusControl.StartAsync AFTER configuration
+        // validation has confirmed a transport adapter is registered, so _adapter is guaranteed
+        // non-null here (15.3 / C1). Capture a non-null local to keep the send sites warning-free
+        // under TreatWarningsAsErrors.
+        ITransportAdapter adapter = _adapter!;
+
         const int maxBatchSize = 64;
         List<OutboundMessage> batch = new(maxBatchSize);
 
@@ -267,7 +282,7 @@ internal sealed partial class BareWireBus : IBus
 
                 // Pass a snapshot so the adapter sees a stable collection even after the batch is cleared.
                 OutboundMessage[] snapshot = batch.ToArray();
-                await _adapter.SendBatchAsync(snapshot, ct).ConfigureAwait(false);
+                await adapter.SendBatchAsync(snapshot, ct).ConfigureAwait(false);
                 DecrementPendingBytes(snapshot);
                 batch.Clear();
             }
@@ -284,7 +299,7 @@ internal sealed partial class BareWireBus : IBus
                     OutboundMessage[] drainSnapshot = batch.ToArray();
                     try
                     {
-                        await _adapter.SendBatchAsync(drainSnapshot, CancellationToken.None).ConfigureAwait(false);
+                        await adapter.SendBatchAsync(drainSnapshot, CancellationToken.None).ConfigureAwait(false);
                         DecrementPendingBytes(drainSnapshot);
                     }
                     catch (Exception ex)
@@ -301,7 +316,7 @@ internal sealed partial class BareWireBus : IBus
                 OutboundMessage[] finalSnapshot = batch.ToArray();
                 try
                 {
-                    await _adapter.SendBatchAsync(finalSnapshot, CancellationToken.None).ConfigureAwait(false);
+                    await adapter.SendBatchAsync(finalSnapshot, CancellationToken.None).ConfigureAwait(false);
                     DecrementPendingBytes(finalSnapshot);
                 }
                 catch (Exception ex)

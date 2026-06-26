@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Routing;
@@ -254,9 +255,13 @@ public sealed class ServiceCollectionExtensionsTests
     }
 
     // ── Existing tests (unchanged) ───────────────────────────────────────────
+    // These tests still call the deprecated UseRabbitMQ marker (Feature 15, ADR-028 D4) to exercise the
+    // coexistence path: the marker is a no-op, transport comes from AddBareWireRabbitMq. CS0618 is
+    // suppressed around the calls because the deprecation is expected here.
+#pragma warning disable CS0618 // Type or member is obsolete
 
     [Fact]
-    public void AddBareWire_WithoutTransportRegistration_ThrowsOnResolve()
+    public async Task AddBareWire_WithoutTransportRegistration_ThrowsFriendlyExceptionOnStart()
     {
         // Arrange — AddBareWire without AddBareWireRabbitMq
         var services = new ServiceCollection();
@@ -270,13 +275,16 @@ public sealed class ServiceCollectionExtensionsTests
             });
         });
 
-        // Act — building the provider succeeds, but resolving the bus fails
-        // because ITransportAdapter is not registered
+        // Act — since 15.3 (C1) resolving the bus NO LONGER throws (the transport adapter is
+        // resolved via GetService, nullable). The friendly BareWireConfigurationException must
+        // surface from StartAsync via ConfigurationValidator, NOT a raw InvalidOperationException.
         using var provider = services.BuildServiceProvider();
-        Action act = () => provider.GetRequiredService<IBus>();
+        var control = provider.GetRequiredService<IBusControl>();
+        Func<Task> act = async () => await control.StartAsync(TestContext.Current.CancellationToken);
 
         // Assert
-        act.Should().Throw<InvalidOperationException>();
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+        await act.Should().NotThrowAsync<InvalidOperationException>();
     }
 
     [Fact]
@@ -336,4 +344,6 @@ public sealed class ServiceCollectionExtensionsTests
         // Assert
         publishEndpoint.Should().NotBeNull();
     }
+
+#pragma warning restore CS0618 // Type or member is obsolete
 }

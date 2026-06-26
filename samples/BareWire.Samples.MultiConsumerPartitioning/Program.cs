@@ -141,7 +141,11 @@ builder.Services.AddBareWire(cfg =>
     // above (see the ReceiveEndpoint block). The deprecated DI-level AddPartitionerMiddleware is
     // no longer used — the inbound runner derives the ordering key from the "ordering-key" header
     // and serializes processing on a fixed lane.
+    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
+    // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
+#pragma warning disable CS0618 // Type or member is obsolete
     cfg.UseRabbitMQ(configureRabbitMq);
+#pragma warning restore CS0618 // Type or member is obsolete
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

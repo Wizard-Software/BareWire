@@ -166,8 +166,12 @@ public static class ServiceCollectionExtensions
         });
 
         // BareWireBus — the core bus implementation. Uses a factory because the constructor is internal.
+        // The transport adapter is resolved via GetService (nullable) rather than GetRequiredService so
+        // that a missing transport does NOT throw a raw InvalidOperationException during graph
+        // construction — the friendly BareWireConfigurationException must surface from StartAsync first
+        // (15.3 / C1 / ADR-028 E6).
         services.AddSingleton(sp => new BareWireBus(
-            sp.GetRequiredService<ITransportAdapter>(),
+            sp.GetService<ITransportAdapter>(),
             sp.GetRequiredService<ISerializerResolver>(),
             sp.GetRequiredService<MessagePipeline>(),
             sp.GetRequiredService<FlowController>(),
@@ -180,9 +184,12 @@ public static class ServiceCollectionExtensions
 
         // BareWireBusControl — wraps BareWireBus and implements IBusControl / IBus.
         // Uses a factory because the constructor is internal.
+        // The transport adapter is resolved via GetService (nullable) — see the BareWireBus factory
+        // comment above (15.3 / C1 / ADR-028 E6): the friendly configuration exception must win the
+        // race against the raw DI resolution error.
         services.AddSingleton(sp => new BareWireBusControl(
             sp.GetRequiredService<BareWireBus>(),
-            sp.GetRequiredService<ITransportAdapter>(),
+            sp.GetService<ITransportAdapter>(),
             sp.GetRequiredService<FlowController>(),
             sp.GetRequiredService<BusConfigurator>(),
             sp.GetRequiredService<ILogger<BareWireBusControl>>(),

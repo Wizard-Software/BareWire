@@ -11,16 +11,31 @@ public interface IBusConfigurator
 {
     /// <summary>
     /// Configures the bus to use RabbitMQ as its transport layer.
-    /// The <paramref name="configure"/> delegate receives an <see cref="IRabbitMqConfigurator"/>
-    /// that provides a typed fluent API for host, topology, endpoint, and header-mapping settings.
     /// </summary>
     /// <param name="configure">
-    /// A delegate that receives the <see cref="IRabbitMqConfigurator"/> and applies transport settings.
-    /// Must not be <see langword="null"/>.
+    /// A delegate that receives the <see cref="IRabbitMqConfigurator"/>. Must not be <see langword="null"/>.
     /// </param>
     /// <exception cref="ArgumentNullException">
     /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
     /// </exception>
+    /// <remarks>
+    /// <para>
+    /// <b>Deprecated.</b> This bus-level method is a no-op marker: any settings applied to the
+    /// <paramref name="configure"/> delegate — including host, credentials, and TLS/mTLS — were and are
+    /// <strong>silently ignored</strong> by the bus. Real RabbitMQ configuration only takes effect when
+    /// passed to the transport registration. Register RabbitMQ via the bundle
+    /// <c>AddBareWireWithRabbitMq(transport, bus?)</c> (single call) or
+    /// <c>AddBareWireRabbitMq(transport)</c> + <c>AddBareWire(bus)</c> (two calls). This member is
+    /// retained for one coexistence release and will be removed.
+    /// </para>
+    /// </remarks>
+    [Obsolete(
+        "UseRabbitMQ on IBusConfigurator is a no-op marker and is deprecated. Any settings passed to the " +
+        "configure delegate — including host, credentials, and TLS/mTLS — were and are silently ignored by " +
+        "the bus and only take effect when passed to AddBareWireRabbitMq. Register RabbitMQ via the bundle " +
+        "AddBareWireWithRabbitMq(transport, bus?) (single call) or AddBareWireRabbitMq(transport) + " +
+        "AddBareWire(bus) (two calls). This member will be removed in a future release.",
+        error: false)]
     void UseRabbitMQ(Action<IRabbitMqConfigurator> configure);
 
     /// <summary>

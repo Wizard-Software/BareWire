@@ -548,7 +548,11 @@ public sealed class ConsumerPerKeyOrderingE2ETests : IAsyncLifetime
                 };
 
                 services.AddBareWireRabbitMq(configureRabbitMq);
+                // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from
+                // AddBareWireRabbitMq above. CS0618 suppressed for the coexistence call.
+#pragma warning disable CS0618 // Type or member is obsolete
                 services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+#pragma warning restore CS0618 // Type or member is obsolete
 
                 if (includeOutboxDispatcher)
                 {
@@ -661,7 +665,11 @@ public sealed class ConsumerPerKeyOrderingE2ETests : IAsyncLifetime
                 };
 
                 services.AddBareWireRabbitMq(configureRabbitMq);
+                // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from
+                // AddBareWireRabbitMq above. CS0618 suppressed for the coexistence call.
+#pragma warning disable CS0618 // Type or member is obsolete
                 services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+#pragma warning restore CS0618 // Type or member is obsolete
 
                 // Only one host in the poison test — it both dispatches and consumes.
                 services.AddBareWireOutbox(

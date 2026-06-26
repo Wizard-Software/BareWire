@@ -165,7 +165,11 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 };
 
 builder.Services.AddBareWireRabbitMq(configureRabbitMq);
+// UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
+// Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
+#pragma warning disable CS0618 // Type or member is obsolete
 builder.Services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+#pragma warning restore CS0618 // Type or member is obsolete
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. Transactional outbox — PerKey ordering (ADR-025)

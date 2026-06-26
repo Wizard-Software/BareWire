@@ -506,7 +506,11 @@ public sealed class OutboxOrderingFlowE2ETests : IAsyncLifetime
                 };
 
                 services.AddBareWireRabbitMq(configureRabbitMq);
+                // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from
+                // AddBareWireRabbitMq above. CS0618 suppressed for the coexistence call.
+#pragma warning disable CS0618 // Type or member is obsolete
                 services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+#pragma warning restore CS0618 // Type or member is obsolete
 
                 // Transactional outbox with PerKey ordering — AutoCreateSchema=false
                 // (schema was created explicitly above from the test)
@@ -587,7 +591,11 @@ public sealed class OutboxOrderingFlowE2ETests : IAsyncLifetime
                 };
 
                 services.AddBareWireRabbitMq(configureRabbitMq);
+                // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from
+                // AddBareWireRabbitMq above. CS0618 suppressed for the coexistence call.
+#pragma warning disable CS0618 // Type or member is obsolete
                 services.AddBareWire(cfg => cfg.UseRabbitMQ(configureRabbitMq));
+#pragma warning restore CS0618 // Type or member is obsolete
 
                 if (includeOutboxDispatcher)
                 {
