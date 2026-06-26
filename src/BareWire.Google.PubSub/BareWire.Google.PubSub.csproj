@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the Google Cloud Pub/Sub transport. References both the BareWire core and BareWire.Transport.Google.PubSub and exposes AddBareWireWithPubSub.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.Google.PubSub\BareWire.Transport.Google.PubSub.csproj" />
+  </ItemGroup>
+
+</Project>
