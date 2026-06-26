@@ -59,6 +59,27 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
         _consumerRegistrations.Add(new ConsumerRegistration(typeof(TConsumer), typeof(TMessage)));
     }
 
+    /// <summary>
+    /// Registers a typed consumer and configures its consume-time routing-key dispatch via the grouped
+    /// <paramref name="configure"/> block. The configurator accumulates the consumer's set of AMQP topic
+    /// patterns and the secure-by-default <c>AcceptUntyped</c> opt-in, materialized into a
+    /// <see cref="ConsumerRegistration"/> with identical semantics to the core endpoint configuration
+    /// (per-project configurator; ADR-030 mandates the overload in both implementations).
+    /// </summary>
+    /// <param name="configure">The configuration block applied to this consumer's routing-key settings.</param>
+    /// <typeparam name="TConsumer">The consumer implementation type.</typeparam>
+    /// <typeparam name="TMessage">The message type the consumer handles.</typeparam>
+    public void Consumer<TConsumer, TMessage>(Action<IConsumerConfigurator<TConsumer, TMessage>> configure)
+        where TConsumer : class, IConsumer<TMessage>
+        where TMessage : class
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        ConsumerConfigurator<TConsumer, TMessage> configurator = new();
+        configure(configurator);
+        _consumerTypes.Add(typeof(TConsumer));
+        _consumerRegistrations.Add(configurator.Build());
+    }
+
     public void RawConsumer<T>() where T : class, IRawConsumer
     {
         _rawConsumerTypes.Add(typeof(T));
