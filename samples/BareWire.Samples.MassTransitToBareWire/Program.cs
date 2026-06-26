@@ -105,15 +105,11 @@ IHost bwHost = Host.CreateDefaultBuilder()
         services.AddMassTransitEnvelopeDeserializer();
 
         services.AddTransient<InventoryConsumer>();
+        // Two-call registration path — kept intentionally to demonstrate it still works (non-breaking, ADR-028 E7).
+        // Core and transport are registered separately; no Use{Transport} is needed (validation now keys on the
+        // ITransportAdapter fact in DI, ADR-028 D5). The single-call BareWire.RabbitMQ bundle is the recommended path.
         services.AddBareWireRabbitMq(configureRabbitMq);
-        services.AddBareWire(cfg =>
-        {
-            // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
-            // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
-#pragma warning disable CS0618 // Type or member is obsolete
-            cfg.UseRabbitMQ(configureRabbitMq);
-#pragma warning restore CS0618 // Type or member is obsolete
-        });
+        services.AddBareWire(cfg => { });
     })
     .Build();
 

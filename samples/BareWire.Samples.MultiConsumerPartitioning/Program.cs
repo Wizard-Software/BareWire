@@ -41,6 +41,7 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Samples.MultiConsumerPartitioning.Consumers;
 using BareWire.Samples.MultiConsumerPartitioning.Data;
@@ -134,19 +135,13 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     });
 };
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    // Per-key consumer ordering is configured per endpoint via e.OrderedByHeader("ordering-key")
-    // above (see the ReceiveEndpoint block). The deprecated DI-level AddPartitionerMiddleware is
-    // no longer used — the inbound runner derives the ordering key from the "ordering-key" header
-    // and serializes processing on a fixed lane.
-    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
-    // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
-#pragma warning disable CS0618 // Type or member is obsolete
-    cfg.UseRabbitMQ(configureRabbitMq);
-#pragma warning restore CS0618 // Type or member is obsolete
-});
+// Per-key consumer ordering is configured per endpoint via e.OrderedByHeader("ordering-key")
+// above (see the ReceiveEndpoint block). The deprecated DI-level AddPartitionerMiddleware is
+// no longer used — the inbound runner derives the ordering key from the "ordering-key" header
+// and serializes processing on a fixed lane.
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(configureRabbitMq);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. Build the application

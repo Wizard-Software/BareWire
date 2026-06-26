@@ -39,6 +39,7 @@ using BwResponse = BareWire.Abstractions.Response<BareWire.Samples.MassTransitRe
 
 using BareWire.Abstractions.Configuration;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Serialization.Json;
 using BareWire.Interop.MassTransit;
@@ -113,21 +114,18 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     rmq.ConfigureTopology(_ => { });
 };
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
-    // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
-#pragma warning disable CS0618 // Type or member is obsolete
-    cfg.UseRabbitMQ(configureRabbitMq);
-#pragma warning restore CS0618 // Type or member is obsolete
-
-    // Key element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>() tells
-    // BareWire to wrap every CheckOrderStatus in a MassTransit envelope. The envelope carries
-    // messageId, requestId, responseAddress (= amq.rabbitmq.reply-to), correlationId,
-    // messageType and the payload — exactly what MassTransit expects.
-    cfg.MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>();
-});
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(
+    configureRabbitMq,
+    cfg =>
+    {
+        // Key element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>() tells
+        // BareWire to wrap every CheckOrderStatus in a MassTransit envelope. The envelope carries
+        // messageId, requestId, responseAddress (= amq.rabbitmq.reply-to), correlationId,
+        // messageType and the payload — exactly what MassTransit expects.
+        cfg.MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>();
+    });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. MassTransit bus — the real responder (the MassTransit side of the interop)

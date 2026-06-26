@@ -43,6 +43,7 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Serialization.Json;
 using BareWire.Interop.MassTransit;
@@ -172,23 +173,20 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     });
 };
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
-    // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
-#pragma warning disable CS0618 // Type or member is obsolete
-    cfg.UseRabbitMQ(configureRabbitMq);
-#pragma warning restore CS0618 // Type or member is obsolete
-
-    // Publish-only bridge: BridgeOrderCreated published via IBus.PublishAsync will be serialized
-    // as application/vnd.masstransit+json. A dedicated message type (not OrderCreated) is used so
-    // the mapping does not affect the raw-JSON /barewire/publish demo. The publish call must also
-    // target the mt-bridge-orders exchange explicitly via the BW-Exchange header — see the
-    // /masstransit/bridge-publish endpoint below.
-    // No ReceiveEndpoint is declared for mt-bridge-orders — this is a one-way outbound bridge.
-    cfg.MapSerializer<BridgeOrderCreated, MassTransitEnvelopeSerializer>();
-});
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(
+    configureRabbitMq,
+    cfg =>
+    {
+        // Publish-only bridge: BridgeOrderCreated published via IBus.PublishAsync will be serialized
+        // as application/vnd.masstransit+json. A dedicated message type (not OrderCreated) is used so
+        // the mapping does not affect the raw-JSON /barewire/publish demo. The publish call must also
+        // target the mt-bridge-orders exchange explicitly via the BW-Exchange header — see the
+        // /masstransit/bridge-publish endpoint below.
+        // No ReceiveEndpoint is declared for mt-bridge-orders — this is a one-way outbound bridge.
+        cfg.MapSerializer<BridgeOrderCreated, MassTransitEnvelopeSerializer>();
+    });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 6. MassTransit simulator — simulates an external MassTransit producer

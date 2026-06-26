@@ -21,6 +21,7 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Samples.RabbitMQ.Models;
 using BareWire.Observability;
@@ -108,15 +109,9 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
 // the serializer type at configuration time (e.g. for type-discriminator headers).
 // The actual IMessageSerializer is already registered above via AddBareWireJsonSerializer().
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from AddBareWireRabbitMq.
-    // Migration to AddBareWireWithRabbitMq is task 15.11; CS0618 suppressed here to keep the build green.
-#pragma warning disable CS0618 // Type or member is obsolete
-    cfg.UseRabbitMQ(configureRabbitMq);
-#pragma warning restore CS0618 // Type or member is obsolete
-});
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(configureRabbitMq);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Transactional outbox / inbox (EF Core + SQLite)
