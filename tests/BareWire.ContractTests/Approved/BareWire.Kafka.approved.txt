@@ -1,0 +1,7 @@
+namespace BareWire.Kafka
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithKafka(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Transport.Kafka.Configuration.IKafkaConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}

@@ -1,0 +1,7 @@
+namespace BareWire.AWS.SQS
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithSqs(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Transport.AWS.SQS.Configuration.ISqsConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}

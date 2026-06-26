@@ -1,0 +1,7 @@
+namespace BareWire.RabbitMQ
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithRabbitMq(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Abstractions.Configuration.IRabbitMqConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}
