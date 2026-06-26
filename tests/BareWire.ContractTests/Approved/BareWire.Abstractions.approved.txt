@@ -256,6 +256,12 @@ namespace BareWire.Abstractions.Configuration
         void UseTls(System.Action<BareWire.Abstractions.Configuration.ITlsConfigurator> configure);
         void Username(string username);
     }
+    public interface IPublishConfigurator<T>
+        where T :  class
+    {
+        void Exchange(string exchangeName);
+        void RoutingKey(string routingKey);
+    }
     public interface IPublishRequestOptions
     {
         bool AutoDeclare { get; set; }
@@ -271,6 +277,8 @@ namespace BareWire.Abstractions.Configuration
         void MapExchange<T>(string exchangeName)
             where T :  class;
         void MapRoutingKey<T>(string routingKey)
+            where T :  class;
+        void Publish<T>(System.Action<BareWire.Abstractions.Configuration.IPublishConfigurator<T>> configure)
             where T :  class;
         void PublishRequest<T>()
             where T :  class;
@@ -650,6 +658,8 @@ namespace BareWire.Abstractions.Topology
         void BindRequestExchangeToQueue<T>(string queue)
             where T :  class;
         void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
+        void DeclareExchange<T>(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false, string? routingKey = null)
+            where T :  class;
         void DeclareQueue(string name, bool durable, bool autoDelete, System.Action<BareWire.Abstractions.Topology.IQueueConfigurator> configure);
         void DeclareQueue(string name, bool durable = true, bool autoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? arguments = null);
         void DeclareRequestExchange<T>()

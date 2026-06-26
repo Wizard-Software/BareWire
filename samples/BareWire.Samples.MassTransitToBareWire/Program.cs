@@ -4,6 +4,13 @@
 //
 // What this sample shows:
 //   - MT->BareWire request/response (the B3 interop direction).
+//   - The ergonomic per-type publish API: after answering each request, BareWire publishes an
+//     InventoryChecked domain event via IBus.PublishAsync<InventoryChecked> with NO exchange or
+//     routing key at the call site. Routing is driven entirely by the per-type mapping registered
+//     with the "declare + map" shortcut t.DeclareExchange<InventoryChecked>(name, type, ...,
+//     routingKey: ...). The equivalent grouped rmq.Publish<InventoryChecked>(p => { p.Exchange(...);
+//     p.RoutingKey(...); }) block and the low-level MapExchange<T>/MapRoutingKey<T> primitives are
+//     shown side-by-side in comments in the topology section below.
 //   - R1 topology finding: MT publishes to a fanout exchange named after the endpoint.
 //     BareWire's topology must declare that exchange (durable=true), the queue, and a
 //     binding between them so MT's publish reaches BareWire's consumer.
@@ -64,6 +71,12 @@ string vhostSegment = string.IsNullOrEmpty(vhost) ? string.Empty : $"{vhost}/";
 const string RequestQueueName = "bw-inventory-check";
 Uri mtEndpointAddress = new($"rabbitmq://localhost/{vhostSegment}{RequestQueueName}");
 
+// Outbound domain-event routing (the ergonomic per-type publish path this sample showcases).
+// After answering the MT request, BareWire publishes an InventoryChecked event to this
+// topic exchange with this routing key — see the DeclareExchange<InventoryChecked> call below.
+const string EventsExchangeName = "bw-inventory-events";
+const string EventsRoutingKey = "inventory.checked";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. BareWire host — responder side
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,10 +91,44 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     // Using durable=true for both prevents AMQP PRECONDITION_FAILED if MT re-declares them.
     rmq.ConfigureTopology(t =>
     {
+        // INBOUND request topology (consume-side): MT publishes here, BareWire consumes.
+        // Stays on the NON-generic DeclareExchange — this exchange is a consume target, not a
+        // PublishAsync<T> destination, so it must NOT register a per-type send mapping.
         t.DeclareExchange(RequestQueueName, BareWire.Abstractions.ExchangeType.Fanout,
             durable: true, autoDelete: false);
         t.DeclareQueue(RequestQueueName, durable: true, autoDelete: false);
         t.BindExchangeToQueue(RequestQueueName, RequestQueueName, routingKey: string.Empty);
+
+        // ─────────────────────────────────────────────────────────────────────
+        // OUTBOUND publish routing — the ergonomic per-type publish API.
+        //
+        // SHAPE A — "declare + map" shortcut (USED HERE): a single call declares the
+        // exchange AND registers the per-type PublishAsync<InventoryChecked> mapping
+        // (exchange + routing key). It replaces the older "scattered" recipe of a plain
+        // ConfigureTopology DeclareExchange followed by separate MapExchange<T> +
+        // MapRoutingKey<T> calls.
+        t.DeclareExchange<InventoryChecked>(
+            EventsExchangeName, BareWire.Abstractions.ExchangeType.Topic,
+            durable: true, autoDelete: false, routingKey: EventsRoutingKey);
+
+        // SHAPE B — grouped per-type send block (EQUIVALENT; shown for didactics).
+        // Declare the exchange once in the topology, then group the send routing on the
+        // configurator (rmq) — NOT inside ConfigureTopology:
+        //
+        //     t.DeclareExchange(EventsExchangeName, BareWire.Abstractions.ExchangeType.Topic, durable: true);
+        //     // ...then, at the configurator level:
+        //     rmq.Publish<InventoryChecked>(p =>
+        //     {
+        //         p.Exchange(EventsExchangeName);
+        //         p.RoutingKey(EventsRoutingKey);
+        //     });
+        //
+        // SHAPE C — low-level primitives the grouped block desugars to:
+        //     rmq.MapExchange<InventoryChecked>(EventsExchangeName);
+        //     rmq.MapRoutingKey<InventoryChecked>(EventsRoutingKey);
+        //
+        // All three shapes feed the SAME per-type mapping set (single source of truth).
+        // Runtime precedence is unchanged: BW-Exchange header > per-type mapping > DefaultExchange.
     });
 
     rmq.ReceiveEndpoint(RequestQueueName, ep =>
@@ -149,6 +196,7 @@ Console.WriteLine("BareWire.Samples.MassTransitToBareWire starting...");
 Console.WriteLine($"  Broker:   {safeRabbitMqUri}");
 Console.WriteLine($"  Queue:    {RequestQueueName}");
 Console.WriteLine($"  Exchange: {RequestQueueName} (fanout, durable=true)");
+Console.WriteLine($"  Events:   {EventsExchangeName} (topic, durable=true) routingKey '{EventsRoutingKey}'");
 Console.WriteLine();
 
 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -166,7 +214,16 @@ await Task.Delay(TimeSpan.FromSeconds(2), cts.Token);
 // 5. Send two requests via MT IRequestClient<T>
 // ─────────────────────────────────────────────────────────────────────────────
 
+// MassTransit's IBus (requester side). Note the fully-qualified BareWire bus below — both
+// libraries expose a type named IBus, so `using MassTransit;` makes the bare name resolve to
+// MassTransit.IBus here.
 IBus bus = mtHost.Services.GetRequiredService<IBus>();
+
+// BareWire's IBus (responder side) — used to publish the InventoryChecked domain event via the
+// ergonomic per-type mapping configured above. PublishAsync<InventoryChecked> resolves the target
+// exchange (bw-inventory-events) and routing key (inventory.checked) from that mapping.
+BareWire.Abstractions.IBus bwBus =
+    bwHost.Services.GetRequiredService<BareWire.Abstractions.IBus>();
 
 string[] skus = ["SKU-001", "SKU-999"];
 
@@ -185,6 +242,16 @@ foreach (string sku in skus)
     Console.WriteLine(
         $"[MassTransit] Response received: Sku={level.Sku}, Available={level.Available}, " +
         $"ProcessedBy={level.ProcessedBy}");
+
+    // Emit a domain event for the processed check. No exchange/routing-key is specified at the
+    // call site — the ergonomic per-type mapping drives routing to bw-inventory-events with
+    // routing key inventory.checked.
+    await bwBus.PublishAsync(
+        new InventoryChecked(level.Sku, level.Available, level.ProcessedBy),
+        cts.Token);
+    Console.WriteLine(
+        $"[BareWire] Published InventoryChecked for SKU={level.Sku} -> " +
+        $"exchange '{EventsExchangeName}', routingKey '{EventsRoutingKey}'.");
 }
 
 Console.WriteLine();

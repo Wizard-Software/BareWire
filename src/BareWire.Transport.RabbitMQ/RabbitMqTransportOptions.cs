@@ -87,6 +87,15 @@ internal sealed class RabbitMqTransportOptions
     /// </summary>
     public IReadOnlyDictionary<Type, Configuration.PublishRequestRegistration>? PublishRequestMappings { get; set; }
 
+    /// <summary>
+    /// Config-time-only diagnostic snapshot of divergent per-type publish-routing overwrites detected
+    /// while the fluent configurator ran (the same message type receiving a different exchange or
+    /// routing key from two registration paths). <see langword="null"/> when no divergence occurred.
+    /// Emitted as DEFAULT-ON warnings by the transport adapter at startup. Never affects runtime
+    /// resolution — last-call-wins applies regardless.
+    /// </summary>
+    public IReadOnlyList<Configuration.PublishRoutingDivergence>? PublishRoutingDivergences { get; set; }
+
     public void Validate()
     {
         if (string.IsNullOrEmpty(ConnectionString))

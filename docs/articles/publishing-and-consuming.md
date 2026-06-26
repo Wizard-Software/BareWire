@@ -361,6 +361,69 @@ services.AddBareWireRabbitMq(cfg =>
 });
 ```
 
+### Ergonomic per-type send mapping
+
+The three primitives above (`DeclareExchange(...)` plus `MapExchange<T>(...)` plus
+`MapRoutingKey<T>(...)`) work, but they spread a single type's send routing across
+three calls, repeat the exchange name, and offer no grouped, discoverable block.
+Two ergonomic shapes close that gap. **Both feed the exact same per-type mapping
+set** as `MapExchange<T>`/`MapRoutingKey<T>` — they are additive sugar over those
+primitives, not a replacement — and they apply **only** to the `PublishAsync<T>`
+path. (Point-to-point `SendAsync<T>` is out of scope and unaffected.)
+
+**Shape 1 — `DeclareExchange<T>(...)`: declare + map in one call.** The generic
+overload of `DeclareExchange` declares the exchange *and* registers the per-type
+exchange (and, when supplied, routing-key) mapping in a single statement, so the
+exchange name is written once:
+
+```csharp
+cfg.ConfigureTopology(t =>
+{
+    // Declares the "payments.topic" exchange AND maps PaymentRequested → it,
+    // with routing key "payment.requested" (needed for topic-pattern bindings).
+    t.DeclareExchange<PaymentRequested>(
+        "payments.topic", ExchangeType.Topic, routingKey: "payment.requested");
+
+    // Omit routingKey to map the exchange only; the routing key then falls back
+    // to the default (the message type's full name).
+    t.DeclareExchange<OrderCreated>("orders.fanout", ExchangeType.Fanout);
+});
+```
+
+> `DeclareExchange<T>(...)` is distinct from `DeclareRequestExchange<T>()`: the
+> latter is topology-only and feeds the separate publish-style request/response
+> path, not `PublishAsync<T>` routing.
+
+**Shape 2 — `Publish<T>(...)`: a grouped send block.** When you prefer to keep a
+type's send configuration together (parity with the `ReceiveEndpoint(...)` style),
+use the grouped block. The exchange must already be declared in the topology:
+
+```csharp
+cfg.ConfigureTopology(t => t.DeclareExchange("payments.topic", ExchangeType.Topic));
+
+cfg.Publish<PaymentRequested>(p =>
+{
+    p.Exchange("payments.topic");
+    p.RoutingKey("payment.requested");
+});
+```
+
+**Which to choose:**
+
+| Shape | Use it when |
+|---|---|
+| `DeclareExchange<T>(name, type, …, routingKey)` | You want the shortcut — declare the exchange and map the type in one call. Self-sufficient: it declares the exchange, so the mapping always passes startup validation. |
+| `Publish<T>(p => { p.Exchange(…); p.RoutingKey(…); })` | You want a grouped, discoverable send block. Requires the exchange to be declared separately via `ConfigureTopology` — an undeclared exchange fails fast at `Build()` with `BareWireConfigurationException`, exactly like `MapExchange<T>(...)`. |
+| `MapExchange<T>` / `MapRoutingKey<T>` | You want the low-level primitives, or are mapping only one dimension. |
+
+**Last-call-wins.** All three shapes write to one source of truth, so the last
+call for a given type wins regardless of which shape made it. If two shapes set a
+**different** exchange or routing key for the same type (for example
+`DeclareExchange<T>("a")` followed by `Publish<T>(p => p.Exchange("b"))`), the
+later value is used **and** a warning is logged at startup so the conflicting
+configuration is visible — this divergence diagnostic is on by default. Idempotent
+repeats of the same value stay silent.
+
 ### Exchange Resolution Precedence
 
 When `bus.PublishAsync<T>(...)` sends a message, the target exchange is resolved

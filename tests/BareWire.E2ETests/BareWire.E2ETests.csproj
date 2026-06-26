@@ -16,6 +16,12 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\samples\BareWire.Samples.AppHost\BareWire.Samples.AppHost.csproj" />
+    <!-- Built (but not referenced) so MassTransitToBareWireErgonomicPublishTests can launch the
+         standalone console sample as a subprocess against the fixture's broker. The sample is an
+         Exe with top-level statements, so ReferenceOutputAssembly=false avoids linking its entry
+         point; the test asserts against the raw JSON body, so the message types are not needed. -->
+    <ProjectReference Include="..\..\samples\BareWire.Samples.MassTransitToBareWire\BareWire.Samples.MassTransitToBareWire.csproj"
+                      ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\BareWire.OutboxE2EAppHost\BareWire.OutboxE2EAppHost.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
