@@ -140,6 +140,53 @@ public interface IRabbitMqConfigurator
     void MapExchange<T>(string exchangeName) where T : class;
 
     /// <summary>
+    /// Configures per-type publish routing for message type <typeparamref name="T"/> on the
+    /// <c>PublishAsync&lt;T&gt;</c> path as a single grouped, discoverable block, by passing an
+    /// <see cref="IPublishConfigurator{T}"/> to <paramref name="configure"/>. This is the full,
+    /// grouped form of the send configuration (parity with <c>IPublishEndpoint</c> / <c>PublishAsync&lt;T&gt;</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Which to choose.</strong> Three complementary shapes feed the SAME per-type mapping set
+    /// (single source of truth):
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <c>Publish&lt;T&gt;</c> (this method) — the full, grouped, discoverable send block; prefer it when
+    ///     configuring the exchange and routing key for a type together.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <see cref="ITopologyConfigurator.DeclareExchange{T}"/> — the "declare + map" shortcut that both
+    ///     declares the exchange and maps the type in one call.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <see cref="MapExchange{T}"/> / <see cref="MapRoutingKey{T}"/> — the low-level primitives.
+    ///   </description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <strong>Last-call-wins.</strong> The exchange and routing key configured here participate in the same
+    /// per-type mapping set as <see cref="MapExchange{T}"/> / <see cref="MapRoutingKey{T}"/>; the last call
+    /// across any of these shapes wins. The exchange must be declared in the topology via
+    /// <see cref="ConfigureTopology"/> — a missing declaration fails fast at bus startup (<c>Build()</c>) with
+    /// <see cref="Exceptions.BareWireConfigurationException"/>, identical to <see cref="MapExchange{T}"/>.
+    /// </para>
+    /// <para>
+    /// <strong>Scope.</strong> The <c>PublishAsync&lt;T&gt;</c> path only; point-to-point <c>SendAsync&lt;T&gt;</c>
+    /// is out of scope. The method is named <c>Publish</c> (not <c>Send</c>) for parity with <c>IPublishEndpoint</c>
+    /// and <see cref="PublishRequest{T}()"/>.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">The message type to configure publish routing for. Must be a reference type.</typeparam>
+    /// <param name="configure">
+    /// A delegate that receives an <see cref="IPublishConfigurator{T}"/> and applies the exchange and/or
+    /// routing-key mapping for type <typeparamref name="T"/>. Must not be <see langword="null"/>.
+    /// </param>
+    /// <exception cref="System.ArgumentNullException">
+    /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
+    /// </exception>
+    void Publish<T>(Action<IPublishConfigurator<T>> configure) where T : class;
+
+    /// <summary>
     /// Enables publish-style request/response for message type <typeparamref name="T"/> using
     /// the default <c>Namespace:TypeName</c> exchange name formatter, with <c>Strict</c> and
     /// <c>AutoDeclare</c> both set to <see langword="false"/>.
