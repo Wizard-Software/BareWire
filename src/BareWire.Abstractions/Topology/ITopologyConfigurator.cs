@@ -24,6 +24,55 @@ public interface ITopologyConfigurator
     void DeclareExchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false);
 
     /// <summary>
+    /// Declares an exchange on the broker AND registers a per-type publish mapping for message
+    /// type <typeparamref name="T"/> in a single call ("declare + map"). This overload carries a
+    /// <strong>dual responsibility</strong>:
+    /// <list type="number">
+    ///   <item><description>
+    ///     it declares the topology exactly like the non-generic
+    ///     <see cref="DeclareExchange(string, ExchangeType, bool, bool)"/>; AND
+    ///   </description></item>
+    ///   <item><description>
+    ///     it registers the per-type routing mapping consumed by the <c>PublishAsync&lt;T&gt;</c> path —
+    ///     the exchange mapping like <see cref="BareWire.Abstractions.Configuration.IRabbitMqConfigurator.MapExchange{T}"/>,
+    ///     plus the routing-key mapping like
+    ///     <see cref="BareWire.Abstractions.Configuration.IRabbitMqConfigurator.MapRoutingKey{T}"/>
+    ///     when <paramref name="routingKey"/> is supplied.
+    ///   </description></item>
+    /// </list>
+    /// When <paramref name="routingKey"/> is <see langword="null"/>, ONLY the exchange mapping is
+    /// registered; the routing key keeps its default fallback of <c>typeof(T).FullName</c>.
+    /// Because the exchange is declared in the same call, the auto-registered mapping is self-consistent
+    /// and always passes startup validation.
+    /// </summary>
+    /// <remarks>
+    /// <strong>Do not confuse with <see cref="DeclareRequestExchange{T}"/>.</strong>
+    /// <see cref="DeclareRequestExchange{T}"/> is topology-only — it declares the per-type fanout exchange
+    /// for publish-style request/response and feeds a SEPARATE publish-request store; it does NOT register a
+    /// mapping on the <c>PublishAsync&lt;T&gt;</c> path. This overload, by contrast, both declares the exchange
+    /// AND maps the type for ordinary <c>PublishAsync&lt;T&gt;</c> routing.
+    /// </remarks>
+    /// <typeparam name="T">
+    /// The message type to declare the exchange for and map. Must be a reference type.
+    /// </typeparam>
+    /// <param name="name">The exchange name. Also used as the type→exchange mapping target.</param>
+    /// <param name="type">The exchange type that controls message routing behaviour.</param>
+    /// <param name="durable">
+    /// <see langword="true"/> if the exchange should survive a broker restart; otherwise <see langword="false"/>.
+    /// </param>
+    /// <param name="autoDelete">
+    /// <see langword="true"/> if the exchange should be deleted automatically when the last
+    /// queue is unbound from it; otherwise <see langword="false"/>.
+    /// </param>
+    /// <param name="routingKey">
+    /// An optional routing key to map for type <typeparamref name="T"/>. When <see langword="null"/>
+    /// (the default), no routing-key mapping is registered and the default <c>typeof(T).FullName</c>
+    /// fallback applies.
+    /// </param>
+    void DeclareExchange<T>(string name, ExchangeType type, bool durable = true,
+        bool autoDelete = false, string? routingKey = null) where T : class;
+
+    /// <summary>
     /// Declares a queue on the broker.
     /// The declaration is idempotent — if the queue already exists with compatible attributes,
     /// no error is raised.
