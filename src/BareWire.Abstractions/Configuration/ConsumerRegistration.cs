@@ -22,7 +22,9 @@ namespace BareWire.Abstractions.Configuration;
 /// routing-key pattern match alone, with the raw payload deserialized into <see cref="MessageType"/>.
 /// Setting this to <see langword="true"/> means the consumer may receive unauthenticated,
 /// producer-controlled foreign payloads; leave it <see langword="false"/> unless the consumer is
-/// intended to deliberately accept untyped foreign messages.
+/// intended to deliberately accept untyped foreign messages. Routing-key pattern matching is
+/// client-side dispatch, NOT authorization — the trust boundary assumes broker-level publish ACLs
+/// are enforced and that a schema-validation middleware validates the foreign input.
 /// </param>
 public sealed record ConsumerRegistration(
     Type ConsumerType,

@@ -81,6 +81,17 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// type-less deserialization must be a conscious decision.
     /// </para>
     /// <para>
+    /// <strong>Trust boundary — broker-level publish ACL is assumed.</strong> Routing-key pattern
+    /// matching is performed <em>client-side at dispatch</em> and is a dispatcher predicate, NOT an
+    /// authorization mechanism: an attacker who can publish to the bound exchange fully controls the
+    /// delivery's routing key and payload, and therefore which type-less consumer is selected and what
+    /// is deserialized into <typeparamref name="TMessage"/>. Exposing this layer assumes publish
+    /// permissions are enforced at the broker (e.g. RabbitMQ publish ACL / vhost permissions) and
+    /// that a schema-validation middleware validates the foreign-input axis (routing key + broker
+    /// identity + payload shape/size). The bus emits a startup warning when an
+    /// <c>AcceptUntyped()</c> endpoint is configured without such a middleware.
+    /// </para>
+    /// <para>
     /// The call is <strong>idempotent</strong>: it sets an on/off flag (not a set that accumulates), so
     /// calling it more than once has the same effect as calling it once.
     /// </para>
