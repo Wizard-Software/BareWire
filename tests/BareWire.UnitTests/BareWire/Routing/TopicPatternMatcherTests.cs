@@ -187,6 +187,175 @@ public sealed class TopicPatternMatcherTests
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Compile — specificity metric fields (17.5)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Compile_ExactTwoWordPattern_SetsIsExactAndMetricFields()
+    {
+        // Arrange & Act
+        CompiledTopicPattern compiled = _matcher.Compile("a.b");
+
+        // Assert
+        compiled.IsExact.Should().BeTrue("a.b contains no wildcards");
+        compiled.LiteralWordCount.Should().Be(2, "a.b has two literal segments");
+        compiled.HashCount.Should().Be(0, "a.b has no # wildcards");
+        compiled.StarCount.Should().Be(0, "a.b has no * wildcards");
+        compiled.LiteralPrefixLength.Should().Be(2, "a.b has two leading literals before any wildcard");
+    }
+
+    [Fact]
+    public void Compile_MixedWildcardPattern_SetsMetricFields()
+    {
+        // Arrange & Act
+        CompiledTopicPattern compiled = _matcher.Compile("a.*.#");
+
+        // Assert
+        compiled.IsExact.Should().BeFalse("a.*.# contains wildcards");
+        compiled.LiteralWordCount.Should().Be(1, "a.*.# has one literal segment");
+        compiled.HashCount.Should().Be(1, "a.*.# has one # wildcard");
+        compiled.StarCount.Should().Be(1, "a.*.# has one * wildcard");
+        compiled.LiteralPrefixLength.Should().Be(1, "only the first segment 'a' precedes the first wildcard");
+    }
+
+    [Fact]
+    public void Compile_EmptyPattern_SetsIsExactTrueAndAllCountsZero()
+    {
+        // Arrange & Act
+        CompiledTopicPattern compiled = _matcher.Compile("");
+
+        // Assert — empty pattern is a degenerate exact pattern (matches only "")
+        compiled.IsExact.Should().BeTrue("empty pattern has no wildcards");
+        compiled.LiteralWordCount.Should().Be(0, "empty pattern has no segments");
+        compiled.HashCount.Should().Be(0, "empty pattern has no # wildcards");
+        compiled.StarCount.Should().Be(0, "empty pattern has no * wildcards");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // CompareSpecificity — D5 ordering (17.5)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// <summary>Compiles two patterns and returns CompareSpecificity(a, b).</summary>
+    private int ComparePatterns(string a, string b)
+    {
+        CompiledTopicPattern ca = _matcher.Compile(a);
+        CompiledTopicPattern cb = _matcher.Compile(b);
+        return _matcher.CompareSpecificity(in ca, in cb);
+    }
+
+    [Theory]
+    [InlineData("a.b",   "a.*",   "K1: exact wins over non-exact")]
+    [InlineData("a.b.*", "a.*",   "K2: more literal words wins over fewer")]
+    [InlineData("a.*",   "a.*.*", "K3b: fewer * wins when exact/literals/hashes all tie")]
+    [InlineData("a.b.#", "a.#.b", "K4: longer literal prefix wins when literals/hashes/stars all tie")]
+    public void CompareSpecificity_MoreSpecificFirst_ReturnsPositive(
+        string moreSpecific,
+        string lessSpecific,
+        string because)
+    {
+        ComparePatterns(moreSpecific, lessSpecific).Should().BeGreaterThan(0, because);
+    }
+
+    [Fact]
+    public void CompareSpecificity_TransferStarVsTransferHash_StarIsMoreSpecific()
+    {
+        // Acceptance example from ADR-030 §D5.
+        // transfer.*: LWC=1, HashCount=0, StarCount=1, LiteralPrefixLength=1
+        // transfer.#: LWC=1, HashCount=1, StarCount=0, LiteralPrefixLength=1
+        // K3a fires first: transfer.* has fewer # → wins.
+        ComparePatterns("transfer.*", "transfer.#").Should().BeGreaterThan(0,
+            "transfer.* has 0 # wildcards, transfer.# has 1 — fewer # wins (K3a)");
+    }
+
+    [Theory]
+    [InlineData("a.b",        "a.*",        "K1 antisymmetry")]
+    [InlineData("a.b.*",      "a.*",        "K2 antisymmetry")]
+    [InlineData("transfer.*", "transfer.#", "K3 antisymmetry")]
+    public void CompareSpecificity_Antisymmetry_ReversingOperandsFlipsSign(
+        string moreSpecific,
+        string lessSpecific,
+        string because)
+    {
+        int forward  = ComparePatterns(moreSpecific, lessSpecific);
+        int backward = ComparePatterns(lessSpecific,  moreSpecific);
+
+        forward.Should().BeGreaterThan(0,  because + " (forward: more specific first)");
+        backward.Should().BeLessThan(0, because + " (backward: less specific first)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SelectMostSpecific — selection and tie-break (17.5)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void SelectMostSpecific_EmptySpan_ReturnsNegativeOneAndNoTie()
+    {
+        // Act
+        int result = _matcher.SelectMostSpecific(ReadOnlySpan<CompiledTopicPattern>.Empty, out bool unresolvedTie);
+
+        // Assert
+        result.Should().Be(-1, "empty span has no candidates");
+        unresolvedTie.Should().BeFalse("no candidates means no tie");
+    }
+
+    [Fact]
+    public void SelectMostSpecific_ThreeCandidatesWithClearWinner_ReturnsMostSpecificIndex()
+    {
+        // Arrange: a.b (exact, K1) > a.b.* (2 literals, non-exact) > a.# (1 literal, non-exact)
+        var candidates = new[]
+        {
+            _matcher.Compile("a.#"),    // index 0: least specific
+            _matcher.Compile("a.b.*"),  // index 1: middle
+            _matcher.Compile("a.b"),    // index 2: most specific (exact)
+        };
+
+        // Act
+        int result = _matcher.SelectMostSpecific(candidates.AsSpan(), out bool unresolvedTie);
+
+        // Assert
+        result.Should().Be(2, "a.b is exact — K1 makes it the most specific candidate");
+        unresolvedTie.Should().BeFalse("there is a clear winner");
+    }
+
+    [Fact]
+    public void SelectMostSpecific_UnresolvableTie_ReturnsFirstRegisteredAndSetsTieFlag()
+    {
+        // *.a.# and #.a.* have identical D5 metrics:
+        //   IsExact=false, LiteralWordCount=1, HashCount=1, StarCount=1, LiteralPrefixLength=0
+        // → K1-K4 all tie → unresolvable tie; first-registered (index 0) wins.
+        var candidates = new[]
+        {
+            _matcher.Compile("*.a.#"),  // index 0 — first registered
+            _matcher.Compile("#.a.*"),  // index 1 — second registered
+        };
+
+        // Act
+        int result = _matcher.SelectMostSpecific(candidates.AsSpan(), out bool unresolvedTie);
+
+        // Assert
+        result.Should().Be(0, "first-registered wins on an unresolvable tie");
+        unresolvedTie.Should().BeTrue("*.a.# and #.a.* have equal D5 metrics on all criteria");
+    }
+
+    [Fact]
+    public void SelectMostSpecific_ClearWinner_LeavesUnresolvedTieFalse()
+    {
+        // Arrange
+        var candidates = new[]
+        {
+            _matcher.Compile("a.b"),  // index 0: exact — most specific
+            _matcher.Compile("a.*"),  // index 1: non-exact
+        };
+
+        // Act
+        int result = _matcher.SelectMostSpecific(candidates.AsSpan(), out bool unresolvedTie);
+
+        // Assert
+        result.Should().Be(0, "a.b (exact) is more specific than a.*");
+        unresolvedTie.Should().BeFalse("there is a clear winner, no tie");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // ADVERSARIAL COMPLEXITY — proves O(n*m) iterative DP, not exponential backtracking
     // ─────────────────────────────────────────────────────────────────────────
 

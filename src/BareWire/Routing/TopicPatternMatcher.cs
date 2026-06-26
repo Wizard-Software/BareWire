@@ -85,6 +85,77 @@ internal sealed class TopicPatternMatcher : ITopicMatcher
     }
 
     /// <inheritdoc/>
+    public int CompareSpecificity(in CompiledTopicPattern a, in CompiledTopicPattern b)
+    {
+        // K1: exact pattern (no wildcards) beats any pattern with wildcards.
+        if (a.IsExact != b.IsExact)
+        {
+            return a.IsExact ? 1 : -1;
+        }
+
+        // K2: more literal words is more specific.
+        if (a.LiteralWordCount != b.LiteralWordCount)
+        {
+            return a.LiteralWordCount - b.LiteralWordCount;
+        }
+
+        // K3a: fewer # wildcards is more specific (flip operands so smaller # → positive result).
+        if (a.HashCount != b.HashCount)
+        {
+            return b.HashCount - a.HashCount;
+        }
+
+        // K3b: fewer * wildcards is more specific (flip operands so smaller * → positive result).
+        if (a.StarCount != b.StarCount)
+        {
+            return b.StarCount - a.StarCount;
+        }
+
+        // K4: longer leading literal prefix is more specific.
+        // Note: all operands are non-negative and bounded by SegmentCount (≤ 255 for AMQP),
+        // so the subtractions cannot overflow int.
+        if (a.LiteralPrefixLength != b.LiteralPrefixLength)
+        {
+            return a.LiteralPrefixLength - b.LiteralPrefixLength;
+        }
+
+        // K5: unresolvable tie on all criteria.
+        return 0;
+    }
+
+    /// <inheritdoc/>
+    public int SelectMostSpecific(ReadOnlySpan<CompiledTopicPattern> candidates, out bool unresolvedTie)
+    {
+        if (candidates.IsEmpty)
+        {
+            unresolvedTie = false;
+            return -1;
+        }
+
+        int best = 0;
+        unresolvedTie = false;
+
+        for (int i = 1; i < candidates.Length; i++)
+        {
+            int c = CompareSpecificity(in candidates[i], in candidates[best]);
+            if (c > 0)
+            {
+                // Strict new winner — update best and reset the tie flag.
+                best = i;
+                unresolvedTie = false;
+            }
+            else if (c == 0)
+            {
+                // Equal specificity: tie with the current best (first-registered wins by not updating best).
+                unresolvedTie = true;
+            }
+            // c < 0: current best is already more specific; no change.
+        }
+
+        return best;
+    }
+
+    /// <inheritdoc/>
     public bool IsMatch(in CompiledTopicPattern pattern, ReadOnlySpan<char> routingKey)
     {
         int n = pattern.SegmentCount;

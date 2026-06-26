@@ -28,9 +28,11 @@ internal enum TopicSegmentKind : byte
 /// </list>
 /// </para>
 /// <para>
-/// The original <see cref="Pattern"/> string is retained for diagnostics and serves as the anchor
-/// for the specificity score that task 17.5 will add (a pre-computed integer, derived in
-/// <c>Compile</c>, will accompany or extend this struct without changing the seam).
+/// Specificity metric fields (<see cref="IsExact"/>, <see cref="LiteralWordCount"/>,
+/// <see cref="HashCount"/>, <see cref="StarCount"/>, <see cref="LiteralPrefixLength"/>) are
+/// computed once in the constructor from the <c>kinds</c> array (Build-time, zero
+/// per-delivery cost). They power the D5 comparator
+/// (<see cref="ITopicMatcher.CompareSpecificity"/>) without re-parsing the pattern at dispatch time.
 /// </para>
 /// <para>
 /// Word semantics — empty string is zero words; non-empty strings split on <c>.</c> keep empty
@@ -48,20 +50,91 @@ internal readonly struct CompiledTopicPattern
     /// </summary>
     internal readonly string[] Literals;
 
-    /// <summary>The original pattern string, kept for diagnostics and the 17.5 specificity score.</summary>
+    /// <summary>The original pattern string, retained for diagnostics.</summary>
     internal readonly string Pattern;
+
+    /// <summary>
+    /// <see langword="true"/> when the pattern contains no wildcards at all
+    /// (<see cref="HashCount"/> == 0 &amp;&amp; <see cref="StarCount"/> == 0).
+    /// An exact pattern is always more specific than any pattern with wildcards (D5 criterion K1).
+    /// </summary>
+    internal readonly bool IsExact;
+
+    /// <summary>
+    /// Number of <see cref="TopicSegmentKind.Literal"/> segments in the pattern.
+    /// More literal words means higher specificity (D5 criterion K2).
+    /// </summary>
+    internal readonly int LiteralWordCount;
+
+    /// <summary>
+    /// Number of <c>#</c> (<see cref="TopicSegmentKind.ZeroOrMore"/>) wildcards.
+    /// Fewer <c>#</c> wildcards means higher specificity (D5 criterion K3a).
+    /// </summary>
+    internal readonly int HashCount;
+
+    /// <summary>
+    /// Number of <c>*</c> (<see cref="TopicSegmentKind.SingleWord"/>) wildcards.
+    /// Fewer <c>*</c> wildcards means higher specificity (D5 criterion K3b).
+    /// </summary>
+    internal readonly int StarCount;
+
+    /// <summary>
+    /// Number of consecutive leading <see cref="TopicSegmentKind.Literal"/> segments before the
+    /// first wildcard. A longer literal prefix means higher specificity (D5 criterion K4).
+    /// For patterns with no wildcards (<see cref="IsExact"/> == <see langword="true"/>) this equals
+    /// <see cref="SegmentCount"/>.
+    /// </summary>
+    internal readonly int LiteralPrefixLength;
 
     /// <summary>Number of segments in the compiled pattern.</summary>
     internal int SegmentCount => Kinds.Length;
 
     /// <summary>
-    /// Initializes a new <see cref="CompiledTopicPattern"/>.
-    /// Only <see cref="TopicPatternMatcher"/> should call this constructor.
+    /// Initializes a new <see cref="CompiledTopicPattern"/> and pre-computes all specificity
+    /// metric fields in a single pass over <paramref name="kinds"/>. Only
+    /// <see cref="TopicPatternMatcher"/> should call this constructor.
     /// </summary>
     internal CompiledTopicPattern(TopicSegmentKind[] kinds, string[] literals, string pattern)
     {
         Kinds = kinds;
         Literals = literals;
         Pattern = pattern;
+
+        // Compute specificity metric fields in one Build-time pass — zero per-delivery cost.
+        int hashCount = 0;
+        int starCount = 0;
+        int literalWordCount = 0;
+        int literalPrefixLength = 0;
+        bool firstWildcardSeen = false;
+
+        for (int i = 0; i < kinds.Length; i++)
+        {
+            switch (kinds[i])
+            {
+                case TopicSegmentKind.Literal:
+                    literalWordCount++;
+                    if (!firstWildcardSeen)
+                    {
+                        literalPrefixLength++;
+                    }
+                    break;
+
+                case TopicSegmentKind.ZeroOrMore:
+                    hashCount++;
+                    firstWildcardSeen = true;
+                    break;
+
+                case TopicSegmentKind.SingleWord:
+                    starCount++;
+                    firstWildcardSeen = true;
+                    break;
+            }
+        }
+
+        HashCount = hashCount;
+        StarCount = starCount;
+        LiteralWordCount = literalWordCount;
+        LiteralPrefixLength = literalPrefixLength;
+        IsExact = hashCount == 0 && starCount == 0;
     }
 }
