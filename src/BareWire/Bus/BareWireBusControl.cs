@@ -65,7 +65,13 @@ internal sealed partial class BareWireBusControl : IBusControl
     public async Task<BusHandle> StartAsync(CancellationToken cancellationToken = default)
     {
         // Fail fast: validate configuration before attempting to start the bus.
-        ConfigurationValidator.Validate(_configurator);
+        // Transport presence is now determined by the FACT that an ITransportAdapter was
+        // resolved into this control (D5 / ADR-028), not by the BusConfigurator.HasTransport marker.
+        // In 15.2 the adapter is still resolved via GetRequiredService (ctor null-guard), so it is
+        // never null here; the signal is therefore literally `true`. Task 15.3 switches resolution
+        // to GetService, at which point this becomes a real null check.
+        const bool transportRegistered = true;
+        ConfigurationValidator.Validate(_configurator, transportRegistered);
 
         lock (_stateLock)
         {
