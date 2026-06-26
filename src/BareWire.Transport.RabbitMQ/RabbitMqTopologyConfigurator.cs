@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Topology;
+using BareWire.Transport.RabbitMQ.Configuration;
 using BareWire.Transport.RabbitMQ.Internal;
 using BareWire.Transport.RabbitMQ.Topology;
 
@@ -16,12 +17,37 @@ internal sealed class RabbitMqTopologyConfigurator : ITopologyConfigurator
     private readonly List<ExchangeQueueBinding> _exchangeQueueBindings = [];
     private readonly List<ExchangeExchangeBinding> _exchangeExchangeBindings = [];
 
+    // Shared BY REFERENCE with the owning RabbitMqConfigurator so DeclareExchange<T> write-through
+    // lands in the SAME per-type map set as MapExchange<T> / MapRoutingKey<T> / Publish<T> — one
+    // source of truth, no merge step. A standalone instance (e.g. topology-only deploy paths)
+    // gets a private registry: its DeclareExchange<T> mappings are simply not consumed.
+    private readonly PublishRegistry _publishRegistry;
+
+    internal RabbitMqTopologyConfigurator(PublishRegistry? publishRegistry = null) =>
+        _publishRegistry = publishRegistry ?? new PublishRegistry();
+
     /// <inheritdoc />
     public void DeclareExchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
 
         _exchanges.Add(new ExchangeDeclaration(name, type, durable, autoDelete));
+    }
+
+    /// <inheritdoc />
+    public void DeclareExchange<T>(string name, ExchangeType type, bool durable = true,
+        bool autoDelete = false, string? routingKey = null) where T : class
+    {
+        // (1) Declare the topology exactly like the non-generic overload (guards name).
+        DeclareExchange(name, type, durable, autoDelete);
+
+        // (2) Write-through the per-type mapping into the shared store: exchange = name always;
+        //     routing key only when supplied (null preserves the typeof(T).FullName fallback).
+        _publishRegistry.MapExchange(typeof(T), name);
+        if (routingKey is not null)
+        {
+            _publishRegistry.MapRoutingKey(typeof(T), routingKey);
+        }
     }
 
     /// <inheritdoc />

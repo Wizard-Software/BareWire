@@ -33,6 +33,20 @@ internal sealed class KafkaTopologyConfigurator : ITopologyConfigurator
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// In Kafka, exchanges have no runtime meaning and there is no per-type publish-routing store
+    /// to write through to, so this overload only records the exchange declaration (silently ignored
+    /// at deploy time, like the non-generic overload). The <paramref name="routingKey"/> is not mapped.
+    /// This method satisfies the <see cref="ITopologyConfigurator"/> contract.
+    /// </remarks>
+    public void DeclareExchange<T>(string name, ExchangeType type, bool durable = true,
+        bool autoDelete = false, string? routingKey = null) where T : class
+    {
+        _ = routingKey;
+        DeclareExchange(name, type, durable, autoDelete);
+    }
+
+    /// <inheritdoc />
     public void DeclareQueue(string name, bool durable = true, bool autoDelete = false,
         IReadOnlyDictionary<string, object>? arguments = null)
     {

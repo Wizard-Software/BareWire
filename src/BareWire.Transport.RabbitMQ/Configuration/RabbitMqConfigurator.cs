@@ -15,8 +15,11 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     private RabbitMqTopologyConfigurator? _topologyConfigurator;
     private RabbitMqHeaderMappingConfigurator? _headerMappingConfigurator;
     private readonly List<RabbitMqEndpointConfiguration> _endpoints = [];
-    private readonly Dictionary<Type, string> _routingKeyMappings = [];
-    private readonly Dictionary<Type, string> _exchangeMappings = [];
+
+    // Single config-time source of truth for per-type publish routing. Shared BY REFERENCE
+    // with the lazily-created topology configurator (see ConfigureTopology) so MapExchange<T>,
+    // MapRoutingKey<T>, DeclareExchange<T>, and Publish<T> all accumulate into ONE map set.
+    private readonly PublishRegistry _publishRegistry = new();
     private readonly Dictionary<Type, PublishRequestRegistration> _publishRequestMappings = [];
 
     public void Host(string uri, Action<IHostConfigurator>? configure = null)
@@ -39,7 +42,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     {
         ArgumentNullException.ThrowIfNull(configure);
 
-        _topologyConfigurator ??= new RabbitMqTopologyConfigurator();
+        _topologyConfigurator ??= new RabbitMqTopologyConfigurator(_publishRegistry);
         configure(_topologyConfigurator);
     }
 
@@ -64,13 +67,22 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
     public void MapRoutingKey<T>(string routingKey) where T : class
     {
         ArgumentException.ThrowIfNullOrEmpty(routingKey);
-        _routingKeyMappings[typeof(T)] = routingKey;
+        _publishRegistry.MapRoutingKey(typeof(T), routingKey);
     }
 
     public void MapExchange<T>(string exchangeName) where T : class
     {
         ArgumentException.ThrowIfNullOrEmpty(exchangeName);
-        _exchangeMappings[typeof(T)] = exchangeName;
+        _publishRegistry.MapExchange(typeof(T), exchangeName);
+    }
+
+    public void Publish<T>(Action<IPublishConfigurator<T>> configure) where T : class
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+
+        // Write-through to the shared registry; last-call-wins per T across every shape.
+        var publishConfigurator = new PublishConfigurator<T>(_publishRegistry);
+        configure(publishConfigurator);
     }
 
     public void PublishRequest<T>() where T : class =>
@@ -144,15 +156,15 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
             options.HeaderMappingConfigurator = _headerMappingConfigurator;
         }
 
-        if (_routingKeyMappings.Count > 0)
+        if (_publishRegistry.RoutingKeyMappings.Count > 0)
         {
-            options.RoutingKeyMappings = new Dictionary<Type, string>(_routingKeyMappings);
+            options.RoutingKeyMappings = new Dictionary<Type, string>(_publishRegistry.RoutingKeyMappings);
         }
 
-        if (_exchangeMappings.Count > 0)
+        if (_publishRegistry.ExchangeMappings.Count > 0)
         {
             ValidateExchangeMappings(options.Topology);
-            options.ExchangeMappings = new Dictionary<Type, string>(_exchangeMappings);
+            options.ExchangeMappings = new Dictionary<Type, string>(_publishRegistry.ExchangeMappings);
         }
 
         if (_publishRequestMappings.Count > 0)
@@ -180,7 +192,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         HashSet<string> declaredExchanges = [..topology.Exchanges.Select(e => e.Name)];
 
         List<string>? missing = null;
-        foreach (string exchangeName in _exchangeMappings.Values)
+        foreach (string exchangeName in _publishRegistry.ExchangeMappings.Values)
         {
             if (!declaredExchanges.Contains(exchangeName))
             {
