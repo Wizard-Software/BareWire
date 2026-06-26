@@ -105,11 +105,11 @@ IHost bwHost = Host.CreateDefaultBuilder()
         services.AddMassTransitEnvelopeDeserializer();
 
         services.AddTransient<InventoryConsumer>();
+        // Two-call registration path — kept intentionally to demonstrate it still works (non-breaking, ADR-028 E7).
+        // Core and transport are registered separately; no Use{Transport} is needed (validation now keys on the
+        // ITransportAdapter fact in DI, ADR-028 D5). The single-call BareWire.RabbitMQ bundle is the recommended path.
         services.AddBareWireRabbitMq(configureRabbitMq);
-        services.AddBareWire(cfg =>
-        {
-            cfg.UseRabbitMQ(configureRabbitMq);
-        });
+        services.AddBareWire(cfg => { });
     })
     .Build();
 

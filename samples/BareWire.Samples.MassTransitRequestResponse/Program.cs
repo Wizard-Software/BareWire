@@ -39,6 +39,7 @@ using BwResponse = BareWire.Abstractions.Response<BareWire.Samples.MassTransitRe
 
 using BareWire.Abstractions.Configuration;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Serialization.Json;
 using BareWire.Interop.MassTransit;
@@ -113,17 +114,18 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     rmq.ConfigureTopology(_ => { });
 };
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    cfg.UseRabbitMQ(configureRabbitMq);
-
-    // Key element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>() tells
-    // BareWire to wrap every CheckOrderStatus in a MassTransit envelope. The envelope carries
-    // messageId, requestId, responseAddress (= amq.rabbitmq.reply-to), correlationId,
-    // messageType and the payload — exactly what MassTransit expects.
-    cfg.MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>();
-});
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(
+    configureRabbitMq,
+    cfg =>
+    {
+        // Key element: MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>() tells
+        // BareWire to wrap every CheckOrderStatus in a MassTransit envelope. The envelope carries
+        // messageId, requestId, responseAddress (= amq.rabbitmq.reply-to), correlationId,
+        // messageType and the payload — exactly what MassTransit expects.
+        cfg.MapSerializer<CheckOrderStatus, MassTransitEnvelopeSerializer>();
+    });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. MassTransit bus — the real responder (the MassTransit side of the interop)

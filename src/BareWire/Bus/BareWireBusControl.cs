@@ -15,7 +15,7 @@ namespace BareWire.Bus;
 internal sealed partial class BareWireBusControl : IBusControl
 {
     private readonly BareWireBus _bus;
-    private readonly ITransportAdapter _adapter;
+    private readonly ITransportAdapter? _adapter;
     private readonly FlowController _flowController;
     private readonly BusConfigurator _configurator;
     private readonly ILogger<BareWireBusControl> _logger;
@@ -34,7 +34,7 @@ internal sealed partial class BareWireBusControl : IBusControl
 
     internal BareWireBusControl(
         BareWireBus bus,
-        ITransportAdapter adapter,
+        ITransportAdapter? adapter,
         FlowController flowController,
         BusConfigurator configurator,
         ILogger<BareWireBusControl> logger,
@@ -47,7 +47,11 @@ internal sealed partial class BareWireBusControl : IBusControl
         IReadOnlyList<ISagaMessageDispatcher> sagaDispatchers)
     {
         _bus = bus ?? throw new ArgumentNullException(nameof(bus));
-        _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+
+        // The adapter is intentionally nullable (15.3 / C1): a missing transport must produce the
+        // friendly BareWireConfigurationException from StartAsync, not a raw ArgumentNullException
+        // (or InvalidOperationException from GetRequiredService) during DI graph construction.
+        _adapter = adapter;
         _flowController = flowController ?? throw new ArgumentNullException(nameof(flowController));
         _configurator = configurator ?? throw new ArgumentNullException(nameof(configurator));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -65,7 +69,17 @@ internal sealed partial class BareWireBusControl : IBusControl
     public async Task<BusHandle> StartAsync(CancellationToken cancellationToken = default)
     {
         // Fail fast: validate configuration before attempting to start the bus.
-        ConfigurationValidator.Validate(_configurator);
+        // Transport presence is determined by the FACT that an ITransportAdapter was resolved into
+        // this control (D5 / ADR-028). Since 15.3 the adapter is resolved via GetService (nullable),
+        // so a missing transport leaves _adapter null and the validator raises the friendly
+        // BareWireConfigurationException FIRST — before any raw DI/NRE error can leak out (C1 / E6).
+        bool transportRegistered = _adapter is not null;
+        ConfigurationValidator.Validate(_configurator, transportRegistered);
+
+        // After validation succeeds, the adapter is guaranteed non-null (the validator throws
+        // otherwise). Capture it in a non-null local so the remainder of StartAsync stays
+        // warning-free under TreatWarningsAsErrors (R4).
+        ITransportAdapter adapter = _adapter!;
 
         lock (_stateLock)
         {
@@ -80,7 +94,7 @@ internal sealed partial class BareWireBusControl : IBusControl
         // Deploy topology (exchanges, queues, bindings) to the broker.
         if (_topology is not null)
         {
-            await _adapter.DeployTopologyAsync(_topology, cancellationToken).ConfigureAwait(false);
+            await adapter.DeployTopologyAsync(_topology, cancellationToken).ConfigureAwait(false);
             LogTopologyDeployed(_logger, _topology.Exchanges.Count, _topology.Queues.Count);
         }
 
@@ -118,14 +132,14 @@ internal sealed partial class BareWireBusControl : IBusControl
             {
                 ConsumerOrderingStrategyResolver.Resolve(
                     binding.Ordering,
-                    _adapter.Capabilities,
-                    _adapter.TransportName,
+                    adapter.Capabilities,
+                    adapter.TransportName,
                     binding.EndpointName);
             }
 
             var runner = new ReceiveEndpointRunner(
                 binding,
-                _adapter,
+                adapter,
                 endpointResolver,
                 _bus, // IPublishEndpoint
                 _bus, // ISendEndpointProvider
@@ -186,8 +200,14 @@ internal sealed partial class BareWireBusControl : IBusControl
 
     public async Task DeployTopologyAsync(CancellationToken cancellationToken = default)
     {
+        // Validate transport presence (the adapter is nullable since 15.3 / C1) so a missing
+        // transport surfaces the friendly BareWireConfigurationException rather than a raw NRE,
+        // even when topology is deployed independently of StartAsync.
+        ConfigurationValidator.Validate(_configurator, transportRegistered: _adapter is not null);
+        ITransportAdapter adapter = _adapter!;
+
         TopologyDeclaration topology = _topology ?? new TopologyDeclaration();
-        await _adapter.DeployTopologyAsync(topology, cancellationToken).ConfigureAwait(false);
+        await adapter.DeployTopologyAsync(topology, cancellationToken).ConfigureAwait(false);
     }
 
     public BusHealthStatus CheckHealth()

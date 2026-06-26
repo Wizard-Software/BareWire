@@ -36,12 +36,12 @@ public sealed class ConfigurationValidatorTests
     [Fact]
     public void Validate_NoTransport_ThrowsConfigurationException()
     {
-        // Arrange
+        // Arrange — configurator is otherwise valid but transportRegistered is false,
+        // meaning no ITransportAdapter was resolved into the control (D5 / ADR-028).
         BusConfigurator configurator = new();
-        // No transport registered — HasInMemoryTransport = false, RabbitMqConfigurator = null.
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: false);
 
         // Assert
         act.Should().Throw<BareWireConfigurationException>()
@@ -56,7 +56,7 @@ public sealed class ConfigurationValidatorTests
         configurator.HasInMemoryTransport = true;
 
         // Act — no endpoints so no endpoint-level errors, only checking transport passes
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert — transport check passes; no exception thrown (no endpoints to validate)
         act.Should().NotThrow();
@@ -67,12 +67,49 @@ public sealed class ConfigurationValidatorTests
     {
         // Arrange
         BusConfigurator configurator = new();
-        configurator.UseRabbitMQ(_ => { }); // Sets RabbitMqConfigurator
+        // Coexistence smoke (Feature 15, ADR-028 D4): UseRabbitMQ is now a deprecated no-op and no longer
+        // sets the RabbitMqConfigurator marker. Validation passes here purely because transportRegistered
+        // is true (D5 — based on the actual ITransportAdapter registration, not the dead marker).
+#pragma warning disable CS0618 // Type or member is obsolete
+        configurator.UseRabbitMQ(_ => { });
+#pragma warning restore CS0618 // Type or member is obsolete
 
         // Act — no endpoints, only transport check
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert — transport check passes
+        act.Should().NotThrow();
+    }
+
+    // ── transportRegistered branch tests (core of task 15.2) ──────────────────
+
+    [Fact]
+    public void Validate_TransportNotRegistered_ThrowsConfigurationException()
+    {
+        // Arrange — any configurator; transportRegistered: false simulates the absence of
+        // ITransportAdapter in the DI container (D5 / ADR-028).
+        BusConfigurator configurator = new();
+
+        // Act
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: false);
+
+        // Assert
+        act.Should().Throw<BareWireConfigurationException>()
+            .Which.OptionName.Should().Be("Transport");
+    }
+
+    [Fact]
+    public void Validate_TransportRegistered_DoesNotThrowForTransport()
+    {
+        // Arrange — BusConfigurator with NO HasTransport marker set (neither HasInMemoryTransport
+        // nor UseRabbitMQ called). This is the key proof that HasTransport is no longer load-bearing:
+        // when transportRegistered is true, the validator must not throw even without the marker.
+        BusConfigurator configurator = new();
+
+        // Act — no endpoints either, so only transport validation is exercised
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
+
+        // Assert
         act.Should().NotThrow();
     }
 
@@ -90,7 +127,7 @@ public sealed class ConfigurationValidatorTests
         });
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         act.Should().Throw<BareWireConfigurationException>()
@@ -108,7 +145,7 @@ public sealed class ConfigurationValidatorTests
         });
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         act.Should().NotThrow();
@@ -128,7 +165,7 @@ public sealed class ConfigurationValidatorTests
         });
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         BareWireConfigurationException ex = act.Should().Throw<BareWireConfigurationException>().Which;
@@ -148,7 +185,7 @@ public sealed class ConfigurationValidatorTests
         });
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         act.Should().Throw<BareWireConfigurationException>()
@@ -169,7 +206,7 @@ public sealed class ConfigurationValidatorTests
         });
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         BareWireConfigurationException ex = act.Should().Throw<BareWireConfigurationException>().Which;
@@ -186,7 +223,7 @@ public sealed class ConfigurationValidatorTests
         BusConfigurator configurator = CreateValidConfiguratorWithEndpoint();
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         act.Should().NotThrow();
@@ -201,7 +238,7 @@ public sealed class ConfigurationValidatorTests
         configurator.AddReceiveEndpoint("queue-b", ep => ep.RawConsumer<FakeRawConsumer>());
 
         // Act
-        Action act = () => ConfigurationValidator.Validate(configurator);
+        Action act = () => ConfigurationValidator.Validate(configurator, transportRegistered: true);
 
         // Assert
         act.Should().NotThrow();
@@ -211,7 +248,7 @@ public sealed class ConfigurationValidatorTests
     public void Validate_NullConfigurator_ThrowsArgumentNullException()
     {
         // Act
-        Action act = () => ConfigurationValidator.Validate(null!);
+        Action act = () => ConfigurationValidator.Validate(null!, transportRegistered: true);
 
         // Assert
         act.Should().Throw<ArgumentNullException>();

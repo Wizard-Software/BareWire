@@ -1,0 +1,7 @@
+namespace BareWire.Google.PubSub
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithPubSub(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Transport.Google.PubSub.Configuration.IPubSubConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}

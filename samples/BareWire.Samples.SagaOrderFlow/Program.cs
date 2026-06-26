@@ -34,6 +34,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Saga;
 using BareWire;
+using BareWire.RabbitMQ;
 using BareWire.Transport.RabbitMQ;
 using BareWire.Saga;
 using BareWire.Saga.EntityFramework;
@@ -112,11 +113,9 @@ Action<IRabbitMqConfigurator> configureRabbitMq = rmq =>
     });
 };
 
-builder.Services.AddBareWireRabbitMq(configureRabbitMq);
-builder.Services.AddBareWire(cfg =>
-{
-    cfg.UseRabbitMQ(configureRabbitMq);
-});
+// Single-call registration (ADR-028): the BareWire.RabbitMQ bundle wires the core engine and the
+// RabbitMQ transport in one statement (equivalent to AddBareWireRabbitMq(...) + AddBareWire(...)).
+builder.Services.AddBareWireWithRabbitMq(configureRabbitMq);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. SAGA persistence (EF Core + PostgreSQL)

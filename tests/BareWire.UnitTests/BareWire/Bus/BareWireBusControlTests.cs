@@ -249,49 +249,12 @@ public sealed class BareWireBusControlTests
         act.Should().Throw<ArgumentNullException>().WithParameterName("bus");
     }
 
-    [Fact]
-    public void Constructor_WhenAdapterIsNull_ThrowsArgumentNullException()
-    {
-        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
-        adapter.TransportName.Returns("test");
-
-        IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
-        serializer.ContentType.Returns("application/json");
-
-        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
-
-        MiddlewareChain chain = new([]);
-        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
-        FlowController flowController = new(NullLogger<FlowController>.Instance);
-
-        BareWireBus bus = new(
-            adapter,
-            new DefaultSerializerResolver(serializer),
-            pipeline,
-            flowController,
-            new PublishFlowControlOptions(),
-            NullLogger<BareWireBus>.Instance,
-            new NullInstrumentation());
-
-        BusConfigurator configurator = new();
-        configurator.HasInMemoryTransport = true;
-
-        Action act = () => _ = new BareWireBusControl(
-            bus: bus,
-            adapter: null!,
-            flowController: flowController,
-            configurator: configurator,
-            logger: NullLogger<BareWireBusControl>.Instance,
-            topology: null,
-            endpointBindings: [],
-            deserializerResolver: deserializerResolver,
-            scopeFactory: Substitute.For<IServiceScopeFactory>(),
-            instrumentation: new NullInstrumentation(),
-            loggerFactory: NullLoggerFactory.Instance,
-            sagaDispatchers: []);
-
-        act.Should().Throw<ArgumentNullException>().WithParameterName("adapter");
-    }
+    // NOTE (15.3 / C1): a previous test asserted that a null adapter throws ArgumentNullException
+    // from the BareWireBusControl constructor. That contract was intentionally removed — the adapter
+    // is now nullable so a missing transport surfaces as a friendly BareWireConfigurationException
+    // from StartAsync (see BusStartupTransportResolutionTests), not a raw ctor exception. The test
+    // was deleted rather than repurposed because its inverse (null adapter does NOT throw at
+    // construction) is covered end-to-end by BusStartupTransportResolutionTests.
 
     [Fact]
     public void Constructor_WhenFlowControllerIsNull_ThrowsArgumentNullException()

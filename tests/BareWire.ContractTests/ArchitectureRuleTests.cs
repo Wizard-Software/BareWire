@@ -637,6 +637,108 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
+    // Rule 14: Single-call transport bundle layer (Feature 15 — ADR-028).
+    //
+    // The five bundle packages (BareWire.{RabbitMQ|Kafka|AzureServiceBus|AWS.SQS|
+    // Google.PubSub}) form a NEW, separate layer that references BOTH the Core
+    // (BareWire) and the matching Transport (BareWire.Transport.*). The dependency
+    // direction is strictly one-way: a bundle may reference Core + Transport, but
+    // neither Core nor any Transport may reference a bundle. This proves the
+    // single-call ergonomics did NOT loosen the Core⊥Transport invariant — the
+    // bundle is an extra layer on top, not a back-edge.
+    // -------------------------------------------------------------------------
+
+    /// <summary>Bundle assembly → the Transport assembly it must wrap.</summary>
+    private static readonly (Assembly Bundle, string TransportName)[] Bundles =
+    [
+        (typeof(BareWire.RabbitMQ.ServiceCollectionExtensions).Assembly, "BareWire.Transport.RabbitMQ"),
+        (typeof(BareWire.Kafka.ServiceCollectionExtensions).Assembly, "BareWire.Transport.Kafka"),
+        (typeof(BareWire.AzureServiceBus.ServiceCollectionExtensions).Assembly, "BareWire.Transport.AzureServiceBus"),
+        (typeof(BareWire.AWS.SQS.ServiceCollectionExtensions).Assembly, "BareWire.Transport.AWS.SQS"),
+        (typeof(BareWire.Google.PubSub.ServiceCollectionExtensions).Assembly, "BareWire.Transport.Google.PubSub"),
+    ];
+
+    private static readonly string[] BundleNames =
+    [
+        "BareWire.RabbitMQ",
+        "BareWire.Kafka",
+        "BareWire.AzureServiceBus",
+        "BareWire.AWS.SQS",
+        "BareWire.Google.PubSub",
+    ];
+
+    // Rule 14a: each bundle references BOTH the Core and its matching Transport.
+    [Fact]
+    public void Bundle_ShouldDependOn_BothCoreAndTransport()
+    {
+        foreach (var (bundle, transportName) in Bundles)
+        {
+            var referenced = bundle.GetReferencedAssemblies()
+                .Select(a => a.Name)
+                .Where(n => n is not null)
+                .ToArray();
+
+            referenced.Should().Contain(
+                "BareWire",
+                "the bundle {0} must reference the Core (BareWire) — it calls AddBareWire", bundle.GetName().Name!);
+
+            referenced.Should().Contain(
+                transportName,
+                "the bundle {0} must reference its transport ({1}) — it calls the transport's AddBareWire registration method",
+                bundle.GetName().Name!, transportName);
+        }
+    }
+
+    // Rule 14b: the Core (BareWire) must NOT reference any bundle (one-directionality).
+    [Fact]
+    public void Core_ShouldNotDependOn_AnyBundle()
+    {
+        var core = typeof(BareWire.ServiceCollectionExtensions).Assembly;
+
+        foreach (var bundleName in BundleNames)
+        {
+            var result = Types.InAssembly(core)
+                .ShouldNot()
+                .HaveDependencyOn(bundleName)
+                .GetResult();
+
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+            core.GetReferencedAssemblies().Select(a => a.Name)
+                .Should().NotContain(bundleName,
+                    "Core must never take a binary reference on the bundle layer ({0})", bundleName);
+        }
+    }
+
+    // Rule 14c: no Transport assembly may reference any bundle (one-directionality).
+    [Fact]
+    public void Transports_ShouldNotDependOn_AnyBundle()
+    {
+        string[] transports =
+        [
+            "BareWire.Transport.RabbitMQ",
+            "BareWire.Transport.Kafka",
+            "BareWire.Transport.AzureServiceBus",
+            "BareWire.Transport.AWS.SQS",
+            "BareWire.Transport.Google.PubSub",
+        ];
+
+        foreach (var transportName in transports)
+        {
+            var transport = GetAssembly(transportName);
+            var referenced = transport.GetReferencedAssemblies().Select(a => a.Name).ToArray();
+
+            foreach (var bundleName in BundleNames)
+            {
+                referenced.Should().NotContain(bundleName,
+                    "transport {0} must never reference the bundle layer ({1}) — the bundle wraps the transport, not the other way round",
+                    transportName, bundleName);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 

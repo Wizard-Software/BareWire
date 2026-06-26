@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the AWS SQS transport. References both the BareWire core and BareWire.Transport.AWS.SQS and exposes AddBareWireWithSqs.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.AWS.SQS\BareWire.Transport.AWS.SQS.csproj" />
+  </ItemGroup>
+
+</Project>

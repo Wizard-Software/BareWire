@@ -28,7 +28,10 @@ internal sealed class BusConfigurator : IBusConfigurator
     internal Type? SerializerType { get; private set; }
 
     /// <summary>
-    /// Gets the RabbitMQ configurator delegate, or <see langword="null"/> when RabbitMQ was not configured.
+    /// Gets the RabbitMQ configurator delegate. Always <see langword="null"/> since Feature 15 (ADR-028 D4):
+    /// the deprecated <see cref="UseRabbitMQ"/> marker is now a no-op and no longer captures the delegate.
+    /// Transport validation (D5) relies on the actual <c>ITransportAdapter</c> registration in DI, so this
+    /// marker is no longer load-bearing. Retained as dead state pending a separate cleanup task.
     /// </summary>
     internal Action<IRabbitMqConfigurator>? RabbitMqConfigurator { get; private set; }
 
@@ -48,10 +51,19 @@ internal sealed class BusConfigurator : IBusConfigurator
     // ── IBusConfigurator ───────────────────────────────────────────────────────
 
     /// <inheritdoc />
+    [Obsolete(
+        "UseRabbitMQ on IBusConfigurator is a no-op marker and is deprecated. Any settings passed to the " +
+        "configure delegate — including host, credentials, and TLS/mTLS — were and are silently ignored by " +
+        "the bus and only take effect when passed to AddBareWireRabbitMq. Register RabbitMQ via the bundle " +
+        "AddBareWireWithRabbitMq(transport, bus?) (single call) or AddBareWireRabbitMq(transport) + " +
+        "AddBareWire(bus) (two calls). This member will be removed in a future release.",
+        error: false)]
     public void UseRabbitMQ(Action<IRabbitMqConfigurator> configure)
     {
+        // Deprecated no-op (Feature 15, ADR-028 D4): the bus-level marker is no longer set. Transport
+        // validation (D5) is based on the actual ITransportAdapter registration in DI, not on this marker.
+        // The null-guard is retained to preserve the existing API contract (ArgumentNullException on null).
         ArgumentNullException.ThrowIfNull(configure);
-        RabbitMqConfigurator = configure;
     }
 
     /// <inheritdoc />

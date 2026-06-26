@@ -9,7 +9,11 @@ namespace BareWire.UnitTests.Core.Configuration;
 
 public sealed class BusConfiguratorTests
 {
-    // ── UseRabbitMQ ───────────────────────────────────────────────────────────
+    // ── UseRabbitMQ (deprecated no-op — Feature 15, ADR-028 D4) ────────────────
+    // UseRabbitMQ is [Obsolete] (deprecated marker reduced to a no-op): real RabbitMQ settings flow
+    // through AddBareWireRabbitMq / AddBareWireWithRabbitMq, never through this bus-level marker.
+    // CS0618 is suppressed for these tests because they intentionally exercise the deprecated method.
+#pragma warning disable CS0618 // Type or member is obsolete
 
     [Fact]
     public void UseRabbitMQ_NullConfigure_ThrowsArgumentNullException()
@@ -26,7 +30,7 @@ public sealed class BusConfiguratorTests
     }
 
     [Fact]
-    public void UseRabbitMQ_ValidConfigure_StoresConfigurator()
+    public void UseRabbitMQ_AfterDeprecation_IsNoOp_DoesNotSetMarker()
     {
         // Arrange
         BusConfigurator sut = new();
@@ -35,9 +39,14 @@ public sealed class BusConfiguratorTests
         // Act
         sut.UseRabbitMQ(configure);
 
-        // Assert
-        sut.RabbitMqConfigurator.Should().BeSameAs(configure);
+        // Assert — the deprecated method no longer captures the delegate: the marker stays null and,
+        // with no InMemory transport registered, HasTransport remains false. This proves the no-op
+        // (before the change the delegate was stored and HasTransport would be true).
+        sut.RabbitMqConfigurator.Should().BeNull();
+        sut.HasTransport.Should().BeFalse();
     }
+
+#pragma warning restore CS0618 // Type or member is obsolete
 
     // ── ConfigureObservability ────────────────────────────────────────────────
 

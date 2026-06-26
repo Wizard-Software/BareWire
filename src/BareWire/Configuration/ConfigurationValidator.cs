@@ -12,28 +12,37 @@ internal static class ConfigurationValidator
     /// <summary>
     /// Validates the supplied <paramref name="configurator"/> and throws
     /// <see cref="BareWireConfigurationException"/> on the first validation failure found.
+    /// Transport presence is determined by <paramref name="transportRegistered"/>, which reflects
+    /// the fact that an <c>ITransportAdapter</c> was resolved from the DI container (D5 / ADR-028),
+    /// rather than by the <c>BusConfigurator.HasTransport</c> marker.
     /// </summary>
     /// <param name="configurator">The bus configurator to validate.</param>
+    /// <param name="transportRegistered">
+    /// <see langword="true"/> when an <c>ITransportAdapter</c> was successfully resolved from the
+    /// DI container; <see langword="false"/> when no transport adapter is registered.
+    /// </param>
     /// <exception cref="BareWireConfigurationException">
     /// Thrown when any required configuration is missing or invalid.
     /// </exception>
-    internal static void Validate(BusConfigurator configurator)
+    internal static void Validate(BusConfigurator configurator, bool transportRegistered)
     {
         ArgumentNullException.ThrowIfNull(configurator);
 
-        ValidateTransport(configurator);
+        ValidateTransport(transportRegistered);
         ValidateReceiveEndpoints(configurator);
     }
 
-    private static void ValidateTransport(BusConfigurator configurator)
+    private static void ValidateTransport(bool transportRegistered)
     {
-        if (!configurator.HasTransport)
+        if (!transportRegistered)
         {
             throw new BareWireConfigurationException(
                 optionName: "Transport",
                 optionValue: null,
                 expectedValue: "A transport adapter must be registered. " +
-                               "Call UseRabbitMQ(...) or register an ITransportAdapter in the DI container.");
+                               "Call AddBareWireWithRabbitMq(...) (or another AddBareWireWith{Transport}) " +
+                               "to register the transport and the core in one call, " +
+                               "or register an ITransportAdapter in the DI container.");
         }
     }
 

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the RabbitMQ transport. References both the BareWire core and BareWire.Transport.RabbitMQ and exposes AddBareWireWithRabbitMq.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
+  </ItemGroup>
+
+</Project>

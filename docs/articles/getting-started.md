@@ -59,7 +59,9 @@ public sealed class MessageConsumer : IConsumer<MessageSent>
 
 ## Configure the Bus
 
-Register BareWire in your DI container with the RabbitMQ transport. Topology is manual by default — you declare exchanges, queues, and bindings explicitly:
+Register BareWire in your DI container with the RabbitMQ transport. The `BareWire.RabbitMQ`
+bundle package registers the core and the RabbitMQ transport in a single call. Topology is
+manual by default — you declare exchanges, queues, and bindings explicitly:
 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
@@ -67,28 +69,33 @@ var builder = WebApplication.CreateBuilder(args);
 // Register JSON serializer (raw-first, no envelope)
 builder.AddBareWireJsonSerializer();
 
-// Configure BareWire with RabbitMQ
-builder.Services.AddBareWire(cfg =>
+// Configure BareWire with RabbitMQ in one call
+builder.Services.AddBareWireWithRabbitMq(transport =>
 {
-    cfg.UseRabbitMQ(rmq =>
-    {
-        // Declare topology explicitly
-        rmq.ConfigureTopology(topology =>
-        {
-            topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
-            topology.DeclareQueue("messages", durable: true);
-            topology.BindExchangeToQueue("messages", "messages");
-        });
+    transport.Host("amqp://guest:guest@localhost:5672/");
 
-        // Register consumer on an endpoint
-        rmq.ReceiveEndpoint("messages", e =>
-        {
-            e.PrefetchCount = 16;
-            e.Consumer<MessageConsumer, MessageSent>();
-        });
+    // Declare topology explicitly
+    transport.ConfigureTopology(topology =>
+    {
+        topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
+        topology.DeclareQueue("messages", durable: true);
+        topology.BindExchangeToQueue("messages", "messages");
+    });
+
+    // Register consumer on an endpoint
+    transport.ReceiveEndpoint("messages", e =>
+    {
+        e.PrefetchCount = 16;
+        e.Consumer<MessageConsumer, MessageSent>();
     });
 });
 ```
+
+`AddBareWireWithRabbitMq` takes an optional second `bus` delegate for core configuration
+(consumers registered on the bus, middleware, serializers). For an application that needs more
+than one transport — or finer control over package references — register the core and transport
+separately instead; see [Configuration](configuration.md#bus-registration) for all three
+registration paths and why the engine and transport are layered the way they are.
 
 > See: `samples/BareWire.Samples.BasicPublishConsume/Program.cs`
 

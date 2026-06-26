@@ -19,6 +19,11 @@
     <ProjectReference Include="..\..\src\BareWire.Transport.AzureServiceBus\BareWire.Transport.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Transport.Kafka\BareWire.Transport.Kafka.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.RabbitMQ\BareWire.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Kafka\BareWire.Kafka.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.AzureServiceBus\BareWire.AzureServiceBus.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.AWS.SQS\BareWire.AWS.SQS.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Google.PubSub\BareWire.Google.PubSub.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga\BareWire.Saga.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.EntityFramework\BareWire.Saga.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.Redis\BareWire.Saga.Redis.csproj" />

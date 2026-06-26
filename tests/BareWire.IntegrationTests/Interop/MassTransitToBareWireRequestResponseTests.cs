@@ -152,7 +152,11 @@ public sealed class MassTransitToBareWireRequestResponseTests(AspireFixture fixt
                 // Core bus with receive endpoint.
                 services.AddBareWire(cfg =>
                 {
+                    // UseRabbitMQ is a deprecated no-op (Feature 15, ADR-028 D4); transport comes from
+                    // AddBareWireRabbitMq above. CS0618 suppressed for the coexistence call.
+#pragma warning disable CS0618 // Type or member is obsolete
                     cfg.UseRabbitMQ(configureRabbitMq);
+#pragma warning restore CS0618 // Type or member is obsolete
                 });
             })
             .Build();

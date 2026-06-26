@@ -1,5 +1,6 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Abstractions.Routing;
@@ -254,9 +255,13 @@ public sealed class ServiceCollectionExtensionsTests
     }
 
     // ── Existing tests (unchanged) ───────────────────────────────────────────
+    // These tests still call the deprecated UseRabbitMQ marker (Feature 15, ADR-028 D4) to exercise the
+    // coexistence path: the marker is a no-op, transport comes from AddBareWireRabbitMq. CS0618 is
+    // suppressed around the calls because the deprecation is expected here.
+#pragma warning disable CS0618 // Type or member is obsolete
 
     [Fact]
-    public void AddBareWire_WithoutTransportRegistration_ThrowsOnResolve()
+    public async Task AddBareWire_WithoutTransportRegistration_ThrowsFriendlyExceptionOnStart()
     {
         // Arrange — AddBareWire without AddBareWireRabbitMq
         var services = new ServiceCollection();
@@ -270,13 +275,16 @@ public sealed class ServiceCollectionExtensionsTests
             });
         });
 
-        // Act — building the provider succeeds, but resolving the bus fails
-        // because ITransportAdapter is not registered
+        // Act — since 15.3 (C1) resolving the bus NO LONGER throws (the transport adapter is
+        // resolved via GetService, nullable). The friendly BareWireConfigurationException must
+        // surface from StartAsync via ConfigurationValidator, NOT a raw InvalidOperationException.
         using var provider = services.BuildServiceProvider();
-        Action act = () => provider.GetRequiredService<IBus>();
+        var control = provider.GetRequiredService<IBusControl>();
+        Func<Task> act = async () => await control.StartAsync(TestContext.Current.CancellationToken);
 
         // Assert
-        act.Should().Throw<InvalidOperationException>();
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+        await act.Should().NotThrowAsync<InvalidOperationException>();
     }
 
     [Fact]
@@ -335,5 +343,44 @@ public sealed class ServiceCollectionExtensionsTests
 
         // Assert
         publishEndpoint.Should().NotBeNull();
+    }
+
+#pragma warning restore CS0618 // Type or member is obsolete
+
+    // -------------------------------------------------------------------------
+    // Feature 15 (ADR-028) — the explicit two-call registration path remains
+    // fully supported (non-breaking, E7). After D5 (validation on the FACT of
+    // ITransportAdapter registration) and the Use{Transport} → [Obsolete] no-op,
+    // registering the transport and the core separately — WITHOUT the deprecated
+    // marker — must still resolve the adapter and pass startup configuration
+    // validation (no friendly BareWireConfigurationException).
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task AddBareWire_TwoCallRegistration_WithoutDeprecatedMarker_ResolvesAdapterAndPassesValidationOnStart()
+    {
+        // Arrange — pure two-call path: transport THEN core, no UseRabbitMQ marker.
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBareWireJsonSerializer();
+        services.AddBareWireRabbitMq(rmq => rmq.Host("amqp://guest:guest@localhost:5672/"));
+        services.AddBareWire(_ => { });
+
+        await using var provider = services.BuildServiceProvider();
+
+        // Assert — the transport adapter is registered (the D5 fact the validator checks).
+        provider.GetService<ITransportAdapter>().Should().NotBeNull(
+            "the two-call path registers ITransportAdapter via AddBareWireRabbitMq");
+        provider.GetService<IBus>().Should().NotBeNull();
+
+        // Act — start with a bounded token (no broker is running in unit tests).
+        var control = provider.GetRequiredService<IBusControl>();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+        Func<Task> start = async () => await control.StartAsync(cts.Token);
+
+        // Assert — configuration validation passes (adapter present), so startup gets PAST the
+        // friendly config check. It must NOT throw BareWireConfigurationException; a connection or
+        // cancellation error is acceptable here since no broker is available.
+        await start.Should().NotThrowAsync<BareWireConfigurationException>();
     }
 }

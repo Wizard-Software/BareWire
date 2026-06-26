@@ -1,0 +1,7 @@
+namespace BareWire.AzureServiceBus
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithAzureServiceBus(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Transport.AzureServiceBus.Configuration.IAzureServiceBusConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}

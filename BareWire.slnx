@@ -40,6 +40,11 @@
     <Project Path="src/BareWire.Transport.AzureServiceBus/BareWire.Transport.AzureServiceBus.csproj" />
     <Project Path="src/BareWire.Transport.Kafka/BareWire.Transport.Kafka.csproj" />
     <Project Path="src/BareWire.Transport.RabbitMQ/BareWire.Transport.RabbitMQ.csproj" />
+    <Project Path="src/BareWire.RabbitMQ/BareWire.RabbitMQ.csproj" />
+    <Project Path="src/BareWire.Kafka/BareWire.Kafka.csproj" />
+    <Project Path="src/BareWire.AzureServiceBus/BareWire.AzureServiceBus.csproj" />
+    <Project Path="src/BareWire.AWS.SQS/BareWire.AWS.SQS.csproj" />
+    <Project Path="src/BareWire.Google.PubSub/BareWire.Google.PubSub.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/BareWire.Analyzers.Tests/BareWire.Analyzers.Tests.csproj" />

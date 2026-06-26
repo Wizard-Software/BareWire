@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the Azure Service Bus transport. References both the BareWire core and BareWire.Transport.AzureServiceBus and exposes AddBareWireWithAzureServiceBus.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.AzureServiceBus\BareWire.Transport.AzureServiceBus.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the Kafka transport. References both the BareWire core and BareWire.Transport.Kafka and exposes AddBareWireWithKafka.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.Kafka\BareWire.Transport.Kafka.csproj" />
+  </ItemGroup>
+
+</Project>
