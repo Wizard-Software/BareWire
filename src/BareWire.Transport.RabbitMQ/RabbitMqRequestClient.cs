@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
@@ -9,6 +10,7 @@ using BareWire.Transport.RabbitMQ.Internal;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace BareWire.Transport.RabbitMQ;
 
@@ -38,6 +40,13 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     private readonly RabbitMqHeaderMapper _headerMapper;
     private readonly Uri _connectionUri;
     private readonly string? _vhost;
+    private readonly bool _strict;
+
+    // 14.13: optional, dimensionless counter for late/duplicate responses dropped under
+    // competing-responders (first-in-wins). Opt-in: created only when an external Meter is
+    // supplied (null = observability OFF, no allocation on the receive path). SEC S1 (ADR-027):
+    // ZERO dimensions — never a correlation-id or exchange-name tag.
+    private readonly Counter<long>? _responsesDroppedAsLate;
 
     // ADR-004: bounded — limits concurrent in-flight requests.
     private readonly SemaphoreSlim _pendingGate;
@@ -69,8 +78,10 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         TimeSpan timeout,
         Uri connectionUri,
         string? vhost,
+        bool strict = false,
         int maxPendingRequests = DefaultMaxPendingRequests,
-        RabbitMqHeaderMapper? headerMapper = null)
+        RabbitMqHeaderMapper? headerMapper = null,
+        Meter? meter = null)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(serializer);
@@ -90,8 +101,18 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         _timeout = timeout;
         _connectionUri = connectionUri;
         _vhost = vhost;
+        _strict = strict;
         _pendingGate = new SemaphoreSlim(maxPendingRequests, maxPendingRequests);
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
+
+        // 14.13 / D-3 / D-4: opt-in counter — only when an external Meter (named "BareWire" by the
+        // composition root) is supplied. The Meter is owned by the caller (Observability layer), so
+        // this client does not create/dispose it — it only creates the instrument. SEC S1 (ADR-027):
+        // the instrument carries NO tags; Add(1) at the call sites is dimensionless.
+        _responsesDroppedAsLate = meter?.CreateCounter<long>(
+            "barewire.responses.dropped_as_late",
+            unit: null,
+            description: "Number of late or duplicate request responses dropped under competing-responders (first-in-wins).");
     }
 
     /// <summary>
@@ -107,11 +128,20 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             return;
         }
 
+        // 14.9 / C2 (SECONDARY first-in-wins mechanism): serialise consumer dispatch on the response
+        // channel so deliveries are processed one-at-a-time. Set EXPLICITLY — do not rely on the
+        // library/connection-factory default; a future RabbitMQ.Client release or a changed
+        // IConnectionFactory.ConsumerDispatchConcurrency could silently enable concurrent dispatch
+        // and introduce a parallel race on the same TCS. The PRIMARY mechanism (TrySetResult
+        // idempotency below) already guarantees first-in-wins regardless of concurrency, but
+        // pinning consumerDispatchConcurrency: 1 here removes the race entirely and self-documents
+        // the intent. (Enforcement C2, ADR-027.)
         _responseChannel = await _connection
             .CreateChannelAsync(
                 new CreateChannelOptions(
                     publisherConfirmationsEnabled: false,
-                    publisherConfirmationTrackingEnabled: false),
+                    publisherConfirmationTrackingEnabled: false,
+                    consumerDispatchConcurrency: 1),
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -144,6 +174,13 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
 
         // Destination address: use the explicit exchange when set, else fall back to the routing key.
         // This is best-effort/diagnostic — real routing uses the targetExchange + routingKey AMQP fields.
+        //
+        // D9 / ADR-027: under publish-style routing (Feature 14), the factory's ResolveDispatch<T>
+        // sets _targetExchange to the per-type fanout exchange name ("Namespace:TypeName") and leaves
+        // _routingKey empty. The fallback above therefore resolves _destinationAddress to the fanout
+        // exchange URI (rabbitmq://host[/vhost]/Namespace:TypeName), matching MassTransit Publish
+        // semantics — a MT responder reads destinationAddress as "where this was published to".
+        // The response routing does NOT rely on this field; it uses responseAddress / AMQP ReplyTo.
         string destinationName = !string.IsNullOrEmpty(_targetExchange)
             ? _targetExchange
             : _routingKey;
@@ -379,11 +416,18 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         out TaskCompletionSource<InboundMessage>? tcs)
     {
         // Stage 1 — Primary: AMQP CorrelationId (BareWire↔BareWire and any transport that echoes it).
-        if (!string.IsNullOrEmpty(amqpCorrelationId)
-            && Guid.TryParse(amqpCorrelationId, out Guid amqpGuid)
-            && _pending.TryGetValue(amqpGuid, out tcs))
+        // amqpCorrelationParsed records a real correlated response (Guid-shaped CorrelationId) so the
+        // raw competing-responders miss can be counted below (D-2) without re-parsing.
+        bool amqpCorrelationParsed = false;
+
+        if (!string.IsNullOrEmpty(amqpCorrelationId) && Guid.TryParse(amqpCorrelationId, out Guid amqpGuid))
         {
-            return true;
+            amqpCorrelationParsed = true;
+
+            if (_pending.TryGetValue(amqpGuid, out tcs))
+            {
+                return true;
+            }
         }
 
         // Stage 2 — Fallback: envelope requestId (MassTransit response path).
@@ -402,10 +446,22 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
                 }
 
                 // Body supplied a requestId that we never registered — discard.
-                LogUnknownCorrelationId(envelopeRequestId.ToString());
+                // D7 (competing-responders): a late/duplicate MT response is expected, not an error —
+                // log at Debug (no warn-spam) and count it (D-2). SEC S1: dimensionless, no id in the log.
+                LogUnknownCorrelationId();
+                _responsesDroppedAsLate?.Add(1);
                 tcs = null;
                 return false;
             }
+        }
+
+        // D-2 (ADR-027 D8(a)): the canonical raw BareWire↔BareWire competing-responders miss reaches
+        // here. The AMQP CorrelationId parsed to a Guid but no _pending entry exists — a late/duplicate
+        // raw response after the winner removed the entry. Count it (dimensionless) so the metric
+        // observes the primary scenario; this path was already silent (no warn-spam), so no log is added.
+        if (amqpCorrelationParsed)
+        {
+            _responsesDroppedAsLate?.Add(1);
         }
 
         tcs = null;
@@ -457,6 +513,10 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             body: bodySequence,
             deliveryTag: args.DeliveryTag);
 
+        // 14.9 / PRIMARY first-in-wins mechanism: the first responder wins. A second (or subsequent)
+        // TrySetResult on an already-completed TCS returns false and is a no-op — race-tolerant with
+        // a duplicate that read _pending before the entry was removed in GetResponseAsync's finally
+        // block. The ignored return value is intentional (idempotency), not a bug.
         tcs!.TrySetResult(inbound);
 
         return Task.CompletedTask;
@@ -515,10 +575,21 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             await publishChannel.BasicPublishAsync<BasicProperties>(
                 exchange: _targetExchange,
                 routingKey: _routingKey,
-                mandatory: false,
+                mandatory: _strict,
                 basicProperties: props,
                 body: new ReadOnlyMemory<byte>(rentedBuffer, 0, length),
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (PublishException ex) when (ex.IsReturn)
+        {
+            // Strict opt-in (14.10, ADR-027 D3): broker returned the message — no responder queue
+            // is bound to the fanout exchange. SEC S1: message contains only the exchange name,
+            // never correlation-id, body, or headers.
+            throw new BareWireTransportException(
+                message: $"Publish-style request returned: no responder is bound to exchange '{_targetExchange}'.",
+                transportName: TransportName,
+                endpointAddress: null,
+                innerException: ex);
         }
         finally
         {
@@ -534,9 +605,12 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         Message = "Received response without CorrelationId on request client response queue. Message discarded.")]
     private partial void LogMissingCorrelationId();
 
-    [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Received response with unknown CorrelationId '{CorrelationId}'. Message discarded (may have timed out).")]
-    private partial void LogUnknownCorrelationId(string correlationId);
+    // 14.13 / D-1: demoted Warning → Debug — under competing-responders a late/duplicate response is an
+    // expected, frequent, NON-error case (ADR-027 D7), so Warning would be warn-spam. The correlation-id
+    // is intentionally NOT in the message: ADR-027 D7(a) forbids it "as a dimension or in the log".
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Received response with unknown CorrelationId. Message discarded (may have timed out).")]
+    private partial void LogUnknownCorrelationId();
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Exception while closing request client publish channel.")]

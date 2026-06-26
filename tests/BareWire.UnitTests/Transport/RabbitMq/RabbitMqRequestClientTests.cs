@@ -9,6 +9,8 @@ using BareWire.Transport.RabbitMQ;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using RabbitMQ.Client.Exceptions;
 
 namespace BareWire.UnitTests.Transport.RabbitMq;
 
@@ -518,5 +520,570 @@ public sealed class RabbitMqRequestClientTests
         // Assert
         resolved.Should().BeFalse();
         ((object?)result).Should().BeNull("non-MT content-type must not trigger the envelope fallback path");
+    }
+
+    // ── GetResponseAsync — publish-style routing (Feature 14) ────────────────
+
+    /// <summary>
+    /// Verifies that a client constructed with <c>targetExchange="OrderSystem.Events:OrderSubmitted"</c>
+    /// and <c>routingKey=""</c> (as the factory produces for publish-style requests) publishes via
+    /// <c>BasicPublishAsync</c> with exactly those values and <c>mandatory=false</c>.
+    ///
+    /// Also asserts (GAP-2 lightweight vehicle) that the captured <c>exchange</c> argument is the
+    /// same string instance as the one passed to the constructor — proving <c>_targetExchange</c> is
+    /// read once as a constant field, not re-derived per request (NF2/ADR-003).
+    ///
+    /// Plumbing: because a mocked <c>BasicPublishAsync</c> never delivers a response to the
+    /// response queue, <c>GetResponseAsync</c> would block until timeout. To avoid this, the test
+    /// captures the AMQP <c>CorrelationId</c> from the publish properties inside the
+    /// <c>BasicPublishAsync</c> callback and uses <c>TryResolvePending</c> +
+    /// <c>TaskCompletionSource.TrySetResult</c> to unblock <c>GetResponseAsync</c> immediately.
+    /// A short client timeout (2 s) is used as a safety net.
+    /// </summary>
+    [Fact]
+    public async Task SerializeAndPublishAsync_WhenPublishStyle_PublishesToFanoutWithEmptyRoutingKey()
+    {
+        // ── Arrange ───────────────────────────────────────────────────────────
+
+        // The exact string instance passed to the constructor — used for GAP-2 ReferenceEquals assertion.
+        const string fanoutExchangeName = "OrderSystem.Events:OrderSubmitted";
+
+        // Set up deserializer so the response can be deserialized after TCS is resolved.
+        var responseDeserializer = Substitute.For<IMessageDeserializer>();
+        responseDeserializer
+            .Deserialize<TestResponse>(Arg.Any<ReadOnlySequence<byte>>())
+            .Returns(new TestResponse("ok"));
+
+        var deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(responseDeserializer);
+
+        // Serializer stub — writes nothing; we only care about the AMQP routing args.
+        var serializer = Substitute.For<IMessageSerializer>();
+        serializer.ContentType.Returns("application/json");
+        serializer
+            .When(s => s.Serialize(Arg.Any<TestRequest>(), Arg.Any<System.Buffers.IBufferWriter<byte>>()))
+            .Do(_ => { /* no-op — body content irrelevant for routing assertions */ });
+
+        // Two-channel connection:
+        //   - response channel: publisherConfirmationsEnabled = false (used by InitializeAsync)
+        //   - publish channel:  publisherConfirmationsEnabled = true  (used by GetResponseAsync)
+        IChannel responseChannel = Substitute.For<IChannel>();
+        IChannel publishChannel = Substitute.For<IChannel>();
+
+        responseChannel
+            .QueueDeclareAsync(
+                queue: Arg.Any<string>(),
+                durable: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                autoDelete: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new QueueDeclareOk("amq.gen-test-queue", 0, 0)));
+
+        responseChannel
+            .BasicConsumeAsync(
+                queue: Arg.Any<string>(),
+                autoAck: Arg.Any<bool>(),
+                consumerTag: Arg.Any<string>(),
+                noLocal: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                consumer: Arg.Any<IAsyncBasicConsumer>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult("consumer-tag"));
+
+        IConnection connection = Substitute.For<IConnection>();
+
+        // Return response channel for the InitializeAsync call (confirmations disabled)
+        // and the publish channel for the GetResponseAsync call (confirmations enabled).
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && !o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(responseChannel));
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(publishChannel));
+
+        // Captured publish arguments — filled by the BasicPublishAsync When/Do.
+        string? capturedExchange = null;
+        string? capturedRoutingKey = null;
+        bool? capturedMandatory = null;
+
+        // Build the client with publish-style routing values (simulating what ResolveDispatch<T>
+        // returns when the type is registered via PublishRequest<T>).
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: connection,
+            serializer: serializer,
+            deserializerResolver: deserializerResolver,
+            logger: NullLogger.Instance,
+            targetExchange: fanoutExchangeName,     // publish-style: fanout exchange name
+            routingKey: string.Empty,               // publish-style: empty routing key
+            timeout: TimeSpan.FromSeconds(2),       // short timeout — safety net only
+            connectionUri: FakeConnectionUri,
+            vhost: null);
+
+        await client.InitializeAsync(CancellationToken.None);
+
+        // Wire up BasicPublishAsync: capture routing arguments AND unblock GetResponseAsync.
+        // NSubstitute's fluent Returns() for ValueTask-returning methods requires suppressing
+        // CA2012 (the ValueTask returned by the setup call is intentionally not awaited —
+        // this is the standard NSubstitute pattern for non-awaitable setup calls).
+        // The factory: (1) captures exchange/routingKey/mandatory, (2) resolves the pending TCS
+        // via the AMQP CorrelationId so GetResponseAsync can complete, (3) returns completed ValueTask.
+#pragma warning disable CA2012 // NSubstitute fluent setup — ValueTask intentionally not awaited here
+        publishChannel
+            .BasicPublishAsync<BasicProperties>(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<bool>(),
+                Arg.Any<BasicProperties>(),
+                Arg.Any<ReadOnlyMemory<byte>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                capturedExchange = (string)call[0];
+                capturedRoutingKey = (string)call[1];
+                capturedMandatory = (bool)call[2];
+
+                // Retrieve CorrelationId from the BasicProperties to locate the pending TCS.
+                var props = (BasicProperties)call[3];
+                string? correlationId = props.CorrelationId;
+
+                // Unblock GetResponseAsync by resolving the pending TCS with a synthetic response
+                // carrying the content-type the deserializer is registered for.
+                if (client.TryResolvePending(
+                        amqpCorrelationId: correlationId,
+                        contentType: "application/json",
+                        body: ReadOnlySequence<byte>.Empty,
+                        out TaskCompletionSource<InboundMessage>? tcs)
+                    && tcs is not null)
+                {
+                    var fakeInbound = new InboundMessage(
+                        messageId: Guid.NewGuid().ToString(),
+                        headers: new Dictionary<string, string> { ["content-type"] = "application/json" },
+                        body: ReadOnlySequence<byte>.Empty,
+                        deliveryTag: 1);
+
+                    tcs.TrySetResult(fakeInbound);
+                }
+
+                return ValueTask.CompletedTask;
+            });
+#pragma warning restore CA2012
+
+        // ── Act ───────────────────────────────────────────────────────────────
+
+        Response<TestResponse> response =
+            await client.GetResponseAsync<TestResponse>(new TestRequest("hello"));
+
+        // ── Assert — AMQP routing arguments ──────────────────────────────────
+
+        capturedExchange.Should().Be(fanoutExchangeName,
+            "publish-style must route to the per-type fanout exchange");
+        capturedRoutingKey.Should().BeEmpty(
+            "publish-style routing key must be empty so the fanout ignores it");
+        capturedMandatory.Should().BeFalse(
+            "mandatory must be false when strict is not set (default opt-out; see strict tests T1/T2)");
+
+        // ── Assert — GAP-2: exchange name is a constant string instance (NF2/ADR-003) ──
+        // The captured exchange argument must be the SAME string object as the one passed into
+        // the constructor (_targetExchange is set once at construction, read without re-derivation).
+        object.ReferenceEquals(capturedExchange, fanoutExchangeName).Should().BeTrue(
+            "the exchange name must be the constant _targetExchange field, not a new string per request");
+
+        // ── Assert — response was correctly deserialized ──────────────────────
+        response.Message.Should().NotBeNull();
+        response.Message.Result.Should().Be("ok");
+
+        await client.DisposeAsync();
+    }
+
+    // ── Strict opt-in tests (T1 / T2 — 14.10) ────────────────────────────────
+
+    /// <summary>
+    /// T1: When the client is constructed with <c>strict: true</c>, <c>BasicPublishAsync</c>
+    /// must be called with <c>mandatory = true</c>.
+    /// </summary>
+    [Fact]
+    public async Task SerializeAndPublishAsync_WhenStrict_PublishesWithMandatoryTrue()
+    {
+        // ── Arrange ───────────────────────────────────────────────────────────
+
+        const string fanoutExchangeName = "OrderSystem.Events:OrderSubmitted";
+
+        var responseDeserializer = Substitute.For<IMessageDeserializer>();
+        responseDeserializer
+            .Deserialize<TestResponse>(Arg.Any<ReadOnlySequence<byte>>())
+            .Returns(new TestResponse("ok"));
+
+        var deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(responseDeserializer);
+
+        var serializer = Substitute.For<IMessageSerializer>();
+        serializer.ContentType.Returns("application/json");
+        serializer
+            .When(s => s.Serialize(Arg.Any<TestRequest>(), Arg.Any<System.Buffers.IBufferWriter<byte>>()))
+            .Do(_ => { });
+
+        IChannel responseChannel = Substitute.For<IChannel>();
+        IChannel publishChannel = Substitute.For<IChannel>();
+
+        responseChannel
+            .QueueDeclareAsync(
+                queue: Arg.Any<string>(),
+                durable: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                autoDelete: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new QueueDeclareOk("amq.gen-test-queue", 0, 0)));
+
+        responseChannel
+            .BasicConsumeAsync(
+                queue: Arg.Any<string>(),
+                autoAck: Arg.Any<bool>(),
+                consumerTag: Arg.Any<string>(),
+                noLocal: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                consumer: Arg.Any<IAsyncBasicConsumer>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult("consumer-tag"));
+
+        IConnection connection = Substitute.For<IConnection>();
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && !o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(responseChannel));
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(publishChannel));
+
+        bool? capturedMandatory = null;
+
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: connection,
+            serializer: serializer,
+            deserializerResolver: deserializerResolver,
+            logger: NullLogger.Instance,
+            targetExchange: fanoutExchangeName,
+            routingKey: string.Empty,
+            timeout: TimeSpan.FromSeconds(2),
+            connectionUri: FakeConnectionUri,
+            vhost: null,
+            strict: true);
+
+        await client.InitializeAsync(CancellationToken.None);
+
+#pragma warning disable CA2012 // NSubstitute fluent setup — ValueTask intentionally not awaited here
+        publishChannel
+            .BasicPublishAsync<BasicProperties>(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<bool>(),
+                Arg.Any<BasicProperties>(),
+                Arg.Any<ReadOnlyMemory<byte>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                capturedMandatory = (bool)call[2];
+
+                var props = (BasicProperties)call[3];
+                string? correlationId = props.CorrelationId;
+
+                if (client.TryResolvePending(
+                        amqpCorrelationId: correlationId,
+                        contentType: "application/json",
+                        body: ReadOnlySequence<byte>.Empty,
+                        out TaskCompletionSource<InboundMessage>? tcs)
+                    && tcs is not null)
+                {
+                    var fakeInbound = new InboundMessage(
+                        messageId: Guid.NewGuid().ToString(),
+                        headers: new Dictionary<string, string> { ["content-type"] = "application/json" },
+                        body: ReadOnlySequence<byte>.Empty,
+                        deliveryTag: 1);
+
+                    tcs.TrySetResult(fakeInbound);
+                }
+
+                return ValueTask.CompletedTask;
+            });
+#pragma warning restore CA2012
+
+        // ── Act ───────────────────────────────────────────────────────────────
+
+        await client.GetResponseAsync<TestResponse>(new TestRequest("hello"));
+
+        // ── Assert ────────────────────────────────────────────────────────────
+
+        capturedMandatory.Should().BeTrue(
+            "mandatory must be true when the client is constructed with strict: true");
+
+        await client.DisposeAsync();
+    }
+
+    /// <summary>
+    /// T2: When the client is constructed with <c>strict: true</c> and <c>BasicPublishAsync</c>
+    /// throws a <see cref="PublishException"/> with <c>IsReturn = true</c> (broker returned the
+    /// message because no responder queue is bound), <c>GetResponseAsync</c> must surface a
+    /// <see cref="BareWireTransportException"/> whose message contains the exchange name and whose
+    /// <c>TransportName</c> is "RabbitMQ".
+    /// </summary>
+    [Fact]
+    public async Task SerializeAndPublishAsync_WhenStrictAndReturned_ThrowsBareWireTransportException()
+    {
+        // ── Arrange ───────────────────────────────────────────────────────────
+
+        const string fanoutExchangeName = "OrderSystem.Events:OrderSubmitted";
+
+        var responseDeserializer = Substitute.For<IMessageDeserializer>();
+        var deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(responseDeserializer);
+
+        var serializer = Substitute.For<IMessageSerializer>();
+        serializer.ContentType.Returns("application/json");
+        serializer
+            .When(s => s.Serialize(Arg.Any<TestRequest>(), Arg.Any<System.Buffers.IBufferWriter<byte>>()))
+            .Do(_ => { });
+
+        IChannel responseChannel = Substitute.For<IChannel>();
+        IChannel publishChannel = Substitute.For<IChannel>();
+
+        responseChannel
+            .QueueDeclareAsync(
+                queue: Arg.Any<string>(),
+                durable: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                autoDelete: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new QueueDeclareOk("amq.gen-test-queue", 0, 0)));
+
+        responseChannel
+            .BasicConsumeAsync(
+                queue: Arg.Any<string>(),
+                autoAck: Arg.Any<bool>(),
+                consumerTag: Arg.Any<string>(),
+                noLocal: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                consumer: Arg.Any<IAsyncBasicConsumer>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult("consumer-tag"));
+
+        IConnection connection = Substitute.For<IConnection>();
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && !o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(responseChannel));
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(publishChannel));
+
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: connection,
+            serializer: serializer,
+            deserializerResolver: deserializerResolver,
+            logger: NullLogger.Instance,
+            targetExchange: fanoutExchangeName,
+            routingKey: string.Empty,
+            timeout: TimeSpan.FromSeconds(2),
+            connectionUri: FakeConnectionUri,
+            vhost: null,
+            strict: true);
+
+        await client.InitializeAsync(CancellationToken.None);
+
+        // Configure BasicPublishAsync to throw PublishException with IsReturn=true,
+        // simulating the broker returning the unroutable message (no responder bound).
+        // PublishException(ulong publishSequenceNumber, bool isReturn) is a public ctor in 7.2.1.
+        // publishSequenceNumber must be >= 1 (the ctor validates != 0).
+#pragma warning disable CA2012 // NSubstitute fluent setup — ValueTask intentionally not awaited here
+        publishChannel
+            .BasicPublishAsync<BasicProperties>(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<bool>(),
+                Arg.Any<BasicProperties>(),
+                Arg.Any<ReadOnlyMemory<byte>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(_ => ValueTask.FromException(new PublishException(publishSequenceNumber: 1UL, isReturn: true)));
+#pragma warning restore CA2012
+
+        // ── Act ───────────────────────────────────────────────────────────────
+
+        Func<Task> act = async () =>
+            await client.GetResponseAsync<TestResponse>(new TestRequest("hello"));
+
+        // ── Assert ────────────────────────────────────────────────────────────
+
+        var ex = await act.Should().ThrowAsync<BareWireTransportException>();
+        ex.WithMessage($"*{fanoutExchangeName}*",
+            "exception message must contain the exchange name for diagnostics");
+        ex.Which.TransportName.Should().Be("RabbitMQ",
+            "TransportName must identify the RabbitMQ transport");
+
+        await client.DisposeAsync();
+    }
+
+    // ── T4: no BasicReturn event subscription (14.10) ─────────────────────────
+
+    /// <summary>
+    /// T4: Verifies that neither the response channel nor the publish channel ever has a
+    /// <c>BasicReturnAsync</c> event handler subscribed — mandatory-return must surface
+    /// via <see cref="RabbitMQ.Client.Exceptions.PublishException.IsReturn"/> on the
+    /// publisher-confirmation channel, NOT via a <c>BasicReturn</c> event subscription.
+    ///
+    /// Assertion mechanism: NSubstitute records every call made on a substitute, including
+    /// event add-accessor invocations (recorded as a call named <c>add_BasicReturnAsync</c>).
+    /// We drive a full publish-style request through the T1 unblock harness and then assert
+    /// that <c>ICallSpecification</c>-named <c>add_BasicReturnAsync</c> never appears in the
+    /// received-calls list of either channel — the assertion fails the moment any production
+    /// code adds <c>channel.BasicReturnAsync += handler;</c>.
+    /// </summary>
+    [Fact]
+    public async Task Initialize_DoesNotSubscribeToBasicReturn()
+    {
+        // ── Arrange ───────────────────────────────────────────────────────────
+
+        const string fanoutExchangeName = "OrderSystem.Events:OrderSubmitted";
+
+        var responseDeserializer = Substitute.For<IMessageDeserializer>();
+        responseDeserializer
+            .Deserialize<TestResponse>(Arg.Any<ReadOnlySequence<byte>>())
+            .Returns(new TestResponse("ok"));
+
+        var deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(responseDeserializer);
+
+        var serializer = Substitute.For<IMessageSerializer>();
+        serializer.ContentType.Returns("application/json");
+        serializer
+            .When(s => s.Serialize(Arg.Any<TestRequest>(), Arg.Any<System.Buffers.IBufferWriter<byte>>()))
+            .Do(_ => { });
+
+        IChannel responseChannel = Substitute.For<IChannel>();
+        IChannel publishChannel = Substitute.For<IChannel>();
+
+        responseChannel
+            .QueueDeclareAsync(
+                queue: Arg.Any<string>(),
+                durable: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                autoDelete: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new QueueDeclareOk("amq.gen-test-queue", 0, 0)));
+
+        responseChannel
+            .BasicConsumeAsync(
+                queue: Arg.Any<string>(),
+                autoAck: Arg.Any<bool>(),
+                consumerTag: Arg.Any<string>(),
+                noLocal: Arg.Any<bool>(),
+                exclusive: Arg.Any<bool>(),
+                arguments: Arg.Any<IDictionary<string, object?>?>(),
+                consumer: Arg.Any<IAsyncBasicConsumer>(),
+                cancellationToken: Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult("consumer-tag"));
+
+        IConnection connection = Substitute.For<IConnection>();
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && !o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(responseChannel));
+
+        connection
+            .CreateChannelAsync(
+                Arg.Is<CreateChannelOptions?>(o => o != null && o.PublisherConfirmationsEnabled),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(publishChannel));
+
+        var client = new RabbitMqRequestClient<TestRequest>(
+            connection: connection,
+            serializer: serializer,
+            deserializerResolver: deserializerResolver,
+            logger: NullLogger.Instance,
+            targetExchange: fanoutExchangeName,
+            routingKey: string.Empty,
+            timeout: TimeSpan.FromSeconds(2),
+            connectionUri: FakeConnectionUri,
+            vhost: null);
+
+        await client.InitializeAsync(CancellationToken.None);
+
+        // Wire up BasicPublishAsync to unblock GetResponseAsync (same pattern as T1).
+#pragma warning disable CA2012 // NSubstitute fluent setup — ValueTask intentionally not awaited here
+        publishChannel
+            .BasicPublishAsync<BasicProperties>(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<bool>(),
+                Arg.Any<BasicProperties>(),
+                Arg.Any<ReadOnlyMemory<byte>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(call =>
+            {
+                var props = (BasicProperties)call[3];
+                if (client.TryResolvePending(
+                        amqpCorrelationId: props.CorrelationId,
+                        contentType: "application/json",
+                        body: ReadOnlySequence<byte>.Empty,
+                        out TaskCompletionSource<InboundMessage>? tcs)
+                    && tcs is not null)
+                {
+                    tcs.TrySetResult(new InboundMessage(
+                        messageId: Guid.NewGuid().ToString(),
+                        headers: new Dictionary<string, string> { ["content-type"] = "application/json" },
+                        body: ReadOnlySequence<byte>.Empty,
+                        deliveryTag: 1));
+                }
+                return ValueTask.CompletedTask;
+            });
+#pragma warning restore CA2012
+
+        // ── Act ───────────────────────────────────────────────────────────────
+
+        await client.GetResponseAsync<TestResponse>(new TestRequest("hello"));
+
+        // ── Assert ───────────────────────────────────────────────────────────
+        // NSubstitute records event add-accessor invocations as calls named "add_BasicReturnAsync".
+        // If production code ever subscribes channel.BasicReturnAsync += handler, the call appears
+        // here and the assertion fails — making this test falsifiable.
+
+        var responseChannelCalls = responseChannel.ReceivedCalls()
+            .Select(c => c.GetMethodInfo().Name)
+            .ToList();
+
+        var publishChannelCalls = publishChannel.ReceivedCalls()
+            .Select(c => c.GetMethodInfo().Name)
+            .ToList();
+
+        responseChannelCalls.Should().NotContain(
+            "add_BasicReturnAsync",
+            "the response channel must never have a BasicReturnAsync subscription; returns are handled via PublishException.IsReturn on the publish channel");
+
+        publishChannelCalls.Should().NotContain(
+            "add_BasicReturnAsync",
+            "the publish channel must never have a BasicReturnAsync subscription; returns surface as PublishException.IsReturn from BasicPublishAsync");
+
+        await client.DisposeAsync();
     }
 }

@@ -101,4 +101,14 @@ builder.AddProject<Projects.BareWire_Samples_OrderedConsumers>("ordered-consumer
     .WaitFor(rabbitmq)
     .WaitFor(postgres);
 
+// Replica count for the competing-responders sample. Set to 2 for CI (smallest number that
+// demonstrates the competing-responder + first-in-wins scenario). Each replica binds its own
+// unique queue to the per-type fanout exchange so every request reaches all replicas.
+const int CompetingRespondersReplicaCount = 2;
+
+builder.AddProject<Projects.BareWire_Samples_CompetingResponders>("competing-responders")
+    .WithReplicas(CompetingRespondersReplicaCount)
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

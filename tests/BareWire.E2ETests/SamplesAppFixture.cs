@@ -50,6 +50,9 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             // "ordered-consumers" to the replica set — verified at runtime against Aspire 13.1.3
             // by the R8.17 smoke-run (no fallback to a per-replica name was needed).
             "ordered-consumers",
+            // "competing-responders" is a WithReplicas(2) resource (same Aspire logical-name
+            // resolution as "ordered-consumers" above).
+            "competing-responders",
         ];
 
         foreach (string resource in sampleResources)

@@ -79,6 +79,14 @@ internal sealed class RabbitMqTransportOptions
     /// </summary>
     public IReadOnlyDictionary<Type, string>? ExchangeMappings { get; set; }
 
+    /// <summary>
+    /// Resolved publish-style request registrations produced by
+    /// <see cref="IRabbitMqConfigurator.PublishRequest{T}()"/> and its overload.
+    /// <see langword="null"/> when no publish-style request types were registered.
+    /// Validation of these mappings (topology presence, Fanout exchange type) is performed separately.
+    /// </summary>
+    public IReadOnlyDictionary<Type, Configuration.PublishRequestRegistration>? PublishRequestMappings { get; set; }
+
     public void Validate()
     {
         if (string.IsNullOrEmpty(ConnectionString))

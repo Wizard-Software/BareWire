@@ -65,7 +65,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
 
         await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
 
-        (IMessageSerializer serializer, string targetExchange, string routingKey) = ResolveDispatch<T>();
+        (IMessageSerializer serializer, string targetExchange, string routingKey, bool strict) = ResolveDispatch<T>();
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
 
         // Parse connection URI and vhost once per client creation.
@@ -83,6 +83,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             timeout: DefaultRequestTimeout,
             connectionUri: connectionUri,
             vhost: vhost,
+            strict: strict,
             headerMapper: _headerMapper);
 
         await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
@@ -99,22 +100,48 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     /// configuration instead of silently falling back to transport defaults (issue #13).
     /// </summary>
     /// <typeparam name="T">The request message type.</typeparam>
-    /// <returns>The serializer, target exchange, and routing key to use for the request client.</returns>
+    /// <returns>
+    /// The serializer, target exchange, routing key, and strict flag to use for the request client.
+    /// The strict flag is <see langword="true"/> only for publish-style registrations that opt into
+    /// mandatory routing; send-style always returns <see langword="false"/> (NF1 bit-identity).
+    /// </returns>
     /// <remarks>
-    /// Exchange precedence mirrors the publish path: an explicit <c>MapExchange&lt;T&gt;</c> mapping
-    /// wins, otherwise the transport <see cref="RabbitMqTransportOptions.DefaultExchange"/> is used.
+    /// <para>
+    /// Publish-style precedence (Feature 14, ADR-027): when <typeparamref name="T"/> is registered
+    /// via <c>PublishRequest&lt;T&gt;()</c> (i.e. <c>typeof(T)</c> is present in
+    /// <see cref="RabbitMqTransportOptions.PublishRequestMappings"/>), the method returns the
+    /// per-type fanout exchange name from the registration with an <strong>empty</strong> routing
+    /// key. Fanout exchanges ignore the routing key and broadcast to every bound responder queue.
+    /// This branch takes precedence over the send-style path below.
+    /// </para>
+    /// <para>
+    /// Send-style exchange precedence (issue #13, unchanged when no publish-style registration
+    /// exists): an explicit <c>MapExchange&lt;T&gt;</c> mapping wins, otherwise the transport
+    /// <see cref="RabbitMqTransportOptions.DefaultExchange"/> is used.
+    /// </para>
     /// </remarks>
-    internal (IMessageSerializer Serializer, string TargetExchange, string RoutingKey) ResolveDispatch<T>()
+    internal (IMessageSerializer Serializer, string TargetExchange, string RoutingKey, bool Strict) ResolveDispatch<T>()
         where T : class
     {
         IMessageSerializer serializer = _serializerResolver.Resolve<T>();
+
+        // Publish-style branch (Feature 14, ADR-027): when T is registered via PublishRequest<T>(),
+        // route to its per-type fanout exchange (Namespace:TypeName) with an EMPTY routing key,
+        // instead of the send-style (exchangeResolver, routingKeyResolver) pair.
+        // The exchange name is already resolved (formatter or explicit override) in RabbitMqConfigurator.
+        if (_options.PublishRequestMappings is { } publishMappings
+            && publishMappings.TryGetValue(typeof(T), out PublishRequestRegistration registration))
+        {
+            // Empty routing key — fanout ignores it; broadcast to every bound responder queue.
+            // Strict flag: forwarded from the registration so mandatory=true can be set on publish (14.10).
+            return (serializer, registration.ExchangeName, string.Empty, registration.Strict);
+        }
+
+        // Send-style path (unchanged — issue #13): explicit MapExchange<T> wins, else DefaultExchange.
+        // NF1: send-style is NEVER strict — mandatory:false is bit-identical to today.
         string routingKey = _routingKeyResolver.Resolve<T>();
-
-        // Exchange precedence mirrors the publish path: explicit MapExchange<T> mapping wins,
-        // otherwise fall back to the transport DefaultExchange (issue #13).
         string targetExchange = _exchangeResolver.Resolve<T>() ?? _options.DefaultExchange;
-
-        return (serializer, targetExchange, routingKey);
+        return (serializer, targetExchange, routingKey, false);
     }
 
     /// <inheritdoc/>

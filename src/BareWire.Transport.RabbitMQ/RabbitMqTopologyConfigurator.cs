@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Topology;
+using BareWire.Transport.RabbitMQ.Internal;
 using BareWire.Transport.RabbitMQ.Topology;
 
 namespace BareWire.Transport.RabbitMQ;
@@ -63,6 +64,17 @@ internal sealed class RabbitMqTopologyConfigurator : ITopologyConfigurator
         ArgumentNullException.ThrowIfNull(routingKey);
 
         _exchangeExchangeBindings.Add(new ExchangeExchangeBinding(source, destination, routingKey));
+    }
+
+    /// <inheritdoc />
+    public void DeclareRequestExchange<T>() where T : class =>
+        DeclareExchange(RequestExchangeNameFormatter.Format<T>(), ExchangeType.Fanout, durable: true, autoDelete: false);
+
+    /// <inheritdoc />
+    public void BindRequestExchangeToQueue<T>(string queue) where T : class
+    {
+        ArgumentException.ThrowIfNullOrEmpty(queue);
+        BindExchangeToQueue(RequestExchangeNameFormatter.Format<T>(), queue, routingKey: string.Empty);
     }
 
     /// <summary>

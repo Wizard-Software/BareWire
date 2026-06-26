@@ -81,6 +81,58 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 
 > See: [Per-Key Consumer Ordering](per-key-ordering.md) for strategies, transport affinity, fail-fast, and the end-to-end story.
 
+### Publish-Style Request Routing
+
+By default request-response is **send-style**: the requester targets a fixed
+responder queue. **Publish-style** mode (opt-in, per request type) publishes the
+request to a per-type fanout exchange instead, so multiple responders can compete
+and the first response wins. Enable it with `PublishRequest<T>()`, optionally with
+an options block:
+
+```csharp
+rmq.PublishRequest<CheckOrderStatus>();          // default name formatter
+
+rmq.PublishRequest<CheckOrderStatus>(o =>
+{
+    o.ExchangeName = "Orders.Api:CheckOrderStatus"; // override the default name
+    o.Strict       = true;                          // mandatory:true → fast "no responder bound"
+    o.AutoDeclare  = true;                          // auto-declare the per-type fanout exchange
+});
+```
+
+| Option | Type | Default | Meaning |
+|--------|------|---------|---------|
+| `ExchangeName` | `string?` | `null` | Overrides the default per-type exchange name. `null` uses the formatter (`Namespace:TypeName`, a literal colon, PascalCase). Required for generic / nested request types. |
+| `Strict` | `bool` | `false` | Publishes with `mandatory: true`; a return surfaces synchronously as a publish exception, turning a silent "no responder bound" into an immediate explicit error instead of a timeout. Opt-in because a brief "zero responders" window during a migration is expected. |
+| `AutoDeclare` | `bool` | `false` | Auto-declares the per-type fanout exchange. Off by default so no broker entity is created without consent; otherwise the exchange must be declared in `ConfigureTopology`. |
+
+The default exchange name follows the MassTransit convention `Namespace:TypeName`
+with a **literal colon** — it must match the responder's exchange exactly, or the
+request publishes to an exchange no responder listens on and times out.
+
+To declare the per-type fanout exchange and bind a responder queue without
+spelling out the `Namespace:TypeName` name by hand, `ITopologyConfigurator`
+offers two opt-in convenience helpers — sugar over `DeclareExchange` +
+`BindExchangeToQueue`:
+
+```csharp
+rmq.ConfigureTopology(t =>
+{
+    t.DeclareRequestExchange<CheckOrderStatus>();              // fanout Namespace:TypeName, durable
+    t.BindRequestExchangeToQueue<CheckOrderStatus>("orders");  // bind a responder queue, no routing key
+});
+```
+
+`DeclareRequestExchange<T>()` declares the fanout exchange (`durable: true`,
+`autoDelete: false`); `BindRequestExchangeToQueue<T>(queue)` binds the queue with
+an empty routing key (fanout ignores the key). They change nothing else — the same
+fail-fast validation and default-OFF posture apply. When `AutoDeclare = true` is
+set on `PublishRequest<T>`, the per-type fanout exchange is declared automatically
+at topology deploy (idempotently — declaring it explicitly with the helper as well
+does not create a duplicate).
+
+> See: [Publishing and Consuming](publishing-and-consuming.md#publish-style-competing-responders-first-in-wins) for the full competing-responders scenario, topology, and the first-in-wins caveats.
+
 ## Topology Configuration
 
 Use `ConfigureTopology` to declare exchanges, queues, and bindings. Queue arguments can be configured using the fluent `IQueueConfigurator` API:

@@ -74,6 +74,25 @@ internal sealed class KafkaTopologyConfigurator : ITopologyConfigurator
         _exchangeExchangeBindings.Add(new ExchangeExchangeBinding(source, destination, routingKey));
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// In Kafka, exchanges have no runtime meaning and are silently ignored during deployment.
+    /// This method satisfies the <see cref="ITopologyConfigurator"/> contract.
+    /// </remarks>
+    public void DeclareRequestExchange<T>() where T : class =>
+        DeclareExchange($"{typeof(T).Namespace}:{typeof(T).Name}", ExchangeType.Fanout, durable: true, autoDelete: false);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// In Kafka, exchange-to-queue bindings have no runtime meaning and are silently ignored during deployment.
+    /// This method satisfies the <see cref="ITopologyConfigurator"/> contract.
+    /// </remarks>
+    public void BindRequestExchangeToQueue<T>(string queue) where T : class
+    {
+        ArgumentException.ThrowIfNullOrEmpty(queue);
+        BindExchangeToQueue($"{typeof(T).Namespace}:{typeof(T).Name}", queue, routingKey: string.Empty);
+    }
+
     /// <summary>
     /// Builds an immutable <see cref="TopologyDeclaration"/> from the accumulated declarations.
     /// The configurator may be reused after calling <see cref="Build"/>.

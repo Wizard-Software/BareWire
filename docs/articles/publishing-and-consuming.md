@@ -126,6 +126,105 @@ topology.BindExchangeToQueue("order-validation", "order-validation", routingKey:
 
 > See: `samples/BareWire.Samples.RequestResponse/`
 
+### Publish-Style (Competing Responders, First-In-Wins)
+
+By default request-response is **send-style**: the requester resolves a fixed
+responder queue once (at `CreateRequestClientAsync<T>`) and must *know* that
+queue. **Publish-style** mode (opt-in, per request type) decouples this: the
+request is **published** to a per-type fanout exchange named `Namespace:TypeName`,
+and responders bind their queues to that exchange. Multiple responders (different
+versions or deployments) can answer the same request type — the **first response
+wins (first-in-wins)** and the rest are silently dropped. This unblocks
+blue-green / canary / A/B migrations without reconfiguring requesters. It is
+**off by default**: without `PublishRequest<T>()` the request-response behaviour
+is byte-identical (non-breaking), and the reply path and correlation are
+unchanged.
+
+```csharp
+services.AddBareWire(cfg =>
+{
+    cfg.UseRabbitMQ(rmq =>
+    {
+        rmq.Host("amqp://localhost");
+
+        // Manual topology: per-type fanout exchange + responder queue bindings.
+        // The exchange name follows the MassTransit convention: a literal colon
+        // between namespace and type name — "Namespace:TypeName".
+        rmq.ConfigureTopology(t =>
+        {
+            t.DeclareExchange("OrderSystem.Contracts:CheckOrderStatus",
+                ExchangeType.Fanout, durable: true, autoDelete: false);
+
+            // Two competing responder queues (e.g. v1 and v2) bound to the
+            // same exchange (fanout ignores the routing key):
+            t.DeclareQueue("order-status-v1", durable: true);
+            t.DeclareQueue("order-status-v2", durable: true);
+            t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v1", routingKey: "");
+            t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v2", routingKey: "");
+        });
+
+        // Enable publish-style for the request type (read at CreateRequestClientAsync<T>).
+        rmq.PublishRequest<CheckOrderStatus>();
+    });
+});
+
+// The requester is unchanged — it never knows the responder queue name, only the
+// request type. The first response (from v1 or v2) wins; the loser arrives on the
+// server-named reply queue, finds no pending entry, is acked (autoAck) and silently
+// dropped — with no warn-spam.
+var client = await bus.CreateRequestClientAsync<CheckOrderStatus>();
+var response = await client.GetResponseAsync<OrderStatusResult>(
+    new CheckOrderStatus(orderId));
+```
+
+#### Options: exchange-name override / strict / auto-declare
+
+When a responder uses a non-default entity name, or you want fast "no responder
+bound" diagnostics, or auto-declaration of the exchange, pass the options block.
+There is **no** bare `PublishRequest<T>(string)` overload — the name override is
+always set through `o.ExchangeName`:
+
+```csharp
+rmq.PublishRequest<CheckOrderStatus>(o =>
+{
+    o.ExchangeName = "Orders.Api:CheckOrderStatus"; // override the default name formatter
+    o.Strict       = true;                          // mandatory:true → fast "no responder bound"
+    o.AutoDeclare  = true;                          // auto-declare the per-type fanout exchange
+});
+```
+
+The default name formatter follows the MassTransit v8 convention: the full type
+name with a **literal colon** between namespace and type name (`Namespace:TypeName`,
+PascalCase, durable, auto-delete=false). The colon must be **exact** — a `.`
+instead of `:`, kebab-case, or lowercase silently breaks interop (BareWire
+publishes to an exchange the responder is not listening on, and the request
+times out).
+
+#### Caveats
+
+Three caveats matter before turning competing-responders on:
+
+1. **Correlation echo in the emitted destination address.** Under publish-style
+   the emitted destination address changes to the per-type fanout exchange URI.
+   It is **diagnostic only** — response routing still relies on the reply
+   address, never on the destination address — and carries no correlation value
+   or PII.
+2. **The reply-queue fan-out is outside credit-based flow control.** The reply
+   queue is consumed with `autoAck: true`, so the fan-out of N responses (one per
+   competing responder) is not bounded by the flow-control mechanism. The cost
+   grows linearly with the number of responders and is bounded operationally —
+   by how many responders you bind to the exchange.
+3. **First-in-wins drops N-1 RESPONSES, not N-1 EXECUTIONS.** Every competing
+   responder **executes** the full request handler (side effects included — DB
+   writes, e-mails); only its *response* is discarded. This is a footgun for
+   responders with side effects — in competing-responders mode those effects run
+   N times. The pattern is safe for idempotent / read-only responders (the
+   typical "query" request-response).
+
+> **Generic / nested request types.** The default formatter maps the
+> `Namespace:TypeName` convention for **simple types** only. A generic or nested
+> request type needs an explicit `o.ExchangeName` override.
+
 ## Raw Message Consumption
 
 For interoperability with legacy systems that don't use BareWire's serialization, use `IRawConsumer`:
@@ -255,8 +354,8 @@ services.AddBareWireRabbitMq(cfg =>
     cfg.DefaultExchange("default.direct");
 
     // Type → exchange mapping. The exchange must be declared above; otherwise
-    // Build() throws BareWireConfigurationException (fail-fast per ADR-002:
-    // manual topology).
+    // Build() throws BareWireConfigurationException — manual topology is
+    // fail-fast, so an unmapped exchange is rejected at startup.
     cfg.MapExchange<PaymentRequested>("payments.topic");
     cfg.MapExchange<OrderCreated>("orders.fanout");
 });

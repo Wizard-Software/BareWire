@@ -255,6 +255,12 @@ namespace BareWire.Abstractions.Configuration
         void UseTls(System.Action<BareWire.Abstractions.Configuration.ITlsConfigurator> configure);
         void Username(string username);
     }
+    public interface IPublishRequestOptions
+    {
+        bool AutoDeclare { get; set; }
+        string? ExchangeName { get; set; }
+        bool Strict { get; set; }
+    }
     public interface IRabbitMqConfigurator
     {
         void ConfigureHeaderMapping(System.Action<BareWire.Abstractions.Headers.IHeaderMappingConfigurator> configure);
@@ -264,6 +270,10 @@ namespace BareWire.Abstractions.Configuration
         void MapExchange<T>(string exchangeName)
             where T :  class;
         void MapRoutingKey<T>(string routingKey)
+            where T :  class;
+        void PublishRequest<T>()
+            where T :  class;
+        void PublishRequest<T>(System.Action<BareWire.Abstractions.Configuration.IPublishRequestOptions> configure)
             where T :  class;
         void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
     }
@@ -636,9 +646,13 @@ namespace BareWire.Abstractions.Topology
     {
         void BindExchangeToExchange(string source, string destination, string routingKey);
         void BindExchangeToQueue(string exchange, string queue, string routingKey);
+        void BindRequestExchangeToQueue<T>(string queue)
+            where T :  class;
         void DeclareExchange(string name, BareWire.Abstractions.ExchangeType type, bool durable = true, bool autoDelete = false);
         void DeclareQueue(string name, bool durable, bool autoDelete, System.Action<BareWire.Abstractions.Topology.IQueueConfigurator> configure);
         void DeclareQueue(string name, bool durable = true, bool autoDelete = false, System.Collections.Generic.IReadOnlyDictionary<string, object>? arguments = null);
+        void DeclareRequestExchange<T>()
+            where T :  class;
     }
     public enum OverflowStrategy
     {
