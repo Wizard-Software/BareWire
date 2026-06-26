@@ -111,4 +111,11 @@ builder.AddProject<Projects.BareWire_Samples_CompetingResponders>("competing-res
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+// Consumer routing keys sample: one shared queue, three consumers with different patterns,
+// demonstrating most-specific-wins dispatch and type-less interop via AcceptUntyped().
+// RabbitMQ only — no Postgres (pure messaging sample).
+builder.AddProject<Projects.BareWire_Samples_ConsumerRoutingKeys>("consumer-routing-keys")
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

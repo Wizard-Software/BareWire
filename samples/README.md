@@ -151,6 +151,21 @@ GET  /health                            — health check
 demonstration values and do not identify natural persons. The poison key is a generated Guid
 fragment and never appears in query strings or response bodies.
 
+### ConsumerRoutingKeys
+
+Consume-time routing-key dispatch with three consumers sharing a single queue. A topic exchange
+delivers all traffic to the shared queue; the BareWire dispatcher selects the correct consumer
+client-side by matching routing-key patterns — the broker topology does not segregate traffic.
+
+Demonstrates three behaviors:
+1. **One shared queue, many consumers** — all deliveries land in one queue; consumer selection is purely client-side.
+2. **Most-specific-wins** — `transfer.eu.priority` (exact) beats `transfer.eu.*` (wildcard) for priority deliveries.
+3. **Type-less interop** — a raw producer omits the `BW-MessageType` header; the consumer opted in via `AcceptUntyped()` receives the delivery and deserializes it raw-first.
+
+```
+POST /run   — publish 3 deliveries, wait for all consumers, return dispatch observations
+```
+
 ## Shared Projects
 
 - **BareWire.Samples.AppHost** — Aspire orchestrator for all samples (RabbitMQ + PostgreSQL + Dashboard)
