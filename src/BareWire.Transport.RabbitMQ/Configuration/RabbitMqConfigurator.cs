@@ -156,6 +156,10 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
             options.HeaderMappingConfigurator = _headerMappingConfigurator;
         }
 
+        // SEC-4 snapshot invariant: hand the resolvers a defensive COPY, never the live config-time
+        // PublishRegistry dictionaries. Build() takes a `new Dictionary<>(...)` clone so that any
+        // post-Build mutation of the shared registry (or the registry being mutated by a still-held
+        // configurator reference) cannot reach into the runtime ExchangeResolver / RoutingKeyResolver.
         if (_publishRegistry.RoutingKeyMappings.Count > 0)
         {
             options.RoutingKeyMappings = new Dictionary<Type, string>(_publishRegistry.RoutingKeyMappings);
@@ -165,6 +169,14 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         {
             ValidateExchangeMappings(options.Topology);
             options.ExchangeMappings = new Dictionary<Type, string>(_publishRegistry.ExchangeMappings);
+        }
+
+        // Snapshot the config-time divergence diagnostics (a defensive COPY, same SEC-4 reasoning).
+        // The transport adapter emits these as DEFAULT-ON warnings at startup; they never affect
+        // runtime resolution (last-call-wins already applied above).
+        if (_publishRegistry.Divergences.Count > 0)
+        {
+            options.PublishRoutingDivergences = _publishRegistry.Divergences.ToArray();
         }
 
         if (_publishRequestMappings.Count > 0)

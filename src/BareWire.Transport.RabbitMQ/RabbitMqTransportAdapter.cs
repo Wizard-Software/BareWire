@@ -62,6 +62,28 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         _options = options;
         _logger = logger;
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
+
+        LogPublishRoutingDivergences();
+    }
+
+    // DEFAULT-ON, zero-extra-configuration diagnostic: surface every divergent per-type publish-routing
+    // overwrite detected at config time as a warning. Last-call-wins already applied — these warnings
+    // only make the divergence LOUD so an operator can reconcile the conflicting registration calls.
+    private void LogPublishRoutingDivergences()
+    {
+        if (_options.PublishRoutingDivergences is not { Count: > 0 } divergences)
+        {
+            return;
+        }
+
+        foreach (Configuration.PublishRoutingDivergence divergence in divergences)
+        {
+            LogPublishRoutingDivergence(
+                divergence.MessageType.FullName ?? divergence.MessageType.Name,
+                divergence.Dimension.ToString(),
+                divergence.PreviousValue,
+                divergence.NewValue);
+        }
     }
 
     public string TransportName => "RabbitMQ";
@@ -698,4 +720,12 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                   "The connection may fail if the broker requires TLS. " +
                   "Call ConfigureTls on RabbitMqTransportOptions to configure TLS explicitly.")]
     private partial void LogAmqpsWithoutTlsConfig();
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Divergent per-type publish routing for message type '{MessageType}': {Dimension} was " +
+                  "overwritten from '{PreviousValue}' to '{NewValue}'. Last-call-wins applies — '{NewValue}' " +
+                  "is used at runtime; reconcile the conflicting registration calls (MapExchange/MapRoutingKey, " +
+                  "DeclareExchange<T>, Publish<T>) to silence this warning.")]
+    private partial void LogPublishRoutingDivergence(
+        string messageType, string dimension, string previousValue, string newValue);
 }
