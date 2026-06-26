@@ -2,18 +2,91 @@
 
 ## Bus Registration
 
-BareWire uses a fluent configuration API registered through `IServiceCollection`:
+BareWire separates the **core engine** from the **transport adapter**: the core (`BareWire`)
+contains the pipeline, flow control, and dispatch; a transport package (e.g.
+`BareWire.Transport.RabbitMQ`) implements the wire protocol. You always register *both*. There
+are three ways to do it.
+
+### 1. Single call — bundle package (recommended)
+
+Each transport ships a thin **bundle** package — `BareWire.RabbitMQ`, `BareWire.Kafka`,
+`BareWire.AzureServiceBus`, `BareWire.AWS.SQS`, `BareWire.Google.PubSub` — that depends on both
+the core and the matching transport and exposes a single `AddBareWireWith{Transport}` method:
 
 ```csharp
-builder.Services.AddBareWire(cfg =>
-{
-    cfg.UseRabbitMQ(rmq =>
+builder.Services.AddBareWireWithRabbitMq(
+    transport => transport.Host("amqp://guest:guest@localhost:5672/"),
+    bus =>
     {
-        rmq.ConfigureTopology(topology => { /* ... */ });
-        rmq.ReceiveEndpoint("my-queue", e => { /* ... */ });
+        bus.AddConsumer<MyConsumer>();
+        // serializers, middleware, endpoints...
     });
+```
+
+The `bus` delegate is optional — omit it when transport defaults are enough:
+
+```csharp
+builder.Services.AddBareWireWithRabbitMq(transport => transport.Host("amqp://localhost"));
+```
+
+This is the most ergonomic path for the common case of a single transport. Install one package
+(`BareWire.RabbitMQ`) instead of two, and register in one statement.
+
+### 2. Two calls — core and transport registered separately
+
+Register the transport adapter and the core explicitly. Use this when you reference the core and
+transport packages separately, or you want maximum control over package versions:
+
+```csharp
+builder.Services.AddBareWireRabbitMq(transport =>
+{
+    transport.Host("amqp://guest:guest@localhost:5672/");
+    transport.ReceiveEndpoint("my-queue", e => { /* ... */ });
+});
+
+builder.Services.AddBareWire(bus =>
+{
+    bus.AddConsumer<MyConsumer>();
 });
 ```
+
+`AddBareWireWith{Transport}` is exactly this pair behind one method, so the two paths are
+equivalent. The two-call form is fully supported and is the path to use when an application needs
+**more than one transport** — call `AddBareWire` once and register each transport on its own
+endpoints (a bundle call registers the core internally, so two bundle calls would register the
+core twice).
+
+> **Deprecated:** earlier versions configured the transport with `cfg.UseRabbitMQ(...)` *inside*
+> the `AddBareWire` delegate. That marker is now an obsolete no-op — any host/credentials passed
+> to it were silently ignored; the transport is configured only through `AddBareWireRabbitMq` (or
+> the bundle). Calls still compile (with a warning) for one release; migrate to one of the forms
+> above.
+
+### 3. In-memory — tests
+
+For unit and integration tests, `BareWire.Testing` provides an in-memory harness that needs no
+broker:
+
+```csharp
+builder.Services.AddBareWireTestHarness(bus =>
+{
+    bus.AddConsumer<MyConsumer>();
+});
+```
+
+See [Custom Serializers](custom-serializers.md) and the testing guide for the harness API.
+
+### Why it is layered this way
+
+- **The core never depends on a transport, and a transport never depends on the core.** Both
+  depend only on the abstractions. The transport *implements* a contract the core drives — the
+  core calls the transport through an interface and is never called back into a specific broker.
+  This keeps the engine swappable and the transports independently versionable.
+- **The bundle is a separate layer on top of both.** Rather than letting a transport reference the
+  core (which would couple the two and let broker concerns leak into the engine), the single-call
+  ergonomics live in a thin bundle package that references core + transport. The one-directional
+  dependency rule is preserved; the convenience is additive. This is enforced by architecture
+  tests, so the ergonomics can never silently erode the layering.
 
 ## JSON Serializer
 
