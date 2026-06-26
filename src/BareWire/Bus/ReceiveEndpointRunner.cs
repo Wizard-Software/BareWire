@@ -10,6 +10,7 @@ using BareWire.Abstractions.Transport;
 using BareWire.FlowControl;
 using BareWire.Pipeline;
 using BareWire.Pipeline.Retry;
+using BareWire.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -38,6 +39,28 @@ internal sealed partial class ReceiveEndpointRunner
     private readonly ISagaMessageDispatcher[] _sagaDispatchers;
     private readonly MiddlewareChain _staticChain;
     private readonly bool _hasDiMiddleware;
+
+    // ── Consume-time routing-key dispatch (ADR-030) ──────────────────────────────
+    // Stateless, zero-alloc matcher — a single shared instance is safe because the matcher holds no
+    // per-delivery state (IsMatch/CompareSpecificity operate only on pre-compiled inputs). Immutable,
+    // so it does not violate the "no static mutable state" rule. Typed as the concrete
+    // TopicPatternMatcher (not the ITopicMatcher seam) so the hot-path calls devirtualize (CA1859);
+    // the ITopicMatcher abstraction still exists for testability and future per-transport strategy.
+    private static readonly TopicPatternMatcher s_topicMatcher = new();
+
+    // Per-consumer compiled topic patterns, indexed 1:1 with _invokers / _binding.Consumers.
+    // An empty inner array means the consumer is a catch-all (selected by message type alone, D8).
+    private readonly CompiledTopicPattern[][] _consumerPatterns;
+
+    // Per-consumer AcceptUntyped opt-in, indexed 1:1 with _invokers. Part of the _hasAnyRoutingKeys
+    // guard now; the type-less dispatch layer (a later task) uses it for candidacy.
+    private readonly bool[] _consumerAcceptUntyped;
+
+    // Guard (ADR-FIX-2): true when ANY consumer declares >=1 routing-key pattern OR AcceptUntyped().
+    // When false, DispatchMessageAsync takes the bit-identical pre-ADR-030 legacy path, so endpoints
+    // without any routing keys behave exactly as before (per-delivery cost unchanged). The name keeps
+    // the task vocabulary, but the flag also accounts for AcceptUntyped() per ADR-FIX-2.
+    private readonly bool _hasAnyRoutingKeys;
 
     internal ReceiveEndpointRunner(
         EndpointBinding binding,
@@ -73,6 +96,26 @@ internal sealed partial class ReceiveEndpointRunner
         _consumerMessageTypeNames = binding.Consumers
             .Select(c => c.MessageType.Name)
             .ToArray();
+
+        // Pre-compile per-consumer topic patterns once at Build()-time (allocation allowed here;
+        // the hot path stays zero-alloc). Indexed 1:1 with _invokers / binding.Consumers. A consumer
+        // with no routing keys gets an empty array and is treated as a catch-all (D8).
+        _consumerPatterns = binding.Consumers
+            .Select(c => c.RoutingKeys is { Count: > 0 } keys
+                ? keys.Select(s_topicMatcher.Compile).ToArray()
+                : Array.Empty<CompiledTopicPattern>())
+            .ToArray();
+
+        _consumerAcceptUntyped = binding.Consumers
+            .Select(c => c.AcceptUntyped)
+            .ToArray();
+
+        // Guard (ADR-FIX-2): the new pattern-aware dispatch path activates only when at least one
+        // consumer declares routing-key patterns or opts into untyped delivery; otherwise the
+        // bit-identical legacy path runs.
+        _hasAnyRoutingKeys =
+            Array.Exists(_consumerPatterns, static p => p.Length > 0)
+            || Array.Exists(_consumerAcceptUntyped, static x => x);
 
         // Build raw invokers once at startup — no reflection in the hot path.
         _rawInvokers = binding.RawConsumers
@@ -432,9 +475,93 @@ internal sealed partial class ReceiveEndpointRunner
         MessageContext context,
         CancellationToken cancellationToken)
     {
+        bool dispatched;
+        string messageType;
+        string messageIdStr = context.MessageIdString;
+
+        // First stage — typed-consumer selection. The guard (ADR-FIX-2) routes endpoints that declare
+        // no routing-key patterns and no AcceptUntyped() to the bit-identical pre-ADR-030 legacy path;
+        // endpoints with the feature active take the pattern-aware path (ADR-030 D4 layers 1-2).
+        if (!_hasAnyRoutingKeys)
+        {
+            (dispatched, messageType) = await SelectTypedLegacyAsync(context, messageIdStr, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            (dispatched, messageType) = await SelectTypedWithPatternsAsync(context, messageIdStr, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // If no typed consumer matched, try saga dispatchers.
+        // Each dispatcher tries to deserialize the body as one of its registered event types.
+        if (!dispatched && _sagaDispatchers.Length > 0)
+        {
+            foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
+            {
+                try
+                {
+                    bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
+                        context.RawBody,
+                        context.Headers,
+                        messageIdStr,
+                        _binding.EndpointName,
+                        _publishEndpoint,
+                        _sendEndpointProvider,
+                        _deserializerResolver,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (sagaHandled)
+                    {
+                        messageType = sagaDispatcher.StateMachineType.Name;
+                        dispatched = true;
+                        break;
+                    }
+                }
+                catch (Abstractions.Exceptions.BareWireSerializationException ex)
+                {
+                    LogDeserializationFailed(_binding.EndpointName, messageIdStr, ex);
+                }
+            }
+        }
+
+        // If no typed consumer or saga matched, fall through to raw consumers.
+        // Raw consumers accept any payload — all registered raw consumers are invoked.
+        if (!dispatched && _rawInvokers.Length > 0)
+        {
+            foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
+            {
+                await rawInvoker(
+                    _scopeFactory,
+                    context.RawBody,
+                    context.Headers,
+                    messageIdStr,
+                    _publishEndpoint,
+                    _sendEndpointProvider,
+                    _deserializerResolver,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
+            messageType = "raw";
+            dispatched = true;
+        }
+
+        return (dispatched, messageType);
+    }
+
+    /// <summary>
+    /// Bit-identical pre-ADR-030 typed selection: the BW-MessageType fast path (break-on-first by
+    /// type name) plus the legacy blind sequential-deserialize fallback for type-less deliveries.
+    /// Reached only when <see cref="_hasAnyRoutingKeys"/> is <see langword="false"/> (ADR-FIX-2 —
+    /// endpoints with no routing keys and no <c>AcceptUntyped()</c> behave exactly as before).
+    /// </summary>
+    private async Task<(bool Dispatched, string MessageType)> SelectTypedLegacyAsync(
+        MessageContext context,
+        string messageIdStr,
+        CancellationToken cancellationToken)
+    {
         bool dispatched = false;
         string messageType = "unknown";
-        string messageIdStr = context.MessageIdString;
 
         // --- Header-based routing (fast path) ---
         // When BW-MessageType header is present, route directly to the matching consumer
@@ -503,45 +630,140 @@ internal sealed partial class ReceiveEndpointRunner
             }
         }
 
-        // If no typed consumer matched, try saga dispatchers.
-        // Each dispatcher tries to deserialize the body as one of its registered event types.
-        if (!dispatched && _sagaDispatchers.Length > 0)
-        {
-            foreach (ISagaMessageDispatcher sagaDispatcher in _sagaDispatchers)
-            {
-                try
-                {
-                    bool sagaHandled = await sagaDispatcher.TryDispatchAsync(
-                        context.RawBody,
-                        context.Headers,
-                        messageIdStr,
-                        _binding.EndpointName,
-                        _publishEndpoint,
-                        _sendEndpointProvider,
-                        _deserializerResolver,
-                        cancellationToken).ConfigureAwait(false);
+        return (dispatched, messageType);
+    }
 
-                    if (sagaHandled)
-                    {
-                        messageType = sagaDispatcher.StateMachineType.Name;
-                        dispatched = true;
-                        break;
-                    }
-                }
-                catch (Abstractions.Exceptions.BareWireSerializationException ex)
+    /// <summary>
+    /// Pattern-aware typed selection (ADR-030 D4 layers 1-2). Reached only when
+    /// <see cref="_hasAnyRoutingKeys"/> is <see langword="true"/>.
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>Layer 1</b> — among consumers of the resolved type whose pattern set matches the
+    ///     delivery's <c>BW-RoutingKey</c>, the most specific matched pattern wins (D5 metric;
+    ///     first-registered on an unresolvable tie, plus a warning).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Layer 2</b> — no pattern matched → the type's first-registered catch-all consumer
+    ///     (empty pattern set) takes over; a warning fires when the delivery carried a routing key,
+    ///     nothing matched, and no catch-all exists.
+    ///   </description></item>
+    /// </list>
+    /// When <c>BW-MessageType</c> is absent (type-less delivery), this returns
+    /// <c>(false, "unknown")</c> — a deliberate seam for the type-less dispatch layer (a later task);
+    /// the delivery then falls through to the shared saga/raw handling. The raw routing key is never
+    /// written to logs (ADR-030 §Security — it is producer-controlled, untrusted input).
+    /// </summary>
+    private async Task<(bool Dispatched, string MessageType)> SelectTypedWithPatternsAsync(
+        MessageContext context,
+        string messageIdStr,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Headers.TryGetValue("BW-MessageType", out string? bwMessageType)
+            || string.IsNullOrEmpty(bwMessageType))
+        {
+            // Type-less delivery — out of scope for layers 1-2; seam for the type-less layer.
+            return (false, "unknown");
+        }
+
+        // D-V1: read BW-RoutingKey via TryGetValue — the IReadOnlyDictionary indexer throws
+        // KeyNotFoundException when the header is absent (e.g. non-RabbitMQ transports). The value is
+        // already a string, so AsSpan() over it allocates nothing on the hot path.
+        context.Headers.TryGetValue("BW-RoutingKey", out string? routingKeyValue);
+        ReadOnlySpan<char> routingKey = (routingKeyValue ?? string.Empty).AsSpan();
+
+        // ── Layer 1: most specific matched pattern across consumers of this type (zero-alloc scan) ──
+        // A pairwise scan reusing CompareSpecificity is the only zero-alloc option — building a
+        // ReadOnlySpan<CompiledTopicPattern> of candidates for SelectMostSpecific would require a
+        // managed-type stackalloc (CS0208) or a per-delivery list allocation (violates the 0-B/op gate).
+        int bestIdx = -1;
+        CompiledTopicPattern bestPattern = default;
+        bool unresolvedTie = false;
+
+        for (int i = 0; i < _invokers.Length; i++)
+        {
+            if (!string.Equals(_consumerMessageTypeNames[i], bwMessageType, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            CompiledTopicPattern[] patterns = _consumerPatterns[i];
+            if (patterns.Length == 0)
+            {
+                continue; // catch-all does not participate in layer 1
+            }
+
+            // Most specific of THIS consumer's own patterns that actually match the routing key.
+            int localMatch = -1;
+            CompiledTopicPattern localBest = default;
+            for (int p = 0; p < patterns.Length; p++)
+            {
+                if (!s_topicMatcher.IsMatch(in patterns[p], routingKey))
                 {
-                    LogDeserializationFailed(_binding.EndpointName, messageIdStr, ex);
+                    continue;
+                }
+
+                if (localMatch == -1 || s_topicMatcher.CompareSpecificity(in patterns[p], in localBest) > 0)
+                {
+                    localMatch = p;
+                    localBest = patterns[p];
+                }
+            }
+
+            if (localMatch == -1)
+            {
+                continue; // this consumer has no matching pattern
+            }
+
+            // Cross-consumer comparison: most-specific-wins, first-registered on tie.
+            if (bestIdx == -1)
+            {
+                bestIdx = i;
+                bestPattern = localBest;
+                unresolvedTie = false;
+            }
+            else
+            {
+                int cmp = s_topicMatcher.CompareSpecificity(in localBest, in bestPattern);
+                if (cmp > 0)
+                {
+                    bestIdx = i;
+                    bestPattern = localBest;
+                    unresolvedTie = false;
+                }
+                else if (cmp == 0)
+                {
+                    unresolvedTie = true; // first-registered wins (bestIdx unchanged)
                 }
             }
         }
 
-        // If no typed consumer or saga matched, fall through to raw consumers.
-        // Raw consumers accept any payload — all registered raw consumers are invoked.
-        if (!dispatched && _rawInvokers.Length > 0)
+        if (bestIdx != -1)
         {
-            foreach (ConsumerInvokerFactory.RawInvokerDelegate rawInvoker in _rawInvokers)
+            if (unresolvedTie)
             {
-                await rawInvoker(
+                LogAmbiguousRoutingKeyMatch(_binding.EndpointName, messageIdStr);
+            }
+
+            await _invokers[bestIdx](
+                _scopeFactory,
+                context.RawBody,
+                context.Headers,
+                messageIdStr,
+                _publishEndpoint,
+                _sendEndpointProvider,
+                _deserializerResolver,
+                _binding.EndpointName,
+                cancellationToken).ConfigureAwait(false);
+            return (true, _consumerMessageTypeNames[bestIdx]);
+        }
+
+        // ── Layer 2: no pattern matched → first-registered catch-all of this type ──
+        for (int i = 0; i < _invokers.Length; i++)
+        {
+            if (string.Equals(_consumerMessageTypeNames[i], bwMessageType, StringComparison.Ordinal)
+                && _consumerPatterns[i].Length == 0)
+            {
+                await _invokers[i](
                     _scopeFactory,
                     context.RawBody,
                     context.Headers,
@@ -549,14 +771,20 @@ internal sealed partial class ReceiveEndpointRunner
                     _publishEndpoint,
                     _sendEndpointProvider,
                     _deserializerResolver,
+                    _binding.EndpointName,
                     cancellationToken).ConfigureAwait(false);
+                return (true, _consumerMessageTypeNames[i]);
             }
-
-            messageType = "raw";
-            dispatched = true;
         }
 
-        return (dispatched, messageType);
+        // No matched pattern and no catch-all. Warn only when a routing key was present (the producer
+        // intended routing but nothing handled it). The raw key is NOT logged (ADR-030 §Security).
+        if (!routingKey.IsEmpty)
+        {
+            LogNoRoutingKeyMatch(_binding.EndpointName, messageIdStr);
+        }
+
+        return (false, "unknown");
     }
 
     private static NextMiddleware WrapDiMiddleware(
@@ -876,6 +1104,16 @@ internal sealed partial class ReceiveEndpointRunner
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "No consumer matched message {MessageId} on endpoint '{EndpointName}' — message will be rejected.")]
     private partial void LogNoConsumerMatched(string endpointName, string messageId);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "No routing-key pattern matched and no catch-all consumer on endpoint '{EndpointName}' " +
+                  "for message {MessageId} — message left undispatched.")]
+    private partial void LogNoRoutingKeyMatch(string endpointName, string messageId);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Ambiguous routing-key match (unresolvable specificity tie) on endpoint '{EndpointName}' " +
+                  "for message {MessageId} — first-registered consumer selected.")]
+    private partial void LogAmbiguousRoutingKeyMatch(string endpointName, string messageId);
 
     [LoggerMessage(Level = LogLevel.Debug,
         Message = "Consume loop cancelled for endpoint '{EndpointName}'.")]
