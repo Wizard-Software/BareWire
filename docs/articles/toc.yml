@@ -6,6 +6,8 @@
   href: publishing-and-consuming.md
 - name: Topology
   href: topology.md
+- name: Consumer Routing Keys
+  href: consumer-routing-keys.md
 - name: Per-Key Consumer Ordering
   href: per-key-ordering.md
 - name: Flow Control

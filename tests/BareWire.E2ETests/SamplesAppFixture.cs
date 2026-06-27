@@ -53,6 +53,9 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             // "competing-responders" is a WithReplicas(2) resource (same Aspire logical-name
             // resolution as "ordered-consumers" above).
             "competing-responders",
+            // Consumer routing keys sample: one shared queue, three consumers, most-specific-wins
+            // dispatch, and type-less interop via AcceptUntyped().
+            "consumer-routing-keys",
         ];
 
         foreach (string resource in sampleResources)

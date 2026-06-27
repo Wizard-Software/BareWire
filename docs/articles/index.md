@@ -8,17 +8,18 @@ Welcome to the BareWire documentation. BareWire is a high-performance async mess
 2. [Configuration](configuration.md) — bus setup, RabbitMQ transport, DI registration
 3. [Publishing and Consuming](publishing-and-consuming.md) — publish/subscribe, request-response, raw messages
 4. [Topology](topology.md) — exchanges, queues, bindings, routing keys
-5. [Per-Key Consumer Ordering](per-key-ordering.md) — ordered consumption per key across competing consumers
-6. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
-7. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
-8. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
-9. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
-10. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
-11. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
-12. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
-13. [Observability](observability.md) — OpenTelemetry, metrics, health checks
-14. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
-15. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
+5. [Consumer Routing Keys](consumer-routing-keys.md) — multiple consumers on one queue selected by routing-key pattern, type-less interop
+6. [Per-Key Consumer Ordering](per-key-ordering.md) — ordered consumption per key across competing consumers
+7. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
+8. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
+9. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
+10. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
+11. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
+12. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
+13. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
+14. [Observability](observability.md) — OpenTelemetry, metrics, health checks
+15. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
+16. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
 
 ## Allocation Characteristics
 

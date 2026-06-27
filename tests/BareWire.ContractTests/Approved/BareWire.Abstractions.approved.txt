@@ -193,9 +193,11 @@ namespace BareWire.Abstractions.Configuration
     }
     public sealed class ConsumerRegistration : System.IEquatable<BareWire.Abstractions.Configuration.ConsumerRegistration>
     {
-        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType) { }
+        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType, System.Collections.Generic.IReadOnlyList<string>? RoutingKeys = null, bool AcceptUntyped = false) { }
+        public bool AcceptUntyped { get; init; }
         public System.Type ConsumerType { get; init; }
         public System.Type MessageType { get; init; }
+        public System.Collections.Generic.IReadOnlyList<string>? RoutingKeys { get; init; }
     }
     public sealed class EndpointBinding
     {
@@ -227,6 +229,14 @@ namespace BareWire.Abstractions.Configuration
         void UseRabbitMQ(System.Action<BareWire.Abstractions.Configuration.IRabbitMqConfigurator> configure);
         void UseSerializer<T>()
             where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
+    }
+    public interface IConsumerConfigurator<TConsumer, TMessage>
+        where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
+        where TMessage :  class
+    {
+        void AcceptUntyped();
+        void RoutingKey(string routingKey);
+        void RoutingKeys(params string[] routingKeys);
     }
     public interface IConsumerOrderingConfiguration
     {
@@ -296,6 +306,9 @@ namespace BareWire.Abstractions.Configuration
         int RetryCount { get; set; }
         System.TimeSpan RetryInterval { get; set; }
         void Consumer<TConsumer, TMessage>()
+            where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
+            where TMessage :  class;
+        void Consumer<TConsumer, TMessage>(System.Action<BareWire.Abstractions.Configuration.IConsumerConfigurator<TConsumer, TMessage>> configure)
             where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
             where TMessage :  class;
         void OrderedBy(System.Action<BareWire.Abstractions.Configuration.IConsumerOrderingConfigurator> configure);

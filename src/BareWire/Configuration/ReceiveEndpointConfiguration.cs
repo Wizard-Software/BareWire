@@ -12,6 +12,7 @@ namespace BareWire.Configuration;
 internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurator
 {
     private readonly List<Type> _consumerTypes = [];
+    private readonly List<ConsumerRegistration> _consumerRegistrations = [];
     private readonly List<Type> _rawConsumerTypes = [];
     private readonly List<Type> _sagaTypes = [];
 
@@ -26,6 +27,14 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
     internal string EndpointName { get; }
 
     internal IReadOnlyList<Type> ConsumerTypes => _consumerTypes;
+
+    /// <summary>
+    /// Gets the materialized consumer registrations for this endpoint — one per <c>Consumer&lt;,&gt;</c>
+    /// call — carrying the consumer/message types plus the accumulated routing-key set and the
+    /// <c>AcceptUntyped</c> flag. Consumed by the consume loop to select consumers at dispatch time.
+    /// </summary>
+    internal IReadOnlyList<ConsumerRegistration> ConsumerRegistrations => _consumerRegistrations;
+
     internal IReadOnlyList<Type> RawConsumerTypes => _rawConsumerTypes;
     internal IReadOnlyList<Type> SagaTypes => _sagaTypes;
 
@@ -70,6 +79,21 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
         where TMessage : class
     {
         _consumerTypes.Add(typeof(TConsumer));
+        _consumerRegistrations.Add(new ConsumerRegistration(typeof(TConsumer), typeof(TMessage)));
+    }
+
+    /// <inheritdoc />
+    public void Consumer<TConsumer, TMessage>(Action<IConsumerConfigurator<TConsumer, TMessage>> configure)
+        where TConsumer : class, IConsumer<TMessage>
+        where TMessage : class
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+
+        ConsumerConfigurator<TConsumer, TMessage> configurator = new();
+        configure(configurator);
+
+        _consumerTypes.Add(typeof(TConsumer));
+        _consumerRegistrations.Add(configurator.Build());
     }
 
     /// <inheritdoc />

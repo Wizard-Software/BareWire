@@ -67,6 +67,42 @@ public interface IReceiveEndpointConfigurator
         where TMessage : class;
 
     /// <summary>
+    /// Registers a typed consumer <typeparamref name="TConsumer"/> that processes messages of type
+    /// <typeparamref name="TMessage"/>, configured through a grouped block that declares a set of
+    /// consume-time routing-key patterns. The consumer is resolved from the DI container per message.
+    /// This is the consume-side ergonomic counterpart of the publish-side per-type routing configurator
+    /// <see cref="IPublishConfigurator{T}"/> (with deliberately different semantics — a set of match
+    /// patterns evaluated <em>client-side at dispatch</em> against the delivery's routing key, not a single
+    /// produced key) and selects which of several consumers sharing a queue handles a given delivery.
+    /// </summary>
+    /// <remarks>
+    /// This overload is purely additive — the parameterless <c>Consumer&lt;TConsumer, TMessage&gt;()</c>
+    /// is unchanged. A consumer that declares no routing keys remains a catch-all over its message type
+    /// (unchanged behaviour). This is a dispatcher predicate, <strong>not</strong> topology: declaring
+    /// routing keys does not create or alter any queue→exchange binding (per ADR-002, manual topology).
+    /// </remarks>
+    /// <typeparam name="TConsumer">
+    /// The consumer implementation type. Must implement <see cref="IConsumer{TMessage}"/>.
+    /// </typeparam>
+    /// <typeparam name="TMessage">The message type this consumer handles. Must be a reference type.</typeparam>
+    /// <param name="configure">
+    /// A delegate that receives an <see cref="IConsumerConfigurator{TConsumer, TMessage}"/> and declares the
+    /// routing-key pattern set (and the optional type-less opt-in) for this consumer. Must not be
+    /// <see langword="null"/>.
+    /// </param>
+    /// <exception cref="System.ArgumentNullException">
+    /// Thrown when <paramref name="configure"/> is <see langword="null"/>.
+    /// </exception>
+    /// <example>
+    /// <code>
+    /// e.Consumer&lt;RegionConsumer, TransferInitiated&gt;(c => c.RoutingKeys("transfer.eu.*", "transfer.pl.*"));
+    /// </code>
+    /// </example>
+    void Consumer<TConsumer, TMessage>(Action<IConsumerConfigurator<TConsumer, TMessage>> configure)
+        where TConsumer : class, IConsumer<TMessage>
+        where TMessage : class;
+
+    /// <summary>
     /// Registers a raw consumer <typeparamref name="T"/> that receives undeserialized byte payloads.
     /// The consumer is resolved from the DI container per message.
     /// </summary>

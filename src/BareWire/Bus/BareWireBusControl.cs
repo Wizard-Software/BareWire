@@ -76,6 +76,13 @@ internal sealed partial class BareWireBusControl : IBusControl
         bool transportRegistered = _adapter is not null;
         ConfigurationValidator.Validate(_configurator, transportRegistered);
 
+        // Advisory diagnostic (SEC-13 / ADR-030 §Security): an endpoint that declares AcceptUntyped()
+        // without a registered schema-validation middleware exposes a type-less foreign-input trust
+        // boundary. Emit a warning naming the endpoint (no raw routing key — none exists at startup).
+        // The bus only goes live here in StartAsync, so this is the right gate; DeployTopologyAsync
+        // starts no consumers and is intentionally not covered.
+        UntypedTrustBoundaryDiagnostic.Run(_configurator, _logger);
+
         // After validation succeeds, the adapter is guaranteed non-null (the validator throws
         // otherwise). Capture it in a non-null local so the remainder of StartAsync stays
         // warning-free under TreatWarningsAsErrors (R4).
