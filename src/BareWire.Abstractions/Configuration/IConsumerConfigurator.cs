@@ -97,4 +97,62 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// </para>
     /// </remarks>
     void AcceptUntyped();
+
+    /// <summary>
+    /// Opts this consumer in to the MassTransit envelope interop format
+    /// (<c>application/vnd.masstransit+json</c>) for both directions — <em>receive</em> and
+    /// <em>reply</em> — independently of the bus-global or per-endpoint default format. A consumer that
+    /// "speaks MassTransit" reads an envelope on the way in and writes an envelope on the way out, as one
+    /// coherent interop mode. This is the third and narrowest axis of message-format choice
+    /// (per-consumer), alongside the bus-global registration and the per-endpoint
+    /// <see cref="IReceiveEndpointConfigurator"/> serializer override.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Scope — receive and reply.</strong> On the <em>receive</em> path the marked consumer's
+    /// payload is deserialized from the MassTransit envelope: the envelope's <c>message</c> field is
+    /// unwrapped into <typeparamref name="TMessage"/>, and the envelope's <c>messageType</c> (a URN) and
+    /// envelope headers are mapped. On the <em>reply</em> path, a <c>RespondAsync</c> from this consumer
+    /// wraps the response in a MassTransit <em>response</em> envelope with the correlating
+    /// <c>requestId</c>, so request/response interop with a MassTransit peer round-trips correctly.
+    /// </para>
+    /// <para>
+    /// <strong>Precedence — per-consumer wins.</strong> Format resolution runs narrowest-to-widest:
+    /// per-consumer <c>UseMassTransitEnvelope()</c> &gt; per-endpoint
+    /// <c>UseSerializer</c>/<c>UseDeserializer</c> override &gt; bus-global default (raw-first, or a
+    /// globally registered envelope). A marked consumer therefore (de)serializes through the MassTransit
+    /// envelope regardless of the endpoint's default deserializer; an unmarked consumer sharing the same
+    /// endpoint keeps the default format. The opt-in is also an explicit declaration that "this consumer
+    /// expects a MassTransit envelope", which disambiguates deliveries with an absent or ambiguous
+    /// <c>content-type</c> and additionally governs the reply side that a content-type router does not
+    /// cover.
+    /// </para>
+    /// <para>
+    /// Like the other methods on this configurator, this returns <see langword="void"/> by design,
+    /// matching the house configurator convention (see <see cref="AcceptUntyped"/> and
+    /// <see cref="IReceiveEndpointConfigurator"/>) — the setting is applied imperatively inside the
+    /// delegate rather than fluently chained. The chained variant
+    /// <c>Consumer&lt;,&gt;().WithMassTransitEnvelope()</c> is deliberately not offered: it would force
+    /// the configurator family away from the <see langword="void"/> convention.
+    /// </para>
+    /// <para>
+    /// The call is <strong>idempotent</strong>: it sets an on/off flag (not a set that accumulates), so
+    /// calling it more than once has the same effect as calling it once. This is a deliberate parity with
+    /// <see cref="AcceptUntyped"/> and a contrast with the accumulating <see cref="RoutingKey"/> /
+    /// <see cref="RoutingKeys"/> set.
+    /// </para>
+    /// <para>
+    /// <strong>Secure-by-default — this is an explicit, conscious opt-in.</strong> The envelope format is
+    /// never enabled for a consumer implicitly; a developer opts a single consumer in to it deliberately.
+    /// This method is <em>orthogonal</em> to the routing-key dispatch axis
+    /// (<see cref="RoutingKey"/>/<see cref="RoutingKeys"/>/<see cref="AcceptUntyped"/>): routing keys
+    /// select <strong>which</strong> consumer handles a delivery, whereas this opt-in selects
+    /// <strong>how</strong> that consumer's payload is (de)serialized and whether its reply is wrapped.
+    /// The two may coexist in the same configuration block. Where envelope opt-in is combined with an
+    /// untrusted-input axis (a consumer also marked <see cref="AcceptUntyped"/> for foreign JSON), the
+    /// bus surfaces a startup warning when a schema-validation middleware is absent, preserving the
+    /// secure-by-default posture.
+    /// </para>
+    /// </remarks>
+    void UseMassTransitEnvelope();
 }
