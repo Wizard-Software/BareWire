@@ -11,7 +11,7 @@ All messages go to all bound queues. Use for broadcast/pub-sub:
 ```csharp
 topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
 topology.DeclareQueue("messages", durable: true);
-topology.BindExchangeToQueue("messages", "messages");
+topology.BindExchangeToQueue("messages", "messages", routingKey: ""); // fanout ignores the key
 ```
 
 > See: `samples/BareWire.Samples.BasicPublishConsume/Program.cs`
@@ -48,11 +48,20 @@ topology.DeclareQueue("demo-saga", durable: true);
 topology.BindExchangeToQueue("events", "demo-saga", routingKey: "#");
 ```
 
-Publish with a specific routing key:
+Map each message type to a routing key once at configuration time, then publish normally —
+`PublishAsync<T>` applies the mapped key automatically (without a mapping it falls back to
+`typeof(T).FullName`):
 
 ```csharp
-await bus.PublishAsync(new DemoOrderCreated(...), routingKey: "order.created", ct);
+// At configuration time, on the RabbitMQ configurator:
+rmq.MapRoutingKey<DemoOrderCreated>("order.created");
+
+// At the call site:
+await bus.PublishAsync(new DemoOrderCreated(...), ct);
 ```
+
+To group an exchange and routing key for a type in one block, see the `Publish<T>(...)` and
+`DeclareExchange<T>(...)` shapes in [Publishing and Consuming](publishing-and-consuming.md#ergonomic-per-type-send-mapping).
 
 > See: `samples/BareWire.Samples.ObservabilityShowcase/Program.cs`
 
@@ -67,6 +76,26 @@ topology.DeclareExchange("ordered-events", ExchangeType.ConsistentHash, durable:
 `ExchangeType.ConsistentHash` requires the broker plugin `rabbitmq_consistent_hash_exchange` to be enabled. It is an opt-in alternative to single-active-consumer; note that re-mapping (adding/removing a bound queue or a node restart) re-hashes keys and briefly breaks per-key order, which is why single-active-consumer is the recommended default.
 
 > See: [Per-Key Consumer Ordering](per-key-ordering.md) for the two transport-affinity paths and their trade-offs.
+
+## Bindings
+
+`BindExchangeToQueue(exchange, queue, routingKey)` routes matching messages from an exchange to a
+queue — the binding used in every example above. The `routingKey` is required: pass `""` for
+fanout exchanges (which ignore it), an exact key for direct exchanges, or a pattern (`order.*`,
+`#`) for topic exchanges.
+
+For hierarchical or fan-out routing topologies you can also bind an exchange to another exchange
+with `BindExchangeToExchange(source, destination, routingKey)`. Messages published to `source`
+that match `routingKey` are forwarded to `destination`, which then applies its own bindings — for
+example, a single top-level topic exchange feeding several domain exchanges:
+
+```csharp
+topology.DeclareExchange("all-events", ExchangeType.Topic, durable: true);
+topology.DeclareExchange("order-events", ExchangeType.Topic, durable: true);
+
+// Forward every "order.*" message from the top-level exchange to the order-events exchange.
+topology.BindExchangeToExchange("all-events", "order-events", routingKey: "order.#");
+```
 
 ## Queue Configuration (IQueueConfigurator)
 
@@ -147,12 +176,12 @@ topology.DeclareQueue("payments", durable: true, autoDelete: false, configure: q
     q.DeadLetterExchange("payments.dlx")
      .SetQueueType(QueueType.Quorum);
 });
-topology.BindExchangeToQueue("payments", "payments");
+topology.BindExchangeToQueue("payments", "payments", routingKey: "");
 
 // Dead letter queue
 topology.DeclareExchange("payments.dlx", ExchangeType.Fanout, durable: true);
 topology.DeclareQueue("payments-dlq", durable: true);
-topology.BindExchangeToQueue("payments.dlx", "payments-dlq");
+topology.BindExchangeToQueue("payments.dlx", "payments-dlq", routingKey: "");
 ```
 
 ### Typical Production Configuration

@@ -64,7 +64,7 @@ dotnet run --project samples/BareWire.Samples.AppHost/
 Observability works seamlessly with SAGA and outbox. The RabbitMQ sample demonstrates all three together:
 
 ```csharp
-builder.Services.AddBareWire(cfg => { /* transport */ });
+builder.Services.AddBareWireWithRabbitMq(transport => { /* host, topology, endpoints */ });
 builder.Services.AddBareWireSaga<OrderSagaState>(options => options.UseSqlite(...));
 builder.Services.AddBareWireOutbox(configureDbContext, configureOutbox);
 builder.Services.AddBareWireObservability(cfg => { cfg.EnableOpenTelemetry = true; });

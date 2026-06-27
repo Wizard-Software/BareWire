@@ -27,7 +27,8 @@
         ],
         "exclude": [
           "_site/**",
-          "obj/**"
+          "obj/**",
+          "MASSTRANSIT_V8_API_REFERENCE.md"
         ]
       }
     ],

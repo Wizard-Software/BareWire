@@ -68,7 +68,7 @@
 | **Deserialize_Envelope** | 1,736 ns / 2,600 B | 7,476 ns / 7,544 B | 70,315 ns / 62,704 B | 739,489 ns / 626,659 B |
 
 **Key observations**:
-- Raw serialization allocates a **constant 448 B** regardless of payload size — the `PooledBufferWriter` rents from `ArrayPool` and the only allocation is the writer struct itself. ADR-003 compliant.
+- Raw serialization allocates a **constant 448 B** regardless of payload size — the `PooledBufferWriter` rents from `ArrayPool` and the only allocation is the writer struct itself, confirming the zero-copy pipeline contract.
 - Envelope serialization allocates proportionally to payload (envelope wrapper + JSON metadata).
 - Deserialization allocates more due to `System.Text.Json` internal buffers and object materialization.
 - Raw is ~5x faster than Envelope for serialization, ~2x faster for deserialization.
@@ -92,7 +92,7 @@ The 600 B per PublishTyped breaks down approximately as:
 
 2. **Throughput targets are comfortably met** — All benchmarks exceed their targets by 2–19x.
 
-3. **Raw serialization is excellent** — Constant 448 B allocation regardless of payload size confirms ADR-003 zero-copy pipeline works correctly.
+3. **Raw serialization is excellent** — Constant 448 B allocation regardless of payload size confirms the zero-copy pipeline works correctly.
 
 4. **Consume path is near-zero-allocation** — 0.48 B/msg demonstrates the bounded channel + in-memory transport is highly optimized.
 
@@ -108,7 +108,7 @@ Raw publish (`PublishRawAsync`) allocates a **constant 136 B** regardless of pay
 | 1 KB | 1.467 µs | **136 B** |
 | 10 KB | 1.575 µs | **136 B** |
 
-Typed publish (`PublishTyped`) allocation = **~544 B fixed overhead + serialized payload size**, because `MessagePipeline.ProcessOutboundAsync` copies the serialized body via `.ToArray()` (C-1, architecturally required — `OutboundMessage` must outlive the pooled writer scope).
+Typed publish (`PublishTyped`) allocation = **~544 B fixed overhead + serialized payload size**, because `MessagePipeline.ProcessOutboundAsync` copies the serialized body via `.ToArray()` (architecturally required — `OutboundMessage` must outlive the pooled writer scope).
 
 ---
 

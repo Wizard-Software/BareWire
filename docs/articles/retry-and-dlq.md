@@ -30,12 +30,12 @@ rmq.ConfigureTopology(topology =>
     {
         ["x-dead-letter-exchange"] = "payments.dlx"
     });
-    topology.BindExchangeToQueue("payments", "payments");
+    topology.BindExchangeToQueue("payments", "payments", routingKey: "");
 
     // Dead letter exchange and queue
     topology.DeclareExchange("payments.dlx", ExchangeType.Fanout, durable: true);
     topology.DeclareQueue("payments-dlq", durable: true);
-    topology.BindExchangeToQueue("payments.dlx", "payments-dlq");
+    topology.BindExchangeToQueue("payments.dlx", "payments-dlq", routingKey: "");
 });
 ```
 

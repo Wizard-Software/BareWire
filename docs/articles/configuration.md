@@ -93,7 +93,7 @@ See [Custom Serializers](custom-serializers.md) and the testing guide for the ha
 BareWire follows a raw-first approach — the default serializer produces raw JSON without an envelope. Register it with:
 
 ```csharp
-builder.AddBareWireJsonSerializer();
+builder.Services.AddBareWireJsonSerializer();
 ```
 
 This uses `System.Text.Json` internally with zero-copy `IBufferWriter<byte>` / `ReadOnlySequence<byte>` pipelines. No `byte[]` is allocated per-message in the hot path.
@@ -249,18 +249,25 @@ builder.Services.AddSingleton(new PublishFlowControlOptions
 
 ## SAGA Persistence
 
-Register SAGA state persistence with EF Core:
+A saga needs two registrations — the repository (persistence) and the state machine (which wires the
+dispatcher into the consume pipeline) — plus a receive endpoint to host it:
 
 ```csharp
+// Repository (EF Core) — BareWire.Saga.EntityFramework
 builder.Services.AddBareWireSaga<OrderSagaState>(
     options => options.UseNpgsql(connectionString));
+// Or with SQLite:
+// builder.Services.AddBareWireSaga<OrderSagaState>(options => options.UseSqlite("Data Source=saga.db"));
 
-// Or with SQLite
-builder.Services.AddBareWireSaga<OrderSagaState>(
-    options => options.UseSqlite("Data Source=saga.db"));
+// State machine — BareWire.Saga
+builder.Services.AddBareWireSagaStateMachine<OrderSagaStateMachine, OrderSagaState>();
+
+// Host it on an endpoint (pass the state-machine type):
+rmq.ReceiveEndpoint("order-saga", e => e.StateMachineSaga<OrderSagaStateMachine>());
 ```
 
-> See: `samples/BareWire.Samples.SagaOrderFlow/Program.cs`
+> See [Saga State Machines](saga.md) for the full DSL, and
+> `samples/BareWire.Samples.SagaOrderFlow/Program.cs` for the complete setup.
 
 ## Transactional Outbox
 

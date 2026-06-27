@@ -67,7 +67,7 @@ manual by default — you declare exchanges, queues, and bindings explicitly:
 var builder = WebApplication.CreateBuilder(args);
 
 // Register JSON serializer (raw-first, no envelope)
-builder.AddBareWireJsonSerializer();
+builder.Services.AddBareWireJsonSerializer();
 
 // Configure BareWire with RabbitMQ in one call
 builder.Services.AddBareWireWithRabbitMq(transport =>
@@ -79,7 +79,7 @@ builder.Services.AddBareWireWithRabbitMq(transport =>
     {
         topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
         topology.DeclareQueue("messages", durable: true);
-        topology.BindExchangeToQueue("messages", "messages");
+        topology.BindExchangeToQueue("messages", "messages", routingKey: "");
     });
 
     // Register consumer on an endpoint

@@ -58,16 +58,17 @@ rmq.ReceiveEndpoint("xml-queue", e =>
 });
 ```
 
-The custom serializer must implement `IMessageSerializer`:
+The custom serializer must implement `IMessageSerializer`. Serialization is zero-copy — you write
+straight into the supplied `IBufferWriter<byte>` rather than returning a `byte[]`:
 
 ```csharp
 public sealed class CustomXmlSerializer : IMessageSerializer
 {
     public string ContentType => "application/xml";
 
-    public ReadOnlyMemory<byte> Serialize<T>(T message) where T : class
+    public void Serialize<T>(T message, IBufferWriter<byte> output) where T : class
     {
-        // Your serialization logic
+        // Write the serialized bytes directly into `output` — no intermediate byte[] allocation.
     }
 }
 ```

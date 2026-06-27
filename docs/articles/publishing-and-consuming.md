@@ -25,7 +25,7 @@ Use a fanout exchange so all bound queues receive every message:
 ```csharp
 topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
 topology.DeclareQueue("messages", durable: true);
-topology.BindExchangeToQueue("messages", "messages");
+topology.BindExchangeToQueue("messages", "messages", routingKey: "");
 ```
 
 > See: `samples/BareWire.Samples.BasicPublishConsume/Program.cs`
@@ -84,7 +84,7 @@ app.MapPost("/validate-order", async (
     IBus bus,
     CancellationToken ct) =>
 {
-    var client = bus.CreateRequestClient<ValidateOrder>();
+    var client = await bus.CreateRequestClientAsync<ValidateOrder>(ct);
 
     try
     {
@@ -335,7 +335,8 @@ The framework sets `EndpointName` automatically from `EndpointBinding.EndpointNa
 ## Routing to a Specific Exchange
 
 By default, every message published via `bus.PublishAsync<T>(...)` lands on the
-`DefaultExchange` configured in `UseRabbitMQ`. When different message types need
+`DefaultExchange` configured on the RabbitMQ transport (via `DefaultExchange(...)` in
+`AddBareWireRabbitMq` or the bundle). When different message types need
 to land on different exchanges without passing a `BW-Exchange` header on every
 call, use `MapExchange<T>(...)` symmetrically to the existing
 `MapRoutingKey<T>(...)`:

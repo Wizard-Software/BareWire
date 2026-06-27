@@ -11,11 +11,15 @@ first-class adapters for Kafka, Azure Service Bus, AWS SQS, and Google Pub/Sub.
 
 | Transport | Bundle package | Single-call registration | Highlights |
 |---|---|---|---|
-| RabbitMQ | `BareWire.RabbitMQ` | `AddBareWireWithRabbitMq` | Exchanges, queues, bindings, consistent-hash, single-active-consumer — covered across this site |
+| RabbitMQ | `BareWire.RabbitMQ` | `AddBareWireWithRabbitMq` | Exchanges, queues, bindings, consistent-hash, single-active-consumer, TLS/mTLS — [RabbitMQ Transport](transport-rabbitmq.md) |
 | Kafka | `BareWire.Kafka` | `AddBareWireWithKafka` | Idempotent producer, consumer groups, retry/DLQ topics — [Kafka Transport](transport-kafka.md) |
 | Azure Service Bus | `BareWire.AzureServiceBus` | `AddBareWireWithAzureServiceBus` | Sessions (per-session FIFO), scheduled messages, Entra ID + SAS — [Azure Service Bus Transport](transport-azure-service-bus.md) |
 | AWS SQS | `BareWire.AWS.SQS` | `AddBareWireWithSqs` | Batch producer, long-polling, FIFO, IAM auth, SSE, redrive DLQ — [AWS SQS Transport](transport-aws-sqs.md) |
 | Google Pub/Sub | `BareWire.Google.PubSub` | `AddBareWireWithPubSub` | Ordering keys, dead-letter topics — [Google Pub/Sub Transport](transport-google-pubsub.md) |
+
+> **Kafka maturity caveat.** The Kafka adapter currently defaults to `SecurityProtocol=Plaintext`
+> and SASL/SSL is not yet wired up — do not point it at a production broker until the secure-config
+> layer lands. See [Kafka Transport](transport-kafka.md) for details.
 
 ## Registering a transport
 

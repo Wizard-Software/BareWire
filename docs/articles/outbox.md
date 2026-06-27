@@ -1,6 +1,6 @@
 # Transactional Outbox
 
-The transactional outbox pattern ensures exactly-once message delivery by writing business data and outbox messages in a single database transaction.
+The transactional outbox pattern gives **effectively-once** delivery: business data and the outbox message are written in a single database transaction (no message is ever lost or published without its data), the dispatcher then delivers **at-least-once**, and consumer-side inbox deduplication suppresses the duplicates. (See the *Delivery guarantee* note under [Horizontal Scaling](#horizontal-scaling) and [Inbox Deduplication](inbox.md).)
 
 ## How It Works
 

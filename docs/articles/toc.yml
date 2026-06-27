@@ -35,6 +35,8 @@
 - name: Transports
   href: transports.md
   items:
+    - name: RabbitMQ
+      href: transport-rabbitmq.md
     - name: Kafka
       href: transport-kafka.md
     - name: Azure Service Bus
