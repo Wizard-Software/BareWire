@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
@@ -35,9 +36,20 @@ internal sealed partial class BareWireBus : IBus
     private readonly Channel<OutboundMessage> _outgoingChannel;
     private readonly CancellationTokenSource _publishCts = new();
     private readonly SemaphoreSlim _bytesSemaphore = new(0, 1);
+    private readonly TimeSpan _publisherRetryInitialDelay;
+    private readonly int _publisherMaxSendAttempts;
     private long _pendingBytes;
     private Task _publisherTask = Task.CompletedTask;
     private bool _disposed;
+
+    // Upper bound for the publisher-loop send retry backoff. The initial delay doubles per
+    // consecutive failure up to this cap so a sustained broker outage retries at a steady,
+    // non-hammering cadence rather than busy-looping.
+    private static readonly TimeSpan s_publisherRetryMaxDelay = TimeSpan.FromSeconds(30);
+
+    // Default maximum send attempts per batch before it is dropped and the loop advances. Bounds
+    // retries so a poison batch / sustained outage cannot wedge the bus indefinitely.
+    private const int DefaultPublisherMaxSendAttempts = 10;
 
     internal BareWireBus(
         ITransportAdapter? adapter,
@@ -49,7 +61,9 @@ internal sealed partial class BareWireBus : IBus
         IBareWireInstrumentation instrumentation,
         IRoutingKeyResolver? routingKeyResolver = null,
         IRequestClientFactory? requestClientFactory = null,
-        IExchangeResolver? exchangeResolver = null)
+        IExchangeResolver? exchangeResolver = null,
+        TimeSpan? publisherRetryInitialDelay = null,
+        int? publisherMaxSendAttempts = null)
     {
         // The adapter is intentionally nullable here (15.3 / C1): when no transport is registered,
         // construction must still succeed so that BareWireBusControl.StartAsync can raise the friendly
@@ -65,6 +79,18 @@ internal sealed partial class BareWireBus : IBus
         _routingKeyResolver = routingKeyResolver ?? new RoutingKeyResolver();
         _exchangeResolver = exchangeResolver ?? new ExchangeResolver();
         _requestClientFactory = requestClientFactory;
+
+        // Default to a 1s initial backoff in production; tests inject a tiny value for fast,
+        // deterministic retry assertions. A non-positive value is coerced to the default.
+        _publisherRetryInitialDelay = publisherRetryInitialDelay is { } d && d > TimeSpan.Zero
+            ? d
+            : TimeSpan.FromSeconds(1);
+
+        // Bound send retries per batch (>= 1). Tests inject a small value; a non-positive value is
+        // coerced to the default.
+        _publisherMaxSendAttempts = publisherMaxSendAttempts is { } maxAttempts && maxAttempts > 0
+            ? maxAttempts
+            : DefaultPublisherMaxSendAttempts;
 
         BusId = Guid.NewGuid();
 
@@ -282,7 +308,7 @@ internal sealed partial class BareWireBus : IBus
 
                 // Pass a snapshot so the adapter sees a stable collection even after the batch is cleared.
                 OutboundMessage[] snapshot = batch.ToArray();
-                await adapter.SendBatchAsync(snapshot, ct).ConfigureAwait(false);
+                await SendBatchWithRetryAsync(adapter, snapshot, ct).ConfigureAwait(false);
                 DecrementPendingBytes(snapshot);
                 batch.Clear();
             }
@@ -326,6 +352,84 @@ internal sealed partial class BareWireBus : IBus
             }
         }
     }
+
+    // Sends a batch, retrying TRANSIENT transport failures with bounded exponential backoff so a
+    // single transient failure cannot permanently kill the publisher loop. Two guards prevent one
+    // bad batch from wedging the whole bus (which a naive retry-everything-forever loop would do):
+    //   1. Deterministic failures (configuration / validation / serialization / unknown-payload)
+    //      cannot succeed on retry, so they are dropped on the first occurrence.
+    //   2. Otherwise retries are bounded by _publisherMaxSendAttempts; once exhausted the batch is
+    //      dropped (e.g. a sustained outage or a poison message that always throws a transport
+    //      exception, such as a missing SQS MessageGroupId or Pub/Sub ordering key).
+    // A dropped batch is logged at Error level (a clear failure signal — these messages are not
+    // delivered) and the loop ADVANCES so subsequent messages keep flowing. Callers always
+    // decrement pending-byte accounting afterwards (the bytes leave the channel whether the batch
+    // was sent or dropped), which also releases publish backpressure. The batch is retained across
+    // retries (no message is dropped while retrying). Cancellation (shutdown) propagates out as
+    // OperationCanceledException so the outer graceful-drain handler takes over.
+    private async Task SendBatchWithRetryAsync(
+        ITransportAdapter adapter,
+        OutboundMessage[] snapshot,
+        CancellationToken ct)
+    {
+        TimeSpan delay = _publisherRetryInitialDelay;
+        int attempt = 0;
+
+        while (true)
+        {
+            try
+            {
+                await adapter.SendBatchAsync(snapshot, ct).ConfigureAwait(false);
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Graceful shutdown — let the outer drain handler take over instead of retrying.
+                throw;
+            }
+            catch (Exception ex) when (IsNonRetryable(ex))
+            {
+                // Deterministic failure — retrying cannot help. Drop this batch (with a loud error)
+                // so one poison message cannot wedge the publisher loop forever.
+                LogPublisherBatchDropped(_logger, snapshot.Length, attempt + 1, ex);
+                return;
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+
+                if (attempt >= _publisherMaxSendAttempts)
+                {
+                    // Bounded retry exhausted (sustained outage or always-failing batch). Drop it
+                    // and advance so the bus keeps publishing other messages instead of stalling.
+                    LogPublisherBatchDropped(_logger, snapshot.Length, attempt, ex);
+                    return;
+                }
+
+                // Explicit handling: log and retry with backoff. The loop stays alive so a transient
+                // broker outage does not become a permanent publish outage.
+                LogPublisherSendRetry(_logger, attempt, delay.TotalMilliseconds, ex);
+
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+
+                delay = delay < s_publisherRetryMaxDelay
+                    ? TimeSpan.FromTicks(Math.Min(delay.Ticks * 2, s_publisherRetryMaxDelay.Ticks))
+                    : s_publisherRetryMaxDelay;
+            }
+        }
+    }
+
+    // Classifies deterministic, non-retryable failures: configuration/validation/serialization
+    // errors that will fail identically on every retry. These are dropped immediately rather than
+    // retried. Transport-level exceptions (including transient connection failures) are NOT listed
+    // here — they go through the bounded-retry path, since some are transient and the few that are
+    // deterministic (e.g. a missing SQS MessageGroupId) are still bounded by the retry cap.
+    private static bool IsNonRetryable(Exception ex) =>
+        ex is BareWireConfigurationException
+            or BareWireSerializationException
+            or UnknownPayloadException
+            or ArgumentException
+            or NotSupportedException;
 
     private void CheckPublishHealthAlert()
     {
@@ -411,6 +515,17 @@ internal sealed partial class BareWireBus : IBus
     [LoggerMessage(Level = LogLevel.Error,
         Message = "Publisher loop terminated with unexpected error.")]
     private static partial void LogPublisherLoopError(ILogger logger, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Publisher batch send failed (attempt {Attempt}); retrying after {DelayMs:F0} ms. " +
+                  "The batch is retained — no messages were dropped.")]
+    private static partial void LogPublisherSendRetry(ILogger logger, int attempt, double delayMs, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Publisher dropped a batch of {MessageCount} message(s) after {Attempts} attempt(s) — " +
+                  "the failure is non-retryable or the retry limit was exhausted. These messages were " +
+                  "NOT delivered; the publisher loop continues with subsequent messages.")]
+    private static partial void LogPublisherBatchDropped(ILogger logger, int messageCount, int attempts, Exception ex);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Error draining outgoing channel during shutdown.")]

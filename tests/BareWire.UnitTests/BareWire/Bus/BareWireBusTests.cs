@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Threading.Channels;
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
@@ -27,7 +28,9 @@ public sealed class BareWireBusTests
         CreateBus(
             int maxPendingPublishes = 1_000,
             BoundedChannelFullMode fullMode = BoundedChannelFullMode.Wait,
-            IRoutingKeyResolver? routingKeyResolver = null)
+            IRoutingKeyResolver? routingKeyResolver = null,
+            TimeSpan? publisherRetryInitialDelay = null,
+            int? publisherMaxSendAttempts = null)
     {
         ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
         adapter.TransportName.Returns("test");
@@ -66,7 +69,9 @@ public sealed class BareWireBusTests
             options,
             NullLogger<BareWireBus>.Instance,
             new NullInstrumentation(),
-            routingKeyResolver: routingKeyResolver);
+            routingKeyResolver: routingKeyResolver,
+            publisherRetryInitialDelay: publisherRetryInitialDelay,
+            publisherMaxSendAttempts: publisherMaxSendAttempts);
 
         return (bus, adapter, serializer);
     }
@@ -136,6 +141,196 @@ public sealed class BareWireBusTests
         await thirdWrite.Should().NotThrowAsync();
 
         await bus.DisposeAsync();
+    }
+
+    // ── Publisher loop resilience ─────────────────────────────────────────────
+    // A single transient transport failure must NOT permanently kill the background
+    // publisher loop: the failed batch is retried with backoff and the message is still
+    // delivered once the transport recovers (otherwise a transient broker outage becomes
+    // a permanent publish outage, surfaced only at DisposeAsync).
+
+    [Fact]
+    public async Task PublisherLoop_WhenSendThrowsTransientlyOnce_RetriesAndDelivers()
+    {
+        // Arrange — adapter throws on the first send (simulating a transient broker outage),
+        // then succeeds on the retry. Capture successful deliveries under a lock.
+        var delivered = new List<OutboundMessage>();
+        var gate = new object();
+        int callCount = 0;
+
+        var (bus, adapter, _) = CreateBus(publisherRetryInitialDelay: TimeSpan.FromMilliseconds(20));
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                int n = Interlocked.Increment(ref callCount);
+                if (n == 1)
+                {
+                    throw new BareWireTransportException(
+                        message: "transient outage",
+                        transportName: "test",
+                        endpointAddress: null);
+                }
+
+                var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                lock (gate)
+                {
+                    delivered.AddRange(messages);
+                }
+
+                return Task.FromResult<IReadOnlyList<SendResult>>(
+                    messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+            });
+        bus.StartPublishing();
+
+        // Act — publish a single message; the first send attempt faults, the retry must succeed.
+        await bus.PublishAsync(new BusTestMessage("survives-transient-failure"), CancellationToken.None);
+
+        // Assert — poll for delivery. With the bug (loop dies on the first throw) this never completes
+        // and the test fails at the deadline; with the retry fix the message arrives after backoff.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (gate)
+            {
+                if (delivered.Count > 0)
+                    break;
+            }
+
+            await Task.Delay(20);
+        }
+
+        lock (gate)
+        {
+            delivered.Should().HaveCount(1,
+                because: "a single transient send failure must not permanently kill the publisher loop; " +
+                         "the batch is retried with backoff and the message is still delivered");
+        }
+
+        await bus.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PublisherLoop_WhenBatchFailsNonRetryably_DropsItAndKeepsDelivering()
+    {
+        // Arrange — the adapter throws a deterministic, non-retryable exception for any batch that
+        // contains a "poison" message; healthy batches succeed.
+        var delivered = new List<OutboundMessage>();
+        var gate = new object();
+
+        var (bus, adapter, _) = CreateBus(publisherRetryInitialDelay: TimeSpan.FromMilliseconds(20));
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                if (messages.Any(m => m.Headers.ContainsKey("x-poison")))
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: "x-poison",
+                        optionValue: "bad",
+                        expectedValue: "a deterministic configuration error that can never succeed on retry");
+                }
+
+                lock (gate)
+                {
+                    delivered.AddRange(messages);
+                }
+
+                return Task.FromResult<IReadOnlyList<SendResult>>(
+                    messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+            });
+        bus.StartPublishing();
+
+        // Act — publish a poison message first; give the loop time to pick it up and drop it,
+        // then publish a healthy message as a separate batch.
+        await bus.PublishAsync(new BusTestMessage("poison"),
+            new Dictionary<string, string> { ["x-poison"] = "1" }, CancellationToken.None);
+        await Task.Delay(100);
+        await bus.PublishAsync(new BusTestMessage("good"), CancellationToken.None);
+
+        // Assert — with the bug (retry every exception forever) the loop wedges on the poison batch
+        // and "good" never arrives; with the fix the poison batch is dropped and the loop advances.
+        await WaitForDeliveryAsync(delivered, gate);
+
+        lock (gate)
+        {
+            delivered.Should().HaveCount(1,
+                because: "a non-retryable batch must be dropped so the publisher loop keeps delivering");
+            delivered.Should().NotContain(m => m.Headers.ContainsKey("x-poison"),
+                "the poison batch must not be delivered");
+        }
+
+        await bus.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PublisherLoop_WhenSendFailsPersistently_StopsRetryingAndAdvances()
+    {
+        // Arrange — the adapter throws a transport exception that NEVER recovers for poison batches
+        // (e.g. a missing SQS MessageGroupId / Pub-Sub ordering key). Bounded retries must give up.
+        var delivered = new List<OutboundMessage>();
+        var gate = new object();
+
+        var (bus, adapter, _) = CreateBus(
+            publisherRetryInitialDelay: TimeSpan.FromMilliseconds(5),
+            publisherMaxSendAttempts: 3);
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                if (messages.Any(m => m.Headers.ContainsKey("x-poison")))
+                {
+                    throw new BareWireTransportException("always fails", "test", endpointAddress: null);
+                }
+
+                lock (gate)
+                {
+                    delivered.AddRange(messages);
+                }
+
+                return Task.FromResult<IReadOnlyList<SendResult>>(
+                    messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+            });
+        bus.StartPublishing();
+
+        // Act
+        await bus.PublishAsync(new BusTestMessage("poison"),
+            new Dictionary<string, string> { ["x-poison"] = "1" }, CancellationToken.None);
+        await Task.Delay(150); // allow the 3 bounded attempts to exhaust and the batch to be dropped
+        await bus.PublishAsync(new BusTestMessage("good"), CancellationToken.None);
+
+        // Assert — with the bug (unbounded retry) the loop wedges forever; with the fix the bounded
+        // retries are exhausted, the batch is dropped, and the loop advances to deliver "good".
+        await WaitForDeliveryAsync(delivered, gate);
+
+        lock (gate)
+        {
+            delivered.Should().HaveCount(1,
+                because: "after bounded retries are exhausted the poison batch is dropped and the loop advances");
+        }
+
+        await bus.DisposeAsync();
+    }
+
+    private static async Task WaitForDeliveryAsync(
+        List<OutboundMessage> delivered, object gate, int expected = 1, int timeoutMs = 5000)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (gate)
+            {
+                if (delivered.Count >= expected)
+                    return;
+            }
+
+            await Task.Delay(20);
+        }
     }
 
     // ── PublishRawAsync ───────────────────────────────────────────────────────
