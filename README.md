@@ -19,11 +19,22 @@ An alternative to MassTransit with a fundamentally different architecture: **raw
 | `BareWire.Abstractions` | Public interfaces, zero dependencies |
 | `BareWire` | Core engine, pipeline, bus implementation |
 | `BareWire.Serialization.Json` | JSON serializer (System.Text.Json) |
+| `BareWire.Serialization.MsgPack` | MessagePack serializer (compact binary) |
+| `BareWire.CloudEvents` | CloudEvents 1.0 envelope (binary + structured) |
 | `BareWire.Transport.RabbitMQ` | RabbitMQ transport |
+| `BareWire.Transport.Kafka` | Kafka transport |
+| `BareWire.Transport.AzureServiceBus` | Azure Service Bus transport |
+| `BareWire.Transport.AWS.SQS` | AWS SQS transport |
+| `BareWire.Transport.Google.PubSub` | Google Pub/Sub transport |
 | `BareWire.Saga` | SAGA state machine |
+| `BareWire.Saga.Redis` | Redis SAGA persistence |
 | `BareWire.Outbox` | Outbox/Inbox pattern |
 | `BareWire.Observability` | OpenTelemetry integration |
 | `BareWire.Testing` | In-memory test harness |
+
+> Each transport also ships a single-call **bundle** package — `BareWire.RabbitMQ`, `BareWire.Kafka`,
+> `BareWire.AzureServiceBus`, `BareWire.AWS.SQS`, `BareWire.Google.PubSub` — that registers the core and
+> the transport in one `AddBareWireWith{Transport}` call.
 
 ## Build & Test
 
@@ -53,8 +64,8 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Publish
 - **PublishTyped** — **~544 B fixed overhead + serialized payload size**. The serialization boundary copy (`.ToArray()` in `MessagePipeline.ProcessOutboundAsync`) is architecturally required — `OutboundMessage` must outlive the pooled writer scope.
 - **Serialization (raw)** — constant **448 B** regardless of payload size. `PooledBufferWriter` rents from `ArrayPool<byte>.Shared`, confirming ADR-003 zero-copy pipeline.
 
-Full report: [doc/benchmark-report.md](doc/benchmark-report.md)
+Full report: [docs/articles/benchmark-report.md](docs/articles/benchmark-report.md)
 
 ## License
 
-Proprietary. All rights reserved.
+MIT. See [LICENSE](LICENSE).

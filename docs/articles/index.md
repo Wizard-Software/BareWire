@@ -5,21 +5,29 @@ Welcome to the BareWire documentation. BareWire is a high-performance async mess
 ## Table of Contents
 
 1. [Getting Started](getting-started.md) — installation, first publisher and consumer
-2. [Configuration](configuration.md) — bus setup, RabbitMQ transport, DI registration
+2. [Configuration](configuration.md) — bus setup, transport registration, DI
 3. [Publishing and Consuming](publishing-and-consuming.md) — publish/subscribe, request-response, raw messages
 4. [Topology](topology.md) — exchanges, queues, bindings, routing keys
 5. [Consumer Routing Keys](consumer-routing-keys.md) — multiple consumers on one queue selected by routing-key pattern, type-less interop
 6. [Per-Key Consumer Ordering](per-key-ordering.md) — ordered consumption per key across competing consumers
 7. [Flow Control and Backpressure](flow-control.md) — credit-based flow control, publish-side backpressure
 8. [Retry and Dead Letter Queues](retry-and-dlq.md) — retry policies, DLX routing, DLQ consumers
-9. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
-10. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
-11. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
-12. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
-13. [MassTransit Interop](masstransit-interop.md) — consuming and publishing MassTransit envelope messages; bus-global, per-endpoint, and per-consumer (`UseMassTransitEnvelope()`) opt-in
-14. [Observability](observability.md) — OpenTelemetry, metrics, health checks
-15. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
-16. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
+9. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
+10. [MessagePack Serialization](serialization-messagepack.md) — compact binary serialization with content-type routing
+11. [CloudEvents](cloudevents.md) — binary and structured CloudEvents 1.0 envelopes
+12. [Saga State Machines](saga.md) — state machines, compensable activities, scheduled timeouts
+13. [Redis Saga Persistence](saga-redis.md) — Redis-backed saga repository with optimistic concurrency
+14. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
+15. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
+16. [Observability](observability.md) — OpenTelemetry, metrics, health checks
+17. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
+18. [Transports](transports.md) — transport-agnostic core; choosing and registering an adapter
+    - [Kafka Transport](transport-kafka.md) — idempotent producer, consumer groups, retry/DLQ topics
+    - [Azure Service Bus Transport](transport-azure-service-bus.md) — sessions, scheduled messages, Entra ID + SAS
+    - [AWS SQS Transport](transport-aws-sqs.md) — batch producer, long-polling, FIFO, IAM, SSE, redrive DLQ
+    - [Google Pub/Sub Transport](transport-google-pubsub.md) — ordering keys, dead-letter topics
+19. [MassTransit Interop](masstransit-interop.md) — consuming and publishing MassTransit envelope messages; bus-global, per-endpoint, and per-consumer (`UseMassTransitEnvelope()`) opt-in
+20. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
 
 ## Allocation Characteristics
 

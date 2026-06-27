@@ -145,31 +145,28 @@ is byte-identical (non-breaking), and the reply path and correlation are
 unchanged.
 
 ```csharp
-services.AddBareWire(cfg =>
+services.AddBareWireWithRabbitMq(transport =>
 {
-    cfg.UseRabbitMQ(rmq =>
+    transport.Host("amqp://localhost");
+
+    // Manual topology: per-type fanout exchange + responder queue bindings.
+    // The exchange name follows the MassTransit convention: a literal colon
+    // between namespace and type name — "Namespace:TypeName".
+    transport.ConfigureTopology(t =>
     {
-        rmq.Host("amqp://localhost");
+        t.DeclareExchange("OrderSystem.Contracts:CheckOrderStatus",
+            ExchangeType.Fanout, durable: true, autoDelete: false);
 
-        // Manual topology: per-type fanout exchange + responder queue bindings.
-        // The exchange name follows the MassTransit convention: a literal colon
-        // between namespace and type name — "Namespace:TypeName".
-        rmq.ConfigureTopology(t =>
-        {
-            t.DeclareExchange("OrderSystem.Contracts:CheckOrderStatus",
-                ExchangeType.Fanout, durable: true, autoDelete: false);
-
-            // Two competing responder queues (e.g. v1 and v2) bound to the
-            // same exchange (fanout ignores the routing key):
-            t.DeclareQueue("order-status-v1", durable: true);
-            t.DeclareQueue("order-status-v2", durable: true);
-            t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v1", routingKey: "");
-            t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v2", routingKey: "");
-        });
-
-        // Enable publish-style for the request type (read at CreateRequestClientAsync<T>).
-        rmq.PublishRequest<CheckOrderStatus>();
+        // Two competing responder queues (e.g. v1 and v2) bound to the
+        // same exchange (fanout ignores the routing key):
+        t.DeclareQueue("order-status-v1", durable: true);
+        t.DeclareQueue("order-status-v2", durable: true);
+        t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v1", routingKey: "");
+        t.BindExchangeToQueue("OrderSystem.Contracts:CheckOrderStatus", "order-status-v2", routingKey: "");
     });
+
+    // Enable publish-style for the request type (read at CreateRequestClientAsync<T>).
+    transport.PublishRequest<CheckOrderStatus>();
 });
 
 // The requester is unchanged — it never knows the responder queue name, only the

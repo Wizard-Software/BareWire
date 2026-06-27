@@ -16,8 +16,14 @@
   href: retry-and-dlq.md
 - name: Custom Serializers
   href: custom-serializers.md
+- name: MessagePack Serialization
+  href: serialization-messagepack.md
+- name: CloudEvents
+  href: cloudevents.md
 - name: Saga
   href: saga.md
+- name: Redis Saga Persistence
+  href: saga-redis.md
 - name: Outbox
   href: outbox.md
 - name: Inbox
@@ -26,6 +32,17 @@
   href: observability.md
 - name: Aspire Integration
   href: aspire-integration.md
+- name: Transports
+  href: transports.md
+  items:
+    - name: Kafka
+      href: transport-kafka.md
+    - name: Azure Service Bus
+      href: transport-azure-service-bus.md
+    - name: AWS SQS
+      href: transport-aws-sqs.md
+    - name: Google Pub/Sub
+      href: transport-google-pubsub.md
 - name: MassTransit Interop
   href: masstransit-interop.md
 - name: Advanced Patterns
