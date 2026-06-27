@@ -111,12 +111,13 @@ internal static class ConsumerInvokerFactory
             body,
             publishEndpoint, sendEndpointProvider, cancellationToken);
 
-        // When the deserializer can read inbound MT request routing metadata, extract it once
-        // and thread it through the context so RespondAsync can route the reply correctly
-        // (echo requestId, send to responseAddress). Gate on content-type to avoid unnecessary
-        // work on raw-first messages (PERF-2 / ADR-003).
-        if (deserializer is IRequestEnvelopeRouteReader routeReader &&
-            string.Equals(contentType, "application/vnd.masstransit+json", StringComparison.OrdinalIgnoreCase))
+        // When the per-consumer resolver selected an MT-capable deserializer (IRequestEnvelopeRouteReader),
+        // extract routing metadata and thread it through the context so RespondAsync can route the
+        // reply correctly (echo requestId, send to responseAddress). The gate is on the deserializer
+        // capability — not on the content-type header — because ReceiveEndpointRunner.ResolverFor(i)
+        // already encodes the per-consumer UseMassTransitEnvelope flag (D4 precedence). Raw-first
+        // stays free of overhead: the `is` test is false for JSON/MsgPack deserializers (ADR-003).
+        if (deserializer is IRequestEnvelopeRouteReader routeReader)
         {
             await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
             IResponseEnvelopeWriter? responseWriter = scope.ServiceProvider
@@ -166,10 +167,11 @@ internal static class ConsumerInvokerFactory
             body,
             publishEndpoint, sendEndpointProvider, deserializer, cancellationToken);
 
-        // Apply the same MT routing wiring as the typed path: gate on content-type to keep the
-        // raw-first path free from overhead (PERF-2 / ADR-003).
-        if (deserializer is IRequestEnvelopeRouteReader routeReader &&
-            string.Equals(contentType, "application/vnd.masstransit+json", StringComparison.OrdinalIgnoreCase))
+        // Apply the same MT routing wiring as the typed path: gate on the deserializer capability
+        // (IRequestEnvelopeRouteReader), not the content-type header, so that the per-consumer
+        // UseMassTransitEnvelope flag (D4 precedence via ResolverFor) drives the reply path.
+        // Raw-first stays free of overhead: the `is` test is false for JSON/MsgPack (ADR-003).
+        if (deserializer is IRequestEnvelopeRouteReader routeReader)
         {
             await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
             IResponseEnvelopeWriter? responseWriter = scope.ServiceProvider
