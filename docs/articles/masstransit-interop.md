@@ -214,7 +214,7 @@ services.AddMassTransitEnvelopeSerializer(); // registers MassTransitEnvelopeSer
 services.AddBareWireRabbitMq(rmq =>
 {
     rmq.Host("amqp://guest:guest@localhost:5672/");
-    rmq.ConfigureTopology(topo => topo.Exchange("mt-orders").Fanout().Durable());
+    rmq.ConfigureTopology(topo => topo.DeclareExchange("mt-orders", ExchangeType.Fanout, durable: true));
     rmq.DefaultExchange("mt-orders");
     // No ReceiveEndpoint — publish-only bridge
 });
@@ -236,6 +236,58 @@ await bus.PublishAsync(new PaymentRequested(...), ct);
 The mapping is bus-global and transport-agnostic: it applies to both `IBus.PublishAsync<T>()` and `ISendEndpoint.SendAsync<T>()`, regardless of which transport is configured.
 
 Unmapped types always fall back to the default `IMessageSerializer` — the raw-first guarantee is preserved.
+
+### Per-type routing to MassTransit (own exchange / routing key)
+
+The MassTransit envelope is the *format*; **where** a bridged message lands is a separate, also
+per-type, decision. The two compose — both keyed on the message type — so you can define, per type,
+a "MassTransit producer" that writes the envelope **and** targets that type's own exchange and
+routing key. MassTransit binds consumers to an exchange named after the message type
+(`Namespace:TypeName`), so per-type routing is what makes a real MassTransit peer receive the
+message.
+
+```csharp
+services.AddBareWireJsonSerializer();
+services.AddMassTransitEnvelopeSerializer();
+
+services.AddBareWireRabbitMq(rmq =>
+{
+    rmq.Host("amqp://guest:guest@localhost:5672/");
+
+    rmq.ConfigureTopology(t =>
+    {
+        // One exchange per MassTransit-bound type (MT convention: Namespace:TypeName).
+        t.DeclareExchange("OrderSystem.Contracts:OrderCreated", ExchangeType.Fanout, durable: true);
+        t.DeclareExchange("OrderSystem.Contracts:PaymentRequested", ExchangeType.Topic, durable: true);
+    });
+
+    // Routing per type — each MT-bound type to its own exchange (and routing key where it matters).
+    rmq.Publish<OrderCreated>(p => p.Exchange("OrderSystem.Contracts:OrderCreated"));
+    rmq.Publish<PaymentRequested>(p =>
+    {
+        p.Exchange("OrderSystem.Contracts:PaymentRequested");
+        p.RoutingKey("payment.requested");
+    });
+});
+
+services.AddBareWire(bus =>
+{
+    // Format per type — only these two go out as a MassTransit envelope; everything else stays raw JSON.
+    bus.MapSerializer<OrderCreated, MassTransitEnvelopeSerializer>();
+    bus.MapSerializer<PaymentRequested, MassTransitEnvelopeSerializer>();
+});
+
+// Each type now carries the MassTransit envelope AND lands on its own exchange/routing key:
+await bus.PublishAsync(new OrderCreated(...), ct);       // → OrderSystem.Contracts:OrderCreated, MT envelope
+await bus.PublishAsync(new PaymentRequested(...), ct);   // → OrderSystem.Contracts:PaymentRequested / payment.requested, MT envelope
+await bus.PublishAsync(new InternalAuditLogged(...), ct); // → DefaultExchange, raw JSON (unaffected)
+```
+
+`MapSerializer<T, …>` (format) lives on the **bus** configurator; `Publish<T>` / `MapExchange<T>` /
+`MapRoutingKey<T>` (routing) live on the **RabbitMQ** configurator. They are orthogonal and both
+opt-in per type — a type with neither stays raw-first on the default exchange. See
+[Publishing and Consuming](publishing-and-consuming.md#ergonomic-per-type-send-mapping) for the full
+per-type send-routing reference.
 
 ### Security and thread-safety note
 
