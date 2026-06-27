@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-06-27
+
+### Added
+
+- Single-call transport bundle packages (`AddBareWireWithRabbitMq`/`Kafka`/`AzureServiceBus`/`AwsSqs`/`GooglePubSub`) for one-line registration
+- Ergonomic per-type send mapping: generic `DeclareExchange<T>` and grouped `Publish<T>` block (`IPublishConfigurator<T>`)
+- Publish-style request/response (`PublishRequest<T>`) with per-type fanout routing, fail-fast exchange-mapping validation, and first-in-wins reply handling
+- Consume-time routing-key dispatch: multi-consumer routing, topic wildcards, most-specific-wins matching, and type-less raw-first interop via `AcceptUntyped()` (secure-by-default)
+- Per-consumer MassTransit envelope opt-in (`UseMassTransitEnvelope()`) with per-consumer deserializer selection and reply-envelope emission from `RespondAsync`
+- Per-key message ordering: `OrderedBy`/`OrderedByHeader` API, `ExchangeType.ConsistentHash`, RabbitMQ single-active-consumer affinity, bounded per-lane depth, and per-key poison handling (park/DLQ)
+- Optional per-key head-of-line ordering for the EF Core outbox (`OrderingMode.PerKey`, default OFF)
+- Zero-allocation `TopicPatternMatcher` with an internal `ITopicMatcher` seam
+- Showcase samples (`ConsumerRoutingKeys`, `OrderedConsumers`, `CompetingResponders`, mixed-consumer MassTransit demo), each with E2E smoke tests
+
+### Changed
+
+- Transport registration: `Use{Transport}` methods are now `[Obsolete]` no-ops, superseded by the `AddBareWireWith{Transport}` bundles
+- Outbox retry releases nacked rows immediately for low-latency retry
+- Improved startup diagnostics: advisories for envelope opt-in with `AcceptUntyped`, type-less trust-boundary without schema validation, and divergent double-write detection
+- Improved ordering-key secrecy: keys are kept out of exception text, logs, and metrics (hashed token)
+
+### Deprecated
+
+- `AddPartitionerMiddleware` is deprecated in favor of `OrderedByHeader`
+
+### Fixed
+
+- Duplicate delivery under horizontal scaling — `EfCoreOutboxStore` now claims rows per-instance (#24)
+
+### Documentation
+
+- Documented per-consumer MassTransit envelope, consume-time routing keys, ergonomic per-type send mapping, publish-style request/response, single-call registration, per-key ordering, and the README-per-package requirement
+
 ## [1.5.1] - 2026-06-23
 
 ### Fixed
