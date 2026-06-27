@@ -16,7 +16,7 @@ Welcome to the BareWire documentation. BareWire is a high-performance async mess
 10. [Transactional Outbox](outbox.md) — exactly-once delivery via transactional outbox
 11. [Inbox Deduplication](inbox.md) — preventing duplicate message processing
 12. [Custom Serializers](custom-serializers.md) — per-endpoint serializer and deserializer overrides
-13. [MassTransit Interop](masstransit-interop.md) — consuming MassTransit envelope messages
+13. [MassTransit Interop](masstransit-interop.md) — consuming and publishing MassTransit envelope messages; bus-global, per-endpoint, and per-consumer (`UseMassTransitEnvelope()`) opt-in
 14. [Observability](observability.md) — OpenTelemetry, metrics, health checks
 15. [Advanced Patterns](advanced-patterns.md) — partitioning, multi-consumer endpoints, raw interop
 16. [Aspire Integration](aspire-integration.md) — orchestrating BareWire apps with .NET Aspire
