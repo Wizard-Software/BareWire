@@ -1,5 +1,7 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
@@ -653,5 +655,100 @@ public sealed class BareWireBusControlTests
         // If construction succeeded, the default [] was applied — verify health check works.
         BusHealthStatus health = control.CheckHealth();
         health.Should().NotBeNull();
+    }
+
+    // ── MT envelope startup validation (task 18.5) ───────────────────────────
+
+    /// <summary>
+    /// When a consumer opts into <c>UseMassTransitEnvelope()</c> but
+    /// <c>AddMassTransitEnvelopeDeserializer()</c> has not been called, the global
+    /// <see cref="IDeserializerResolver"/> cannot return the MT deserializer. StartAsync must
+    /// detect this mismatch at startup (fail-closed / SEC-1) and throw
+    /// <see cref="BareWireConfigurationException"/> BEFORE accepting any messages.
+    /// </summary>
+    [Fact]
+    public async Task StartAsync_ConsumerWithUseMassTransitEnvelopeButNoInteropDeserializer_ThrowsBareWireConfigurationException()
+    {
+        // Arrange — endpoint with a consumer that opted into MT envelope.
+        EndpointBinding binding = new()
+        {
+            EndpointName = "mt-validation-queue",
+            PrefetchCount = 1,
+            // Reuse existing public types from the routing-key test module (same namespace).
+            Consumers = [new ConsumerRegistration(typeof(RegionEuConsumer), typeof(TransferInitiated),
+                UseMassTransitEnvelope: true)],
+            RawConsumers = [],
+        };
+
+        // Global resolver returns a non-MT deserializer (simulates missing AddMassTransitEnvelopeDeserializer()).
+        IMessageDeserializer nonMtDeserializer = Substitute.For<IMessageDeserializer>();
+        nonMtDeserializer.ContentType.Returns("application/json"); // NOT application/vnd.masstransit+json
+        IDeserializerResolver nonMtResolver = Substitute.For<IDeserializerResolver>();
+        nonMtResolver.Resolve(Arg.Any<string?>()).Returns(nonMtDeserializer);
+
+        BareWireBusControl control = CreateControlForMtStartupValidation([binding], nonMtResolver);
+
+        // Act & Assert — StartAsync must throw before accepting any messages.
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Creates a <see cref="BareWireBusControl"/> pre-configured with the supplied endpoint bindings
+    /// and deserializer resolver. Used by the MT envelope startup-validation test; avoids duplicating
+    /// the full <see cref="BareWireBus"/> wiring in each test case.
+    /// </summary>
+    private static BareWireBusControl CreateControlForMtStartupValidation(
+        IReadOnlyList<EndpointBinding> endpointBindings,
+        IDeserializerResolver deserializerResolver)
+    {
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
+        adapter.TransportName.Returns("test");
+        adapter.DeployTopologyAsync(Arg.Any<TopologyDeclaration>(), Arg.Any<CancellationToken>())
+               .Returns(Task.CompletedTask);
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo =>
+               {
+                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+                   return Task.FromResult<IReadOnlyList<SendResult>>(
+                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
+               });
+
+        IMessageSerializer serializer = Substitute.For<IMessageSerializer>();
+        serializer.ContentType.Returns("application/json");
+
+        MiddlewareChain chain = new([]);
+        FlowController flowController = new(NullLogger<FlowController>.Instance);
+        MessagePipeline pipeline = new(chain, deserializerResolver, NullLogger<MessagePipeline>.Instance, new NullInstrumentation());
+
+        BareWireBus bus = new(
+            adapter,
+            new DefaultSerializerResolver(serializer),
+            pipeline,
+            flowController,
+            new PublishFlowControlOptions(),
+            NullLogger<BareWireBus>.Instance,
+            new NullInstrumentation());
+
+        BusConfigurator configurator = new();
+        configurator.HasInMemoryTransport = true;
+
+        return new BareWireBusControl(
+            bus,
+            adapter,
+            flowController,
+            configurator,
+            NullLogger<BareWireBusControl>.Instance,
+            topology: null,
+            endpointBindings: endpointBindings,
+            deserializerResolver: deserializerResolver,
+            scopeFactory: Substitute.For<IServiceScopeFactory>(),
+            instrumentation: new NullInstrumentation(),
+            loggerFactory: NullLoggerFactory.Instance,
+            sagaDispatchers: []);
     }
 }

@@ -111,8 +111,9 @@ public abstract class ConsumeContext : IPublishEndpoint, ISendEndpointProvider
 
     /// <summary>
     /// Gets or sets the inbound request routing metadata extracted from an MT envelope.
-    /// Set by <c>ConsumerInvokerFactory</c> in BareWire core when the deserializer implements
-    /// <see cref="IRequestEnvelopeRouteReader"/> and the content-type is the MT JSON envelope.
+    /// Set by <c>ConsumerInvokerFactory</c> in BareWire core when the resolved deserializer
+    /// implements <see cref="IRequestEnvelopeRouteReader"/> (selected per-consumer via the D4
+    /// precedence) and the inbound envelope yields routing metadata.
     /// <see langword="null"/> for non-MT messages.
     /// </summary>
     internal RequestEnvelopeContext? InboundRequestContext { get; set; }
@@ -120,7 +121,9 @@ public abstract class ConsumeContext : IPublishEndpoint, ISendEndpointProvider
     /// <summary>
     /// Gets or sets the response envelope writer used to serialize the reply envelope when
     /// handling an MT request. Set by <c>ConsumerInvokerFactory</c> alongside
-    /// <see cref="InboundRequestContext"/>. <see langword="null"/> for non-MT messages.
+    /// <see cref="InboundRequestContext"/> when the resolved deserializer implements
+    /// <see cref="IRequestEnvelopeRouteReader"/> (selected per-consumer via the D4 precedence).
+    /// <see langword="null"/> for non-MT messages.
     /// </summary>
     internal IResponseEnvelopeWriter? ResponseEnvelopeWriter { get; set; }
 

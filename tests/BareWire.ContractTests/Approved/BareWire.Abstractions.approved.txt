@@ -193,11 +193,12 @@ namespace BareWire.Abstractions.Configuration
     }
     public sealed class ConsumerRegistration : System.IEquatable<BareWire.Abstractions.Configuration.ConsumerRegistration>
     {
-        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType, System.Collections.Generic.IReadOnlyList<string>? RoutingKeys = null, bool AcceptUntyped = false) { }
+        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType, System.Collections.Generic.IReadOnlyList<string>? RoutingKeys = null, bool AcceptUntyped = false, bool UseMassTransitEnvelope = false) { }
         public bool AcceptUntyped { get; init; }
         public System.Type ConsumerType { get; init; }
         public System.Type MessageType { get; init; }
         public System.Collections.Generic.IReadOnlyList<string>? RoutingKeys { get; init; }
+        public bool UseMassTransitEnvelope { get; init; }
     }
     public sealed class EndpointBinding
     {
@@ -237,6 +238,7 @@ namespace BareWire.Abstractions.Configuration
         void AcceptUntyped();
         void RoutingKey(string routingKey);
         void RoutingKeys(params string[] routingKeys);
+        void UseMassTransitEnvelope();
     }
     public interface IConsumerOrderingConfiguration
     {

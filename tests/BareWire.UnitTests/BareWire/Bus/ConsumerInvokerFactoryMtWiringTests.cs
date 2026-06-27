@@ -11,9 +11,9 @@ namespace BareWire.UnitTests.Core.Bus;
 
 /// <summary>
 /// Tests for the MassTransit request routing wiring in <see cref="ConsumerInvokerFactory"/>:
-/// when the resolved deserializer implements <see cref="IRequestEnvelopeRouteReader"/> and the
-/// content-type is <c>application/vnd.masstransit+json</c>, the invoker must set
-/// <see cref="ConsumeContext.InboundRequestContext"/> and <see cref="ConsumeContext.ResponseEnvelopeWriter"/>
+/// when the resolved deserializer implements <see cref="IRequestEnvelopeRouteReader"/> (selected
+/// per-consumer via the D4 precedence, independent of the inbound content-type header), the invoker
+/// must set <see cref="ConsumeContext.InboundRequestContext"/> and <see cref="ConsumeContext.ResponseEnvelopeWriter"/>
 /// on the context passed to the consumer.
 /// </summary>
 public sealed class ConsumerInvokerFactoryMtWiringTests
@@ -217,5 +217,72 @@ public sealed class ConsumerInvokerFactoryMtWiringTests
         // Assert — no routing set when read returns false
         consumer.LastContext!.InboundRequestContext.Should().BeNull();
         consumer.LastContext.ResponseEnvelopeWriter.Should().BeNull();
+    }
+
+    // ── Flag-driven wiring: gate on deserializer capability, not on content-type header ──
+
+    [Fact]
+    public async Task InvokeTypedConsumer_WhenRouteReaderSelectedAndNoMtContentTypeHeader_SetsInboundRequestContext()
+    {
+        // Arrange — resolver returns an MT-capable (route-reader) deserializer, but headers carry
+        // no content-type key. The wiring gate must be driven by the per-consumer deserializer
+        // selection (D4 precedence), not by the header value.
+        var requestId = Guid.NewGuid();
+        const string responseAddress = "rabbitmq://localhost/reply-no-header";
+        var routing = new RequestEnvelopeContext(responseAddress, null, null, requestId, null, null);
+
+        IResponseEnvelopeWriter writer = BuildCapturingWriter();
+        var (scopeFactory, consumer) = BuildScopeFactoryWithMtWriter(writer);
+        IDeserializerResolver resolver = BuildMtDeserializerResolver(routing);
+
+        ConsumerInvokerFactory.InvokerDelegate invoker =
+            ConsumerInvokerFactory.Create(typeof(CapturingTypedConsumer), typeof(InvokerTestMessage));
+
+        // Headers deliberately contain no content-type — simulates a producer that omits the header.
+        var headers = new Dictionary<string, string>();
+        ReadOnlySequence<byte> body = BuildMtRequestEnvelopeBody(requestId, responseAddress);
+
+        // Act
+        await invoker(scopeFactory, body, headers, Guid.NewGuid().ToString(),
+            Substitute.For<IPublishEndpoint>(), Substitute.For<ISendEndpointProvider>(),
+            resolver, "test-ep", CancellationToken.None);
+
+        // Assert — wiring must be set because the per-consumer resolver returned a route-reader.
+        consumer.LastContext.Should().NotBeNull();
+        consumer.LastContext!.InboundRequestContext.Should().NotBeNull();
+        consumer.LastContext.InboundRequestContext!.Value.RequestId.Should().Be(requestId);
+    }
+
+    [Fact]
+    public async Task InvokeTypedConsumer_WhenRouteReaderSelectedAndPlainContentTypeHeader_SetsResponseEnvelopeWriter()
+    {
+        // Arrange — resolver returns the MT-capable (route-reader) deserializer even though the
+        // inbound content-type header says "application/json" (per-consumer D4 selection overrides).
+        var requestId = Guid.NewGuid();
+        const string responseAddress = "rabbitmq://localhost/reply-mismatched-header";
+        var routing = new RequestEnvelopeContext(responseAddress, null, null, requestId, null, null);
+
+        IResponseEnvelopeWriter writer = BuildCapturingWriter();
+        var (scopeFactory, consumer) = BuildScopeFactoryWithMtWriter(writer);
+        IDeserializerResolver resolver = BuildMtDeserializerResolver(routing);
+
+        ConsumerInvokerFactory.InvokerDelegate invoker =
+            ConsumerInvokerFactory.Create(typeof(CapturingTypedConsumer), typeof(InvokerTestMessage));
+
+        // Mismatched header: content-type says plain JSON, but the resolver was pre-configured to
+        // return the MT deserializer (simulating per-consumer UseMassTransitEnvelope opt-in).
+        var headers = new Dictionary<string, string>
+        {
+            ["content-type"] = "application/json",
+        };
+        ReadOnlySequence<byte> body = BuildMtRequestEnvelopeBody(requestId, responseAddress);
+
+        // Act
+        await invoker(scopeFactory, body, headers, Guid.NewGuid().ToString(),
+            Substitute.For<IPublishEndpoint>(), Substitute.For<ISendEndpointProvider>(),
+            resolver, "test-ep", CancellationToken.None);
+
+        // Assert — ResponseEnvelopeWriter must be set because the resolver returned a route-reader.
+        consumer.LastContext!.ResponseEnvelopeWriter.Should().Be(writer);
     }
 }

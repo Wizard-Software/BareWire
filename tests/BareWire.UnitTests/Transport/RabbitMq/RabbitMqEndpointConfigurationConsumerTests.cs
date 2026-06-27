@@ -66,6 +66,52 @@ public sealed class RabbitMqEndpointConfigurationConsumerTests
     }
 
     [Fact]
+    public void Consumer_WithUseMassTransitEnvelopeCalledMultipleTimes_SetsFlagTrueIdempotently()
+    {
+        RabbitMqEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c =>
+        {
+            c.UseMassTransitEnvelope();
+            c.UseMassTransitEnvelope();
+        });
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+        // Guards against a positional-argument swap with the adjacent AcceptUntyped bool in Build().
+        registration.AcceptUntyped.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Consumer_WithoutUseMassTransitEnvelope_DefaultsToFalse()
+    {
+        RabbitMqEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c => c.RoutingKey("a.*"));
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.UseMassTransitEnvelope.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Consumer_WithRoutingKeyAcceptUntypedAndEnvelope_MaterializesAll()
+    {
+        RabbitMqEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c =>
+        {
+            c.RoutingKey("x.y");
+            c.AcceptUntyped();
+            c.UseMassTransitEnvelope();
+        });
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.RoutingKeys.Should().Equal("x.y");
+        registration.AcceptUntyped.Should().BeTrue();
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+    }
+
+    [Fact]
     public void Consumer_WithEmptyConfigure_IsCatchAll()
     {
         RabbitMqEndpointConfiguration sut = new("test-queue");
@@ -75,6 +121,7 @@ public sealed class RabbitMqEndpointConfigurationConsumerTests
         ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
         registration.RoutingKeys.Should().BeNull();
         registration.AcceptUntyped.Should().BeFalse();
+        registration.UseMassTransitEnvelope.Should().BeFalse();
     }
 
     [Fact]
@@ -89,6 +136,7 @@ public sealed class RabbitMqEndpointConfigurationConsumerTests
         registration.MessageType.Should().Be<FakeMessage>();
         registration.RoutingKeys.Should().BeNull();
         registration.AcceptUntyped.Should().BeFalse();
+        registration.UseMassTransitEnvelope.Should().BeFalse();
     }
 
     [Fact]

@@ -11,6 +11,7 @@ using BareWire.FlowControl;
 using BareWire.Pipeline;
 using BareWire.Pipeline.Retry;
 using BareWire.Routing;
+using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -67,6 +68,71 @@ internal sealed partial class ReceiveEndpointRunner
     // short-circuits without scanning _invokers[] on every type-less delivery when no consumer opted in.
     private readonly bool _hasAnyAcceptUntyped;
 
+    // Per-consumer MassTransit envelope opt-in, indexed 1:1 with _invokers (task 18.5, D4 precedence).
+    // Default OFF — the no-opt-in path is bit-identical to pre-18.5: _hasAnyMtEnvelope == false causes
+    // ResolverFor(i) to return _deserializerResolver unchanged, with no allocation.
+    private readonly bool[] _consumerUseMtEnvelope;
+    private readonly bool _hasAnyMtEnvelope;
+
+    // Built once in ctor when _hasAnyMtEnvelope is true; wraps the MT deserializer so ResolverFor(i)
+    // returns a resolver that always resolves to MT regardless of the delivery content-type header
+    // (per-consumer shadows per-endpoint and global ContentTypeDeserializerRouter — D4 precedence).
+    private readonly SingleDeserializerResolver? _mtResolver;
+
+    /// <summary>
+    /// Initializes a new <see cref="ReceiveEndpointRunner"/> for the given endpoint binding.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The <c>massTransitEnvelopeDeserializer</c> parameter is non-null only when at least one
+    /// consumer on this endpoint has <c>UseMassTransitEnvelope = true</c>. It is resolved from
+    /// the GLOBAL deserializer chain by <c>BareWireBusControl.StartAsync</c> so that per-consumer
+    /// selection shadows the per-endpoint override.
+    /// </para>
+    /// <para>
+    /// <b>Deserializer precedence (D4):</b>
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>per-consumer</b> (highest): when <c>UseMassTransitEnvelope = true</c>,
+    ///     <see cref="ResolverFor"/> returns <c>_mtResolver</c> — content-type is ignored and the
+    ///     MT deserializer is always used.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>per-endpoint</b>: non-marked consumers use the supplied <c>deserializerResolver</c>
+    ///     (which may already be a <see cref="SingleDeserializerResolver"/> wrapping a per-endpoint
+    ///     override).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>global</b>: when neither override is active, <c>deserializerResolver</c>
+    ///     is the global <see cref="IDeserializerResolver"/> (e.g. <c>ContentTypeDeserializerRouter</c>).
+    ///   </description></item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// <b>Format-mismatch settlement:</b> when a consumer marked <c>UseMassTransitEnvelope</c>
+    /// receives a raw (non-envelope) payload, the MT deserializer returns <see langword="null"/> →
+    /// <see cref="Abstractions.Exceptions.UnknownPayloadException"/> is thrown from the invoker.
+    /// Settlement depends on the dispatch path:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>Typed-header fast path</b> (<c>BW-MessageType</c> present) and <b>pattern layers 1/2</b>
+    ///     — no local catch → exception propagates to the outer catch in
+    ///     <see cref="ProcessMessageAsync"/> → <b>Nack</b>.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Legacy-fallback</b> (no <c>BW-MessageType</c>, sequential deserialize loop) and
+    ///     <b>untyped layer 3</b> — exception caught locally → consumer not dispatched → falls
+    ///     through to layer 4 → <b>Reject</b>.
+    ///   </description></item>
+    /// </list>
+    /// In both cases the trust-boundary invariant is upheld: no silent mis-dispatch.
+    /// </para>
+    /// <para>
+    /// <b>Residual:</b> a raw payload that coincidentally carries a top-level <c>message</c>
+    /// property may parse as an MT envelope. Shape validation is <c>SchemaValidationMiddleware</c>
+    /// (out of 18.5 scope).
+    /// </para>
+    /// </remarks>
     internal ReceiveEndpointRunner(
         EndpointBinding binding,
         ITransportAdapter adapter,
@@ -78,7 +144,8 @@ internal sealed partial class ReceiveEndpointRunner
         IBareWireInstrumentation instrumentation,
         ILogger logger,
         IReadOnlyList<ISagaMessageDispatcher>? sagaDispatchers = null,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        IMessageDeserializer? massTransitEnvelopeDeserializer = null)
     {
         _binding = binding;
         _adapter = adapter;
@@ -124,6 +191,17 @@ internal sealed partial class ReceiveEndpointRunner
         _hasAnyRoutingKeys =
             Array.Exists(_consumerPatterns, static p => p.Length > 0)
             || Array.Exists(_consumerAcceptUntyped, static x => x);
+
+        // Per-consumer MT envelope opt-in arrays (task 18.5, D4). Mirror _consumerAcceptUntyped pattern.
+        // Built once; PERF: _hasAnyMtEnvelope == false short-circuits ResolverFor(i) to the shared
+        // _deserializerResolver reference with no allocation — bit-identical to the pre-18.5 path.
+        _consumerUseMtEnvelope = binding.Consumers
+            .Select(c => c.UseMassTransitEnvelope)
+            .ToArray();
+        _hasAnyMtEnvelope = Array.Exists(_consumerUseMtEnvelope, static x => x);
+        _mtResolver = _hasAnyMtEnvelope
+            ? new SingleDeserializerResolver(massTransitEnvelopeDeserializer!)
+            : null;
 
         // Build raw invokers once at startup — no reflection in the hot path.
         _rawInvokers = binding.RawConsumers
@@ -564,6 +642,41 @@ internal sealed partial class ReceiveEndpointRunner
     }
 
     /// <summary>
+    /// Selects the <see cref="IDeserializerResolver"/> for consumer at index <paramref name="i"/>,
+    /// implementing D4 per-consumer precedence (task 18.5).
+    /// </summary>
+    /// <param name="i">Zero-based index into <see cref="_invokers"/> / <see cref="_binding"/> consumers.</param>
+    /// <returns>
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <b>No opt-in path</b> (<see cref="_hasAnyMtEnvelope"/> is <see langword="false"/>):
+    ///     returns the shared <see cref="_deserializerResolver"/> reference — zero allocation, bit-identical
+    ///     to the pre-18.5 behavior (gate for the 0-B/op benchmark, task 18.8).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Consumer is MT-marked</b> (<see cref="_consumerUseMtEnvelope"/>[i] is <see langword="true"/>):
+    ///     returns <see cref="_mtResolver"/> — a <see cref="SingleDeserializerResolver"/> wrapping the
+    ///     MT envelope deserializer resolved from the global chain. Content-type is ignored; the MT
+    ///     deserializer always wins (per-consumer &gt; per-endpoint &gt; global).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <b>Consumer is not MT-marked</b>: returns <see cref="_deserializerResolver"/> (per-endpoint
+    ///     or global resolver as supplied by <c>BareWireBusControl.StartAsync</c>).
+    ///   </description></item>
+    /// </list>
+    /// <para>
+    /// <b>Format-mismatch</b>: when the MT resolver is returned for a raw (non-envelope) delivery,
+    /// the MT deserializer returns <see langword="null"/> → <see cref="Abstractions.Exceptions.UnknownPayloadException"/>.
+    /// Settlement is path-dependent: <b>Nack</b> on typed-header / pattern layers 1-2 (no local catch,
+    /// propagates to the outer catch in <see cref="ProcessMessageAsync"/>); <b>Reject</b> on the
+    /// legacy fallback loop and untyped layer 3 (local catch → falls through to layer 4).
+    /// </para>
+    /// </returns>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private IDeserializerResolver ResolverFor(int i) =>
+        _hasAnyMtEnvelope && _consumerUseMtEnvelope[i] ? _mtResolver! : _deserializerResolver;
+
+    /// <summary>
     /// Bit-identical pre-ADR-030 typed selection: the BW-MessageType fast path (break-on-first by
     /// type name) plus the legacy blind sequential-deserialize fallback for type-less deliveries.
     /// Reached only when <see cref="_hasAnyRoutingKeys"/> is <see langword="false"/> (ADR-FIX-2 —
@@ -596,7 +709,7 @@ internal sealed partial class ReceiveEndpointRunner
                         messageIdStr,
                         _publishEndpoint,
                         _sendEndpointProvider,
-                        _deserializerResolver,
+                        ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
                         _binding.EndpointName,
                         cancellationToken).ConfigureAwait(false);
                     messageType = _consumerMessageTypeNames[i];
@@ -623,7 +736,7 @@ internal sealed partial class ReceiveEndpointRunner
                         messageIdStr,
                         _publishEndpoint,
                         _sendEndpointProvider,
-                        _deserializerResolver,
+                        ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
                         _binding.EndpointName,
                         cancellationToken).ConfigureAwait(false);
                     messageType = _binding.Consumers[i].MessageType.Name;
@@ -766,7 +879,7 @@ internal sealed partial class ReceiveEndpointRunner
                 messageIdStr,
                 _publishEndpoint,
                 _sendEndpointProvider,
-                _deserializerResolver,
+                ResolverFor(bestIdx),  // D4: per-consumer MT envelope override (task 18.5)
                 _binding.EndpointName,
                 cancellationToken).ConfigureAwait(false);
             return (true, _consumerMessageTypeNames[bestIdx]);
@@ -785,7 +898,7 @@ internal sealed partial class ReceiveEndpointRunner
                     messageIdStr,
                     _publishEndpoint,
                     _sendEndpointProvider,
-                    _deserializerResolver,
+                    ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
                     _binding.EndpointName,
                     cancellationToken).ConfigureAwait(false);
                 return (true, _consumerMessageTypeNames[i]);
@@ -973,7 +1086,7 @@ internal sealed partial class ReceiveEndpointRunner
                 messageIdStr,
                 _publishEndpoint,
                 _sendEndpointProvider,
-                _deserializerResolver,
+                ResolverFor(bestIdx),  // D4: per-consumer MT envelope override (task 18.5)
                 _binding.EndpointName,
                 cancellationToken).ConfigureAwait(false);
 

@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Saga;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
@@ -131,6 +132,26 @@ internal sealed partial class BareWireBusControl : IBusControl
                 endpointResolver = new SingleDeserializerResolver(perEndpointDeserializer);
             }
 
+            // Per-consumer MassTransit envelope opt-in (task 18.5, D4 precedence): if any consumer
+            // on this endpoint opts into MT envelope deserialization, resolve the MT deserializer
+            // from the GLOBAL chain (not from endpointResolver — per-consumer must shadow per-endpoint).
+            // Fail-fast when AddMassTransitEnvelopeDeserializer() has not been called so the bus never
+            // starts accepting messages with a misconfigured deserializer chain (fail-closed / SEC).
+            IMessageDeserializer? mtDeserializer = null;
+            if (binding.Consumers.Any(c => c.UseMassTransitEnvelope))
+            {
+                IMessageDeserializer mt = _deserializerResolver.Resolve("application/vnd.masstransit+json");
+                if (mt.ContentType != "application/vnd.masstransit+json")
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: $"UseMassTransitEnvelope (endpoint '{binding.EndpointName}')",
+                        optionValue: mt.ContentType,
+                        expectedValue: "Call services.AddMassTransitEnvelopeDeserializer() before starting the bus.");
+                }
+
+                mtDeserializer = mt;
+            }
+
             // Validate consumer ordering configuration at startup (fail-fast, R8.11).
             // Throws BareWireConfigurationException when no guaranteed ordering path is declared.
             // Resolver is validate-only — the returned struct is discarded (OQ2: runner reads
@@ -155,7 +176,8 @@ internal sealed partial class BareWireBusControl : IBusControl
                 _instrumentation,
                 _loggerFactory.CreateLogger<ReceiveEndpointRunner>(),
                 _sagaDispatchers,
-                _loggerFactory);
+                _loggerFactory,
+                mtDeserializer);
 
             _consumeTasks.Add(Task.Run(() => runner.RunAsync(consumeToken), CancellationToken.None));
         }

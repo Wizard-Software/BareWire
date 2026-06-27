@@ -23,6 +23,22 @@ namespace BareWire.Configuration;
 /// logger-driven diagnostic that is unit-testable in isolation. The raw <c>BW-RoutingKey</c> is never
 /// logged (none exists at configuration time) — the warning carries only the endpoint name.
 /// </para>
+/// <para>
+/// A second advisory (task 18.7 / D5) covers the per-consumer MassTransit-envelope axis: a consumer
+/// combining <c>UseMassTransitEnvelope()</c> with <c>AcceptUntyped()</c> deserializes an
+/// unauthenticated, producer-controlled foreign MassTransit envelope AND is selected by routing-key
+/// match alone. That combination, absent a schema validator, gets its own warning. A consumer that
+/// opts into the MT envelope WITHOUT <c>AcceptUntyped()</c> has a narrower boundary (its message type
+/// is declared, not attacker-chosen) and does not trigger the MT advisory.
+/// </para>
+/// <para>
+/// Both advisories share the same bus-global suppression heuristic: a registered middleware whose
+/// type name contains <c>SchemaValidation</c> is treated as the foreign-input validator and silences
+/// the warnings. For the MT-envelope axis this assumes the named validator also covers the MT
+/// envelope shape — a possible advisory false-negative (SEC-3). The diagnostic is advisory only
+/// (never enforces), so this heuristic cannot cause a security regression; the operator remains
+/// responsible for ensuring the validator covers envelope-wrapped foreign input.
+/// </para>
 /// </remarks>
 internal static partial class UntypedTrustBoundaryDiagnostic
 {
@@ -50,7 +66,30 @@ internal static partial class UntypedTrustBoundaryDiagnostic
             {
                 LogUntypedWithoutSchemaValidation(logger, endpoint.EndpointName);
             }
+
+            // D5 (task 18.7): the per-consumer MassTransit-envelope axis. Emitted once per endpoint
+            // (not per consumer) to keep advisory noise bounded.
+            if (EndpointHasMtEnvelopeUntypedConsumer(endpoint))
+            {
+                LogMtEnvelopeUntypedWithoutSchemaValidation(logger, endpoint.EndpointName);
+            }
         }
+    }
+
+    private static bool EndpointHasMtEnvelopeUntypedConsumer(ReceiveEndpointConfiguration endpoint)
+    {
+        IReadOnlyList<ConsumerRegistration> registrations = endpoint.ConsumerRegistrations;
+        for (int i = 0; i < registrations.Count; i++)
+        {
+            // The advisory targets the COMBINATION: an MT-enveloped consumer that also accepts
+            // untyped foreign input. UseMassTransitEnvelope() alone (typed) is a narrower boundary.
+            if (registrations[i].UseMassTransitEnvelope && registrations[i].AcceptUntyped)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool EndpointAcceptsUntyped(ReceiveEndpointConfiguration endpoint)
@@ -93,4 +132,14 @@ internal static partial class UntypedTrustBoundaryDiagnostic
                   "schema-validation middleware via AddMiddleware<...>() and ensure broker-level publish " +
                   "ACLs are enforced.")]
     private static partial void LogUntypedWithoutSchemaValidation(ILogger logger, string endpointName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Receive endpoint '{EndpointName}' has a consumer combining UseMassTransitEnvelope() " +
+                  "with AcceptUntyped() but no schema-validation middleware is registered. The MassTransit " +
+                  "envelope is unauthenticated, producer-controlled foreign input; combined with type-less " +
+                  "acceptance (routing-key dispatch, NOT authorization) foreign-input validation (envelope " +
+                  "shape + payload size/depth) is effectively required. Register a schema-validation " +
+                  "middleware via AddMiddleware<...>() and ensure broker-level publish ACLs are enforced.")]
+    private static partial void LogMtEnvelopeUntypedWithoutSchemaValidation(ILogger logger, string endpointName);
 }

@@ -7,8 +7,8 @@ namespace BareWire.Configuration;
 /// Core (transport-agnostic) implementation of <see cref="IConsumerConfigurator{TConsumer, TMessage}"/>,
 /// driving the grouped <c>Consumer&lt;TConsumer, TMessage&gt;(Action&lt;...&gt;)</c> overload on
 /// <see cref="ReceiveEndpointConfiguration"/>. Accumulates the consumer's set of AMQP topic patterns and the
-/// secure-by-default <see cref="AcceptUntyped"/> opt-in, then materializes both into an immutable
-/// <see cref="ConsumerRegistration"/> via <see cref="Build"/>.
+/// secure-by-default <see cref="AcceptUntyped"/> and <see cref="UseMassTransitEnvelope"/> opt-ins, then
+/// materializes them into an immutable <see cref="ConsumerRegistration"/> via <see cref="Build"/>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -19,7 +19,8 @@ namespace BareWire.Configuration;
 /// <para>
 /// <strong>Accumulation</strong>: each <see cref="RoutingKey"/> / <see cref="RoutingKeys"/> call adds to the
 /// set (order-preserving, duplicates idempotent via ordinal comparison) — a consumer may listen on many keys.
-/// <strong>Idempotent opt-in</strong>: <see cref="AcceptUntyped"/> sets an on/off flag.
+/// <strong>Idempotent opt-in</strong>: <see cref="AcceptUntyped"/> and <see cref="UseMassTransitEnvelope"/>
+/// each set an on/off flag (calling either more than once has the same effect as calling it once).
 /// </para>
 /// </remarks>
 /// <typeparam name="TConsumer">The consumer implementation type.</typeparam>
@@ -30,6 +31,7 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
 {
     private readonly List<string> _routingKeys = [];
     private bool _acceptUntyped;
+    private bool _useMassTransitEnvelope;
 
     /// <inheritdoc />
     public void RoutingKey(string routingKey)
@@ -52,6 +54,9 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
     /// <inheritdoc />
     public void AcceptUntyped() => _acceptUntyped = true;
 
+    /// <inheritdoc />
+    public void UseMassTransitEnvelope() => _useMassTransitEnvelope = true;
+
     /// <summary>
     /// Materializes the accumulated state into an immutable <see cref="ConsumerRegistration"/>. An empty
     /// routing-key set materializes as <see langword="null"/> (catch-all selected by message type alone).
@@ -62,7 +67,8 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
             typeof(TConsumer),
             typeof(TMessage),
             _routingKeys.Count == 0 ? null : _routingKeys.ToArray(),
-            _acceptUntyped);
+            _acceptUntyped,
+            _useMassTransitEnvelope);
 
     private void AddDistinct(string routingKey)
     {

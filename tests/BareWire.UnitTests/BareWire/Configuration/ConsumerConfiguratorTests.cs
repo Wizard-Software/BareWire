@@ -9,7 +9,7 @@ namespace BareWire.UnitTests.Core.Configuration;
 /// Tests for the core <see cref="ReceiveEndpointConfiguration.Consumer{TConsumer, TMessage}(Action{IConsumerConfigurator{TConsumer, TMessage}})"/>
 /// overload and the <c>internal sealed ConsumerConfigurator&lt;,&gt;</c> it drives — asserts the accumulation
 /// semantics (set of routing-key patterns with order-preserving dedup), the idempotent secure-by-default
-/// <c>AcceptUntyped</c> flag, catch-all materialization (empty set → <see langword="null"/>), and the
+/// <c>AcceptUntyped</c> and <c>UseMassTransitEnvelope</c> flags, catch-all materialization (empty set → <see langword="null"/>), and the
 /// published "must not be null or empty" pattern contract. Mirrors the transport-side reference
 /// (<c>RabbitMqEndpointConfiguration</c>): the configurator is per-project, the impl is internal, and both
 /// overloads materialize a <see cref="ConsumerRegistration"/>.
@@ -66,6 +66,63 @@ public sealed class ConsumerConfiguratorTests
     }
 
     [Fact]
+    public void Consumer_WithUseMassTransitEnvelopeCalledMultipleTimes_SetsFlagTrueIdempotently()
+    {
+        ReceiveEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c =>
+        {
+            c.UseMassTransitEnvelope();
+            c.UseMassTransitEnvelope();
+        });
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Consumer_WithoutUseMassTransitEnvelope_FlagIsFalse()
+    {
+        ReceiveEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c => c.RoutingKey("a.*"));
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.UseMassTransitEnvelope.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Consumer_WithUseMassTransitEnvelope_CoexistsWithRoutingKeysAndAcceptUntyped()
+    {
+        ReceiveEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c =>
+        {
+            c.RoutingKey("x.y");
+            c.AcceptUntyped();
+            c.UseMassTransitEnvelope();
+        });
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.RoutingKeys.Should().Equal("x.y");
+        registration.AcceptUntyped.Should().BeTrue();
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Consumer_WithUseMassTransitEnvelopeOnly_DoesNotAffectRoutingKeysOrAcceptUntyped()
+    {
+        ReceiveEndpointConfiguration sut = new("test-queue");
+
+        sut.Consumer<FakeConsumer, FakeMessage>(c => c.UseMassTransitEnvelope());
+
+        ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+        registration.RoutingKeys.Should().BeNull();
+        registration.AcceptUntyped.Should().BeFalse();
+    }
+
+    [Fact]
     public void Consumer_WithEmptyConfigure_IsCatchAll()
     {
         ReceiveEndpointConfiguration sut = new("test-queue");
@@ -75,6 +132,7 @@ public sealed class ConsumerConfiguratorTests
         ConsumerRegistration registration = sut.ConsumerRegistrations.Should().ContainSingle().Subject;
         registration.RoutingKeys.Should().BeNull();
         registration.AcceptUntyped.Should().BeFalse();
+        registration.UseMassTransitEnvelope.Should().BeFalse();
     }
 
     [Fact]
@@ -89,6 +147,7 @@ public sealed class ConsumerConfiguratorTests
         registration.MessageType.Should().Be<FakeMessage>();
         registration.RoutingKeys.Should().BeNull();
         registration.AcceptUntyped.Should().BeFalse();
+        registration.UseMassTransitEnvelope.Should().BeFalse();
     }
 
     [Fact]

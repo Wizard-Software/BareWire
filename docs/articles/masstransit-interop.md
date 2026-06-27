@@ -146,6 +146,60 @@ rmq.ReceiveEndpoint("masstransit-bridge", e =>
 });
 ```
 
+## Per-Consumer Envelope (`UseMassTransitEnvelope()`)
+
+The two mechanisms above set the envelope format at the **bus-global** level (`AddMassTransitEnvelopeSerializer` / `MapSerializer<T>`) or the **per-endpoint** level (`UseSerializer<T>` / `UseDeserializer<T>`). A third, narrowest axis selects the format for a **single consumer**: call `UseMassTransitEnvelope()` on the consumer configurator. A consumer marked this way "speaks MassTransit" in both directions — it reads an envelope on the way in and writes one on the way out — independently of whatever default format its endpoint uses.
+
+### The three axes and their precedence
+
+Format resolution runs from the narrowest scope to the widest, and the narrowest active scope wins:
+
+| Scope | How it is set | Precedence |
+|-------|---------------|------------|
+| Per-consumer | `UseMassTransitEnvelope()` on the consumer | highest |
+| Per-endpoint | `UseSerializer<T>()` / `UseDeserializer<T>()` on the receive endpoint | middle |
+| Bus-global | default raw JSON, or a globally registered envelope serializer | lowest |
+
+When a consumer is marked, the `Content-Type` header is ignored for that consumer and the MassTransit deserializer is always used. A marked consumer therefore (de)serializes through the MassTransit envelope **regardless** of the endpoint's default deserializer, while an unmarked consumer sharing the same endpoint keeps the endpoint (or global) default.
+
+### Opting a consumer in
+
+`UseMassTransitEnvelope()` is called inside the consumer-configuration delegate of `Consumer<TConsumer, TMessage>`:
+
+```csharp
+rmq.ReceiveEndpoint("orders", e =>
+{
+    // Reads and replies in MassTransit envelope format, whatever the endpoint default is.
+    e.Consumer<MtOrderConsumer, OrderCreated>(c => c.UseMassTransitEnvelope());
+
+    // Same endpoint, but this consumer keeps the endpoint/global default format.
+    e.Consumer<BwOrderConsumer, OrderShipped>();
+});
+```
+
+The opt-in is **secure by default** — the envelope format is never enabled for a consumer implicitly. A developer turns it on for one consumer deliberately, and that doubles as an explicit declaration that "this consumer expects a MassTransit envelope", which also disambiguates a delivery that arrives with an absent or ambiguous `Content-Type`. The call returns `void` (matching the configurator convention) and is **idempotent**: it sets an on/off flag, so calling it twice is the same as calling it once. It is orthogonal to the routing-key and `AcceptUntyped()` opt-ins on the same configurator and may be combined with them.
+
+### Receive and reply
+
+The opt-in covers both directions as one coherent interop mode:
+
+- **Receive** — the incoming MassTransit envelope is unwrapped: the envelope's `message` field is deserialized into `TMessage`, and the envelope's `messageType` (a URN) and headers are mapped. The consumer receives a plain record, exactly as it would from a raw BareWire publisher.
+- **Reply** — a `RespondAsync` from a marked consumer wraps the response in a MassTransit **response** envelope carrying the correlating `requestId`, so request/response interop with a MassTransit peer round-trips correctly.
+
+This makes a marked consumer a drop-in responder for a MassTransit request client: the request envelope is unwrapped on the way in and the reply envelope is built on the way out, without any envelope-handling code in the consumer itself.
+
+### Mixed consumers on one endpoint
+
+Because the opt-in is per-consumer, a single endpoint can host envelope-speaking and raw consumers side by side (as in the example above). Format selection is resolved independently for each consumer, so adding a MassTransit-speaking consumer to an existing endpoint never changes how the other consumers there deserialize.
+
+### Format-mismatch settlement
+
+If a consumer marked `UseMassTransitEnvelope()` receives a raw, non-envelope payload, the MassTransit deserializer yields no message and the delivery is **negatively settled** (Nack or Reject, depending on the dispatch path and your DLX topology) rather than silently mis-processed — the trust-boundary invariant is that a format mismatch never reaches the consumer as a bad message. One residual edge case is worth knowing: a raw payload that happens to carry a top-level `message` property can parse as a minimal envelope. Enforcing the full envelope shape is the job of a schema-validation middleware; add one when you accept untrusted input (see below).
+
+### Trust boundary with `AcceptUntyped()`
+
+A MassTransit envelope is producer-controlled, unauthenticated input; the safe baseline assumes broker-level publish ACLs gate who can write to the queue. Opting a consumer into the envelope **and** into type-less delivery (`AcceptUntyped()`) at the same time widens the trust boundary to arbitrary foreign JSON. When a consumer combines both without a schema-validation middleware on the endpoint, the bus emits a **startup advisory** so the gap is visible at configuration time. The advisory is specific to that combination — envelope opt-in alone (typed) is a narrower boundary and does not raise it. The mitigation is to add a schema-validation middleware (or rely on enforced publish ACLs) before accepting untyped envelope traffic.
+
 ## Publish-only bridge (no receive endpoint)
 
 The scenarios above require at least one `ReceiveEndpoint` to activate the per-endpoint serializer override. When your application only **publishes** to a MassTransit-compatible exchange and does not consume any MassTransit queues, you can use `IBusConfigurator.MapSerializer<TMessage, TSerializer>()` instead — no receive endpoint required.
@@ -168,7 +222,7 @@ services.AddBareWireRabbitMq(rmq =>
 services.AddBareWire(bus =>
 {
     bus.MapSerializer<OrderCreated, MassTransitEnvelopeSerializer>();
-    // All other message types continue using the default raw JSON serializer (ADR-001).
+    // All other message types continue using the default raw JSON serializer (raw-first default).
 });
 
 // Usage:
@@ -181,7 +235,7 @@ await bus.PublishAsync(new PaymentRequested(...), ct);
 
 The mapping is bus-global and transport-agnostic: it applies to both `IBus.PublishAsync<T>()` and `ISendEndpoint.SendAsync<T>()`, regardless of which transport is configured.
 
-Unmapped types always fall back to the default `IMessageSerializer` — the raw-first guarantee from ADR-001 is preserved.
+Unmapped types always fall back to the default `IMessageSerializer` — the raw-first guarantee is preserved.
 
 ### Security and thread-safety note
 

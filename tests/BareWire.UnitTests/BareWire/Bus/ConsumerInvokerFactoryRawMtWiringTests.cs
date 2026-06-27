@@ -12,7 +12,8 @@ namespace BareWire.UnitTests.Core.Bus;
 /// <summary>
 /// Tests for the MassTransit request routing wiring in <see cref="ConsumerInvokerFactory"/>
 /// for the raw <see cref="IRawConsumer"/> path: when the resolved deserializer implements
-/// <see cref="IRequestEnvelopeRouteReader"/> and the content-type is MT JSON, the invoker must
+/// <see cref="IRequestEnvelopeRouteReader"/> (selected per-consumer via the D4 precedence,
+/// independent of the inbound content-type header), the invoker must
 /// set <see cref="ConsumeContext.InboundRequestContext"/> and
 /// <see cref="ConsumeContext.ResponseEnvelopeWriter"/> on the context passed to the raw consumer.
 /// </summary>
@@ -172,5 +173,39 @@ public sealed class ConsumerInvokerFactoryRawMtWiringTests
         // Assert
         consumer.LastContext!.InboundRequestContext.Should().BeNull();
         consumer.LastContext.ResponseEnvelopeWriter.Should().BeNull();
+    }
+
+    // ── Flag-driven wiring: gate on deserializer capability, not on content-type header ──
+
+    [Fact]
+    public async Task InvokeRawConsumer_WhenRouteReaderSelectedAndNoMtContentTypeHeader_SetsInboundRequestContext()
+    {
+        // Arrange — resolver returns an MT-capable (route-reader) deserializer, but headers carry
+        // no content-type key. The wiring gate must be driven by per-consumer deserializer selection
+        // (D4 precedence), not by the header value (raw-path parity with typed path).
+        var requestId = Guid.NewGuid();
+        const string responseAddress = "rabbitmq://localhost/raw-reply-no-header";
+        var routing = new RequestEnvelopeContext(responseAddress, null, null, requestId, null, null);
+
+        IResponseEnvelopeWriter writer = Substitute.For<IResponseEnvelopeWriter>();
+        var (scopeFactory, consumer) = BuildScopeFactoryWithMtWriter(writer);
+        IDeserializerResolver resolver = BuildMtDeserializerResolver(routing);
+
+        ConsumerInvokerFactory.RawInvokerDelegate rawInvoker =
+            ConsumerInvokerFactory.CreateRaw(typeof(CapturingRawConsumer));
+
+        // Headers deliberately contain no content-type.
+        var headers = new Dictionary<string, string>();
+        ReadOnlySequence<byte> body = BuildMtBody(requestId, responseAddress);
+
+        // Act
+        await rawInvoker(scopeFactory, body, headers, Guid.NewGuid().ToString(),
+            Substitute.For<IPublishEndpoint>(), Substitute.For<ISendEndpointProvider>(),
+            resolver, CancellationToken.None);
+
+        // Assert
+        consumer.LastContext.Should().NotBeNull();
+        consumer.LastContext!.InboundRequestContext.Should().NotBeNull();
+        consumer.LastContext.InboundRequestContext!.Value.RequestId.Should().Be(requestId);
     }
 }

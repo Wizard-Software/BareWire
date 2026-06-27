@@ -24,6 +24,33 @@ namespace BareWire.Interop.MassTransit;
 /// <see cref="JsonException"/> internally and returns <see langword="false"/> — it never
 /// throws (SEC-3).
 /// </para>
+/// <para>
+/// <strong>Deserialization-hardening parity with the type-less path.</strong> The MassTransit
+/// envelope is unauthenticated, producer-controlled foreign input. <see cref="Deserialize{T}"/>
+/// shares <c>BareWireJsonSerializerOptions.Default</c> with the type-less
+/// <c>SystemTextJsonRawDeserializer</c>, so its <em>security profile</em> is identical to type-less:
+/// no polymorphic <c>TypeInfoResolver</c> is configured (a <c>$type</c> discriminator is treated as
+/// an unknown property and ignored — no type-confusion gadget chain), and the default
+/// <c>System.Text.Json</c> <c>MaxDepth</c> (64) is enforced. Depth is gated in the <em>stage-1</em>
+/// envelope parse: materializing the <c>message</c> as a <see cref="System.Text.Json.JsonElement"/>
+/// walks the whole subtree under the same depth counter, so the inner message is in fact
+/// <em>~62-bounded</em> — slightly stricter than type-less. Payload size is bounded at the transport
+/// boundary (bounded channels + broker max frame), identically to type-less; no deserializer-level
+/// size cap is imposed here.
+/// </para>
+/// <para>
+/// Parity refers to the <em>security profile</em>, not the per-message cost: unlike the single-pass
+/// type-less path, the envelope path is <em>two-stage</em> — stage-1 materializes the <c>message</c>
+/// as a <see cref="System.Text.Json.JsonElement"/> (a buffer), then stage-2 re-parses it into
+/// the requested message type <c>T</c> (≈2× parse plus the envelope overhead). This deliberately differs from
+/// the sibling <c>CloudEventsEnvelopeDeserializer</c>, which applies its own tighter limits
+/// (<c>MaxDepth=32</c> + an explicit <c>CloudEventsEnvelopeLimits</c> size cap) under a separate
+/// CloudEvents hardening regime. The MT path keeps parity-with-type-less by design; the stage-1
+/// depth gate plus the transport size bound keep the vector bounded. The trust boundary assumes
+/// broker-level publish ACLs are enforced; a consumer that combines <c>UseMassTransitEnvelope()</c>
+/// with <c>AcceptUntyped()</c> additionally requires a schema-validation middleware (SEC-13), for
+/// which a startup advisory is emitted by <c>UntypedTrustBoundaryDiagnostic</c>.
+/// </para>
 /// </remarks>
 internal sealed class MassTransitEnvelopeDeserializer : IMessageDeserializer, IResponseEnvelopeReader, IRequestEnvelopeRouteReader
 {

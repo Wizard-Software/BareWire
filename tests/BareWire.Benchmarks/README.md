@@ -49,6 +49,7 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*' --exp
 | `SagaBenchmarks` | State machine transitions with InMemorySagaRepository | > 100K msgs/s |
 | `SerializationBenchmarks` | JSON serialize/deserialize with System.Text.Json | < 1 μs |
 | `JsonVsMessagePackBenchmarks` | JSON vs MessagePack serialize/deserialize/on-wire size, same object graph, 100 B – 100 KB | MessagePack ~2-5x fewer allocations |
+| `ConsumerEnvelopeDispatchBenchmarks` | Per-consumer MassTransit-envelope deserializer selection (`ReceiveEndpointRunner.ResolverFor`); no-opt-in degradation to the pre-18.5 dispatch path (18.5, ADR-031 D4) | 0 B/op (no-opt-in) |
 
 ## OrderedConsume Benchmark (R8.15)
 
@@ -269,6 +270,49 @@ nie emiter DynamicMethod — daje większość zysku przy zachowaniu AOT-safety 
 kodu IL. Prototyp i benchmark pozostają w repo jako udokumentowany dowód spike'u (przyszli
 czytelnicy nie powtarzają badania). Produkcyjna implementacja `IMessageSerializer`
 (D-PROD) NIE jest rekomendowana — osobne zadanie roadmap nie jest potrzebne.
+
+## ConsumerEnvelopeDispatch Benchmark (18.8)
+
+`ConsumerEnvelopeDispatchBenchmarks` measures the per-consumer MassTransit-envelope deserializer
+selection introduced by task 18.5 (ADR-031 D4 precedence): `ReceiveEndpointRunner.ResolverFor(int)`.
+
+### Goal
+
+- **0 B/op on the no-opt-in path.** When NO consumer on an endpoint opts into `UseMassTransitEnvelope()`
+  (the default for ~all deployments), the per-delivery selection arithmetic must degrade to the exact
+  pre-18.5 behaviour: `_hasAnyMtEnvelope == false` short-circuits the `&&` and returns the
+  reference-identical `_deserializerResolver`, allocating nothing. The opt-in must not tax the path that
+  does not use it.
+- The benchmark mirrors the production `ResolverFor` ternary one-to-one and reaches the real internal
+  `SingleDeserializerResolver` seam via `[InternalsVisibleTo("BareWire.Benchmarks")]` — no production
+  code or public API is touched.
+
+### Two measured paths
+
+- `Select_NoOptIn` — `_hasAnyMtEnvelope == false`: the short-circuit returning `_deserializerResolver`.
+  **Target: `0 B/op` (the gate).**
+- `Select_AllOptIn` — every consumer opts in: returns `_mtResolver`. Documents that the selection
+  arithmetic itself is always allocation-free; the opt-in cost lives downstream in deserialization, not
+  in selection. Expected `0 B/op`.
+
+The consumer invocation itself (scope creation + payload deserialization) is **out of scope** — it
+allocates by definition and is not part of the selection cost the gate governs (same boundary as
+`DispatchBenchmarks`).
+
+### Running
+
+```bash
+# Smoke-check registration (no full run)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --list flat | grep ConsumerEnvelope
+
+# Short run (allocation is deterministic — a short job is a reliable B/op measurement)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*ConsumerEnvelopeDispatch*' --job short
+
+# Full run
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*ConsumerEnvelopeDispatch*'
+```
+
+The `Allocated` column must read `-` / `0 B` for both methods.
 
 ## Interpreting Results
 

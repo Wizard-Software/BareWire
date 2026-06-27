@@ -4,6 +4,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Serialization;
 using BareWire.Interop.MassTransit;
+using BareWire.Serialization.Json;
 
 namespace BareWire.UnitTests.Interop;
 
@@ -205,7 +206,72 @@ public sealed class MassTransitEnvelopeDeserializerTests
         requestId.Should().Be(Guid.Empty);
     }
 
+    // ── Hardening parity with type-less (task 18.7) ──────────────────────────────
+
+    [Fact]
+    public void Deserialize_MessageWithTypeDiscriminator_DoesNotResolvePolymorphically()
+    {
+        // A malicious "$type" discriminator must be ignored. The shared
+        // BareWireJsonSerializerOptions.Default configures no polymorphic TypeInfoResolver, so STJ
+        // treats "$type" as an unknown property — identical to the type-less path (no gadget-chain
+        // type confusion).
+        var json = BuildEnvelopeJson(
+            """{"$type":"System.Uri, System.Private.Uri","orderId":"ORD-POLY","amount":5.50}""");
+        var data = ToSequence(json);
+
+        var result = _sut.Deserialize<TestOrder>(data);
+
+        result.Should().BeOfType<TestOrder>();
+        result!.OrderId.Should().Be("ORD-POLY");
+        result.Amount.Should().Be(5.50m);
+    }
+
+    [Fact]
+    public void Deserialize_OverlyDeepMessage_ThrowsSerializationException()
+    {
+        // Depth counts from the document root; the envelope wrapper adds ~2 levels. Nesting the
+        // message 70 deep clears STJ's default MaxDepth (64) with margin and is rejected in the
+        // stage-1 envelope parse (materializing the message JsonElement walks the whole subtree
+        // under the same depth counter), so the inner message is in fact ~62-bounded.
+        var json = BuildEnvelopeJson(BuildDeeplyNested(70));
+        var data = ToSequence(json);
+
+        Action act = () => _sut.Deserialize<TestOrder>(data);
+
+        act.Should().Throw<BareWireSerializationException>()
+            .Which.ContentType.Should().Be("application/vnd.masstransit+json");
+    }
+
+    [Fact]
+    public void Deserialize_OverlyDeepPayload_RejectedByBothMtAndRawDeserializers_ConfirmingParity()
+    {
+        // Hardening parity: the MT envelope path and the type-less raw path share
+        // BareWireJsonSerializerOptions.Default, so both enforce the same default MaxDepth (64).
+        var deepPayload = BuildDeeplyNested(70);
+        var mtData = ToSequence(BuildEnvelopeJson(deepPayload));
+        var rawData = ToSequence(deepPayload);
+        var rawDeserializer = new SystemTextJsonRawDeserializer();
+
+        Action mtAct = () => _sut.Deserialize<TestOrder>(mtData);
+        Action rawAct = () => rawDeserializer.Deserialize<TestOrder>(rawData);
+
+        mtAct.Should().Throw<BareWireSerializationException>();
+        rawAct.Should().Throw<BareWireSerializationException>();
+    }
+
     // --- Helpers ---
+
+    private static string BuildDeeplyNested(int depth)
+    {
+        // Produces {"a":{"a":...1...}} nested `depth` levels deep.
+        var sb = new StringBuilder();
+        for (int i = 0; i < depth; i++)
+            sb.Append("{\"a\":");
+        sb.Append('1');
+        for (int i = 0; i < depth; i++)
+            sb.Append('}');
+        return sb.ToString();
+    }
 
     private static string BuildEnvelopeJson(string messageJson)
     {
