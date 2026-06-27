@@ -3,7 +3,7 @@ using System.Buffers;
 namespace BareWire.Abstractions.Serialization;
 
 /// <summary>
-/// Serializes typed messages into a raw byte representation following the ADR-001 raw-first contract.
+/// Serializes typed messages into a raw byte representation following the raw-first contract (no envelope by default).
 /// Implementations write directly into an <see cref="IBufferWriter{T}"/> to achieve zero-copy serialization
 /// without intermediate byte array allocations.
 /// </summary>

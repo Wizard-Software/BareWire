@@ -38,7 +38,7 @@ public interface ITransportAdapter
 
     /// <summary>
     /// Returns an asynchronous stream of inbound messages from the specified endpoint,
-    /// applying the given flow-control options to bound concurrency and memory usage (ADR-004).
+    /// applying the given flow-control options to bound concurrency and memory usage.
     /// The stream continues until the <paramref name="cancellationToken"/> is cancelled.
     /// </summary>
     /// <param name="endpointName">The transport queue or topic name to consume from.</param>
@@ -66,7 +66,7 @@ public interface ITransportAdapter
     /// <summary>
     /// Deploys the specified topology declarations (exchanges, queues, bindings) to the broker.
     /// This method is idempotent — it is safe to call multiple times.
-    /// Per ADR-002 this is never invoked automatically; callers must trigger it explicitly.
+    /// This is never invoked automatically; callers must trigger it explicitly (manual topology).
     /// </summary>
     /// <param name="topology">The topology to deploy. Must not be null.</param>
     /// <param name="cancellationToken">A token to cancel the deployment operation.</param>

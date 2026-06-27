@@ -30,7 +30,7 @@ public interface IRabbitMqConfigurator
     /// <summary>
     /// Configures the AMQP topology (exchanges, queues, bindings) that will be deployed
     /// to the broker when <c>IBusControl.DeployTopologyAsync</c> is called.
-    /// Per ADR-002, topology must be declared and deployed explicitly.
+    /// Topology must be declared and deployed explicitly (manual topology — nothing is auto-declared).
     /// </summary>
     /// <param name="configure">
     /// A delegate that receives an <see cref="ITopologyConfigurator"/> and declares the topology.
@@ -65,7 +65,7 @@ public interface IRabbitMqConfigurator
     /// <summary>
     /// Sets the default exchange name used by <c>PublishAsync</c> when no <c>BW-Exchange</c>
     /// header is present on the outbound message.
-    /// Per ADR-002, this must match an exchange declared via <see cref="ConfigureTopology"/>.
+    /// This must match an exchange declared via <see cref="ConfigureTopology"/> (manual topology).
     /// </summary>
     /// <param name="exchangeName">
     /// The exchange name. Must not be <see langword="null"/> or empty.

@@ -3,7 +3,7 @@ using System.Buffers;
 namespace BareWire.Abstractions.Serialization;
 
 /// <summary>
-/// Deserializes raw byte sequences into typed messages following the ADR-001 raw-first contract.
+/// Deserializes raw byte sequences into typed messages following the raw-first contract (no envelope by default).
 /// Implementations read directly from a <see cref="ReadOnlySequence{T}"/> to achieve zero-copy deserialization
 /// without intermediate byte array allocations.
 /// </summary>

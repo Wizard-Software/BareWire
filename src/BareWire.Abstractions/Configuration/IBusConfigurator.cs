@@ -86,7 +86,7 @@ public interface IBusConfigurator
     /// <remarks>
     /// This is a <strong>per-type</strong> override, not a global replacement of
     /// <see cref="IMessageSerializer"/>. Unmapped types continue using the default serializer
-    /// (ADR-001 raw-first). Calling this method twice for the same
+    /// (raw-first). Calling this method twice for the same
     /// <typeparamref name="TMessage"/> overwrites the previous mapping.
     /// <para>
     /// The mapping is bus-global and transport-agnostic — it applies to all

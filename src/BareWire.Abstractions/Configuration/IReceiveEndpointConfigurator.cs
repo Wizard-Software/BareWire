@@ -6,8 +6,8 @@ namespace BareWire.Abstractions.Configuration;
 /// Configures a single receive endpoint (queue consumer) on the bus.
 /// Passed to the delegate in <see cref="IBus.ConnectReceiveEndpoint"/> and to
 /// static endpoint configuration during bus setup.
-/// Per ADR-002, <see cref="ConfigureConsumeTopology"/> defaults to <see langword="false"/> —
-/// topology must be declared and deployed explicitly.
+/// <see cref="ConfigureConsumeTopology"/> defaults to <see langword="false"/> —
+/// topology must be declared and deployed explicitly (manual topology by default).
 /// </summary>
 public interface IReceiveEndpointConfigurator
 {
@@ -26,7 +26,7 @@ public interface IReceiveEndpointConfigurator
     /// <summary>
     /// Gets or sets a value indicating whether the bus should automatically declare and bind
     /// transport topology (exchanges, queues) for this endpoint's consumers.
-    /// Defaults to <see langword="false"/> per ADR-002 (manual topology).
+    /// Defaults to <see langword="false"/> (manual topology — nothing is declared automatically).
     /// </summary>
     bool ConfigureConsumeTopology { get; set; }
 
@@ -79,7 +79,7 @@ public interface IReceiveEndpointConfigurator
     /// This overload is purely additive — the parameterless <c>Consumer&lt;TConsumer, TMessage&gt;()</c>
     /// is unchanged. A consumer that declares no routing keys remains a catch-all over its message type
     /// (unchanged behaviour). This is a dispatcher predicate, <strong>not</strong> topology: declaring
-    /// routing keys does not create or alter any queue→exchange binding (per ADR-002, manual topology).
+    /// routing keys does not create or alter any queue→exchange binding (manual topology).
     /// </remarks>
     /// <typeparam name="TConsumer">
     /// The consumer implementation type. Must implement <see cref="IConsumer{TMessage}"/>.
@@ -153,7 +153,7 @@ public interface IReceiveEndpointConfigurator
     /// <summary>
     /// Enables per-key consumer ordering for this endpoint, deriving the ordering key from a message
     /// header (one-liner form, raw / cross-language). The header name is symmetric to the producer-side
-    /// ordering-key header (ADR-025). Opt-in and additive — per-key ordering is OFF by default.
+    /// ordering-key header. Opt-in and additive — per-key ordering is OFF by default.
     /// </summary>
     /// <param name="headerName">The header carrying the ordering key.</param>
     /// <remarks>

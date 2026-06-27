@@ -3,7 +3,7 @@ using System.Threading.Channels;
 namespace BareWire.Abstractions;
 
 /// <summary>
-/// Configures credit-based flow control for inbound message consumption, as defined by ADR-004.
+/// Configures credit-based flow control for inbound message consumption.
 /// All limits are bounded to prevent unbounded memory growth and enable predictable back-pressure.
 /// </summary>
 public sealed class FlowControlOptions

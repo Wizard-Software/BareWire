@@ -16,7 +16,7 @@ namespace BareWire.Interop.MassTransit;
 /// This class is <see langword="public"/> solely so that it can be referenced by name in
 /// <c>IBusConfigurator.MapSerializer&lt;TMessage, MassTransitEnvelopeSerializer&gt;()</c>
 /// for publish-only bridge scenarios where no receive endpoint is required.
-/// The default bus behavior remains raw-first per ADR-001 — mapping a type to this serializer
+/// The default bus behavior remains raw-first — mapping a type to this serializer
 /// is an explicit opt-in that does not affect other message types.
 /// <para>
 /// This class additionally implements <see cref="IRequestEnvelopeSerializer"/>, which is used

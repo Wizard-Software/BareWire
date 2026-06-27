@@ -31,7 +31,7 @@ public static class ServiceCollectionExtensions
     /// Both are registered as singletons — they are stateless and safe to share across scopes.
     /// </para>
     /// <para>
-    /// Per ADR-001 (raw-first), <see cref="SystemTextJsonSerializer"/> produces plain JSON
+    /// Following the raw-first default, <see cref="SystemTextJsonSerializer"/> produces plain JSON
     /// with no envelope wrapper. To opt into envelope format, register
     /// <see cref="BareWireEnvelopeSerializer"/> manually before calling <c>AddBareWire()</c>.
     /// </para>

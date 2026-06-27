@@ -34,7 +34,7 @@ public static class ServiceCollectionExtensions
     /// <remarks>
     /// <para>
     /// This method does <em>not</em> replace the default <see cref="IMessageSerializer"/>
-    /// (ADR-001 raw-first). It only registers the concrete <see cref="MassTransitEnvelopeSerializer"/>
+    /// (the raw-first default is preserved). It only registers the concrete <see cref="MassTransitEnvelopeSerializer"/>
     /// type so per-endpoint overrides can resolve it from the container:
     /// </para>
     /// <code>

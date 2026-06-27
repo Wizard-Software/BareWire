@@ -3,7 +3,7 @@ namespace BareWire.Abstractions.Topology;
 /// <summary>
 /// Provides a fluent API for declaring exchanges, queues, and bindings that form the message topology.
 /// Declarations are accumulated during bus configuration and deployed to the broker via
-/// <see cref="IBusControl.DeployTopologyAsync"/> (ADR-002: manual topology).
+/// <see cref="IBusControl.DeployTopologyAsync"/> (manual topology — nothing is declared automatically).
 /// </summary>
 public interface ITopologyConfigurator
 {

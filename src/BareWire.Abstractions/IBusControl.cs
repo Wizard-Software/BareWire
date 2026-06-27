@@ -29,7 +29,7 @@ public interface IBusControl : IBus
     /// <summary>
     /// Deploys the configured topology (exchanges, queues, and bindings) to the broker
     /// without starting the bus. Safe to call in CI/CD pipelines before application startup.
-    /// Per ADR-002, topology is never deployed automatically — this method must be called explicitly.
+    /// Topology is never deployed automatically — this method must be called explicitly (manual topology).
     /// </summary>
     /// <param name="cancellationToken">A token to cancel the deployment operation.</param>
     /// <returns>A <see cref="Task"/> that completes when all topology elements have been declared.</returns>

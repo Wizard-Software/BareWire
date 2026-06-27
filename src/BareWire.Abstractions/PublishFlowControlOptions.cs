@@ -3,7 +3,7 @@ using System.Threading.Channels;
 namespace BareWire.Abstractions;
 
 /// <summary>
-/// Configures publish-side back-pressure for outbound message publishing, as defined by ADR-006.
+/// Configures publish-side back-pressure for outbound message publishing.
 /// Bounds the number and total byte size of messages that can be queued for sending before
 /// the publisher is asked to wait, preventing unbounded memory growth under high publish rates.
 /// </summary>
