@@ -537,10 +537,12 @@ public sealed class ReceiveEndpointRunnerMassTransitEnvelopeTests
         // Act
         UntypedTrustBoundaryDiagnostic.Run(configurator, logger);
 
-        // Assert — warning fires (UseMassTransitEnvelope does not suppress the AcceptUntyped advisory).
-        logger.Events.Should().ContainSingle(e => e.Level == LogLevel.Warning);
-        logger.Events.Single(e => e.Level == LogLevel.Warning).Message
-            .Should().Contain("mt-untyped-queue");
+        // Assert — both advisories fire (DEC-1, task 18.7 additive): the type-less AcceptUntyped()
+        // advisory is NOT suppressed by UseMassTransitEnvelope(), AND the per-consumer MT-envelope
+        // axis adds its own advisory. Both name the endpoint; neither suppresses the other.
+        var warnings = logger.Events.Where(e => e.Level == LogLevel.Warning).Select(e => e.Message).ToList();
+        warnings.Should().Contain(m => m.Contains("mt-untyped-queue") && m.Contains("declares AcceptUntyped()"));
+        warnings.Should().Contain(m => m.Contains("mt-untyped-queue") && m.Contains("MassTransit envelope"));
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────

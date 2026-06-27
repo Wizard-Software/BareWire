@@ -137,6 +137,101 @@ public sealed class UntypedTrustBoundaryDiagnosticTests
             .Should().NotContain("secret.tenant.payload.key");
     }
 
+    // ── MassTransit-envelope axis (D5 — task 18.7) ───────────────────────────────
+
+    [Fact]
+    public void Run_MtEnvelopeWithAcceptUntypedWithoutSchemaValidation_EmitsMtAdvisoryNamingEndpoint()
+    {
+        // Arrange — a consumer combining the MassTransit-envelope opt-in with AcceptUntyped()
+        // opens BOTH foreign-input axes (foreign MT envelope + type-less selection) without a
+        // schema validator.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        configurator.AddReceiveEndpoint(
+            "mt-foreign",
+            ep => ep.Consumer<FakeConsumer, FakeMessage>(c =>
+            {
+                c.RoutingKey("interop.eu.*");
+                c.AcceptUntyped();
+                c.UseMassTransitEnvelope();
+            }));
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run(configurator, logger);
+
+        // Assert — the MT-axis advisory is present, naming the endpoint and the MassTransit envelope.
+        // (The generic type-less advisory also fires for this consumer — DEC-1 additive; asserted by
+        // presence of the MT message, not ContainSingle.)
+        logger.Events.Should().Contain(e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("mt-foreign")
+            && e.Message.Contains("MassTransit envelope"));
+    }
+
+    [Fact]
+    public void Run_MtEnvelopeWithAcceptUntypedWithSchemaValidationMiddleware_EmitsNoWarning()
+    {
+        // Arrange — same combination, but a bus-global schema validator is registered.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        configurator.AddMiddleware<FakeSchemaValidationMiddleware>();
+        configurator.AddReceiveEndpoint(
+            "mt-foreign",
+            ep => ep.Consumer<FakeConsumer, FakeMessage>(c =>
+            {
+                c.AcceptUntyped();
+                c.UseMassTransitEnvelope();
+            }));
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run(configurator, logger);
+
+        // Assert — bus-global validation present → both axes suppressed, no advisory.
+        logger.Events.Should().NotContain(e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public void Run_MtEnvelopeWithoutAcceptUntyped_EmitsNoMtAdvisory()
+    {
+        // Arrange — a typed MT consumer (UseMassTransitEnvelope() WITHOUT AcceptUntyped()).
+        // Type metadata is declared by the consumer, not chosen by an attacker's routing key,
+        // so the trust boundary is narrower and the MT advisory must NOT fire.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        configurator.AddReceiveEndpoint(
+            "mt-typed",
+            ep => ep.Consumer<FakeConsumer, FakeMessage>(c => c.UseMassTransitEnvelope()));
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run(configurator, logger);
+
+        // Assert — the advisory requires the COMBINATION; UseMassTransitEnvelope() alone stays silent.
+        logger.Events.Should().NotContain(e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public void Run_MtEnvelopeUntyped_DoesNotLogRoutingKeyValue()
+    {
+        // Arrange — the producer-controlled routing-key VALUE must never leak into ANY advisory.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        configurator.AddReceiveEndpoint(
+            "mt-foreign",
+            ep => ep.Consumer<FakeConsumer, FakeMessage>(c =>
+            {
+                c.RoutingKey("secret.tenant.payload.key");
+                c.AcceptUntyped();
+                c.UseMassTransitEnvelope();
+            }));
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run(configurator, logger);
+
+        // Assert — every emitted warning carries only the endpoint name, never the routing-key value.
+        logger.Events.Should()
+            .OnlyContain(e => e.Level != LogLevel.Warning || !e.Message.Contains("secret.tenant.payload.key"));
+    }
+
     // ── Test doubles ────────────────────────────────────────────────────────────
 
     /// <summary>Minimal logger that captures emitted log events for assertion.</summary>
