@@ -4,8 +4,9 @@ namespace BareWire.Abstractions.Configuration;
 /// Captures a consumer type and the message type it handles, bridging the gap between
 /// transport-level endpoint configuration (e.g. <c>e.Consumer&lt;TConsumer, TMessage&gt;()</c>)
 /// and the core consume loop that needs both types to deserialize and dispatch.
-/// Optionally carries a set of topic patterns the consumer listens on and a flag opting the
-/// consumer into receiving messages that arrive without type metadata.
+/// Optionally carries a set of topic patterns the consumer listens on, a flag opting the
+/// consumer into receiving messages that arrive without type metadata, and a flag opting the
+/// consumer into per-consumer MassTransit envelope (de)serialization.
 /// </summary>
 /// <param name="ConsumerType">The concrete consumer type that handles the message.</param>
 /// <param name="MessageType">The message type the consumer deserializes and processes.</param>
@@ -26,8 +27,20 @@ namespace BareWire.Abstractions.Configuration;
 /// client-side dispatch, NOT authorization — the trust boundary assumes broker-level publish ACLs
 /// are enforced and that a schema-validation middleware validates the foreign input.
 /// </param>
+/// <param name="UseMassTransitEnvelope">
+/// Explicit, secure-by-default opt-in (defaults to <see langword="false"/>) that selects the
+/// MassTransit envelope format for this consumer's inbound deserialization and its reply
+/// serialization, in preference to any per-endpoint override or the bus-global default
+/// (precedence: per-consumer &gt; per-endpoint &gt; global). It is an on/off flag, not a format
+/// enum. Like <paramref name="AcceptUntyped"/>, enabling it widens the trust boundary: an
+/// envelope-marked consumer deserializes producer-controlled foreign payloads, so when combined
+/// with <paramref name="AcceptUntyped"/> a schema-validation middleware must validate the input;
+/// leave it <see langword="false"/> unless the consumer is intended to interoperate with a
+/// MassTransit-enveloped producer.
+/// </param>
 public sealed record ConsumerRegistration(
     Type ConsumerType,
     Type MessageType,
     IReadOnlyList<string>? RoutingKeys = null,
-    bool AcceptUntyped = false);
+    bool AcceptUntyped = false,
+    bool UseMassTransitEnvelope = false);
