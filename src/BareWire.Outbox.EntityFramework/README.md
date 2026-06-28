@@ -74,9 +74,9 @@ services.AddDbContext<MyConsumerDbContext>((sp, options) =>
 > `SaveChangesAsync()` as usual; because it runs inside the middleware's `TransactionScope`, its write
 > commits atomically with the outbox and inbox writes — now as one single-phase commit.
 
-The `OrderedConsumers` sample uses this single-commit pattern and needs no 2PC. Samples that have **not**
-adopted it — `TransactionalOutbox`, `InboxDeduplication` — still rely on 2PC, which the Aspire AppHost
-enables via `max_prepared_transactions` (see `samples/README.md`).
+Every BareWire outbox sample whose consumer persists business state — `OrderedConsumers`,
+`TransactionalOutbox`, `InboxDeduplication` — uses this single-commit pattern, so the samples need no 2PC
+and the Aspire AppHost runs PostgreSQL with the default `max_prepared_transactions = 0`.
 
 ## Horizontal Scaling and Row Claims
 

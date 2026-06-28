@@ -72,7 +72,28 @@ string dbConnectionString =
 // 3. EF Core — application DbContext for notification log entities
 // ─────────────────────────────────────────────────────────────────────────────
 
-builder.Services.AddDbContext<NotificationDbContext>(o => o.UseNpgsql(dbConnectionString));
+// Single-commit connection sharing: while the transactional outbox middleware processes a message it
+// has pinned ONE connection (exposed via IOutboxConnectionAccessor). Both consumers below persist a
+// NotificationLog through THIS context — share the pinned connection so each write commits single-phase
+// with the inbox marker — one physical connection, one enlistment, no escalation to a two-phase
+// (prepared) commit, and no max_prepared_transactions requirement. Outside a consume operation (startup
+// schema init, the HTTP endpoints below) the accessor returns null, so we fall back to a standalone
+// connection. The (sp, options) overload makes the EF options Scoped, so each per-message consumer scope
+// binds to the live pinned connection at resolution time.
+builder.Services.AddDbContext<NotificationDbContext>((sp, o) =>
+{
+    System.Data.Common.DbConnection? sharedOutboxConnection =
+        sp.GetRequiredService<IOutboxConnectionAccessor>().Current;
+
+    if (sharedOutboxConnection is not null)
+    {
+        o.UseNpgsql(sharedOutboxConnection);
+    }
+    else
+    {
+        o.UseNpgsql(dbConnectionString);
+    }
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. BareWire messaging — serializer, transport, topology, endpoints
