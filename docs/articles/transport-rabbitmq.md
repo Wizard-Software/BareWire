@@ -146,6 +146,39 @@ queue, the failed message is routed to the DLX rather than discarded — without
 message is permanently lost (and BareWire logs a warning). Always configure a DLX on production
 queues. See [Retry and Dead Letter Queues](retry-and-dlq.md).
 
+## Routing semantics
+
+A publisher confirm tells you the broker **accepted** a publication — not that it **routed** it to a
+queue. By default BareWire publishes with the AMQP `mandatory` flag off, so a message the broker
+accepts but cannot route to any queue (topology drift, a missing binding or queue, a wrong routing
+key) is silently dropped while `SendResult.IsConfirmed` still reports `true`. This is at-most-once
+routing: fast, but a misconfigured topology loses messages without a signal.
+
+Enable **guaranteed routing** to surface unroutable publications instead of dropping them silently:
+
+```csharp
+wire.UseRabbitMq(rmq =>
+{
+    rmq.GuaranteedRouting();   // opt-in; default is off
+    // ... host, topology, endpoints ...
+});
+```
+
+With it enabled, BareWire publishes `mandatory` and detects an unroutable message via the broker's
+return, mapping it to `SendResult.IsConfirmed == false` (and logging a warning). The default-off
+behaviour is unchanged — routable publishes are unaffected (the channel already awaits a per-message
+publisher confirm, so there is no extra round-trip), and there is no per-message allocation on the
+send path.
+
+**Where it fails closed.** The negative confirm only changes the outcome for code that inspects
+`SendResult` — chiefly the [transactional outbox](outbox.md) dispatcher, which treats
+`IsConfirmed == false` as non-delivery and retries (the row stays claimed instead of being marked
+delivered). The direct `IBus.PublishAsync` / `ISendEndpoint.SendAsync` path is **fire-and-forget**:
+the caller never receives a `SendResult`, and the background publisher does not redeliver on a
+negative confirm. On that path guaranteed routing turns a *silent* drop into an *observable* one (the
+warning log) but does not by itself make direct publishing at-least-once. For at-least-once delivery
+against topology drift, publish through the outbox with this option enabled.
+
 ## Feature map
 
 RabbitMQ-specific behaviour is documented across these guides:
@@ -159,6 +192,7 @@ RabbitMQ-specific behaviour is documented across these guides:
 | Single-active-consumer / consistent-hash per-key ordering | [Per-Key Consumer Ordering](per-key-ordering.md) |
 | Retry policies and dead-letter exchanges | [Retry and Dead Letter Queues](retry-and-dlq.md) |
 | Publish-style competing responders | [Publishing and Consuming](publishing-and-consuming.md#publish-style-competing-responders-first-in-wins) |
+| At-most-once vs opt-in guaranteed routing | [Routing semantics](#routing-semantics) |
 
 ## See also
 

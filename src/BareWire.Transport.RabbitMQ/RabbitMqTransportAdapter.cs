@@ -139,6 +139,10 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             _cachedEpochBoxed = _cachedEpoch is { } e ? (object)e : null;
         }
 
+        // Opt-in guaranteed-routing: publish mandatory so the broker returns (rather than silently
+        // drops) an unroutable message. Read once per batch (PERF) — the publish loop is single-writer.
+        bool mandatory = _options.GuaranteedRouting;
+
         try
         {
             for (int i = 0; i < messages.Count; i++)
@@ -194,12 +198,23 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                     await channel.BasicPublishAsync<BasicProperties>(
                         exchange: exchange,
                         routingKey: outbound.RoutingKey,
-                        mandatory: false,
+                        mandatory: mandatory,
                         basicProperties: props,
                         body: outbound.Body,
                         cancellationToken: cancellationToken).ConfigureAwait(false);
 
                     results[i] = new SendResult(IsConfirmed: true, DeliveryTag: deliveryTag);
+                }
+                catch (PublishException ex) when (ex.IsReturn)
+                {
+                    // Guaranteed-routing mode only (mandatory:true): the broker accepted the publish
+                    // but could not route it to any queue and returned it (surfaced synchronously as
+                    // PublishException.IsReturn because the channel has publisher-confirm tracking on).
+                    // Report it as not confirmed so the caller (e.g. the outbox) retries instead of
+                    // treating an unroutable message as delivered. Continue the batch (per-message result).
+                    // SEC: log only the exchange + routing key (topology structure), never body/headers.
+                    LogPublishMessageReturned(exchange, outbound.RoutingKey);
+                    results[i] = new SendResult(IsConfirmed: false, DeliveryTag: deliveryTag);
                 }
                 catch (PublishException)
                 {
@@ -710,6 +725,15 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Exception while closing publish channel.")]
     private partial void LogPublishChannelCloseError(Exception ex);
+
+    // Guaranteed-routing return diagnostic. Logs only the exchange and routing key — both are topology
+    // structure (the routing key on the send path is derived from the message type / an explicit mapping,
+    // not from message content), never the body or headers. If a future routing-key scheme derives the key
+    // from message content, that key would become sensitive and this log must be revisited (SEC).
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Publish returned as unroutable (guaranteed-routing mode): exchange '{Exchange}', " +
+                  "routing key '{RoutingKey}' has no bound queue. Reported as not confirmed.")]
+    private partial void LogPublishMessageReturned(string exchange, string routingKey);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Exception while closing consumer channel for endpoint '{EndpointName}'.")]

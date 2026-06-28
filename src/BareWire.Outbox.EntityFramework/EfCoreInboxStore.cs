@@ -33,10 +33,38 @@ internal sealed class EfCoreInboxStore : IInboxStore
 
         if (rowsAffected > 0)
         {
-            return true; // Lock acquired.
+            return true; // Lock acquired (fresh insert).
         }
 
-        // Existing entry — check if expired and unprocessed → re-lock.
+        // Existing entry — re-acquire ONLY if it is expired AND unprocessed.
+        //
+        // Use the configured dialect's atomic re-lock SQL when it targets the active EF Core provider
+        // — matched via the base DatabaseFacade.ProviderName API (keeps this package
+        // provider-agnostic: no hard dependency on any provider package, and any provider with a
+        // matching dialect gets the atomic path). A single conditional UPDATE makes the re-lock
+        // atomic: concurrent workers racing on the same expired row contend on the row lock, so
+        // exactly one UPDATE matches (reLockedRows == 1) and the losers match zero rows — which
+        // upholds the inbox dedup guarantee. Returning reLockedRows == 1, rather than an
+        // unconditional update that always returns true, is what closes the double-processing window.
+        // Mirrors InMemoryInboxStore's compare-and-swap re-lock and EfCoreOutboxStore's provider-gated
+        // atomic claim.
+        if (string.Equals(
+                _dbContext.Database.ProviderName,
+                _dialect.ProviderName,
+                StringComparison.Ordinal))
+        {
+            int reLockedRows = await _dbContext.Database.ExecuteSqlAsync(
+                _dialect.GetReLockSql(messageId, consumerType, now, expiresAt),
+                cancellationToken).ConfigureAwait(false);
+
+            return reLockedRows == 1;
+        }
+
+        // Providers without a matching dialect (e.g. SQLite for tests, or a provider whose dialect
+        // was not registered): non-atomic read-then-update fallback. Safe for a single dispatcher
+        // instance / testing; multi-instance production must run on a provider whose dialect's
+        // ProviderName matches so the atomic re-lock above is used. Consistent with the outbox
+        // store's client-side claim fallback for unmatched providers.
         InboxMessage? existing = await _dbContext.Set<InboxMessage>()
             .AsNoTracking()
             .FirstOrDefaultAsync(
@@ -49,7 +77,6 @@ internal sealed class EfCoreInboxStore : IInboxStore
             return false; // Not expired, already processed, or missing — duplicate.
         }
 
-        // Expired lock — update ExpiresAt to re-acquire.
         await _dbContext.Set<InboxMessage>()
             .Where(m => m.MessageId == messageId && m.ConsumerType == consumerType)
             .ExecuteUpdateAsync(

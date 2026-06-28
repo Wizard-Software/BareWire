@@ -76,6 +76,47 @@ public interface IRabbitMqConfigurator
     void DefaultExchange(string exchangeName);
 
     /// <summary>
+    /// Enables opt-in guaranteed-routing mode for the send/publish path. When enabled, outbound messages
+    /// are published with the AMQP <c>mandatory</c> flag set, so a publication the broker accepts but
+    /// cannot route to any queue — caused by topology drift, a missing binding/queue, or a wrong routing
+    /// key — is surfaced as <c>SendResult.IsConfirmed = false</c> (and logged by the transport), instead
+    /// of the publisher confirm reporting success for a message no queue ever received.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <strong>Default is OFF.</strong> Without this call the send path is bit-identical to the historical
+    /// behavior: messages are published with <c>mandatory: false</c>, and a publication the broker accepts
+    /// but cannot route is reported as confirmed (at-most-once routing — silent loss on topology drift is
+    /// possible). Publisher confirms guarantee only that the broker <em>accepted</em> the publication, not
+    /// that it was <em>routed</em> to a queue; this option closes that gap for queued sends.
+    /// </para>
+    /// <para>
+    /// <strong>Where it takes effect.</strong> The fail-closed behavior is realized by components that
+    /// inspect the returned <c>SendResult</c> — chiefly the transactional outbox dispatcher, which treats
+    /// <c>IsConfirmed == false</c> as non-delivery and retries (the outbox row stays claimed rather than
+    /// being marked delivered). The direct <c>IBus.PublishAsync</c> / <c>ISendEndpoint.SendAsync</c> path
+    /// is fire-and-forget: the caller does not receive a <c>SendResult</c>, and the background publisher
+    /// does not redeliver on a negative confirm. On that path this option turns a silent drop into an
+    /// <em>observable</em> one (the transport logs a warning for the unroutable return) but does not by
+    /// itself make direct publishing at-least-once. For at-least-once delivery against topology drift,
+    /// publish through the outbox with this option enabled.
+    /// </para>
+    /// <para>
+    /// <strong>Scope.</strong> Transport-wide toggle for the send/publish path. It does not affect the
+    /// request/response path (which has its own strict mode) or durable park (which always publishes
+    /// mandatory). With the option OFF an unroutable outbox publication is reported as delivered and the
+    /// record is removed despite no consumer ever receiving it.
+    /// </para>
+    /// <para>
+    /// <strong>Performance.</strong> Routable publications are unaffected: the publish channel already
+    /// awaits a per-message publisher confirm, so the <c>mandatory</c> flag adds no extra round-trip.
+    /// Only an unroutable publication incurs a returned-message exception (an exceptional, misconfiguration
+    /// path). There is no per-message allocation on the hot path.
+    /// </para>
+    /// </remarks>
+    void GuaranteedRouting();
+
+    /// <summary>
     /// Configures the mapping between BareWire canonical header names and RabbitMQ
     /// transport-specific header names. Use this to integrate with services that use
     /// non-standard or legacy header conventions.

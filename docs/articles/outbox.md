@@ -84,4 +84,13 @@ You can inspect pending messages:
 GET /outbox/pending   — returns count of undispatched outbox messages
 ```
 
+> **Topology drift and at-least-once.** The outbox marks a row delivered only when the transport
+> reports the publication confirmed. By default the RabbitMQ transport reports a publication the
+> broker *accepted but could not route* (missing binding/queue, wrong routing key) as confirmed — so
+> an unroutable outbox message would be marked delivered and removed though no consumer ever saw it.
+> To keep the at-least-once guarantee against topology drift, enable guaranteed routing on the
+> transport (`rmq.GuaranteedRouting()`): an unroutable publication is then reported as not confirmed,
+> the outbox leaves the row claimed, and it is retried. See
+> [Routing semantics](transport-rabbitmq.md#routing-semantics).
+
 > See: `samples/BareWire.Samples.TransactionalOutbox/`

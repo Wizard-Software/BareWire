@@ -355,6 +355,37 @@ public sealed class RabbitMqConfiguratorTests
         act.Should().Throw<ArgumentException>();
     }
 
+    // ── GuaranteedRouting ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void Build_GuaranteedRoutingEnabled_SetsOption()
+    {
+        // Arrange
+        var configurator = new RabbitMqConfigurator();
+        configurator.Host("amqp://localhost:5672/");
+
+        // Act
+        configurator.GuaranteedRouting();
+        RabbitMqTransportOptions options = configurator.Build();
+
+        // Assert
+        options.GuaranteedRouting.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Build_GuaranteedRoutingNotConfigured_DefaultsFalse()
+    {
+        // Arrange
+        var configurator = new RabbitMqConfigurator();
+        configurator.Host("amqp://localhost:5672/");
+
+        // Act
+        RabbitMqTransportOptions options = configurator.Build();
+
+        // Assert — opt-in: default OFF preserves the historical at-most-once routing behavior.
+        options.GuaranteedRouting.Should().BeFalse();
+    }
+
     // ── Build_NoHost ──────────────────────────────────────────────────────────
 
     [Fact]
