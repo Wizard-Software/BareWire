@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-06-28
+
+### Added
+
+- Opt-in guaranteed-routing for unroutable RabbitMQ publishes
+
+### Fixed
+
+- Atomic outbox inbox re-lock and a resilient publisher loop that survives failures
+
+### Documentation
+
+- Documented all transports and serializers, added a dedicated RabbitMQ transport page, and rewrote the saga guide
+- Added per-type MassTransit producer routing to the MassTransit interop guide
+- Dropped internal ADR references from public XML doc comments and fixed a deprecated example and the README
+- Fixed article inaccuracies
+
 ## [2.0.0] - 2026-06-27
 
 ### Added
