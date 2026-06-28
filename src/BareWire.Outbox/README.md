@@ -1,6 +1,6 @@
 # BareWire.Outbox
 
-Transactional outbox and inbox pattern for BareWire ensuring exactly-once message delivery.
+Transactional outbox and inbox pattern for BareWire. Delivery is **at-least-once**; combined with inbox deduplication (whose `ProcessedAt` marker commits atomically with the consumer's business transaction) it yields **exactly-once processing** (effectively-once).
 
 ## Installation
 

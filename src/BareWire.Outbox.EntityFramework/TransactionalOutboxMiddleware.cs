@@ -1,5 +1,6 @@
 using System.Transactions;
 using BareWire.Abstractions.Pipeline;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 using static BareWire.Abstractions.Pipeline.WellKnownItemKeys;
@@ -53,74 +54,93 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
                 ? headerValue
                 : context.GetType().Name;
 
-        // 1. Inbox deduplication check — skip processing if we already have a lock.
-        bool lockAcquired = await _inboxFilter
-            .TryLockAsync(context.MessageId, consumerType, ct)
-            .ConfigureAwait(false);
-
-        if (!lockAcquired)
-        {
-            TransactionalOutboxLogMessages.DuplicateMessageSkipped(_logger, context.MessageId);
-            context.Items[InboxFiltered] = true;
-            return;
-        }
-
-        var buffer = new OutboxBuffer();
-        _current.Value = buffer;
-
-        // 2. Begin ambient transaction — both the application DbContext and OutboxDbContext
-        //    must share the same connection string to avoid DTC escalation.
-        using var scope = new TransactionScope(
-            TransactionScopeOption.Required,
-            new TransactionOptions { IsolationLevel = IsolationLevel.ReadCommitted },
-            TransactionScopeAsyncFlowOption.Enabled);
-
+        // Open and hold the physical database connection for the entire operation.
+        // Keeping one connection open ensures SaveChangesAsync and MarkProcessedAsync
+        // (ExecuteUpdateAsync) share ONE physical connection enlisted once in the ambient
+        // TransactionScope — preventing DTC escalation on Npgsql / non-Windows hosts.
+        await _dbContext.Database.OpenConnectionAsync(ct).ConfigureAwait(false);
         try
         {
-            // 3. Invoke handler — business logic runs inside the transaction.
-            await nextMiddleware(context).ConfigureAwait(false);
+            // 1. Inbox deduplication check — deliberately OUTSIDE the TransactionScope so the
+            //    lock row is committed immediately and visible to other workers even if the
+            //    business transaction later rolls back.
+            bool lockAcquired = await _inboxFilter
+                .TryLockAsync(context.MessageId, consumerType, ct)
+                .ConfigureAwait(false);
 
-            // 4. Flush outbox buffer — add OutboxMessage entities to DbContext (no SaveChanges yet).
-            if (!buffer.IsEmpty)
+            if (!lockAcquired)
             {
-                var messages = buffer.GetMessages();
-                TransactionalOutboxLogMessages.FlushingBuffer(_logger, context.MessageId, messages.Count);
-                await _outboxStore.SaveMessagesAsync(messages, ct).ConfigureAwait(false);
+                TransactionalOutboxLogMessages.DuplicateMessageSkipped(_logger, context.MessageId);
+                context.Items[InboxFiltered] = true;
+                return;
             }
 
-            // 5. Atomically persist business state + outbox messages + inbox record.
-            await _dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+            var buffer = new OutboxBuffer();
+            _current.Value = buffer;
 
-            // 6. Commit the transaction.
-            scope.Complete();
+            // 2. Begin ambient transaction. The connection is already open and will be enlisted
+            //    once in this scope. Both SaveChangesAsync and MarkProcessedAsync use the same
+            //    enlisted connection — no second connection is opened, DTC is never triggered.
+            using var scope = new TransactionScope(
+                TransactionScopeOption.Required,
+                new TransactionOptions { IsolationLevel = IsolationLevel.ReadCommitted },
+                TransactionScopeAsyncFlowOption.Enabled);
 
-            // 7. Mark the inbox entry as permanently processed — prevents re-lock after ExpiresAt.
-            //    Runs in a Suppress scope to explicitly opt out of any completed ambient
-            //    TransactionScope. This is a standalone best-effort UPDATE; crash between Complete()
-            //    and here is an accepted at-least-once risk — consumers must be idempotent.
-            using (var suppressScope = new TransactionScope(
-                TransactionScopeOption.Suppress,
-                TransactionScopeAsyncFlowOption.Enabled))
+            try
             {
+                // 3. Invoke handler — business logic runs inside the transaction.
+                await nextMiddleware(context).ConfigureAwait(false);
+
+                // 4. Flush outbox buffer — add OutboxMessage entities to DbContext (no SaveChanges yet).
+                if (!buffer.IsEmpty)
+                {
+                    var messages = buffer.GetMessages();
+                    TransactionalOutboxLogMessages.FlushingBuffer(_logger, context.MessageId, messages.Count);
+                    await _outboxStore.SaveMessagesAsync(messages, ct).ConfigureAwait(false);
+                }
+
+                // 5. Atomically persist business state + outbox messages.
+                await _dbContext.SaveChangesAsync(ct).ConfigureAwait(false);
+
+                // 6. Mark the inbox entry as permanently processed — atomically with the business
+                //    state and outbox messages in this same TransactionScope. No window exists
+                //    between committing the business state and setting ProcessedAt: either all
+                //    three writes commit together via scope.Complete(), or all three roll back.
                 await _inboxFilter.MarkProcessedAsync(context.MessageId, consumerType, ct)
                     .ConfigureAwait(false);
-                suppressScope.Complete();
-            }
 
-            TransactionalOutboxLogMessages.TransactionCompleted(_logger, context.MessageId);
-        }
-        catch
-        {
-            // Buffer is discarded; DbContext changes are not saved; TransactionScope
-            // disposes without Complete() — automatic rollback.
-            int discardCount = buffer.GetMessages().Count;
-            TransactionalOutboxLogMessages.DiscardingBuffer(_logger, context.MessageId, discardCount);
-            buffer.Clear();
-            throw;
+                // 7. Commit: business state + outbox messages + processed marker atomically.
+                scope.Complete();
+
+                TransactionalOutboxLogMessages.TransactionCompleted(_logger, context.MessageId);
+            }
+            catch
+            {
+                // Buffer is discarded; DbContext changes are not saved; TransactionScope
+                // disposes without Complete() — automatic rollback of all three writes.
+                int discardCount = buffer.GetMessages().Count;
+                TransactionalOutboxLogMessages.DiscardingBuffer(_logger, context.MessageId, discardCount);
+                buffer.Clear();
+                throw;
+            }
+            finally
+            {
+                _current.Value = null;
+            }
         }
         finally
         {
-            _current.Value = null;
+            // Close the pinned connection on every path. Guard the close so a connection-close
+            // failure never masks the original exception propagating from the try block (handler
+            // fault or commit error) — the real cause must reach the transport for correct settlement.
+            try
+            {
+                await _dbContext.Database.CloseConnectionAsync().ConfigureAwait(false);
+            }
+            catch (Exception closeException)
+            {
+                TransactionalOutboxLogMessages.ConnectionCloseFailed(_logger, context.MessageId, closeException);
+            }
         }
     }
 }
@@ -156,4 +176,12 @@ internal static partial class TransactionalOutboxLogMessages
     internal static partial void TransactionCompleted(
         ILogger logger,
         Guid messageId);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "Failed to close the pinned database connection for message {MessageId}; the original operation outcome is unaffected")]
+    internal static partial void ConnectionCloseFailed(
+        ILogger logger,
+        Guid messageId,
+        Exception exception);
 }

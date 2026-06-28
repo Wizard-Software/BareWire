@@ -154,4 +154,58 @@ public sealed class TransactionalOutboxMiddlewareTests
         nextCalled.Should().BeTrue(
             "the downstream pipeline must be invoked when the inbox lock is acquired");
     }
+
+    /// <summary>
+    /// Verifies that <c>MarkProcessedAsync</c> is called on the inbox store when the handler
+    /// completes successfully. This is the regression guard for the atomicity fix: the marker
+    /// must now be called inside the <c>TransactionScope</c> before <c>scope.Complete()</c>.
+    /// Atomicity of the write (marker + business state) is proven by the E2E test against a
+    /// real PostgreSQL instance, where <c>TransactionScope</c> is enforced.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_WhenLockAcquiredAndHandlerSucceeds_CallsMarkProcessedAsync()
+    {
+        // Arrange — inbox store grants the lock; handler is a no-op.
+        var (middleware, inboxStore) = CreateMiddleware(lockAcquired: true);
+        MessageContext context = CreateContext();
+        NextMiddleware next = _ => Task.CompletedTask;
+
+        // Act
+        await middleware.InvokeAsync(context, next);
+
+        // Assert — MarkProcessedAsync must be called exactly once to close the reprocessing window.
+        // Discard the returned ValueTask — NSubstitute Received() checks call registration, not result.
+        _ = inboxStore.Received(1).MarkProcessedAsync(
+            context.MessageId,
+            Arg.Any<string>(),
+            Arg.Any<CancellationToken>());
+    }
+
+    /// <summary>
+    /// Verifies that <c>MarkProcessedAsync</c> is NOT called when the handler throws.
+    /// With the atomicity fix, <c>MarkProcessedAsync</c> runs inside the <c>TransactionScope</c>
+    /// before <c>scope.Complete()</c>. A handler exception causes the scope to dispose without
+    /// <c>Complete()</c> — all three writes (business state + outbox + processed marker) roll back.
+    /// This test guards the rollback path: the marker must never be persisted on a failed handler.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_WhenHandlerThrows_DoesNotCallMarkProcessedAsync()
+    {
+        // Arrange — inbox store grants the lock; handler faults.
+        var (middleware, inboxStore) = CreateMiddleware(lockAcquired: true);
+        MessageContext context = CreateContext();
+        NextMiddleware next = _ => Task.FromException(new InvalidOperationException("handler fault"));
+
+        // Act — exception must propagate out of InvokeAsync.
+        Func<Task> act = () => middleware.InvokeAsync(context, next);
+        await act.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("handler fault");
+
+        // Assert — MarkProcessedAsync must NOT be invoked; the transaction rolls back.
+        // Discard the returned ValueTask — NSubstitute DidNotReceive() checks call registration, not result.
+        _ = inboxStore.DidNotReceive().MarkProcessedAsync(
+            Arg.Any<Guid>(),
+            Arg.Any<string>(),
+            Arg.Any<CancellationToken>());
+    }
 }
