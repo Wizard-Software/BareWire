@@ -9,9 +9,18 @@ var rabbitmq = builder.AddRabbitMQ("rabbitmq")
     .WithLifetime(ContainerLifetime.Session)
     .WithManagementPlugin();
 
-var postgres = builder.AddPostgres("postgres")
+// Enable PostgreSQL prepared transactions (2-phase commit) via max_prepared_transactions.
+// System.Transactions.TransactionScope — used by the BareWire transactional outbox middleware —
+// escalates to 2PC when a consumer enlists a SECOND database connection inside the consume
+// transaction (e.g. the OrderedConsumers sample persists a ProcessedRecord via its own DbContext
+// alongside the outbox/inbox writes). PostgreSQL ships with max_prepared_transactions=0 (2PC
+// disabled), which makes such a consume abort with SqlState 55000 ("prepared transactions are
+// disabled") and dead-letter every message. A small nonzero pool enables the atomic commit.
+var postgresServer = builder.AddPostgres("postgres")
     .WithLifetime(ContainerLifetime.Session)
-    .AddDatabase("barewiredb");
+    .WithArgs("-c", "max_prepared_transactions=100");
+
+var postgres = postgresServer.AddDatabase("barewiredb");
 
 builder.AddProject<Projects.BareWire_Samples_BasicPublishConsume>("basic-publish-consume")
     .WithReference(rabbitmq)

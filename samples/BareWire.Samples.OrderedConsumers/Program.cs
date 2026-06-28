@@ -72,6 +72,12 @@ string dbConnectionString =
 // 3. EF Core — application DbContext for processed-record log
 // ─────────────────────────────────────────────────────────────────────────────
 
+// NOTE (PostgreSQL 2PC): the consumers below persist a ProcessedRecord through THIS DbContext while
+// the transactional outbox middleware holds an ambient TransactionScope on its own OutboxDbContext.
+// That second connection makes the scope escalate to a two-phase (prepared) commit, which requires
+// max_prepared_transactions > 0 on PostgreSQL (disabled by default → consume aborts with SqlState
+// 55000 and every message is dead-lettered). The Aspire AppHost sets it; a manual Postgres container
+// needs `-c max_prepared_transactions=100`. See BareWire.Outbox.EntityFramework/README.md.
 builder.Services.AddDbContext<OrderedConsumersDbContext>(o => o.UseNpgsql(dbConnectionString));
 
 // No singleton PoisonKeyHolder needed — the poison-head indicator is stamped as a

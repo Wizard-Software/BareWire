@@ -18,8 +18,16 @@ If you prefer to run a sample individually, start RabbitMQ and PostgreSQL first:
 
 ```bash
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
-docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=password postgres
+docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=barewiredb postgres -c max_prepared_transactions=100
 ```
+
+> **Why `-c max_prepared_transactions=100`?** The transactional-outbox samples wrap each consume in a
+> `System.Transactions.TransactionScope`. When a consumer also persists business state through **its own**
+> `DbContext` (a second database connection) — as `OrderedConsumers` does with its `ProcessedRecord` log —
+> the scope escalates to a two-phase (prepared) commit. PostgreSQL ships with `max_prepared_transactions=0`
+> (2PC disabled), so without this flag those consumes abort with `55000: prepared transactions are disabled`
+> and every message is dead-lettered. The Aspire AppHost sets this automatically; a manual container needs
+> it explicitly. See the [transactional outbox limitation](../src/BareWire.Outbox.EntityFramework/README.md).
 
 Then run the sample:
 
