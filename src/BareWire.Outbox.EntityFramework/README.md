@@ -260,11 +260,48 @@ services.AddSingleton<IOutboxSqlDialect, SqlServerOutboxSqlDialect>(); // wins o
 services.AddBareWireOutbox(options => options.UseSqlServer(connectionString));
 ```
 
+## Startup Fail-Fast Guard (Atomic-Provider Requirement)
+
+At host startup, `OutboxProviderAtomicityChecker` verifies that both the registered
+`IOutboxSqlDialect` and `IInboxSqlDialect` have a `ProviderName` matching the active EF Core
+provider. If either dialect does not match, the host throws `BareWireConfigurationException`
+and refuses to start.
+
+This prevents the silent non-atomic fallback from activating in multi-instance deployments,
+where it would break claim/dedup invariants and cause duplicate message delivery.
+
+### Single-instance / testing opt-out
+
+For single-instance deployments or test environments using a provider without a matching atomic
+dialect (e.g. SQLite), set `AllowNonAtomicProvider = true`:
+
+```csharp
+services.AddBareWireOutbox(
+    options => options.UseSqlite("DataSource=:memory:"),
+    outbox =>
+    {
+        outbox.AllowNonAtomicProvider = true; // single-instance / testing only — see warning below
+        outbox.AutoCreateSchema = true;
+    });
+```
+
+**Warning:** `AllowNonAtomicProvider = true` activates the non-atomic client-side fallback.
+A startup Warning is logged (EventId 7601) identifying the active provider and both dialect names.
+This option is safe only when a single dispatcher instance is running. Never use it in
+multi-instance production deployments.
+
+### SQL Server
+
+SQL Server requires a user-supplied `IOutboxSqlDialect` and `IInboxSqlDialect` with
+`ProviderName = "Microsoft.EntityFrameworkCore.SqlServer"`. Register them before calling
+`AddBareWireOutbox` so that `TryAddSingleton` keeps your registration. Without a custom dialect,
+the startup guard throws `BareWireConfigurationException` (default dialects target PostgreSQL).
+
 ## Supported Databases
 
 - **PostgreSQL** — full atomic claim with `FOR UPDATE SKIP LOCKED` (recommended for production)
-- **SQL Server** — supply a custom `IOutboxSqlDialect` (`ProviderName` = `"Microsoft.EntityFrameworkCore.SqlServer"`) using `WITH (UPDLOCK, READPAST)`; the store invokes it once the provider name matches
-- **SQLite** — client-side claim for testing; not suitable for multi-instance production use
+- **SQL Server** — supply custom `IOutboxSqlDialect` and `IInboxSqlDialect` (see above)
+- **SQLite** — client-side claim; set `AllowNonAtomicProvider = true`; not suitable for multi-instance production use
 
 ## Documentation
 
