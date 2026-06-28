@@ -12,6 +12,9 @@ internal sealed class PostgresOutboxSqlDialect : IOutboxSqlDialect
     public string ProviderName => "Npgsql.EntityFrameworkCore.PostgreSQL";
 
     /// <inheritdoc />
+    public bool SupportsPerKeyHeadOfLineOrdering => true;
+
+    /// <inheritdoc />
     public FormattableString GetClaimSql(
         string instanceId,
         DateTimeOffset now,

@@ -9,24 +9,39 @@ internal sealed partial class OutboxCleanupService : IHostedService, IAsyncDispo
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly OutboxOptions _options;
     private readonly ILogger<OutboxCleanupService> _logger;
+    private readonly IHostApplicationLifetime _lifetime;
 
     private CancellationTokenSource? _cts;
+    private CancellationTokenRegistration _startedRegistration;
     private Task? _cleanupTask;
 
     public OutboxCleanupService(
         IServiceScopeFactory scopeFactory,
         OutboxOptions options,
-        ILogger<OutboxCleanupService> logger)
+        ILogger<OutboxCleanupService> logger,
+        IHostApplicationLifetime lifetime)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _lifetime = lifetime ?? throw new ArgumentNullException(nameof(lifetime));
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _cleanupTask = RunCleanupLoopAsync(_cts.Token);
+        CancellationToken token = _cts.Token;
+
+        // Defer the cleanup loop until the host has FULLY started. Cleanup performs destructive DELETEs
+        // (outbox/inbox row removal), so — exactly like the dispatcher — it must never run from a process
+        // that never became healthy. IHostApplicationLifetime.ApplicationStarted fires only after every
+        // IHostedService.StartAsync has completed successfully, and never fires if startup aborts. The
+        // callback runs on the host's startup thread, so it only kicks the loop onto the thread pool
+        // (Task.Run), never runs it inline. If the token is already signalled (the host has already started)
+        // Register invokes the callback synchronously, which still merely schedules the loop and returns.
+        _startedRegistration = _lifetime.ApplicationStarted.Register(
+            () => _cleanupTask = Task.Run(() => RunCleanupLoopAsync(token), token));
+
         LogCleanupServiceStarted(_logger, _options.CleanupInterval);
         return Task.CompletedTask;
     }
@@ -34,6 +49,9 @@ internal sealed partial class OutboxCleanupService : IHostedService, IAsyncDispo
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         LogCleanupServiceStopping(_logger);
+
+        // Dispose the ApplicationStarted registration FIRST so the loop cannot start after stop begins.
+        _startedRegistration.Dispose();
 
         if (_cts is not null)
         {
@@ -57,6 +75,8 @@ internal sealed partial class OutboxCleanupService : IHostedService, IAsyncDispo
 
     public async ValueTask DisposeAsync()
     {
+        _startedRegistration.Dispose();
+
         if (_cts is not null)
         {
             await _cts.CancelAsync().ConfigureAwait(false);

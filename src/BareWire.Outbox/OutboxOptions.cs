@@ -15,6 +15,7 @@ internal sealed record OutboxOptions
     public TimeSpan OutboxLockTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan CleanupInterval { get; init; } = TimeSpan.FromHours(1);
     public bool AllowNonAtomicProvider { get; init; }
+    public bool AllowDegradedOrdering { get; init; }
     public bool AutoCreateSchema { get; init; }
     public OrderingMode OrderingMode { get; init; } = OrderingMode.None;
     public string? OrderingKeyHeaderName { get; init; }

@@ -57,9 +57,11 @@ public interface IOutboxConfigurator
     /// before the cleanup service removes the row.
     /// </para>
     /// <para>
-    /// Nacked rows (partial send failures) are not explicitly unlocked. They become
-    /// eligible for re-delivery once this timeout elapses. To minimize retry latency,
-    /// set this value conservatively relative to your broker's worst-case publish-confirm time.
+    /// This timeout governs <b>crash recovery only</b>. Nacked rows (partial send failures) are
+    /// <b>not</b> left for this timeout to expire: the dispatcher explicitly releases their claim and
+    /// retries them on the next poll cycle (roughly every <see cref="PollingInterval"/>). Size retry
+    /// pressure during broker degradation or poison-message scenarios off <see cref="PollingInterval"/>,
+    /// not this value.
     /// </para>
     /// Defaults to <c>30 seconds</c>.
     /// </remarks>
@@ -78,6 +80,17 @@ public interface IOutboxConfigurator
     /// claim/dedup invariants under multi-instance load. Default: <see langword="false"/>.
     /// </summary>
     bool AllowNonAtomicProvider { get; set; }
+
+    /// <summary>
+    /// When <see langword="true"/>, suppresses the startup fail-fast guard that rejects
+    /// <see cref="OrderingMode.PerKey"/> on a dialect that does not provide native head-of-line
+    /// ordering (i.e. does not override the 5-arg <c>GetClaimSql</c>). With the guard suppressed,
+    /// per-key ordering silently degrades to passthrough: messages sharing an ordering key can be
+    /// delivered out of order and marked delivered (irreversible). Leave <see langword="false"/>
+    /// unless you accept that degradation. Has no effect when <see cref="OrderingMode"/> is
+    /// <see cref="OrderingMode.None"/>. Default: <see langword="false"/>.
+    /// </summary>
+    bool AllowDegradedOrdering { get; set; }
 
     /// <summary>
     /// When <see langword="true"/>, Outbox/Inbox tables are created automatically at host startup.

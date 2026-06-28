@@ -10,30 +10,53 @@ namespace BareWire.Outbox;
 
 internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposable
 {
+    // Maximum number of back-to-back full+confirmed batches the polling loop drains before forcing a
+    // PollingInterval pause. Caps the catch-up rate at MaxConsecutiveDrains × DispatchBatchSize per
+    // PollingInterval, so a large backlog cannot turn the drain into an unbounded tight send loop that
+    // churns one broker channel (and one DB row-claim UPDATE) per batch as fast as the process can spin.
+    // It still raises the single-instance ceiling far above the ~DispatchBatchSize-per-PollingInterval of
+    // a pure timer (10× at the defaults), just not without limit. Internal, not configurable by design.
+    private const int MaxConsecutiveDrains = 10;
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ITransportAdapter _adapter;
     private readonly OutboxOptions _options;
     private readonly ILogger<OutboxDispatcher> _logger;
+    private readonly IHostApplicationLifetime _lifetime;
 
     private CancellationTokenSource? _cts;
+    private CancellationTokenRegistration _startedRegistration;
     private Task? _pollingTask;
 
     public OutboxDispatcher(
         IServiceScopeFactory scopeFactory,
         ITransportAdapter adapter,
         OutboxOptions options,
-        ILogger<OutboxDispatcher> logger)
+        ILogger<OutboxDispatcher> logger,
+        IHostApplicationLifetime lifetime)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _lifetime = lifetime ?? throw new ArgumentNullException(nameof(lifetime));
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _pollingTask = RunPollingLoopAsync(_cts.Token);
+        CancellationToken token = _cts.Token;
+
+        // Defer the polling loop until the host has FULLY started. IHostApplicationLifetime.ApplicationStarted
+        // fires only after every IHostedService.StartAsync has completed successfully — and never fires if
+        // startup aborts — so the dispatcher claims/sends nothing from a process that never became healthy
+        // (publishing a message and marking the row delivered are irreversible external side effects). The
+        // callback runs on the host's startup thread, so it only kicks the loop onto the thread pool
+        // (Task.Run), never runs it inline. If the token is already signalled (the host has already started)
+        // Register invokes the callback synchronously, which still merely schedules the loop and returns.
+        _startedRegistration = _lifetime.ApplicationStarted.Register(
+            () => _pollingTask = Task.Run(() => RunPollingLoopAsync(token), token));
+
         LogDispatcherStarted(_logger, _options.PollingInterval, _options.DispatchBatchSize);
         return Task.CompletedTask;
     }
@@ -41,6 +64,11 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         LogDispatcherStopping(_logger);
+
+        // Dispose the ApplicationStarted registration FIRST so the loop cannot start after stop begins.
+        // CancellationTokenRegistration.Dispose() blocks until any in-flight callback completes, so once
+        // it returns _pollingTask is either set (callback ran) or will never be set (callback removed).
+        _startedRegistration.Dispose();
 
         if (_cts is not null)
         {
@@ -64,6 +92,8 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
     public async ValueTask DisposeAsync()
     {
+        _startedRegistration.Dispose();
+
         if (_cts is not null)
         {
             await _cts.CancelAsync().ConfigureAwait(false);
@@ -74,13 +104,27 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
     private async Task RunPollingLoopAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(_options.PollingInterval);
+        // Relative-paced poll loop. Each iteration dispatches one batch, then decides how long to wait
+        // before the next claim based on the OUTCOME — pacing is relative to this batch's completion,
+        // never to a fixed timer grid:
+        //   - FULL batch, every row confirmed (no nacks) → claim again immediately (drain the backlog),
+        //     so a single instance is not capped at ~DispatchBatchSize per PollingInterval.
+        //   - anything else (empty, partial, fully nacked, or a transient error) → wait one
+        //     PollingInterval before the next claim.
+        // The relative delay is what makes nack pacing correct: a nack always backs off ~PollingInterval
+        // from the failure regardless of how long the preceding drain ran. A fixed PeriodicTimer grid
+        // would instead let a nack landing near a tick boundary retry almost immediately, hammering a
+        // struggling broker (nacked rows are released for retry, so the very next claim re-sends them).
+        // Counts consecutive immediate drains so a sustained backlog drains in bounded bursts
+        // (MaxConsecutiveDrains) rather than an unbounded tight loop. Reset whenever the loop pauses.
+        int consecutiveDrains = 0;
 
-        while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+        while (!ct.IsCancellationRequested)
         {
+            (int Claimed, int Confirmed) batch;
             try
             {
-                await DispatchBatchAsync(ct).ConfigureAwait(false);
+                batch = await DispatchBatchAsync(ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -89,12 +133,31 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
             catch (Exception ex)
             {
                 LogDispatchError(_logger, ex);
-                // Continue — do not crash the hosted service on transient errors.
+                // Transient error: treat as no progress so the loop paces before retrying (below).
+                batch = default;
             }
+
+            // Drain immediately only on a full, fully-confirmed batch AND while under the burst cap;
+            // otherwise (empty, partial, fully nacked, transient error, or cap reached) pace the next
+            // claim by one PollingInterval. The cap bounds broker/DB churn during backlog recovery.
+            if (batch.Claimed >= _options.DispatchBatchSize
+                && batch.Confirmed == batch.Claimed
+                && consecutiveDrains < MaxConsecutiveDrains)
+            {
+                consecutiveDrains++;
+                continue;
+            }
+
+            consecutiveDrains = 0;
+            await Task.Delay(_options.PollingInterval, ct).ConfigureAwait(false);
         }
     }
 
-    private async Task DispatchBatchAsync(CancellationToken ct)
+    // Returns (Claimed, Confirmed): how many entries this cycle claimed and how many the broker
+    // confirmed. The polling loop drains again immediately only when a full batch was claimed (more
+    // backlog is likely) AND every claimed row was confirmed (no nacks), so any failure — partial or
+    // total — degrades to tick-paced retry rather than a hot re-claim loop on the released rows.
+    private async Task<(int Claimed, int Confirmed)> DispatchBatchAsync(CancellationToken ct)
     {
         await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
         IOutboxStore store = scope.ServiceProvider.GetRequiredService<IOutboxStore>();
@@ -105,7 +168,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
         if (pending.Count == 0)
         {
-            return;
+            return (0, 0);
         }
 
         LogDispatching(_logger, pending.Count);
@@ -128,6 +191,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         // re-enqueued in-memory entries). Their buffers must NOT be returned to the ArrayPool below
         // — the store still references them. Empty for EF Core (fresh per-cycle buffers).
         IReadOnlySet<long> retainedByStore = FrozenSet<long>.Empty;
+        int confirmedCount = 0;
 
         try
         {
@@ -241,6 +305,8 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 }
             }
 
+            confirmedCount = confirmedIds.Count;
+
             if (confirmedIds.Count > 0)
             {
                 await store.MarkDeliveredAsync(confirmedIds, ct).ConfigureAwait(false);
@@ -269,6 +335,8 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 }
             }
         }
+
+        return (pending.Count, confirmedCount);
     }
 
     [LoggerMessage(

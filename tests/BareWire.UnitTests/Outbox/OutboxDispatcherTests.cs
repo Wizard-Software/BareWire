@@ -7,6 +7,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 
@@ -44,28 +45,48 @@ public sealed class OutboxDispatcherTests
             .Returns(_ => ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty));
     }
 
-    private OutboxDispatcher CreateSut(TimeSpan? pollingInterval = null, int batchSize = 100)
+    private OutboxDispatcher CreateSut(
+        TimeSpan? pollingInterval = null,
+        int batchSize = 100,
+        IHostApplicationLifetime? lifetime = null)
     {
         var options = new OutboxOptions
         {
             PollingInterval = pollingInterval ?? TimeSpan.FromMilliseconds(10),
             DispatchBatchSize = batchSize
         };
-        return new OutboxDispatcher(_scopeFactory, _adapter, options, _logger);
+        return new OutboxDispatcher(_scopeFactory, _adapter, options, _logger, lifetime ?? StartedLifetime());
     }
 
     private OutboxDispatcher CreateSutWithOptions(OutboxOptions options)
-        => new OutboxDispatcher(_scopeFactory, _adapter, options, _logger);
+        => new OutboxDispatcher(_scopeFactory, _adapter, options, _logger, StartedLifetime());
 
+    // A lifetime whose ApplicationStarted has already fired, so the dispatcher's loop starts
+    // immediately on StartAsync — preserving the behaviour the timing tests rely on.
+    private static IHostApplicationLifetime StartedLifetime()
+    {
+        var lifetime = Substitute.For<IHostApplicationLifetime>();
+        var started = new CancellationTokenSource();
+        started.Cancel();
+        lifetime.ApplicationStarted.Returns(started.Token);
+        return lifetime;
+    }
+
+    // PooledBody must be rented from ArrayPool.Shared (as EfCoreOutboxStore.GetPendingAsync does):
+    // the dispatcher returns it to the shared pool in its finally block, and the pool rejects a plain
+    // (non-rented) array on Return with an ArgumentException. BodyLength is the logical length; the
+    // rented buffer may be larger.
     private static OutboxEntry CreateEntry(long id, string routingKey = "test.routing.key")
     {
-        byte[] body = "test-body"u8.ToArray();
+        ReadOnlySpan<byte> body = "test-body"u8;
+        byte[] pooled = System.Buffers.ArrayPool<byte>.Shared.Rent(body.Length);
+        body.CopyTo(pooled);
         return new OutboxEntry
         {
             Id = id,
             RoutingKey = routingKey,
             Headers = new Dictionary<string, string>(),
-            PooledBody = body,
+            PooledBody = pooled,
             BodyLength = body.Length,
             ContentType = "application/json",
             CreatedAt = DateTimeOffset.UtcNow,
@@ -75,13 +96,15 @@ public sealed class OutboxDispatcherTests
 
     private static OutboxEntry CreateKeyedEntry(long id, string? orderingKey, string routingKey = "test.routing.key")
     {
-        byte[] body = "test-body"u8.ToArray();
+        ReadOnlySpan<byte> body = "test-body"u8;
+        byte[] pooled = System.Buffers.ArrayPool<byte>.Shared.Rent(body.Length);
+        body.CopyTo(pooled);
         return new OutboxEntry
         {
             Id = id,
             RoutingKey = routingKey,
             Headers = new Dictionary<string, string>(),
-            PooledBody = body,
+            PooledBody = pooled,
             BodyLength = body.Length,
             ContentType = "application/json",
             CreatedAt = DateTimeOffset.UtcNow,
@@ -344,7 +367,6 @@ public sealed class OutboxDispatcherTests
     public async Task DispatchBatchAsync_AllNacked_NoMarkDelivered_RetriesOnNextPoll()
     {
         // Arrange — all messages are nacked by the broker.
-        var entries = new List<OutboxEntry> { CreateEntry(1), CreateEntry(2), CreateEntry(3) };
         int getPendingCallCount = 0;
 
         _store
@@ -352,9 +374,13 @@ public sealed class OutboxDispatcherTests
             .Returns(_ =>
             {
                 getPendingCallCount++;
-                // Return entries on every poll to verify they remain pending.
+                // Fresh entries per poll (each poll rents its own pooled buffers, as in production) so
+                // the dispatcher's buffer return stays balanced across re-polls. Entries on the first
+                // two polls to verify they remain pending; empty afterwards.
                 return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
-                    getPendingCallCount <= 2 ? entries : Array.Empty<OutboxEntry>());
+                    getPendingCallCount <= 2
+                        ? new List<OutboxEntry> { CreateEntry(1), CreateEntry(2), CreateEntry(3) }
+                        : Array.Empty<OutboxEntry>());
             });
 
         _adapter
@@ -407,7 +433,6 @@ public sealed class OutboxDispatcherTests
     public async Task DispatchBatchAsync_SendThrows_MessagesRetainedForRetry()
     {
         // Arrange — SendBatchAsync throws a transport exception on the first call.
-        var entries = new List<OutboxEntry> { CreateEntry(1), CreateEntry(2) };
         int getPendingCallCount = 0;
 
         _store
@@ -415,8 +440,11 @@ public sealed class OutboxDispatcherTests
             .Returns(_ =>
             {
                 getPendingCallCount++;
+                // Fresh entries per poll (pooled buffers rented anew each poll, as in production).
                 return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
-                    getPendingCallCount <= 2 ? entries : Array.Empty<OutboxEntry>());
+                    getPendingCallCount <= 2
+                        ? new List<OutboxEntry> { CreateEntry(1), CreateEntry(2) }
+                        : Array.Empty<OutboxEntry>());
             });
 
         _adapter
@@ -607,5 +635,436 @@ public sealed class OutboxDispatcherTests
         releaseLockCallCount.Should().Be(1, "None path must issue a single ReleaseLockAsync call");
         releasedIds.Should().NotBeNull();
         releasedIds!.Should().BeEquivalentTo([2L]);
+    }
+
+    // Drain-loop: within a SINGLE poll tick the dispatcher keeps claiming while each batch comes
+    // back full (more backlog is likely), instead of dispatching one batch per PollingInterval and
+    // idling the rest of the tick. Without the drain-loop a single instance is capped at
+    // ~DispatchBatchSize per PollingInterval.
+    [Fact]
+    public async Task RunPollingLoop_FullBatch_DrainsNextBatchWithinSamePollTick()
+    {
+        // Arrange — batch size 2; the store returns a FULL batch (2 entries) on the first two claims
+        // and empties afterwards. With the drain-loop the second claim happens in the SAME tick as
+        // the first; without it, the second claim waits a whole PollingInterval for the next tick.
+        const int batchSize = 2;
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        var secondClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long firstClaimMs = -1;
+        long secondClaimMs = -1;
+        int getPendingCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int call = Interlocked.Increment(ref getPendingCalls);
+                if (call == 1)
+                {
+                    firstClaimMs = stopwatch.ElapsedMilliseconds;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(1), CreateEntry(2) });
+                }
+
+                if (call == 2)
+                {
+                    secondClaimMs = stopwatch.ElapsedMilliseconds;
+                    secondClaim.TrySetResult();
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(3), CreateEntry(4) });
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                IReadOnlyList<OutboundMessage> msgs = ci.Arg<IReadOnlyList<OutboundMessage>>();
+                SendResult[] results = msgs
+                    .Select((_, i) => new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i))
+                    .ToArray();
+                return Task.FromResult<IReadOnlyList<SendResult>>(results);
+            });
+
+        _store
+            .MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => ValueTask.CompletedTask);
+
+        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+
+        // Wait until the second claim happens. With the drain-loop it lands in the SAME tick as the
+        // first (gap ≈ 0); without it, the second claim waits a whole PollingInterval for the next tick.
+        await secondClaim.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — the gap between the two claims must be well under one PollingInterval, which is only
+        // possible if the dispatcher drains the backlog within a single tick instead of one-per-tick.
+        long gapMs = secondClaimMs - firstClaimMs;
+        gapMs.Should().BeLessThan(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"a full batch must trigger an immediate re-claim within the same poll tick (drain-loop); " +
+            $"firstClaim@{firstClaimMs}ms secondClaim@{secondClaimMs}ms gap={gapMs}ms " +
+            $"pollingInterval={pollingInterval.TotalMilliseconds}ms");
+    }
+
+    // Drain-loop failure guard: a FULL batch the broker entirely NACKs must NOT hot-loop. With zero
+    // forward progress the dispatcher stops draining and waits one PollingInterval (relative delay)
+    // before the next claim, pacing retries instead of hammering a failing broker. So the second claim
+    // must land ~one PollingInterval after the first, NOT back-to-back.
+    [Fact]
+    public async Task RunPollingLoop_FullBatchAllNacked_DoesNotDrain_WaitsForNextTick()
+    {
+        const int batchSize = 2;
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        var secondClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long firstClaimMs = -1;
+        long secondClaimMs = -1;
+        int getPendingCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int call = Interlocked.Increment(ref getPendingCalls);
+                if (call == 1)
+                {
+                    firstClaimMs = stopwatch.ElapsedMilliseconds;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(1), CreateEntry(2) });
+                }
+
+                if (call == 2)
+                {
+                    secondClaimMs = stopwatch.ElapsedMilliseconds;
+                    secondClaim.TrySetResult();
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(3), CreateEntry(4) });
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        // Broker nacks every message — no forward progress.
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                IReadOnlyList<OutboundMessage> msgs = ci.Arg<IReadOnlyList<OutboundMessage>>();
+                SendResult[] results = msgs
+                    .Select((_, i) => new SendResult(IsConfirmed: false, DeliveryTag: (ulong)i))
+                    .ToArray();
+                return Task.FromResult<IReadOnlyList<SendResult>>(results);
+            });
+
+        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await secondClaim.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — the all-nacked batch makes no forward progress, so the second claim must wait ~one
+        // full PollingInterval for the next tick (no hot-spin against a failing broker).
+        long gapMs = secondClaimMs - firstClaimMs;
+        gapMs.Should().BeGreaterThanOrEqualTo(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"an all-nacked full batch makes no forward progress and must wait for the next tick, not " +
+            $"drain within the same one; firstClaim@{firstClaimMs}ms secondClaim@{secondClaimMs}ms " +
+            $"gap={gapMs}ms pollingInterval={pollingInterval.TotalMilliseconds}ms");
+    }
+
+    // Drain-loop failure guard: a FULL batch that is only PARTIALLY confirmed (at least one nack) must
+    // NOT drain within the tick. The nacked rows are released for retry; re-claiming them immediately
+    // within the same tick would hot-retry the failing subset against a struggling broker. The
+    // dispatcher must wait for the next tick, where the released rows retry ~PollingInterval later
+    // (the ADR-024 release-on-nack pacing). So the second claim lands on the next tick, not this one.
+    [Fact]
+    public async Task RunPollingLoop_FullBatchPartiallyNacked_DoesNotDrain_WaitsForNextTick()
+    {
+        const int batchSize = 2;
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        var secondClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long firstClaimMs = -1;
+        long secondClaimMs = -1;
+        int getPendingCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int call = Interlocked.Increment(ref getPendingCalls);
+                if (call == 1)
+                {
+                    firstClaimMs = stopwatch.ElapsedMilliseconds;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(1), CreateEntry(2) });
+                }
+
+                if (call == 2)
+                {
+                    secondClaimMs = stopwatch.ElapsedMilliseconds;
+                    secondClaim.TrySetResult();
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(3), CreateEntry(4) });
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        // Broker confirms the first message, nacks the second — a partially failing full batch.
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
+            {
+                new(IsConfirmed: true,  DeliveryTag: 0),
+                new(IsConfirmed: false, DeliveryTag: 1),
+            }));
+
+        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await secondClaim.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — a partially-nacked batch must not hot-retry the released rows within the tick; the
+        // second claim waits ~one full PollingInterval for the next tick.
+        long gapMs = secondClaimMs - firstClaimMs;
+        gapMs.Should().BeGreaterThanOrEqualTo(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"a partially-nacked full batch must not drain within the tick (the released nacked rows " +
+            $"would be hot-retried); it waits for the next tick. firstClaim@{firstClaimMs}ms " +
+            $"secondClaim@{secondClaimMs}ms gap={gapMs}ms pollingInterval={pollingInterval.TotalMilliseconds}ms");
+    }
+
+    // Regression (Codex adversarial review): nack→retry pacing must be measured from the NACKED
+    // batch's completion, NOT from the polling timer's fixed tick grid. A long same-tick drain (many
+    // confirmed full batches) can push a nack close to the next scheduled tick; if the retry is paced
+    // by that grid, the released rows are reclaimed almost immediately (far sooner than PollingInterval)
+    // against a struggling broker. The next claim after a nack must wait ~PollingInterval from the nack.
+    [Fact]
+    public async Task RunPollingLoop_NackAfterLongDrain_RetryPacedFromNackNotTimerGrid()
+    {
+        const int batchSize = 2;
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(200);
+
+        var reclaimSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long nackMs = -1;
+        long reclaimMs = -1;
+        int getPendingCalls = 0;
+        int sendCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int call = Interlocked.Increment(ref getPendingCalls);
+                // Calls 1 and 2: full batches, driving a multi-batch drain within a single tick.
+                if (call <= 2)
+                {
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                        new[] { CreateEntry(call * 10), CreateEntry(call * 10 + 1) });
+                }
+
+                // Call 3: the next claim AFTER the nack — when the released rows would be retried.
+                if (call == 3)
+                {
+                    reclaimMs = stopwatch.ElapsedMilliseconds;
+                    reclaimSignal.TrySetResult();
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        // A confirmed batch whose send consumes most of the PollingInterval, so the drain runs long
+        // and the subsequent nack lands near the next scheduled tick.
+        async Task<IReadOnlyList<SendResult>> DelayedConfirmAsync(IReadOnlyList<OutboundMessage> msgs)
+        {
+            await Task.Delay(150);
+            return msgs.Select((_, i) => new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i)).ToArray();
+        }
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                int s = Interlocked.Increment(ref sendCalls);
+                IReadOnlyList<OutboundMessage> msgs = ci.Arg<IReadOnlyList<OutboundMessage>>();
+                if (s == 1)
+                {
+                    // First batch: confirmed but slow — consumes most of the interval (long drain).
+                    return DelayedConfirmAsync(msgs);
+                }
+
+                // Second batch: nacked near the end of the interval. Drain stops; rows are released.
+                nackMs = stopwatch.ElapsedMilliseconds;
+                return Task.FromResult<IReadOnlyList<SendResult>>(
+                    msgs.Select((_, i) => new SendResult(IsConfirmed: false, DeliveryTag: (ulong)i)).ToArray());
+            });
+
+        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await reclaimSignal.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — the next claim after a nack must be paced ~PollingInterval from the NACK, regardless
+        // of how long the preceding same-tick drain ran.
+        long gapMs = reclaimMs - nackMs;
+        gapMs.Should().BeGreaterThanOrEqualTo(
+            (long)(pollingInterval.TotalMilliseconds * 0.6),
+            $"nack→retry pacing must be relative to the nacked batch completion, not the polling timer " +
+            $"grid; nack@{nackMs}ms reclaim@{reclaimMs}ms gap={gapMs}ms " +
+            $"pollingInterval={pollingInterval.TotalMilliseconds}ms");
+    }
+
+    // Drain throttle (Codex adversarial review): a sustained full + fully-confirmed backlog must NOT
+    // re-claim unbounded within a single burst. Each batch costs a claim UPDATE and (on RabbitMQ) a
+    // channel open+close, so an unbounded tight drain would churn the DB and broker as fast as the
+    // process can loop. The drain is capped: after a bounded burst the loop yields one PollingInterval.
+    [Fact]
+    public async Task RunPollingLoop_SustainedFullBacklog_DrainBurstIsBounded()
+    {
+        const int batchSize = 1;
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(300);
+        int getPendingCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int n = Interlocked.Increment(ref getPendingCalls);
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(new[] { CreateEntry(n) });
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                IReadOnlyList<OutboundMessage> msgs = ci.Arg<IReadOnlyList<OutboundMessage>>();
+                return Task.FromResult<IReadOnlyList<SendResult>>(
+                    msgs.Select((_, i) => new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i)).ToArray());
+            });
+
+        _store
+            .MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => ValueTask.CompletedTask);
+
+        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+
+        // Act — run for LESS than one PollingInterval, so only the first drain burst (then the forced
+        // pause, not yet elapsed) has happened. StartAsync offloads the loop to the background, so it
+        // returns promptly even though this store never yields; the burst cap then bounds the claims.
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(150);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — the burst is bounded (~the internal cap), not the hundreds/thousands an unthrottled
+        // tight loop would issue in 150 ms.
+        getPendingCalls.Should().BeLessThanOrEqualTo(
+            15,
+            $"a sustained full backlog must drain in bounded bursts, not unbounded; got {getPendingCalls} " +
+            $"claims in <1 PollingInterval ({pollingInterval.TotalMilliseconds}ms)");
+    }
+
+    // Host-startup safety (Codex adversarial review): IHostedService.StartAsync runs sequentially during
+    // host startup, each instance awaited before the next starts. The dispatcher must offload its polling
+    // loop and return immediately — it must NOT run the first poll inline, or a slow/blocking store would
+    // delay (and a never-yielding store would hang) host startup. Here the first GetPendingAsync blocks
+    // synchronously; StartAsync must still return well before that poll completes.
+    [Fact]
+    public async Task StartAsync_WhenFirstPollBlocks_ReturnsWithoutRunningItInline()
+    {
+        using var releaseFirstPoll = new ManualResetEventSlim(initialState: false);
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                // Simulate a slow/synchronous first poll (e.g. a cold DB connection). Bounded so a
+                // regression cannot hang the suite — it self-releases after 5s even if never signalled.
+                releaseFirstPoll.Wait(TimeSpan.FromSeconds(5));
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        await using var sut = CreateSut();
+
+        // Act — call StartAsync on a background thread: on the (buggy) inline path the synchronous
+        // dispatch portion runs *before* StartAsync returns, so the CALL itself blocks; running it off
+        // the test thread lets us observe whether it returns promptly without deadlocking the test.
+        Task startCallReturned = Task.Run(() => sut.StartAsync(CancellationToken.None));
+        Task winner = await Task.WhenAny(startCallReturned, Task.Delay(TimeSpan.FromSeconds(2)));
+
+        // Assert — StartAsync returned promptly even though the first poll is still blocked.
+        winner.Should().BeSameAs(
+            startCallReturned,
+            "StartAsync must offload the polling loop and return without executing the first (blocked) poll inline");
+
+        // Cleanup — release the blocked poll and stop the dispatcher.
+        releaseFirstPoll.Set();
+        await startCallReturned;
+        await sut.StopAsync(CancellationToken.None);
+    }
+
+    // Startup atomicity (Codex adversarial review): publishing an outbox message and marking it
+    // delivered are irreversible external side effects, so the dispatcher must not claim/send until the
+    // host has FULLY started. IHostApplicationLifetime.ApplicationStarted does NOT fire if startup aborts
+    // (a later IHostedService.StartAsync throws), so gating the loop on it guarantees a process that
+    // never became healthy publishes nothing.
+    [Fact]
+    public async Task StartAsync_DoesNotClaimOrSendUntilApplicationStarted()
+    {
+        using var appStarted = new CancellationTokenSource();
+        var lifetime = Substitute.For<IHostApplicationLifetime>();
+        lifetime.ApplicationStarted.Returns(appStarted.Token);
+
+        int getPendingCalls = 0;
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                Interlocked.Increment(ref getPendingCalls);
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        await using var sut = CreateSut(lifetime: lifetime);
+
+        // Act 1 — started, but the host has NOT signalled ApplicationStarted yet.
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(100);
+
+        // Assert 1 — the loop is gated: no claim has happened.
+        Volatile.Read(ref getPendingCalls).Should().Be(
+            0,
+            "the dispatcher must not poll/claim before the host has fully started");
+
+        // Act 2 — the host completes startup.
+        await appStarted.CancelAsync();
+
+        // Wait (bounded) until the loop has polled at least once.
+        for (int i = 0; i < 100 && Volatile.Read(ref getPendingCalls) == 0; i++)
+        {
+            await Task.Delay(10);
+        }
+
+        // Assert 2 — once the host has started, the dispatcher begins polling.
+        Volatile.Read(ref getPendingCalls).Should().BeGreaterThan(
+            0,
+            "after ApplicationStarted fires the dispatcher must begin polling");
+
+        await sut.StopAsync(CancellationToken.None);
     }
 }
