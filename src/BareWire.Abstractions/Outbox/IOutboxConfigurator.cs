@@ -72,6 +72,14 @@ public interface IOutboxConfigurator
     TimeSpan CleanupInterval { get; set; }
 
     /// <summary>
+    /// When <see langword="true"/>, suppresses the startup fail-fast guard that rejects an EF Core
+    /// provider without a matching atomic outbox/inbox dialect. The store then uses a NON-ATOMIC
+    /// client-side fallback that is safe ONLY for a single dispatcher instance / testing — it breaks
+    /// claim/dedup invariants under multi-instance load. Default: <see langword="false"/>.
+    /// </summary>
+    bool AllowNonAtomicProvider { get; set; }
+
+    /// <summary>
     /// When <see langword="true"/>, Outbox/Inbox tables are created automatically at host startup.
     /// Default: <see langword="false"/>.
     /// </summary>

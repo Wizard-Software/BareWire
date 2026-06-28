@@ -16,6 +16,7 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     private TimeSpan _inboxLockTimeout = OutboxOptions.Default.InboxLockTimeout;
     private TimeSpan _outboxLockTimeout = OutboxOptions.Default.OutboxLockTimeout;
     private TimeSpan _cleanupInterval = OutboxOptions.Default.CleanupInterval;
+    private bool _allowNonAtomicProvider = OutboxOptions.Default.AllowNonAtomicProvider;
     private bool _autoCreateSchema = OutboxOptions.Default.AutoCreateSchema;
     private OrderingMode _orderingMode = OutboxOptions.Default.OrderingMode;
     private string _orderingKeyHeaderName = OutboxOptions.Default.OrderingKeyHeaderName ?? string.Empty;
@@ -70,6 +71,13 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     }
 
     /// <inheritdoc />
+    public bool AllowNonAtomicProvider
+    {
+        get => _allowNonAtomicProvider;
+        set => _allowNonAtomicProvider = value;
+    }
+
+    /// <inheritdoc />
     public bool AutoCreateSchema
     {
         get => _autoCreateSchema;
@@ -100,6 +108,7 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     {
         var options = new OutboxOptions
         {
+            AllowNonAtomicProvider = _allowNonAtomicProvider,
             PollingInterval = _pollingInterval,
             DispatchBatchSize = _dispatchBatchSize,
             InboxRetention = _inboxRetention,

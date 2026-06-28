@@ -25,7 +25,10 @@ public static class ServiceCollectionExtensions
     /// <param name="configureDbContext">
     /// A delegate that configures the <see cref="DbContextOptionsBuilder"/> for
     /// <see cref="OutboxDbContext"/>.
-    /// For example: <c>options => options.UseSqlServer(connectionString)</c>.
+    /// For example: <c>options => options.UseNpgsql(connectionString)</c>.
+    /// Providers without a matching atomic dialect require a custom <see cref="IOutboxSqlDialect"/>
+    /// and <see cref="IInboxSqlDialect"/>, or <see cref="IOutboxConfigurator.AllowNonAtomicProvider"/>
+    /// must be set to <see langword="true"/> for single-instance / testing scenarios.
     /// </param>
     /// <param name="configureOutbox">
     /// An optional delegate for customizing outbox behavior such as polling interval,
@@ -93,6 +96,18 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IOutboxStore>(),
             sp.GetRequiredService<InboxFilter>(),
             sp.GetRequiredService<ILogger<TransactionalOutboxMiddleware>>()));
+
+        // Register the provider-atomicity guard as the FIRST hosted service so it runs before the
+        // dispatcher, cleanup service, and schema initializer. The checker resolves OutboxOptions
+        // lazily at StartAsync time. The OutboxOptions singleton is registered further below in this
+        // method; lazy factory resolution is safe because all DI registrations are complete before
+        // the host calls StartAsync.
+        services.AddHostedService(sp => new OutboxProviderAtomicityChecker(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<IOutboxSqlDialect>(),
+            sp.GetRequiredService<IInboxSqlDialect>(),
+            sp.GetRequiredService<OutboxOptions>(),
+            sp.GetRequiredService<ILogger<OutboxProviderAtomicityChecker>>()));
 
         // Register the background services that poll and dispatch pending outbox messages
         // and periodically clean up expired outbox/inbox records.

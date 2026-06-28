@@ -128,6 +128,12 @@ builder.Services.AddBareWireOutbox(
 
         // Automatically create Outbox/Inbox tables at host startup (development convenience).
         outbox.AutoCreateSchema = true;
+
+        // This is a single-instance / development demo running on SQLite.
+        // Production multi-instance deployments require an atomic provider (PostgreSQL) — see README.
+        // Without this flag, the startup guard would throw BareWireConfigurationException because
+        // the default dialects target PostgreSQL and SQLite has no matching atomic dialect.
+        outbox.AllowNonAtomicProvider = true;
     });
 
 // ─────────────────────────────────────────────────────────────────────────────

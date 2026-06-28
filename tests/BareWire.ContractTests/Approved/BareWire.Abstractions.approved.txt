@@ -433,6 +433,7 @@ namespace BareWire.Abstractions.Outbox
 {
     public interface IOutboxConfigurator
     {
+        bool AllowNonAtomicProvider { get; set; }
         bool AutoCreateSchema { get; set; }
         System.TimeSpan CleanupInterval { get; set; }
         int DispatchBatchSize { get; set; }
