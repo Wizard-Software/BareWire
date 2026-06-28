@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Transactions;
 using BareWire.Abstractions.Pipeline;
 using Microsoft.EntityFrameworkCore;
@@ -14,12 +15,20 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
 
     private static readonly AsyncLocal<OutboxBuffer?> _current = new();
 
+    // The physical connection pinned for the in-flight consume operation, flowed across the
+    // consumer's (separate) DI scope via the async execution context. A consumer DbContext can
+    // share this exact connection so its business write commits single-phase with the outbox
+    // write and the inbox marker — no second connection, no escalation to a two-phase commit.
+    private static readonly AsyncLocal<DbConnection?> _currentConnection = new();
+
     private readonly OutboxDbContext _dbContext;
     private readonly IOutboxStore _outboxStore;
     private readonly InboxFilter _inboxFilter;
     private readonly ILogger<TransactionalOutboxMiddleware> _logger;
 
     internal static OutboxBuffer? Current => _current.Value;
+
+    internal static DbConnection? CurrentConnection => _currentConnection.Value;
 
     internal TransactionalOutboxMiddleware(
         OutboxDbContext dbContext,
@@ -59,6 +68,12 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
         // (ExecuteUpdateAsync) share ONE physical connection enlisted once in the ambient
         // TransactionScope — preventing DTC escalation on Npgsql / non-Windows hosts.
         await _dbContext.Database.OpenConnectionAsync(ct).ConfigureAwait(false);
+
+        // Publish the pinned connection on the async flow so a consumer DbContext (resolved in its
+        // own DI scope, but on the same execution context) can share this exact connection. Sharing
+        // one connection lets the business write commit single-phase with the outbox messages and the
+        // inbox marker — no second connection, hence no escalation to a two-phase (prepared) commit.
+        _currentConnection.Value = _dbContext.Database.GetDbConnection();
         try
         {
             // 1. Inbox deduplication check — deliberately OUTSIDE the TransactionScope so the
@@ -130,6 +145,10 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
         }
         finally
         {
+            // Stop exposing the pinned connection before it is closed — it must never leak to a
+            // subsequent message processed on this asynchronous flow.
+            _currentConnection.Value = null;
+
             // Close the pinned connection on every path. Guard the close so a connection-close
             // failure never masks the original exception propagating from the try block (handler
             // fault or commit error) — the real cause must reach the transport for correct settlement.

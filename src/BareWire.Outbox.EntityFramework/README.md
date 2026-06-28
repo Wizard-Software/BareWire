@@ -32,26 +32,51 @@ The inbox `ProcessedAt` marker is committed **atomically** within the same trans
 consumer's business state and buffered outbox messages, so a crash after the business commit
 cannot leave a message reprocessable (see ADR-033).
 
-### PostgreSQL: prepared transactions (2PC) requirement
+### PostgreSQL: consumer business writes — single-commit vs 2PC
 
 The atomic commit above uses a `System.Transactions.TransactionScope`. The middleware pins **one**
-physical connection for its own inbox/outbox writes, so the common case stays single-connection (no
-two-phase commit). However, if your **consumer also persists business state through a separate
-`DbContext`** (a second database connection enlisted in the same scope), `TransactionScope` escalates
-to a **two-phase (prepared) commit**. PostgreSQL ships with `max_prepared_transactions = 0` (prepared
-transactions disabled), so such a consume aborts with `55000: prepared transactions are disabled` and
-the message is retried until dead-lettered.
+physical connection for its own inbox/outbox writes, so the common case stays single-connection. But a
+frequent pattern is for the **consumer to also persist business state through its own `DbContext`**
+inside the same transaction. How that second write enlists decides whether the commit is one phase or
+two:
 
-To support a consumer that writes to its own `DbContext` under the transactional outbox on PostgreSQL,
-either:
+- **Two physical connections → two-phase (prepared) commit.** If the consumer's `DbContext` opens its
+  own connection, `TransactionScope` enlists two resources and escalates to a 2PC. PostgreSQL ships with
+  `max_prepared_transactions = 0` (prepared transactions disabled), so the consume aborts with
+  `55000: prepared transactions are disabled` and the message is retried until dead-lettered. Enabling it
+  (start Postgres with `-c max_prepared_transactions=100`) makes it work, but a prepared commit is also
+  **slower** — an extra `PREPARE` / `COMMIT PREPARED` round-trip and fsync per message.
 
-- set a nonzero `max_prepared_transactions` on the server (e.g. start Postgres with
-  `-c max_prepared_transactions=100`), enabling 2PC; or
-- have the consumer persist through a connection **shared** with `OutboxDbContext` (single connection →
-  no escalation).
+- **One shared connection → single-phase commit (recommended).** Have the consumer's `DbContext` use the
+  **same** connection the middleware already pinned for the in-flight message, exposed via
+  `IOutboxConnectionAccessor`. One physical connection enlists exactly once, so the business write, the
+  buffered outbox messages, and the inbox marker all commit in a single local transaction — **faster**,
+  and with **no** `max_prepared_transactions` requirement at all.
 
-The BareWire samples take the first option — the Aspire AppHost configures
-`max_prepared_transactions` automatically (see `samples/README.md`).
+Wire the consumer's `DbContext` to prefer the shared connection, falling back to a standalone connection
+outside a consume operation (startup schema creation, HTTP request handlers, background jobs):
+
+```csharp
+services.AddDbContext<MyConsumerDbContext>((sp, options) =>
+{
+    // System.Data.Common.DbConnection — non-null only while the outbox middleware is processing
+    // a message on the current async flow; null on startup / HTTP / background paths.
+    DbConnection? shared = sp.GetRequiredService<IOutboxConnectionAccessor>().Current;
+    if (shared is not null)
+        options.UseNpgsql(shared);            // share the outbox connection → single-phase commit
+    else
+        options.UseNpgsql(connectionString);  // standalone connection
+});
+```
+
+> Use the `(IServiceProvider, DbContextOptionsBuilder)` overload so EF builds the options **per scope** —
+> each per-message consumer scope then binds to the live pinned connection. The consumer keeps calling
+> `SaveChangesAsync()` as usual; because it runs inside the middleware's `TransactionScope`, its write
+> commits atomically with the outbox and inbox writes — now as one single-phase commit.
+
+Every BareWire outbox sample whose consumer persists business state — `OrderedConsumers`,
+`TransactionalOutbox`, `InboxDeduplication` — uses this single-commit pattern, so the samples need no 2PC
+and the Aspire AppHost runs PostgreSQL with the default `max_prepared_transactions = 0`.
 
 ## Horizontal Scaling and Row Claims
 

@@ -72,13 +72,34 @@ string dbConnectionString =
 // 3. EF Core — application DbContext for processed-record log
 // ─────────────────────────────────────────────────────────────────────────────
 
-// NOTE (PostgreSQL 2PC): the consumers below persist a ProcessedRecord through THIS DbContext while
-// the transactional outbox middleware holds an ambient TransactionScope on its own OutboxDbContext.
-// That second connection makes the scope escalate to a two-phase (prepared) commit, which requires
-// max_prepared_transactions > 0 on PostgreSQL (disabled by default → consume aborts with SqlState
-// 55000 and every message is dead-lettered). The Aspire AppHost sets it; a manual Postgres container
-// needs `-c max_prepared_transactions=100`. See BareWire.Outbox.EntityFramework/README.md.
-builder.Services.AddDbContext<OrderedConsumersDbContext>(o => o.UseNpgsql(dbConnectionString));
+// SINGLE-COMMIT connection sharing: the consumers below persist a ProcessedRecord through THIS
+// DbContext while the transactional outbox middleware holds an ambient TransactionScope on its own
+// OutboxDbContext. If this context opened its OWN connection, the scope would enlist two connections
+// and escalate to a two-phase (prepared) commit — slower, and disabled by default on PostgreSQL
+// (max_prepared_transactions=0 → SqlState 55000, every message dead-lettered).
+//
+// Instead we share the SINGLE connection the outbox middleware has already pinned for the in-flight
+// message (exposed via IOutboxConnectionAccessor). One physical connection → one enlistment → a
+// single-phase commit of the business write + outbox messages + inbox marker. No 2PC, no
+// max_prepared_transactions requirement. The accessor returns null outside a consume operation
+// (startup schema init, the HTTP endpoints below), so we fall back to a standalone connection there.
+//
+// The (sp, options) overload makes the EF options Scoped — rebuilt per DI scope — so each per-message
+// consumer scope reads the accessor at resolution time and binds to the live pinned connection.
+builder.Services.AddDbContext<OrderedConsumersDbContext>((sp, o) =>
+{
+    System.Data.Common.DbConnection? sharedOutboxConnection =
+        sp.GetRequiredService<IOutboxConnectionAccessor>().Current;
+
+    if (sharedOutboxConnection is not null)
+    {
+        o.UseNpgsql(sharedOutboxConnection);
+    }
+    else
+    {
+        o.UseNpgsql(dbConnectionString);
+    }
+});
 
 // No singleton PoisonKeyHolder needed — the poison-head indicator is stamped as a
 // transport header ("poison-head-demo: true") on seq=0 of the poison key only. This

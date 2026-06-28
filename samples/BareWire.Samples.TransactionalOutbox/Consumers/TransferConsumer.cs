@@ -32,8 +32,9 @@ public sealed partial class TransferConsumer(
         await Task.Delay(millisecondsDelay: 50, context.CancellationToken).ConfigureAwait(false);
 
         // Update the transfer status in the same transaction managed by TransactionalOutboxMiddleware.
-        // The OutboxDbContext and TransferDbContext share the same connection string,
-        // so both participate in the same ambient TransactionScope.
+        // This TransferDbContext shares the SAME physical connection the middleware pinned for this
+        // message (via IOutboxConnectionAccessor — see Program.cs), so the UPDATE commits single-phase
+        // with the outbox + inbox writes: one connection, one enlistment, no two-phase (prepared) commit.
         Transfer? transfer = await dbContext.Transfers
             .FirstOrDefaultAsync(t => t.TransferId == message.TransferId, context.CancellationToken)
             .ConfigureAwait(false);

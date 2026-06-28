@@ -18,16 +18,17 @@ If you prefer to run a sample individually, start RabbitMQ and PostgreSQL first:
 
 ```bash
 docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
-docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=barewiredb postgres -c max_prepared_transactions=100
+docker run -d --name postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=barewiredb postgres
 ```
 
-> **Why `-c max_prepared_transactions=100`?** The transactional-outbox samples wrap each consume in a
-> `System.Transactions.TransactionScope`. When a consumer also persists business state through **its own**
-> `DbContext` (a second database connection) — as `OrderedConsumers` does with its `ProcessedRecord` log —
-> the scope escalates to a two-phase (prepared) commit. PostgreSQL ships with `max_prepared_transactions=0`
-> (2PC disabled), so without this flag those consumes abort with `55000: prepared transactions are disabled`
-> and every message is dead-lettered. The Aspire AppHost sets this automatically; a manual container needs
-> it explicitly. See the [transactional outbox limitation](../src/BareWire.Outbox.EntityFramework/README.md).
+> **No `max_prepared_transactions` needed.** A consumer that persists its own business state while the
+> transactional outbox middleware holds an ambient `System.Transactions.TransactionScope` would normally
+> open a **second** database connection, escalating the commit to a two-phase (prepared) commit — which
+> PostgreSQL disables by default (`max_prepared_transactions=0` → `55000: prepared transactions are
+> disabled`). Every outbox sample here avoids that by **sharing the outbox's pinned connection** for the
+> consumer write (via `IOutboxConnectionAccessor`), so each consume commits **single-phase**: faster, and
+> with no `max_prepared_transactions` requirement. See the
+> [single-commit vs 2PC guidance](../src/BareWire.Outbox.EntityFramework/README.md).
 
 Then run the sample:
 
@@ -131,6 +132,11 @@ GET  /events/processing-log  — verify per-correlation ordering
 
 End-to-end per-key consumer ordering with competing consumer instances (Aspire `WithReplicas(2)`),
 transactional outbox (`OrderingMode.PerKey`), and poison-head parking via DLX.
+
+The consumers persist a `ProcessedRecord` through the **same connection the outbox middleware pinned**
+for the in-flight message (via `IOutboxConnectionAccessor`), so the business write commits **single-phase**
+with the outbox and inbox writes — one commit, no two-phase (prepared) commit, and no
+`max_prepared_transactions` requirement on PostgreSQL.
 
 Demonstrates two ordering tiers (ADR-026):
 

@@ -3,10 +3,13 @@
 #pragma warning disable CA2012
 
 using System.Buffers;
+using System.Data;
+using System.Data.Common;
 using AwesomeAssertions;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -76,7 +79,100 @@ public sealed class TransactionalOutboxMiddlewareTests
         return (middleware, inboxStore);
     }
 
+    /// <summary>
+    /// Same as <see cref="CreateMiddleware"/> but also returns the <see cref="OutboxDbContext"/> so a
+    /// test can assert the connection the middleware pins for sharing is that context's own connection.
+    /// </summary>
+    private static (TransactionalOutboxMiddleware Middleware, OutboxDbContext DbContext)
+        CreateMiddlewareWithDbContext()
+    {
+        IInboxStore inboxStore = Substitute.For<IInboxStore>();
+        inboxStore
+            .TryLockAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>())
+            .Returns(ValueTask.FromResult(true));
+        inboxStore
+            .MarkProcessedAsync(Arg.Any<Guid>(), Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(ValueTask.CompletedTask);
+
+        InboxFilter inboxFilter = new(inboxStore, OutboxOptions.Default, NullLogger<InboxFilter>.Instance);
+
+        DbContextOptions<OutboxDbContext> dbOptions = new DbContextOptionsBuilder<OutboxDbContext>()
+            .UseSqlite("DataSource=:memory:")
+            .Options;
+        OutboxDbContext dbContext = new(dbOptions);
+
+        IOutboxStore outboxStore = Substitute.For<IOutboxStore>();
+
+        TransactionalOutboxMiddleware middleware = new(
+            dbContext,
+            outboxStore,
+            inboxFilter,
+            NullLogger<TransactionalOutboxMiddleware>.Instance);
+
+        return (middleware, dbContext);
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Regression guard for single-commit connection sharing: while the consumer handler runs, the
+    /// outbox middleware must expose its pinned, open connection through <see cref="IOutboxConnectionAccessor"/>
+    /// — and it must be the <see cref="OutboxDbContext"/>'s own connection, so a consumer DbContext can
+    /// share that exact connection and commit single-phase (no escalation to a two-phase commit).
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_WhileHandlerRuns_ExposesPinnedOpenConnectionViaAccessor()
+    {
+        // Arrange
+        var (middleware, dbContext) = CreateMiddlewareWithDbContext();
+        MessageContext context = CreateContext();
+
+        OutboxConnectionAccessor accessor = new();
+
+        DbConnection? capturedDuringHandler = null;
+        ConnectionState capturedState = ConnectionState.Closed;
+        NextMiddleware next = _ =>
+        {
+            capturedDuringHandler = accessor.Current;
+            capturedState = capturedDuringHandler?.State ?? ConnectionState.Closed;
+            return Task.CompletedTask;
+        };
+
+        // Act
+        await middleware.InvokeAsync(context, next);
+
+        // Assert — during the handler the accessor exposes the middleware's pinned connection,
+        // it is the OutboxDbContext's own connection, and it is open for the transaction's duration.
+        capturedDuringHandler.Should().NotBeNull(
+            "the outbox middleware must expose its pinned connection so a consumer can share it");
+        capturedDuringHandler.Should().BeSameAs(
+            dbContext.Database.GetDbConnection(),
+            "the exposed connection must be the OutboxDbContext's own connection for single-commit sharing");
+        capturedState.Should().Be(
+            ConnectionState.Open,
+            "the exposed connection must be open for the duration of the consume transaction");
+    }
+
+    /// <summary>
+    /// The pinned connection must not leak past the consume flow: once <see cref="TransactionalOutboxMiddleware.InvokeAsync"/>
+    /// returns, the accessor reports <see langword="null"/> on this asynchronous flow.
+    /// </summary>
+    [Fact]
+    public async Task InvokeAsync_AfterCompletion_ClearsExposedConnection()
+    {
+        // Arrange
+        var (middleware, _) = CreateMiddlewareWithDbContext();
+        MessageContext context = CreateContext();
+        OutboxConnectionAccessor accessor = new();
+        NextMiddleware next = _ => Task.CompletedTask;
+
+        // Act
+        await middleware.InvokeAsync(context, next);
+
+        // Assert
+        accessor.Current.Should().BeNull(
+            "the pinned connection must be cleared after the consume operation completes");
+    }
 
     [Fact]
     public async Task InvokeAsync_WhenDuplicateDetected_SetsInboxFilteredFlag()

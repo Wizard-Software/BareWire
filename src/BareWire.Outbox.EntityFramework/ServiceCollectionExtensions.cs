@@ -58,6 +58,11 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton(instanceId);
 
+        // Exposes the connection the transactional middleware pins per consume operation so a consumer
+        // DbContext can share it (single-phase commit instead of a two-phase prepared commit). Stateless
+        // singleton over an async-flow-local — see IOutboxConnectionAccessor for the consumer wiring.
+        services.TryAddSingleton<IOutboxConnectionAccessor, OutboxConnectionAccessor>();
+
         // Default outbox claim dialect: PostgreSQL (FOR UPDATE SKIP LOCKED). The store invokes a
         // dialect only when its IOutboxSqlDialect.ProviderName matches the active EF Core provider,
         // so this default is used on PostgreSQL and is inert elsewhere. To get an atomic claim on
