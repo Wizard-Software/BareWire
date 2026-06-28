@@ -31,6 +31,38 @@ public interface IOutboxSqlDialect
     string ProviderName { get; }
 
     /// <summary>
+    /// Indicates whether this dialect's 5-argument
+    /// <see cref="GetClaimSql(string, DateTimeOffset, DateTimeOffset, int, OrderingMode)"/> overload emits
+    /// a genuine per-key head-of-line ordering predicate under <see cref="OrderingMode.PerKey"/> (for
+    /// example a correlated <c>NOT EXISTS</c> that blocks a row while a strictly older undelivered row with
+    /// the same ordering key exists).
+    /// </summary>
+    /// <remarks>
+    /// This is an <b>explicit capability declaration</b>, not something the framework can — or does —
+    /// infer from the shape of the returned SQL. The <see cref="OrderingMode.PerKey"/> startup guard reads
+    /// this flag: a dialect that returns <see langword="false"/> (the default) is rejected at startup when
+    /// <see cref="OrderingMode.PerKey"/> is configured, because per-key ordering would otherwise silently
+    /// degrade to passthrough and deliver messages sharing a key out of order. To support ordering, override
+    /// the 5-arg <c>GetClaimSql</c> with a real head-of-line predicate <b>and</b> return
+    /// <see langword="true"/> here. Declaring <see langword="true"/> is not a bypass: the guard additionally
+    /// rejects a declared-true dialect whose <see cref="OrderingMode.PerKey"/> claim SQL is identical to its
+    /// <see cref="OrderingMode.None"/> claim SQL (a half-implementation that set the flag without a real
+    /// override), since identical claim SQL cannot enforce head-of-line ordering. Defaults to
+    /// <see langword="false"/> so existing dialects remain passthrough-safe and never accidentally opt in.
+    /// </remarks>
+    /// <remarks>
+    /// <b>Trust boundary.</b> These startup checks catch <i>accidental</i> misconfiguration (an undeclared
+    /// capability, or a declared capability backed by passthrough SQL). They <b>cannot</b> verify that a
+    /// custom dialect's <see cref="OrderingMode.PerKey"/> SQL actually enforces head-of-line ordering — that
+    /// is undecidable from outside the dialect. A dialect that declares <see langword="true"/> and emits
+    /// superficially different but semantically incorrect SQL will pass startup and may still deliver
+    /// same-key messages out of order. You, the dialect author, are responsible for the correctness of the
+    /// head-of-line predicate; for a guaranteed-correct implementation use a framework-provided dialect
+    /// (<see cref="PostgresOutboxSqlDialect"/> today).
+    /// </remarks>
+    bool SupportsPerKeyHeadOfLineOrdering => false;
+
+    /// <summary>
     /// Returns a parameterized SQL statement that atomically claims up to
     /// <paramref name="batchSize"/> unclaimed or stale-locked outbox rows for the given
     /// <paramref name="instanceId"/>. Claimed rows are identified by <c>LockedBy = instanceId</c>
@@ -75,9 +107,11 @@ public interface IOutboxSqlDialect
     /// bit-identical to <see cref="GetClaimSql(string, DateTimeOffset, DateTimeOffset, int)"/>.
     /// </param>
     /// <remarks>
-    /// Custom dialects <b>must override</b> this 5-arg overload to benefit from per-key
-    /// ordering; otherwise <see cref="OrderingMode.PerKey"/> degrades silently to passthrough
-    /// (the default implementation delegates to the 4-arg overload).
+    /// Custom dialects <b>must override</b> this 5-arg overload with a real head-of-line predicate to
+    /// benefit from per-key ordering <b>and</b> declare the capability by returning
+    /// <see langword="true"/> from <see cref="SupportsPerKeyHeadOfLineOrdering"/>; otherwise
+    /// <see cref="OrderingMode.PerKey"/> is rejected at startup (the per-key ordering guard reads the
+    /// capability flag — it does not, and cannot, infer ordering support from the shape of the SQL).
     /// The default implementation always delegates to
     /// <see cref="GetClaimSql(string, DateTimeOffset, DateTimeOffset, int)"/>, preserving
     /// backward compatibility for dialects that do not yet support ordering.

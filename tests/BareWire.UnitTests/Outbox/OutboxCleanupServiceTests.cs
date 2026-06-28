@@ -5,6 +5,7 @@
 using AwesomeAssertions;
 using BareWire.Outbox;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NSubstitute;
 
@@ -15,6 +16,7 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
     private readonly IOutboxStore _outboxStore;
     private readonly IInboxStore _inboxStore;
     private readonly ILogger<OutboxCleanupService> _logger;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly OutboxOptions _options;
     private readonly OutboxCleanupService _sut;
 
@@ -29,8 +31,8 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
         serviceProvider.GetService(typeof(IInboxStore)).Returns(_inboxStore);
         var scope = Substitute.For<IServiceScope>();
         scope.ServiceProvider.Returns(serviceProvider);
-        var scopeFactory = Substitute.For<IServiceScopeFactory>();
-        scopeFactory.CreateScope().Returns(scope);
+        _scopeFactory = Substitute.For<IServiceScopeFactory>();
+        _scopeFactory.CreateScope().Returns(scope);
 
         // Use a short cleanup interval so the loop fires quickly in tests.
         _options = new OutboxOptions
@@ -40,7 +42,21 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
             InboxRetention = TimeSpan.FromDays(8),   // must be > InboxLockTimeout (30s)
         };
 
-        _sut = new OutboxCleanupService(scopeFactory, _options, _logger);
+        // Default SUT: ApplicationStarted already fired, so the loop runs as soon as StartAsync is called.
+        _sut = CreateSut(StartedLifetime());
+    }
+
+    private OutboxCleanupService CreateSut(IHostApplicationLifetime lifetime)
+        => new(_scopeFactory, _options, _logger, lifetime);
+
+    // A lifetime whose ApplicationStarted has already fired, so the cleanup loop starts immediately.
+    private static IHostApplicationLifetime StartedLifetime()
+    {
+        var lifetime = Substitute.For<IHostApplicationLifetime>();
+        var started = new CancellationTokenSource();
+        started.Cancel();
+        lifetime.ApplicationStarted.Returns(started.Token);
+        return lifetime;
     }
 
     public async ValueTask DisposeAsync()
@@ -152,5 +168,39 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
 
         // Assert — no exceptions thrown even when stores are empty
         await act.Should().NotThrowAsync();
+    }
+
+    [Fact]
+    public async Task StartAsync_DoesNotCleanupUntilApplicationStarted()
+    {
+        // Cleanup performs destructive DELETEs (outbox/inbox row removal). Like the dispatcher, it must NOT
+        // run from a process that never reached full host startup — otherwise a slow or aborting startup
+        // could delete rows from an instance the operator considers "never started". The loop is therefore
+        // gated on IHostApplicationLifetime.ApplicationStarted, which fires only after every hosted service's
+        // StartAsync completes and never fires if startup aborts.
+        _outboxStore.CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>()).Returns(_ => ValueTask.CompletedTask);
+        _inboxStore.CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>()).Returns(_ => ValueTask.CompletedTask);
+
+        var appStarted = new CancellationTokenSource();
+        var lifetime = Substitute.For<IHostApplicationLifetime>();
+        lifetime.ApplicationStarted.Returns(appStarted.Token);
+        await using var sut = CreateSut(lifetime);
+
+        // Act 1 — started, but the host has NOT signalled ApplicationStarted yet.
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(TimeSpan.FromMilliseconds(80));
+
+        // Assert 1 — no destructive cleanup before the host is fully started.
+        await _outboxStore.DidNotReceive().CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
+        await _inboxStore.DidNotReceive().CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
+
+        // Act 2 — fire ApplicationStarted; the cleanup loop must now run.
+        await appStarted.CancelAsync();
+        await Task.Delay(TimeSpan.FromMilliseconds(80));
+
+        // Assert 2 — cleanup happens only after full host startup completes.
+        await _outboxStore.Received().CleanupAsync(_options.OutboxRetention, Arg.Any<CancellationToken>());
+
+        await sut.StopAsync(CancellationToken.None);
     }
 }

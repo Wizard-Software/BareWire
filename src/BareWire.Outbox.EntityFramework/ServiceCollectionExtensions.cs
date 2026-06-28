@@ -97,25 +97,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<InboxFilter>(),
             sp.GetRequiredService<ILogger<TransactionalOutboxMiddleware>>()));
 
-        // Register the provider-atomicity guard as the FIRST hosted service so it runs before the
-        // dispatcher, cleanup service, and schema initializer. The checker resolves OutboxOptions
-        // lazily at StartAsync time. The OutboxOptions singleton is registered further below in this
-        // method; lazy factory resolution is safe because all DI registrations are complete before
-        // the host calls StartAsync.
-        services.AddHostedService(sp => new OutboxProviderAtomicityChecker(
-            sp.GetRequiredService<IServiceScopeFactory>(),
-            sp.GetRequiredService<IOutboxSqlDialect>(),
-            sp.GetRequiredService<IInboxSqlDialect>(),
-            sp.GetRequiredService<OutboxOptions>(),
-            sp.GetRequiredService<ILogger<OutboxProviderAtomicityChecker>>()));
-
-        // Register the background services that poll and dispatch pending outbox messages
-        // and periodically clean up expired outbox/inbox records.
-        services.AddHostedService<OutboxDispatcher>();
-        services.AddHostedService<OutboxCleanupService>();
-
-        // Build and register OutboxOptions as a singleton.
-        // OutboxDispatcher and OutboxCleanupService resolve it directly from DI.
+        // Build and register OutboxOptions as a singleton BEFORE the hosted services, so their
+        // registration can branch on it (AutoCreateSchema, OrderingMode) and the start order below is
+        // explicit. OutboxDispatcher and OutboxCleanupService resolve it directly from DI.
         OutboxOptions options;
 
         if (configureOutbox is not null)
@@ -131,20 +115,52 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton(options);
 
-        // R7.7.7 — When PerKey ordering is active, register a startup checker that warns if the
-        // active dialect does not override the 5-arg GetClaimSql (DIM passthrough silently disables
-        // per-key head-of-line ordering). Registered only when needed — zero overhead for None mode.
+        // Hosted-service registration order is load-bearing: IHostedService.StartAsync runs sequentially
+        // in registration order, each awaited before the next starts. The dispatcher gates its first
+        // claim/send on IHostApplicationLifetime.ApplicationStarted, which fires only after every service
+        // below has started successfully — so the guards run (and can fail fast) before any outbox side
+        // effect. The sequence is:
+        //   1. provider-atomicity guard — fail fast on a non-atomic provider;
+        //   2. per-key ordering guard (when PerKey) — fail fast on a dialect without head-of-line support;
+        //   3. schema initializer (when AutoCreateSchema) — create the outbox/inbox tables;
+        //   4. dispatcher — claims/sends nothing until ApplicationStarted (i.e. until every guard passed);
+        //   5. cleanup service.
+
+        // 1. Provider-atomicity guard, first so it fails fast before schema creation or dispatch. It
+        // resolves OutboxOptions lazily at StartAsync time; the singleton registered just above is
+        // available because all DI registrations complete before the host calls StartAsync.
+        services.AddHostedService(sp => new OutboxProviderAtomicityChecker(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<IOutboxSqlDialect>(),
+            sp.GetRequiredService<IInboxSqlDialect>(),
+            sp.GetRequiredService<OutboxOptions>(),
+            sp.GetRequiredService<ILogger<OutboxProviderAtomicityChecker>>()));
+
+        // 2. Per-key ordering guard — registered BEFORE the dispatcher so a PerKey configuration on a
+        // dialect that lacks native head-of-line ordering fails fast (or warns under AllowDegradedOrdering)
+        // before any batch is claimed and irreversibly delivered out of order. Registered only when needed
+        // — zero overhead for None mode.
         if (options.OrderingMode == OrderingMode.PerKey)
         {
             services.AddHostedService(sp => new OutboxDialectMismatchChecker(
+                sp.GetRequiredService<IServiceScopeFactory>(),
                 sp.GetRequiredService<IOutboxSqlDialect>(),
+                sp.GetRequiredService<OutboxOptions>(),
                 sp.GetRequiredService<ILogger<OutboxDialectMismatchChecker>>()));
         }
 
+        // 3. Schema initializer — registered BEFORE the dispatcher so the outbox/inbox tables exist
+        // before the dispatcher's first poll. Only when AutoCreateSchema is enabled; otherwise the
+        // operator owns schema creation (migrations) and no race exists.
         if (options.AutoCreateSchema)
         {
             services.AddHostedService<OutboxSchemaInitializer>();
         }
+
+        // 4 & 5. Background services that poll and dispatch pending outbox messages (the dispatcher gates
+        // its loop on IHostApplicationLifetime.ApplicationStarted), and periodically clean up expired rows.
+        services.AddHostedService<OutboxDispatcher>();
+        services.AddHostedService<OutboxCleanupService>();
 
         // Register the EF Core DbContext together with the ordering model customizer extension.
         // OutboxModelCustomizerExtension.ApplyServices registers OutboxModelCustomizer into EF

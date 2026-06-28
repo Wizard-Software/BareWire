@@ -32,6 +32,27 @@ The inbox `ProcessedAt` marker is committed **atomically** within the same trans
 consumer's business state and buffered outbox messages, so a crash after the business commit
 cannot leave a message reprocessable (see ADR-033).
 
+### PostgreSQL: prepared transactions (2PC) requirement
+
+The atomic commit above uses a `System.Transactions.TransactionScope`. The middleware pins **one**
+physical connection for its own inbox/outbox writes, so the common case stays single-connection (no
+two-phase commit). However, if your **consumer also persists business state through a separate
+`DbContext`** (a second database connection enlisted in the same scope), `TransactionScope` escalates
+to a **two-phase (prepared) commit**. PostgreSQL ships with `max_prepared_transactions = 0` (prepared
+transactions disabled), so such a consume aborts with `55000: prepared transactions are disabled` and
+the message is retried until dead-lettered.
+
+To support a consumer that writes to its own `DbContext` under the transactional outbox on PostgreSQL,
+either:
+
+- set a nonzero `max_prepared_transactions` on the server (e.g. start Postgres with
+  `-c max_prepared_transactions=100`), enabling 2PC; or
+- have the consumer persist through a connection **shared** with `OutboxDbContext` (single connection →
+  no escalation).
+
+The BareWire samples take the first option — the Aspire AppHost configures
+`max_prepared_transactions` automatically (see `samples/README.md`).
+
 ## Horizontal Scaling and Row Claims
 
 When running multiple dispatcher instances (horizontal scaling), each `GetPendingAsync` call
@@ -50,20 +71,53 @@ elapses, another healthy dispatcher instance re-claims and re-publishes those ro
 
 This ensures **no message is permanently lost** due to instance failure.
 
-### Polling Cost
+### Startup Safety
 
-Each polling cycle issues one claim `UPDATE` per instance (affecting `0..DispatchBatchSize` rows),
-even when no rows are pending. At the default `PollingInterval` of `1s` that is roughly one write
-statement per second per instance. For low-throughput deployments — or when running many instances —
-raise `PollingInterval` to reduce steady-state write/WAL load and bound write-amplification on the
+The dispatcher claims and publishes nothing until the host has **fully started**: it gates its first poll
+on `IHostApplicationLifetime.ApplicationStarted`, which fires only after every hosted service's `StartAsync`
+has completed successfully. If startup aborts (a later hosted service throws, or the host is stopped
+mid-startup), `ApplicationStarted` never fires — so an instance that never became healthy publishes no
+messages and marks no rows delivered. The startup guards (atomic-provider and, under `PerKey`, the
+ordering-dialect check) are registered **before** the dispatcher, so they run — and can fail fast — before
+any outbox side effect.
+
+### Polling Cost and Backlog Drain
+
+When the outbox is idle — or the pending backlog is smaller than `DispatchBatchSize` — each polling
+cycle issues one claim `UPDATE` per instance (affecting `0..DispatchBatchSize` rows) and then waits
+`PollingInterval` before the next cycle. At the default `PollingInterval` of `1s` that is roughly one
+write statement per second per instance at steady state. For low-throughput deployments — or when
+running many instances — raise `PollingInterval` to reduce steady-state idle write/WAL load on the
 shared `OutboxMessages` table.
+
+Under a backlog larger than `DispatchBatchSize` the dispatcher **drains**: as long as each batch is
+full and every row is confirmed by the broker, it claims and sends the next batch **immediately**,
+without waiting `PollingInterval` — so a single instance is not capped at
+`DispatchBatchSize / PollingInterval`. The drain runs in **bounded bursts**: after a fixed internal cap
+of consecutive full-and-confirmed batches (currently 10) the loop yields one `PollingInterval` before
+resuming. This holds catch-up to roughly `cap × DispatchBatchSize` per `PollingInterval` (≈10× the timer
+ceiling at the defaults), so a large backlog cannot become an unbounded tight loop that churns one
+broker channel and one claim-`UPDATE` per batch as fast as the process can spin. The first claim after a
+nacked, empty, partial, or burst-capped batch *is* paced by `PollingInterval` (so a failing broker is
+retried no faster than once per `PollingInterval`, never hammered). In short, `PollingInterval` bounds
+the **idle poll rate** and the **retry backoff**, and together with the burst cap bounds the
+**catch-up ceiling** — it is not a per-batch throttle during an active drain burst. To further cap
+catch-up load against a shared store/broker, keep `DispatchBatchSize` modest and provision for the
+recovery burst.
 
 ### Nacked Rows (Partial Send Failures)
 
-Rows that fail to publish (nacked by the broker) are NOT explicitly unlocked.
-They become eligible for re-delivery after `OutboxLockTimeout` elapses.
-To minimize retry latency, set `OutboxLockTimeout` conservatively relative to
-your broker's worst-case publish-confirm time.
+Rows the broker does not confirm (nacks) are **explicitly released**: the dispatcher clears their
+per-instance lock as soon as the batch completes, so they are re-claimed on the **next poll cycle**
+(about one `PollingInterval` later) — **not** after `OutboxLockTimeout`. `OutboxLockTimeout` is only the
+fallback for a dispatcher that *crashes* mid-send (see [Crash Recovery](#crash-recovery)); a normal nack
+never waits for it.
+
+Because a nack retries within ~`PollingInterval`, a persistently failing ("poison") row is re-sent
+roughly once per `PollingInterval` per instance, and during a broker outage every pending row nacks and
+is released each cycle — so retry load scales with the backlog at the poll cadence. Size
+`PollingInterval` for that worst case (and add poison-message handling upstream if a row can fail
+indefinitely) rather than assuming a slower `OutboxLockTimeout`-spaced retry.
 
 ## Configuration Options
 
@@ -77,6 +131,7 @@ your broker's worst-case publish-confirm time.
 | `InboxRetention` | `7 days` | How long processed inbox entries are retained. |
 | `CleanupInterval` | `1h` | How often the cleanup service removes expired rows. |
 | `AutoCreateSchema` | `false` | When `true`, creates tables automatically at startup. |
+| `AllowDegradedOrdering` | `false` | When `OrderingMode` is `PerKey` on a dialect without native head-of-line ordering, startup **fails fast**. Set `true` to downgrade to a warning and accept passthrough (possibly out-of-order) delivery. |
 
 ### Validation Rules
 
@@ -191,23 +246,54 @@ ordering primitive) will **not** honor end-to-end order even when the outbox emi
 
 ### Custom SQL dialects and PerKey
 
-If you implement a custom `IOutboxSqlDialect` (e.g. for SQL Server), you must **override the
-5-argument `GetClaimSql` overload** to emit a head-of-line predicate for `PerKey`.
-The default interface implementation delegates to the 4-argument overload (passthrough —
-no ordering), and the outbox logs a startup warning when `PerKey` is active but the dialect
-appears to ignore it (the claim SQL for `PerKey` and `None` are identical).
+If you implement a custom `IOutboxSqlDialect` (e.g. for SQL Server) and want `PerKey` ordering, you must
+do **two** things: (1) **override the 5-argument `GetClaimSql` overload** to emit a head-of-line predicate
+for `PerKey`, and (2) **declare the capability** by returning `true` from
+`SupportsPerKeyHeadOfLineOrdering`. The default interface implementation delegates to the 4-argument
+overload (passthrough — no ordering) and the capability flag defaults to `false`. When `PerKey` is active,
+that dialect is the **active claim path** (its `ProviderName` matches the active EF Core provider), and it
+does not declare `SupportsPerKeyHeadOfLineOrdering`, startup **fails fast** with a
+`BareWireConfigurationException` so messages are never silently delivered out of order.
+
+The guard is **provider-aware**: it only enforces the capability when your dialect actually runs. If the
+active provider has *no* matching dialect — for example SQLite single-instance with
+`AllowNonAtomicProvider = true` — the store uses the client-side fallback claim, which enforces head-of-line
+ordering itself (it filters to each key's oldest undelivered row before the `LIMIT`). `PerKey` therefore
+starts cleanly on a fallback provider with no dialect capability and **without** `AllowDegradedOrdering`; the
+capability requirement applies only to the dialect on the path that actually claims rows.
+
+Capability is an **explicit declaration**, never inferred from the SQL text: a dialect whose claim SQL
+merely *differs* from the `None` variant — but still lacks a real head-of-line predicate — is rejected
+unless it declares the flag. (A SQL-text diff would be cosmetic and could give false confidence on this
+public extension boundary.) Conversely, declaring the flag is **not** a bypass either: a dialect that
+declares `SupportsPerKeyHeadOfLineOrdering` but whose `PerKey` claim SQL is identical to its `None` SQL
+(it set the flag but never overrode the 5-arg method) is also rejected at startup — identical claim SQL
+cannot enforce head-of-line ordering. Set `AllowDegradedOrdering = true` to downgrade the failure to a
+startup warning and accept passthrough ordering.
+
+> **Trust boundary.** These startup checks catch *accidental* misconfiguration (an undeclared capability,
+> or a declared capability backed by passthrough SQL). They **cannot** verify that a custom dialect's
+> `PerKey` SQL actually enforces head-of-line ordering — that is undecidable from outside the dialect. A
+> dialect that declares `SupportsPerKeyHeadOfLineOrdering` and emits superficially different but
+> semantically incorrect SQL will pass startup and may still deliver same-key messages out of order.
+> **You are responsible for the correctness of your head-of-line predicate.** If you need a
+> guaranteed-correct implementation, use a framework-provided dialect (PostgreSQL today).
 
 ```csharp
 public sealed class SqlServerOutboxSqlDialect : IOutboxSqlDialect
 {
     public string ProviderName => "Microsoft.EntityFrameworkCore.SqlServer";
 
+    // Declares that the 5-arg overload below emits a real head-of-line predicate.
+    // Required for PerKey — without it, startup fails fast.
+    public bool SupportsPerKeyHeadOfLineOrdering => true;
+
     // 4-arg: used by None mode — bit-identical to pre-PerKey behavior.
     public FormattableString GetClaimSql(
         string instanceId, DateTimeOffset now, DateTimeOffset staleCutoff, int batchSize)
         => /* ... */;
 
-    // 5-arg: MUST be overridden for PerKey head-of-line ordering.
+    // 5-arg: MUST be overridden with a head-of-line predicate for PerKey ordering.
     public FormattableString GetClaimSql(
         string instanceId, DateTimeOffset now, DateTimeOffset staleCutoff, int batchSize,
         BareWire.Abstractions.Outbox.OrderingMode orderingMode)
