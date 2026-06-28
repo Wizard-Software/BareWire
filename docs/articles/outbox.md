@@ -65,6 +65,34 @@ The `TransactionalOutboxMiddleware` automatically deduplicates messages on the c
 
 > See: [Inbox Deduplication](inbox.md) for full details on configuration, composite keys, and multi-consumer patterns
 
+## Consumer Business Writes: Single-Commit vs 2PC
+
+The inbox `ProcessedAt` marker is committed inside a `System.Transactions.TransactionScope`, atomically with the consumer's work. The middleware pins **one** physical connection for its own inbox/outbox writes, so the common case stays single-connection.
+
+A frequent pattern, though, is for the **consumer to also persist business state through its own `DbContext`** inside that same transaction (e.g. a `TransferConsumer` that updates the `Transfer` row). How that second write enlists decides whether the commit is one phase or two:
+
+- **Two physical connections → two-phase (prepared) commit.** If the consumer's `DbContext` opens its own connection, `TransactionScope` enlists two resources and escalates to a 2PC. PostgreSQL ships with `max_prepared_transactions = 0` (prepared transactions disabled), so the consume aborts with `55000: prepared transactions are disabled` and the message is retried until dead-lettered. Enabling it (start Postgres with `-c max_prepared_transactions=100`) makes it work, but a prepared commit is also **slower** — an extra `PREPARE` / `COMMIT PREPARED` round-trip and fsync per message.
+- **One shared connection → single-phase commit (recommended).** Have the consumer's `DbContext` reuse the **same** connection the middleware already pinned for the in-flight message, exposed via `IOutboxConnectionAccessor`. One physical connection enlists exactly once, so the business write, the buffered outbox messages, and the inbox marker all commit in a single local transaction — **faster**, and with **no** `max_prepared_transactions` requirement.
+
+Wire the consumer's `DbContext` to prefer the shared connection, falling back to a standalone connection outside a consume operation (startup schema creation, HTTP request handlers, background jobs):
+
+```csharp
+services.AddDbContext<TransferDbContext>((sp, options) =>
+{
+    // System.Data.Common.DbConnection — non-null only while the outbox middleware is
+    // processing a message on the current async flow; null on startup / HTTP / background paths.
+    DbConnection? shared = sp.GetRequiredService<IOutboxConnectionAccessor>().Current;
+    if (shared is not null)
+        options.UseNpgsql(shared);            // share the outbox connection → single-phase commit
+    else
+        options.UseNpgsql(connectionString);  // standalone connection
+});
+```
+
+> Use the `(IServiceProvider, DbContextOptionsBuilder)` overload so EF builds the options **per scope** — each per-message consumer scope binds to the live pinned connection. The consumer keeps calling `SaveChangesAsync()` as usual; running inside the middleware's `TransactionScope`, its write commits atomically with the outbox and inbox writes — now as one single-phase commit.
+
+> See: `samples/BareWire.Samples.TransactionalOutbox/`, `samples/BareWire.Samples.OrderedConsumers/`, and `samples/BareWire.Samples.InboxDeduplication/` — every sample whose consumer persists business state uses this single-commit pattern, so none requires 2PC.
+
 ## Horizontal Scaling
 
 When you run more than one instance of the dispatcher (multiple pods/processes), each `GetPendingAsync` poll **atomically claims** its batch so two instances never pick the same rows. On PostgreSQL the claim uses `FOR UPDATE SKIP LOCKED`; a claimed row carries a `LockedAt`/`LockedBy` marker and is invisible to other instances until the claim expires.
