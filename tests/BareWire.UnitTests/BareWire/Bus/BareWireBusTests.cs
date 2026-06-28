@@ -317,6 +317,88 @@ public sealed class BareWireBusTests
         await bus.DisposeAsync();
     }
 
+    // Characterizes the direct (fire-and-forget) publish-path contract for guaranteed-routing:
+    // when SendBatchAsync returns normally with IsConfirmed:false (the broker accepted but could not
+    // route the message — what RabbitMQ guaranteed-routing surfaces), the publisher loop treats the
+    // batch as handled and ADVANCES. It does NOT retry on a negative confirm and does NOT surface an
+    // error to the PublishAsync caller — the caller never receives a SendResult on this path. The
+    // fail-closed behavior of guaranteed routing is realized by SendResult consumers (the outbox
+    // dispatcher), not by this fire-and-forget path. Guard: if the loop is ever changed to retry or
+    // throw on IsConfirmed:false, this test turns red.
+    [Fact]
+    public async Task PublisherLoop_WhenSendReturnsUnconfirmed_DoesNotRetryAndAdvances()
+    {
+        // Arrange — the adapter returns IsConfirmed:false (NO throw) for the "unroutable" batch,
+        // exactly as the RabbitMQ adapter does for a mandatory return under guaranteed routing.
+        var delivered = new List<OutboundMessage>();
+        var gate = new object();
+
+        var (bus, adapter, _) = CreateBus(
+            publisherRetryInitialDelay: TimeSpan.FromMilliseconds(5),
+            publisherMaxSendAttempts: 3);
+        adapter.SendBatchAsync(
+                Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
+
+                // Per-message result so the test is robust to how the loop batches: an "x-unroutable"
+                // message gets a non-throwing negative confirm (what the RabbitMQ adapter returns for a
+                // mandatory return); every other message is delivered normally — even if both land in
+                // the same batch.
+                var results = new List<SendResult>(messages.Count);
+                foreach (OutboundMessage m in messages)
+                {
+                    if (m.Headers.ContainsKey("x-unroutable"))
+                    {
+                        results.Add(new SendResult(false, 0UL));
+                    }
+                    else
+                    {
+                        lock (gate)
+                        {
+                            delivered.Add(m);
+                        }
+
+                        results.Add(new SendResult(true, 0UL));
+                    }
+                }
+
+                return Task.FromResult<IReadOnlyList<SendResult>>(results);
+            });
+        bus.StartPublishing();
+
+        // Act — publish an unroutable message (negative confirm), then a routable one.
+        Func<Task> publishUnroutable = async () => await bus.PublishAsync(
+            new BusTestMessage("unroutable"),
+            new Dictionary<string, string> { ["x-unroutable"] = "1" },
+            CancellationToken.None);
+        await publishUnroutable.Should().NotThrowAsync(
+            "the direct fire-and-forget path never surfaces a SendResult or error to the caller");
+
+        await Task.Delay(150); // window in which a retry-on-negative-confirm loop would re-send the batch
+        await bus.PublishAsync(new BusTestMessage("good"), CancellationToken.None);
+
+        // Assert — the loop advanced and delivered the routable message (it did not wedge on the
+        // unconfirmed batch).
+        await WaitForDeliveryAsync(delivered, gate);
+
+        lock (gate)
+        {
+            delivered.Should().HaveCount(1,
+                because: "a negative confirm is treated as handled; the loop advances to the next message");
+        }
+
+        // Assert — the unconfirmed batch was sent exactly once: the fire-and-forget path does NOT
+        // retry on IsConfirmed:false (it ignores SendResult for redelivery).
+        await adapter.Received(1).SendBatchAsync(
+            Arg.Is<IReadOnlyList<OutboundMessage>>(msgs => msgs.Any(m => m.Headers.ContainsKey("x-unroutable"))),
+            Arg.Any<CancellationToken>());
+
+        await bus.DisposeAsync();
+    }
+
     private static async Task WaitForDeliveryAsync(
         List<OutboundMessage> delivered, object gate, int expected = 1, int timeoutMs = 5000)
     {

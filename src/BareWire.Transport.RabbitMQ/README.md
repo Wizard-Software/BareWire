@@ -32,6 +32,7 @@ builder.AddBareWire(wire =>
 - Connection pooling with configurable channel limits
 - TLS/mTLS support
 - Auto-topology available as opt-in
+- Opt-in guaranteed routing (`GuaranteedRouting()`) — publishes `mandatory` and maps an unroutable message to `SendResult.IsConfirmed:false` (acted on by the outbox dispatcher for at-least-once; the direct fire-and-forget path logs a warning but does not redeliver); default off, bit-identical to before
 
 ## Documentation
 

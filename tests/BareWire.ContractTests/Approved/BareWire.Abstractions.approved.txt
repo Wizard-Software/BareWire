@@ -285,6 +285,7 @@ namespace BareWire.Abstractions.Configuration
         void ConfigureHeaderMapping(System.Action<BareWire.Abstractions.Headers.IHeaderMappingConfigurator> configure);
         void ConfigureTopology(System.Action<BareWire.Abstractions.Topology.ITopologyConfigurator> configure);
         void DefaultExchange(string exchangeName);
+        void GuaranteedRouting();
         void Host(string uri, System.Action<BareWire.Abstractions.Configuration.IHostConfigurator>? configure = null);
         void MapExchange<T>(string exchangeName)
             where T :  class;

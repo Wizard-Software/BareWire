@@ -50,6 +50,17 @@ internal sealed class RabbitMqTransportOptions
     public int DeferDelayMs { get; set; } = 30_000;
 
     /// <summary>
+    /// Opt-in guaranteed-routing mode for the send/publish path (<c>SendBatchAsync</c>).
+    /// When <see langword="true"/>, messages are published with the AMQP <c>mandatory</c> flag set,
+    /// so a publication the broker accepts but cannot route to any queue (topology drift, missing
+    /// binding/queue, wrong routing key) is reported as <c>SendResult.IsConfirmed = false</c> instead
+    /// of being silently dropped while reporting success. Default <see langword="false"/> preserves the
+    /// historical behavior bit-for-bit (publish with <c>mandatory: false</c>; an unroutable message is
+    /// reported as confirmed). Set via <see cref="BareWire.Abstractions.Configuration.IRabbitMqConfigurator.GuaranteedRouting"/>.
+    /// </summary>
+    public bool GuaranteedRouting { get; set; }
+
+    /// <summary>
     /// The accumulated topology declaration produced by <see cref="IRabbitMqConfigurator.ConfigureTopology"/>.
     /// <see langword="null"/> when no topology was configured.
     /// </summary>

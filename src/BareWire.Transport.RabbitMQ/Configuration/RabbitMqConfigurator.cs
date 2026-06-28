@@ -11,6 +11,7 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
 {
     private string? _hostUri;
     private string? _defaultExchange;
+    private bool _guaranteedRouting;
     private RabbitMqHostConfigurator? _hostConfigurator;
     private RabbitMqTopologyConfigurator? _topologyConfigurator;
     private RabbitMqHeaderMappingConfigurator? _headerMappingConfigurator;
@@ -37,6 +38,8 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         ArgumentException.ThrowIfNullOrEmpty(exchangeName);
         _defaultExchange = exchangeName;
     }
+
+    public void GuaranteedRouting() => _guaranteedRouting = true;
 
     public void ConfigureTopology(Action<ITopologyConfigurator> configure)
     {
@@ -127,6 +130,8 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         {
             options.DefaultExchange = _defaultExchange;
         }
+
+        options.GuaranteedRouting = _guaranteedRouting;
 
         if (_hostConfigurator is not null)
         {
