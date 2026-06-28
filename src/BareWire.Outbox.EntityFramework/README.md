@@ -28,6 +28,9 @@ BareWire Outbox provides **exactly-once-claim per row** within a single polling 
 each pending outbox row is claimed by exactly one dispatcher instance at a time.
 End-to-end delivery remains **at-least-once** — the consumer side must be idempotent
 (use `InboxFilter` / `BareWire.Outbox`'s inbox deduplication to achieve exactly-once processing).
+The inbox `ProcessedAt` marker is committed **atomically** within the same transaction as the
+consumer's business state and buffered outbox messages, so a crash after the business commit
+cannot leave a message reprocessable (see ADR-033).
 
 ## Horizontal Scaling and Row Claims
 
