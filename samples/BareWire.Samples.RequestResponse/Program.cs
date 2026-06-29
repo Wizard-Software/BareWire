@@ -143,7 +143,9 @@ app.MapPost("/validate-order", async (
     IBus bus,
     CancellationToken cancellationToken) =>
 {
-    IRequestClient<ValidateOrder> client = await bus.CreateRequestClientAsync<ValidateOrder>(cancellationToken);
+    // Dispose the client (await using) to release its exclusive response queue once the request
+    // completes — otherwise temporary queues accumulate on the broker (issue #41).
+    await using IRequestClient<ValidateOrder> client = await bus.CreateRequestClientAsync<ValidateOrder>(cancellationToken);
 
     Response<OrderValidationResult> response = await client
         .GetResponseAsync<OrderValidationResult>(

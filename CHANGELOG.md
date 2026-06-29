@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `IRequestClient<T>` now extends `IAsyncDisposable`, so request clients returned by `IBus.CreateRequestClientAsync` can be released with `await using`. Source-compatible for callers; breaking only for external implementations of `IRequestClient<T>`, which must now provide `DisposeAsync` (#41)
+
+### Fixed
+
+- Surfaced disposability on the `IRequestClient<T>` contract so callers get a compile-time signal to dispose request clients. The disposable implementation was previously `internal`-only, so undisposed clients left their exclusive auto-delete response queue (plus channel and consumer) on the broker until the shared connection closed on restart, causing temporary queues to accumulate (#41)
+
 ## [2.0.3] - 2026-06-28
 
 ### Added
