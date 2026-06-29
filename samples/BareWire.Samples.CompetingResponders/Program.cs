@@ -149,7 +149,9 @@ app.MapPost("/ask", async (
 {
     string requestPayload = payload ?? "ping";
 
-    IRequestClient<PingRequest> client =
+    // Dispose the client (await using) to release its exclusive response queue once the request
+    // completes — otherwise temporary queues accumulate on the broker (issue #41).
+    await using IRequestClient<PingRequest> client =
         await bus.CreateRequestClientAsync<PingRequest>(cancellationToken).ConfigureAwait(false);
 
     Response<PingResponse> response = await client

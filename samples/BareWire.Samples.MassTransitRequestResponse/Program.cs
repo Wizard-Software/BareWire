@@ -181,7 +181,9 @@ app.MapPost("/order-status", async (
 {
     Log.SendingRequest(logger, request.OrderId);
 
-    BwIRequestClient client =
+    // Dispose the client (await using) to release its exclusive response queue once the request
+    // completes — otherwise temporary queues accumulate on the broker (issue #41).
+    await using BwIRequestClient client =
         await bus.CreateRequestClientAsync<CheckOrderStatus>(cancellationToken);
 
     BwResponse response = await client

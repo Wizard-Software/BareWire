@@ -105,7 +105,7 @@ namespace BareWire.Abstractions
         System.Threading.Tasks.ValueTask<BareWire.Abstractions.IRequestClient<T>> CreateRequestClientAsync<T>(System.Threading.CancellationToken cancellationToken = default)
             where T :  class;
     }
-    public interface IRequestClient<TRequest>
+    public interface IRequestClient<TRequest> : System.IAsyncDisposable
         where TRequest :  class
     {
         System.Threading.Tasks.Task<BareWire.Abstractions.Response<TResponse>> GetResponseAsync<TResponse>(TRequest request, System.Threading.CancellationToken cancellationToken = default)

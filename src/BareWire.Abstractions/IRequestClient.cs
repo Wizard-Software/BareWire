@@ -5,10 +5,18 @@ namespace BareWire.Abstractions;
 /// Sends a request message and waits for a correlated response, applying a configurable timeout.
 /// Obtain instances via <see cref="IBus.CreateRequestClientAsync{T}(CancellationToken)"/>.
 /// </summary>
+/// <remarks>
+/// A request client owns transport resources — a dedicated response channel and an exclusive,
+/// auto-delete response queue created per instance. Dispose the client when you are done with it
+/// (preferably via <c>await using</c>) to release those resources promptly; otherwise the response
+/// queue lingers on the broker until the underlying connection closes (e.g. an application restart),
+/// causing temporary queues to accumulate. The contract extends <see cref="IAsyncDisposable"/> so
+/// callers get this signal at compile time.
+/// </remarks>
 /// <typeparam name="TRequest">
 /// The request message type. Must be a reference type (typically a <c>record</c>).
 /// </typeparam>
-public interface IRequestClient<TRequest> where TRequest : class
+public interface IRequestClient<TRequest> : IAsyncDisposable where TRequest : class
 {
     /// <summary>
     /// Sends <paramref name="request"/> and asynchronously waits for a correlated response
