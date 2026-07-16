@@ -76,4 +76,30 @@ public sealed class EndpointBinding
 
     /// <summary>Gets the optional per-endpoint deserializer type override. Null means use global.</summary>
     public Type? DeserializerOverrideType { get; init; }
+
+    /// <summary>
+    /// Creates a copy of this <see cref="EndpointBinding"/> with <see cref="Consumers"/> replaced by
+    /// <paramref name="consumers"/> and every other <see langword="init"/>-only property preserved
+    /// unchanged. Used by the core's start-up <c>ConsumerDefinition&lt;TConsumer&gt;</c> discovery to
+    /// materialize merged consumer registrations without a <c>record</c>-style <c>with</c> expression
+    /// (this type is a plain <see langword="sealed class"/>, not a <see langword="record"/>).
+    /// </summary>
+    /// <param name="consumers">The replacement consumer registrations for this endpoint.</param>
+    /// <returns>A new <see cref="EndpointBinding"/> instance carrying <paramref name="consumers"/>.</returns>
+    internal EndpointBinding WithConsumers(IReadOnlyList<ConsumerRegistration> consumers) => new()
+    {
+        EndpointName = EndpointName,
+        PrefetchCount = PrefetchCount,
+        ConcurrentMessageLimit = ConcurrentMessageLimit,
+        Ordering = Ordering,
+        Consumers = consumers,
+        RawConsumers = RawConsumers,
+        SagaTypes = SagaTypes,
+        RetryCount = RetryCount,
+        RetryInterval = RetryInterval,
+        DeadLetterExchange = DeadLetterExchange,
+        DeadLetterRoutingKey = DeadLetterRoutingKey,
+        SerializerOverrideType = SerializerOverrideType,
+        DeserializerOverrideType = DeserializerOverrideType,
+    };
 }

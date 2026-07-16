@@ -39,6 +39,14 @@ namespace BareWire.Abstractions.Configuration;
 /// machinery; the configurator surface handed to <see cref="Configure(IReceiveEndpointConfigurator, IConsumerConfigurator{TConsumer})"/>
 /// is therefore the message-agnostic façade <see cref="IConsumerConfigurator{TConsumer}"/>.
 /// </para>
+/// <para>
+/// <strong>Registration lifetime — Singleton or Transient, never Scoped.</strong> The container discovers
+/// and applies registered definitions <em>once at start-up</em>, resolving them from the root
+/// <see cref="IServiceProvider"/>. A definition registered with a <em>scoped</em> lifetime cannot be resolved
+/// from the root provider (the container throws for a scoped service resolved outside a scope), so register a
+/// <c>ConsumerDefinition&lt;TConsumer&gt;</c> as <em>singleton</em> (stateless, shared) or <em>transient</em>
+/// — not scoped.
+/// </para>
 /// </remarks>
 /// <typeparam name="TConsumer">The consumer implementation type. Must be a reference type.</typeparam>
 public abstract class ConsumerDefinition<TConsumer>
@@ -64,4 +72,17 @@ public abstract class ConsumerDefinition<TConsumer>
     {
         // Default no-op: a definition without bespoke settings is a valid, empty configuration block.
     }
+
+    /// <summary>
+    /// Invokes <see cref="Configure(IReceiveEndpointConfigurator, IConsumerConfigurator{TConsumer})"/> on
+    /// behalf of the core's start-up discovery component, which resolves this definition from DI but cannot
+    /// call the <see langword="protected"/> <c>Configure</c> method directly. Not a public seam — visible
+    /// only to <c>BareWire</c> and <c>BareWire.UnitTests</c> via <c>InternalsVisibleTo</c>.
+    /// </summary>
+    /// <param name="endpoint">The receive endpoint the consumer is being configured on.</param>
+    /// <param name="consumer">The message-agnostic per-consumer configurator façade.</param>
+    internal void ApplyConfiguration(
+        IReceiveEndpointConfigurator endpoint,
+        IConsumerConfigurator<TConsumer> consumer)
+        => Configure(endpoint, consumer);
 }
