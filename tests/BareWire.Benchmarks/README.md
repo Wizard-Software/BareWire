@@ -50,6 +50,7 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*' --exp
 | `SerializationBenchmarks` | JSON serialize/deserialize with System.Text.Json | < 1 μs |
 | `JsonVsMessagePackBenchmarks` | JSON vs MessagePack serialize/deserialize/on-wire size, same object graph, 100 B – 100 KB | MessagePack ~2-5x fewer allocations |
 | `ConsumerEnvelopeDispatchBenchmarks` | Per-consumer MassTransit-envelope deserializer selection (`ReceiveEndpointRunner.ResolverFor`); no-opt-in degradation to the pre-18.5 dispatch path (18.5, ADR-031 D4) | 0 B/op (no-opt-in) |
+| `ConsumerDefinitionDispatchAllocationBenchmarks` | Consumer-definition dispatch WITHOUT any definition opt-in — discovery + `TMessage` inference baked ONCE at start-up (19.6 seam), per-delivery read of baked delegate + precompiled `ConsumerRegistration` fields (19.12) | 0 B/op (no-opt-in) |
 
 ## OrderedConsume Benchmark (R8.15)
 
@@ -313,6 +314,43 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Consume
 ```
 
 The `Allocated` column must read `-` / `0 B` for both methods.
+
+## ConsumerDefinitionDispatch Allocation Benchmark (19.12)
+
+`ConsumerDefinitionDispatchAllocationBenchmarks` proves that the consume-time dispatch path WHEN NO
+consumer definition opts in stays **0-B/op**, and that the global `< 512 B/op` consume budget is
+unchanged by the consumer-definition enhancement (19.x).
+
+### Goal
+
+- **Discovery + `TMessage` inference happen ONCE at start-up, not per delivery.** The closed invoker
+  delegate is baked in `[GlobalSetup]` via the production `ConsumerInvokerFactory.Create` seam (the 19.6
+  `MakeGenericMethod` path). That reflection is a start-up cost — it never runs per delivery.
+- **0 B/op on the no-opt-in path.** The measured method `Dispatch_NoDefinitionOptIn_SettingsRead` does
+  only what the dispatcher does per delivery on the default-off path: read the already-baked delegate
+  reference and read the precompiled `ConsumerRegistration` fields (all opt-in knobs default-off). No
+  `MakeGenericMethod`, no reflection, no per-message lookup, no allocation. **Target: `0 B/op` (the gate).**
+- **Settings read is precompiled**, not a per-message lookup — the definition settings live as
+  `ConsumerRegistration` fields read directly.
+- The actual invocation of the baked delegate is OUT of the measured path (invoking a consumer allocates a
+  DI scope + deserialization) — same boundary as `DispatchBenchmarks` and `ConsumerEnvelopeDispatchBenchmarks`.
+- The global `< 512 B/op` consume budget stays guarded by `ConsumeBenchmarks.ConsumeAndAck_InMemory`
+  (transport floor, unchanged by the enhancement).
+
+### Running
+
+```bash
+# Smoke-check registration (no full run)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --list flat | grep ConsumerDefinitionDispatch
+
+# Short run (allocation is deterministic — a short job is a reliable B/op measurement)
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*ConsumerDefinitionDispatch*' --job short
+
+# Full run
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*ConsumerDefinitionDispatch*'
+```
+
+The `Allocated` column must read `-` / `0 B` for `Dispatch_NoDefinitionOptIn_SettingsRead`.
 
 ## Interpreting Results
 
