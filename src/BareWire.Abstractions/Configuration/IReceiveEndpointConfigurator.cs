@@ -55,6 +55,25 @@ public interface IReceiveEndpointConfigurator
     TimeSpan RetryInterval { get; set; }
 
     /// <summary>
+    /// Registers a typed consumer <typeparamref name="TConsumer"/> that implements exactly one
+    /// <see cref="IConsumer{TMessage}"/>, inferring the message type from that single interface.
+    /// Sugar over the explicit <c>Consumer&lt;TConsumer, TMessage&gt;()</c> overload — the consumer
+    /// is resolved from the DI container per message.
+    /// </summary>
+    /// <remarks>
+    /// This overload supports consumers that implement a <strong>single</strong>
+    /// <see cref="IConsumer{TMessage}"/> only. A consumer implementing several
+    /// <see cref="IConsumer{TMessage}"/> interfaces is ambiguous here and MUST use the explicit
+    /// <c>Consumer&lt;TConsumer, TMessage&gt;()</c> overload (multi-consumer fail-fast is enforced
+    /// by the core registration path). Purely additive — the explicit overloads are unchanged.
+    /// </remarks>
+    /// <typeparam name="TConsumer">
+    /// The consumer implementation type. Must implement exactly one <see cref="IConsumer{TMessage}"/>.
+    /// </typeparam>
+    void Consumer<TConsumer>()
+        where TConsumer : class;
+
+    /// <summary>
     /// Registers a typed consumer <typeparamref name="TConsumer"/> that processes messages of type
     /// <typeparamref name="TMessage"/>. The consumer is resolved from the DI container per message.
     /// </summary>
