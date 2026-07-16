@@ -1,16 +1,12 @@
 namespace BareWire.Abstractions.Configuration;
 
 /// <summary>
-/// Configures consume-time routing-key dispatch for a typed consumer
-/// <typeparamref name="TConsumer"/> handling message type <typeparamref name="TMessage"/>, as a single
-/// grouped, discoverable block. An instance is passed to the delegate supplied to the grouped
-/// <c>Consumer&lt;TConsumer, TMessage&gt;</c> configuration overload on
-/// <see cref="IReceiveEndpointConfigurator"/>. The declared routing keys are a set of AMQP topic
-/// patterns matched <em>client-side at dispatch</em> against the delivery's routing key — a dispatcher
-/// predicate that selects which of several consumers sharing a queue handles a given delivery. This is
-/// the consume-side ergonomic counterpart of the publish-side per-type routing configurator
-/// (<see cref="IPublishConfigurator{T}"/>) with deliberately different semantics (a set of match
-/// patterns, not a single produced key).
+/// Message-agnostic façade grouping the per-consumer settings that do not depend on the consumer's message
+/// type, for a typed consumer <typeparamref name="TConsumer"/>. It is the single-parameter base of
+/// <see cref="IConsumerConfigurator{TConsumer, TMessage}"/> — which inherits every member declared here — and
+/// the configurator surface handed to
+/// <see cref="ConsumerDefinition{TConsumer}.Configure(IReceiveEndpointConfigurator, IConsumerConfigurator{TConsumer})"/>,
+/// where the consumer's message type is not yet bound at the type level (it is inferred at start-up).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -19,19 +15,16 @@ namespace BareWire.Abstractions.Configuration;
 /// applied imperatively inside the delegate rather than fluently chained.
 /// </para>
 /// <para>
-/// This is a dispatcher predicate, <strong>not</strong> topology: which deliveries arrive in the queue
-/// stays governed by manually declared bindings (queue→exchange). Declaring routing keys does not create
-/// or alter any binding. A consumer that declares no routing keys is a catch-all over its message type
+/// This façade carries only message-agnostic settings and names <strong>no</strong> AMQP topology
+/// vocabulary (exchange / queue / binding): declaring routing keys is a client-side dispatcher predicate,
+/// <strong>not</strong> topology. Which deliveries arrive in the queue stays governed by manually declared
+/// bindings (queue→exchange). A consumer that declares no routing keys is a catch-all over its message type
 /// (unchanged behaviour).
 /// </para>
 /// </remarks>
-/// <typeparam name="TConsumer">
-/// The consumer implementation type. Must implement <see cref="IConsumer{TMessage}"/>.
-/// </typeparam>
-/// <typeparam name="TMessage">The message type this consumer handles. Must be a reference type.</typeparam>
-public interface IConsumerConfigurator<TConsumer, TMessage>
-    where TConsumer : class, IConsumer<TMessage>
-    where TMessage : class
+/// <typeparam name="TConsumer">The consumer implementation type. Must be a reference type.</typeparam>
+public interface IConsumerConfigurator<TConsumer>
+    where TConsumer : class
 {
     /// <summary>
     /// Adds a single AMQP topic pattern to this consumer's routing-key set (sugar for a one-pattern
@@ -69,8 +62,8 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// <summary>
     /// Opts this consumer in to the type-less dispatch layer: deliveries whose message type cannot be
     /// resolved (foreign / raw JSON with no BareWire message-type header) become eligible to be dispatched
-    /// to this consumer purely by routing-key pattern match, with the raw payload deserialized to
-    /// <typeparamref name="TMessage"/> (raw-first interop).
+    /// to this consumer purely by routing-key pattern match, with the raw payload deserialized to the
+    /// consumer's message type (raw-first interop).
     /// </summary>
     /// <remarks>
     /// <para>
@@ -85,7 +78,7 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// matching is performed <em>client-side at dispatch</em> and is a dispatcher predicate, NOT an
     /// authorization mechanism: an attacker who can publish to the bound exchange fully controls the
     /// delivery's routing key and payload, and therefore which type-less consumer is selected and what
-    /// is deserialized into <typeparamref name="TMessage"/>. Exposing this layer assumes publish
+    /// is deserialized into the consumer's message type. Exposing this layer assumes publish
     /// permissions are enforced at the broker (e.g. RabbitMQ publish ACL / vhost permissions) and
     /// that a schema-validation middleware validates the foreign-input axis (routing key + broker
     /// identity + payload shape/size). The bus emits a startup warning when an
@@ -111,7 +104,7 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// <para>
     /// <strong>Scope — receive and reply.</strong> On the <em>receive</em> path the marked consumer's
     /// payload is deserialized from the MassTransit envelope: the envelope's <c>message</c> field is
-    /// unwrapped into <typeparamref name="TMessage"/>, and the envelope's <c>messageType</c> (a URN) and
+    /// unwrapped into the consumer's message type, and the envelope's <c>messageType</c> (a URN) and
     /// envelope headers are mapped. On the <em>reply</em> path, a <c>RespondAsync</c> from this consumer
     /// wraps the response in a MassTransit <em>response</em> envelope with the correlating
     /// <c>requestId</c>, so request/response interop with a MassTransit peer round-trips correctly.
@@ -155,4 +148,36 @@ public interface IConsumerConfigurator<TConsumer, TMessage>
     /// </para>
     /// </remarks>
     void UseMassTransitEnvelope();
+}
+
+/// <summary>
+/// Configures consume-time routing-key dispatch for a typed consumer <typeparamref name="TConsumer"/>
+/// handling message type <typeparamref name="TMessage"/>, as a single grouped, discoverable block. An
+/// instance is passed to the delegate supplied to the grouped <c>Consumer&lt;TConsumer, TMessage&gt;</c>
+/// configuration overload on <see cref="IReceiveEndpointConfigurator"/>. The declared routing keys are a set
+/// of AMQP topic patterns matched <em>client-side at dispatch</em> against the delivery's routing key — a
+/// dispatcher predicate that selects which of several consumers sharing a queue handles a given delivery.
+/// This is the consume-side ergonomic counterpart of the publish-side per-type routing configurator
+/// (<see cref="IPublishConfigurator{T}"/>) with deliberately different semantics (a set of match patterns,
+/// not a single produced key).
+/// </summary>
+/// <remarks>
+/// This two-parameter form inherits every (message-agnostic) member from the single-parameter façade
+/// <see cref="IConsumerConfigurator{TConsumer}"/>; the current four settings are all message-agnostic and
+/// therefore live on the façade. The second type parameter binds the consumer's message type at the type
+/// level and reserves this form for future members that genuinely require <typeparamref name="TMessage"/>.
+/// The change is additive and non-breaking: existing callers of the four inherited methods continue to see
+/// them unchanged through inheritance.
+/// </remarks>
+/// <typeparam name="TConsumer">
+/// The consumer implementation type. Must implement <see cref="IConsumer{TMessage}"/>.
+/// </typeparam>
+/// <typeparam name="TMessage">The message type this consumer handles. Must be a reference type.</typeparam>
+public interface IConsumerConfigurator<TConsumer, TMessage> : IConsumerConfigurator<TConsumer>
+    where TConsumer : class, IConsumer<TMessage>
+    where TMessage : class
+{
+    // The four message-agnostic settings (RoutingKey, RoutingKeys, AcceptUntyped, UseMassTransitEnvelope)
+    // are inherited from IConsumerConfigurator<TConsumer>. This form is reserved for future members that
+    // require TMessage bound at the type level.
 }
