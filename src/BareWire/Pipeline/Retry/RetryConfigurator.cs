@@ -1,3 +1,5 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Pipeline.Retry;
 
 internal sealed class RetryConfigurator : IRetryConfigurator
