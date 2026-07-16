@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Topology;
 
 namespace BareWire.Transport.RabbitMQ.Configuration;
 
@@ -40,6 +41,9 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
     private Action<IRetryConfigurator>? _configureRetry;
     private int? _prefetchCount;
     private int? _concurrentMessageLimit;
+    private readonly List<ExchangeDeclaration> _topoExchanges = [];
+    private readonly List<QueueDeclaration> _topoQueues = [];
+    private readonly List<ExchangeQueueBinding> _topoBindings = [];
 
     /// <inheritdoc />
     public void RoutingKey(string routingKey)
@@ -120,6 +124,46 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
             _configureRetry,
             _prefetchCount,
             _concurrentMessageLimit);
+
+    /// <summary>
+    /// Records one exchange + queue + (exchange-&gt;queue) binding fragment for this consumer's opt-in AMQP
+    /// topology. This is a SEPARATE, PARALLEL output of the configurator from <see cref="Build"/>: it never
+    /// reads the dispatcher routing-key set (<see cref="RoutingKey"/>) and never influences
+    /// <see cref="ConsumerRegistration"/> — the AMQP <paramref name="bindingKey"/> and the dispatcher routing
+    /// keys are independent axes. The empty binding key is allowed (mirrors fanout bindings); the exchange and
+    /// queue names must be non-empty.
+    /// </summary>
+    /// <param name="exchange">The exchange to declare. Must not be <see langword="null"/> or empty.</param>
+    /// <param name="queue">The queue to declare. Must not be <see langword="null"/> or empty.</param>
+    /// <param name="bindingKey">The AMQP binding routing-key (broker-side). Must not be <see langword="null"/>.</param>
+    /// <param name="exchangeType">The exchange type to declare.</param>
+    /// <param name="durable">Whether the declared exchange and queue survive a broker restart.</param>
+    internal void DeclareConsumerTopology(
+        string exchange, string queue, string bindingKey, ExchangeType exchangeType, bool durable)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(exchange);
+        ArgumentException.ThrowIfNullOrEmpty(queue);
+        ArgumentNullException.ThrowIfNull(bindingKey);
+        _topoExchanges.Add(new ExchangeDeclaration(exchange, exchangeType, durable));
+        _topoQueues.Add(new QueueDeclaration(queue, durable));
+        _topoBindings.Add(new ExchangeQueueBinding(exchange, queue, bindingKey));
+    }
+
+    /// <summary>
+    /// Returns the accumulated opt-in topology fragment for this consumer, or <see langword="null"/> when
+    /// <see cref="DeclareConsumerTopology"/> was never called. A <see langword="null"/> result is the opt-in
+    /// signal (manual topology unchanged — no broker entity is created without an explicit declaration).
+    /// </summary>
+    /// <returns>The topology fragment, or <see langword="null"/> when none was declared.</returns>
+    internal TopologyDeclaration? BuildTopology() =>
+        _topoExchanges.Count == 0 && _topoQueues.Count == 0 && _topoBindings.Count == 0
+            ? null
+            : new TopologyDeclaration
+            {
+                Exchanges = _topoExchanges.ToArray(),
+                Queues = _topoQueues.ToArray(),
+                ExchangeQueueBindings = _topoBindings.ToArray(),
+            };
 
     private void AddDistinct(string routingKey)
     {

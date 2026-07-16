@@ -2,6 +2,7 @@ using System.Reflection;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Serialization;
+using BareWire.Abstractions.Topology;
 
 namespace BareWire.Transport.RabbitMQ.Configuration;
 
@@ -11,6 +12,7 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     private readonly List<ConsumerRegistration> _consumerRegistrations = [];
     private readonly List<Type> _rawConsumerTypes = [];
     private readonly List<Type> _sagaTypes = [];
+    private readonly List<TopologyDeclaration> _consumerTopologyFragments = [];
 
     internal RabbitMqEndpointConfiguration(string queueName)
     {
@@ -24,6 +26,14 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     internal IReadOnlyList<ConsumerRegistration> ConsumerRegistrations => _consumerRegistrations;
     internal IReadOnlyList<Type> RawConsumerTypes => _rawConsumerTypes;
     internal IReadOnlyList<Type> SagaTypes => _sagaTypes;
+
+    /// <summary>
+    /// The opt-in AMQP topology fragments declared by this endpoint's consumers via
+    /// <c>DeclareTopology</c>. Empty when no consumer opted in (manual topology unchanged). Merged into
+    /// <c>RabbitMqTransportOptions.Topology</c> at build time so the entities flow through the transport
+    /// adapter's topology-deployment path.
+    /// </summary>
+    internal IReadOnlyList<TopologyDeclaration> ConsumerTopologyFragments => _consumerTopologyFragments;
 
     internal Type? SerializerOverrideType { get; private set; }
     internal Type? DeserializerOverrideType { get; private set; }
@@ -103,6 +113,13 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
         configure(configurator);
         _consumerTypes.Add(typeof(TConsumer));
         _consumerRegistrations.Add(configurator.Build());
+
+        // Opt-in AMQP topology is a SEPARATE, PARALLEL output from Build()/ConsumerRegistration: collect the
+        // fragment only when DeclareTopology was called (null == opt-in signal, manual topology unchanged).
+        if (configurator.BuildTopology() is { } topology)
+        {
+            _consumerTopologyFragments.Add(topology);
+        }
     }
 
     public void RawConsumer<T>() where T : class, IRawConsumer
