@@ -1,3 +1,4 @@
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Pipeline.Retry;
 using Microsoft.Extensions.Logging;
@@ -8,11 +9,19 @@ internal sealed class RetryMiddleware : IMessageMiddleware
 {
     private readonly RetryPolicy _policy;
     private readonly ILogger<RetryMiddleware> _logger;
+    private readonly IBareWireInstrumentation _instrumentation;
+    private readonly string _messageTypeTag;
 
-    internal RetryMiddleware(RetryPolicy policy, ILogger<RetryMiddleware> logger)
+    internal RetryMiddleware(
+        RetryPolicy policy,
+        ILogger<RetryMiddleware> logger,
+        IBareWireInstrumentation instrumentation,
+        string messageTypeTag)
     {
         _policy = policy ?? throw new ArgumentNullException(nameof(policy));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
+        _messageTypeTag = messageTypeTag ?? throw new ArgumentNullException(nameof(messageTypeTag));
     }
 
     public async Task InvokeAsync(MessageContext context, NextMiddleware nextMiddleware)
@@ -39,6 +48,9 @@ internal sealed class RetryMiddleware : IMessageMiddleware
                 TimeSpan delay = _policy.GetDelay(attempt);
                 RetryMiddlewareLogMessages.RetryingMessage(
                     _logger, context.MessageId, attempt + 1, _policy.MaxRetries, delay, ex.GetType().Name);
+
+                // Retry-branch only (never on the 0-B/op success path); TagList is a struct — no heap alloc.
+                _instrumentation.RecordRetryAttempt(context.EndpointName, _messageTypeTag, ex.GetType().Name);
 
                 await _policy.DelayAsync(attempt, context.CancellationToken).ConfigureAwait(false);
 

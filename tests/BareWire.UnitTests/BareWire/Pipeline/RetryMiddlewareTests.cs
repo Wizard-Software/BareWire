@@ -1,5 +1,6 @@
 using System.Buffers;
 using AwesomeAssertions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Pipeline;
 using BareWire.Pipeline.Retry;
@@ -40,7 +41,11 @@ public sealed class RetryMiddlewareTests
         // Arrange
         int callCount = 0;
         var policy = CreateIntervalPolicy();
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
 
         // Act
@@ -60,7 +65,11 @@ public sealed class RetryMiddlewareTests
         // Arrange
         int callCount = 0;
         var policy = CreateIntervalPolicy(retryCount: 3);
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
 
         // Act
@@ -128,7 +137,11 @@ public sealed class RetryMiddlewareTests
         // Arrange — use a short real delay (50ms) and verify total time reflects retries.
         var interval = TimeSpan.FromMilliseconds(50);
         var policy = new IntervalRetryPolicy(2, interval, [], []);
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
         int callCount = 0;
 
@@ -155,7 +168,11 @@ public sealed class RetryMiddlewareTests
         var policy = CreateIntervalPolicy(
             retryCount: 3,
             handled: [typeof(InvalidOperationException)]);
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
 
         // Act — ArgumentException is NOT in Handle list, should not retry
@@ -173,7 +190,11 @@ public sealed class RetryMiddlewareTests
         var policy = CreateIntervalPolicy(
             retryCount: 3,
             ignored: [typeof(ArgumentException)]);
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
         int callCount = 0;
 
@@ -194,7 +215,11 @@ public sealed class RetryMiddlewareTests
     {
         // Arrange
         var policy = CreateIntervalPolicy(retryCount: 2);
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext();
         int callCount = 0;
 
@@ -216,7 +241,11 @@ public sealed class RetryMiddlewareTests
         // Arrange — use real short delay so cancellation has something to cancel
         using var cts = new CancellationTokenSource();
         var policy = CreateIntervalPolicy(retryCount: 5, interval: TimeSpan.FromSeconds(60));
-        var sut = new RetryMiddleware(policy, NullLogger<RetryMiddleware>.Instance);
+        var sut = new RetryMiddleware(
+            policy,
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
         var context = CreateContext(cts.Token);
         int callCount = 0;
 

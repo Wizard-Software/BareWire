@@ -88,6 +88,18 @@ public interface IBareWireInstrumentation
     void RecordFailure(string endpoint, string messageType, string errorType);
 
     /// <summary>
+    /// Records a retry attempt: increments the <c>barewire.messages.retried</c> counter.
+    /// Call this once per retry attempt performed on the consume pipeline (per-consumer retry
+    /// composed via the public retry configurator), before the delay is awaited.
+    /// </summary>
+    /// <param name="endpoint">The receive endpoint or queue name where the retry occurred.</param>
+    /// <param name="messageType">The fully-qualified or short message type name.</param>
+    /// <param name="errorType">
+    /// The exception type name that triggered the retry (e.g. <c>InvalidOperationException</c>).
+    /// </param>
+    void RecordRetryAttempt(string endpoint, string messageType, string errorType);
+
+    /// <summary>
     /// Records a dead-letter event: increments the <c>barewire.messages.dead_lettered</c> counter.
     /// Call this when a message is moved to the dead-letter queue after all retries are exhausted.
     /// </summary>

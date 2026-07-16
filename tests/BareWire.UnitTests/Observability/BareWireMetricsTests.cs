@@ -146,6 +146,34 @@ public sealed class BareWireMetricsTests : IDisposable
         SumLong("barewire.messages.failed").Should().Be(1);
     }
 
+    // ── RecordRetryAttempt ────────────────────────────────────────────────────
+
+    [Fact]
+    public void RecordRetryAttempt_IncrementsRetriedCounter()
+    {
+        // Act
+        _metrics.RecordRetryAttempt("orders-queue", "OrderCreated", "InvalidOperationException");
+
+        // Assert
+        SumLong("barewire.messages.retried").Should().Be(1);
+    }
+
+    [Fact]
+    public void RecordRetryAttempt_IncludesEndpointMessageTypeAndErrorTypeTags()
+    {
+        // Act
+        _metrics.RecordRetryAttempt("orders-queue", "OrderCreated", "TimeoutException");
+
+        // Assert — retry counter carries endpoint, message_type and error_type tags
+        var measurement = _longMeasurements
+            .Single(m => m.InstrumentName == "barewire.messages.retried");
+
+        var tagDict = measurement.Tags.ToDictionary(kvp => kvp.Key, kvp => kvp.Value?.ToString());
+        tagDict["endpoint"].Should().Be("orders-queue");
+        tagDict["message_type"].Should().Be("OrderCreated");
+        tagDict["error_type"].Should().Be("TimeoutException");
+    }
+
     // ── RecordDeadLetter ──────────────────────────────────────────────────────
 
     [Fact]

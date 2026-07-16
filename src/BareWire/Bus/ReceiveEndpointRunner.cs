@@ -236,7 +236,12 @@ internal sealed partial class ReceiveEndpointRunner
                 interval: binding.RetryInterval,
                 handledExceptions: [],
                 ignoredExceptions: []);
-            middlewares.Add(new RetryMiddleware(retryPolicy, retryLogger));
+            // Precompiled message_type tag (zero per-message cost): single-consumer endpoint uses its
+            // message type name; multi-consumer / raw-only endpoints fall back to "unknown".
+            string retryMessageTypeTag = _consumerMessageTypeNames.Length == 1
+                ? _consumerMessageTypeNames[0]
+                : "unknown";
+            middlewares.Add(new RetryMiddleware(retryPolicy, retryLogger, instrumentation, retryMessageTypeTag));
         }
 
         // DeadLetterMiddleware logs the error; re-throws so ReceiveEndpointRunner NACKs.
