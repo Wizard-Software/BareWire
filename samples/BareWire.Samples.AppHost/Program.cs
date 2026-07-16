@@ -124,4 +124,11 @@ builder.AddProject<Projects.BareWire_Samples_ConsumerRoutingKeys>("consumer-rout
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+// Consumer definition showcase: ConsumerDefinition<TConsumer> discovered via explicit DI
+// registration, colocating a retry policy and routing-key patterns next to the consumer, plus the
+// opt-in transport-level DeclareTopology helper. RabbitMQ only — no Postgres (pure messaging sample).
+builder.AddProject<Projects.BareWire_Samples_ConsumerDefinitionShowcase>("consumer-definition-showcase")
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

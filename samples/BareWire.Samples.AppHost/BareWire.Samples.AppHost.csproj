@@ -27,5 +27,6 @@
     <ProjectReference Include="..\BareWire.Samples.OrderedConsumers\BareWire.Samples.OrderedConsumers.csproj" />
     <ProjectReference Include="..\BareWire.Samples.CompetingResponders\BareWire.Samples.CompetingResponders.csproj" />
     <ProjectReference Include="..\BareWire.Samples.ConsumerRoutingKeys\BareWire.Samples.ConsumerRoutingKeys.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.ConsumerDefinitionShowcase\BareWire.Samples.ConsumerDefinitionShowcase.csproj" />
   </ItemGroup>
 </Project>

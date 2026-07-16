@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Serialization.Json\BareWire.Serialization.Json.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.Transport.RabbitMQ\BareWire.Transport.RabbitMQ.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.RabbitMQ\BareWire.RabbitMQ.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.ServiceDefaults\BareWire.Samples.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Raw AMQP publisher: RabbitMQ.Client used directly in TransferPublisher to publish to the
+         exchange declared (opt-in) by DeclareTopology, with an exact-matching exchange declaration. -->
+    <PackageReference Include="RabbitMQ.Client" />
+  </ItemGroup>
+
+</Project>
