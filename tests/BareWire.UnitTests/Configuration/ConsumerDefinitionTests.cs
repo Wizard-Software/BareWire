@@ -70,6 +70,10 @@ public sealed class ConsumerDefinitionTests
         public void UseMassTransitEnvelope()
         {
         }
+
+        public void Retry(Action<IRetryConfigurator> configure)
+        {
+        }
     }
 
     [Fact]

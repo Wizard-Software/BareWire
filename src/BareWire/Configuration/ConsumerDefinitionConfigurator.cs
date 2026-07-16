@@ -25,6 +25,7 @@ internal sealed class ConsumerDefinitionConfigurator<TConsumer> : IConsumerConfi
     private readonly List<string> _routingKeys = [];
     private bool _acceptUntyped;
     private bool _useMassTransitEnvelope;
+    private Action<IRetryConfigurator>? _configureRetry;
 
     /// <inheritdoc />
     public void RoutingKey(string routingKey)
@@ -50,13 +51,21 @@ internal sealed class ConsumerDefinitionConfigurator<TConsumer> : IConsumerConfi
     /// <inheritdoc />
     public void UseMassTransitEnvelope() => _useMassTransitEnvelope = true;
 
+    /// <inheritdoc />
+    public void Retry(Action<IRetryConfigurator> configure)
+    {
+        ArgumentNullException.ThrowIfNull(configure);
+        _configureRetry = configure;
+    }
+
     /// <summary>
     /// Merges the settings accumulated from a <c>ConsumerDefinition&lt;TConsumer&gt;</c> into
     /// <paramref name="existing"/>, an already-materialized <see cref="ConsumerRegistration"/>: routing keys
     /// are unioned (existing set first, then any new pattern from this definition, deduplicated ordinally),
     /// <see cref="ConsumerRegistration.AcceptUntyped"/> and <see cref="ConsumerRegistration.UseMassTransitEnvelope"/>
-    /// are OR-combined, and every other field (<see cref="ConsumerRegistration.MessageType"/>,
-    /// <see cref="ConsumerRegistration.ConfigureRetry"/>, <see cref="ConsumerRegistration.PrefetchCount"/>,
+    /// are OR-combined, <see cref="ConsumerRegistration.ConfigureRetry"/> is replaced when this definition
+    /// composed a retry policy (via <see cref="Retry"/>) and otherwise preserved, and every other field
+    /// (<see cref="ConsumerRegistration.MessageType"/>, <see cref="ConsumerRegistration.PrefetchCount"/>,
     /// <see cref="ConsumerRegistration.ConcurrentMessageLimit"/>) is preserved unchanged.
     /// </summary>
     /// <param name="existing">The registration to merge this definition's settings into.</param>
@@ -77,6 +86,7 @@ internal sealed class ConsumerDefinitionConfigurator<TConsumer> : IConsumerConfi
             RoutingKeys = keys.Count == 0 ? null : keys,
             AcceptUntyped = existing.AcceptUntyped || _acceptUntyped,
             UseMassTransitEnvelope = existing.UseMassTransitEnvelope || _useMassTransitEnvelope,
+            ConfigureRetry = _configureRetry ?? existing.ConfigureRetry,
         };
     }
 

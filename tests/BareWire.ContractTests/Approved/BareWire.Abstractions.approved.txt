@@ -185,6 +185,12 @@ namespace BareWire.Abstractions
 }
 namespace BareWire.Abstractions.Configuration
 {
+    public abstract class ConsumerDefinition<TConsumer>
+        where TConsumer :  class
+    {
+        protected ConsumerDefinition() { }
+        protected virtual void Configure(BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator endpoint, BareWire.Abstractions.Configuration.IConsumerConfigurator<TConsumer> consumer) { }
+    }
     public enum ConsumerOrderingStrategy
     {
         Auto = 0,
@@ -193,10 +199,13 @@ namespace BareWire.Abstractions.Configuration
     }
     public sealed class ConsumerRegistration : System.IEquatable<BareWire.Abstractions.Configuration.ConsumerRegistration>
     {
-        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType, System.Collections.Generic.IReadOnlyList<string>? RoutingKeys = null, bool AcceptUntyped = false, bool UseMassTransitEnvelope = false) { }
+        public ConsumerRegistration(System.Type ConsumerType, System.Type MessageType, System.Collections.Generic.IReadOnlyList<string>? RoutingKeys = null, bool AcceptUntyped = false, bool UseMassTransitEnvelope = false, System.Action<BareWire.Abstractions.Configuration.IRetryConfigurator>? ConfigureRetry = null, int? PrefetchCount = default, int? ConcurrentMessageLimit = default) { }
         public bool AcceptUntyped { get; init; }
+        public int? ConcurrentMessageLimit { get; init; }
+        public System.Action<BareWire.Abstractions.Configuration.IRetryConfigurator>? ConfigureRetry { get; init; }
         public System.Type ConsumerType { get; init; }
         public System.Type MessageType { get; init; }
+        public int? PrefetchCount { get; init; }
         public System.Collections.Generic.IReadOnlyList<string>? RoutingKeys { get; init; }
         public bool UseMassTransitEnvelope { get; init; }
     }
@@ -231,15 +240,18 @@ namespace BareWire.Abstractions.Configuration
         void UseSerializer<T>()
             where T :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
     }
-    public interface IConsumerConfigurator<TConsumer, TMessage>
-        where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
-        where TMessage :  class
+    public interface IConsumerConfigurator<TConsumer>
+        where TConsumer :  class
     {
         void AcceptUntyped();
+        void Retry(System.Action<BareWire.Abstractions.Configuration.IRetryConfigurator> configure);
         void RoutingKey(string routingKey);
         void RoutingKeys(params string[] routingKeys);
         void UseMassTransitEnvelope();
     }
+    public interface IConsumerConfigurator<TConsumer, TMessage> : BareWire.Abstractions.Configuration.IConsumerConfigurator<TConsumer>
+        where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
+        where TMessage :  class { }
     public interface IConsumerOrderingConfiguration
     {
         int? Concurrency { get; }
@@ -308,6 +320,8 @@ namespace BareWire.Abstractions.Configuration
         BareWire.Abstractions.RawSerializerOptions RawSerializerOptions { get; set; }
         int RetryCount { get; set; }
         System.TimeSpan RetryInterval { get; set; }
+        void Consumer<TConsumer>()
+            where TConsumer :  class;
         void Consumer<TConsumer, TMessage>()
             where TConsumer :  class, BareWire.Abstractions.IConsumer<TMessage>
             where TMessage :  class;
@@ -326,6 +340,16 @@ namespace BareWire.Abstractions.Configuration
             where TDeserializer :  class, BareWire.Abstractions.Serialization.IMessageDeserializer;
         void UseSerializer<TSerializer>()
             where TSerializer :  class, BareWire.Abstractions.Serialization.IMessageSerializer;
+    }
+    public interface IRetryConfigurator
+    {
+        BareWire.Abstractions.Configuration.IRetryConfigurator Exponential(int retryCount, System.TimeSpan minInterval, System.TimeSpan maxInterval);
+        BareWire.Abstractions.Configuration.IRetryConfigurator Handle<TException>()
+            where TException : System.Exception;
+        BareWire.Abstractions.Configuration.IRetryConfigurator Ignore<TException>()
+            where TException : System.Exception;
+        BareWire.Abstractions.Configuration.IRetryConfigurator Incremental(int retryCount, System.TimeSpan initial, System.TimeSpan increment);
+        BareWire.Abstractions.Configuration.IRetryConfigurator Interval(int retryCount, System.TimeSpan interval);
     }
     public interface ITlsConfigurator
     {
@@ -424,6 +448,7 @@ namespace BareWire.Abstractions.Observability
         void RecordPublish(string endpoint, string messageType, int messageSize);
         void RecordPublishPending(string endpoint, int delta);
         void RecordPublishRejected(string endpoint, string messageType);
+        void RecordRetryAttempt(string endpoint, string messageType, string errorType);
         System.Diagnostics.Activity? StartConsumeActivity(string messageType, string endpoint, System.Guid messageId, System.Collections.Generic.IReadOnlyDictionary<string, string> headers);
         System.Diagnostics.Activity? StartPublishActivity(string messageType, string destination, System.Guid messageId);
         System.Diagnostics.Activity? StartSagaTransitionActivity(string sagaType, string stateFrom, string stateTo, System.Guid correlationId);

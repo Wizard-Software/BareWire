@@ -148,6 +148,22 @@ public interface IConsumerConfigurator<TConsumer>
     /// </para>
     /// </remarks>
     void UseMassTransitEnvelope();
+
+    /// <summary>
+    /// Configures this consumer's retry policy through the public <see cref="IRetryConfigurator"/> fluent
+    /// contract. The delegate is invoked to build the policy (for example
+    /// <c>r =&gt; r.Exponential(5, TimeSpan.FromSeconds(1), TimeSpan.FromMinutes(1), 2.0)</c>); it is stored
+    /// verbatim and materialized to a concrete retry policy later in the core, so no core policy type leaks
+    /// into this zero-dependency abstraction.
+    /// </summary>
+    /// <remarks>
+    /// The call is a <strong>scalar knob — last call wins</strong> (unlike the accumulating
+    /// <see cref="RoutingKey"/>/<see cref="RoutingKeys"/> set). Not calling it leaves the consumer's retry
+    /// behaviour unchanged (the endpoint-level default). It is the ergonomic composition point for retry on a
+    /// <see cref="ConsumerDefinition{TConsumer}"/>: <c>consumer.Retry(r =&gt; r.Interval(3, delay))</c>.
+    /// </remarks>
+    /// <param name="configure">The retry-configuration delegate. Must not be <see langword="null"/>.</param>
+    void Retry(Action<IRetryConfigurator> configure);
 }
 
 /// <summary>

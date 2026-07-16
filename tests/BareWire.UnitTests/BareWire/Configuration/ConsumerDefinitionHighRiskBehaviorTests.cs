@@ -65,6 +65,22 @@ public sealed class ConsumerDefinitionHighRiskBehaviorTests
     }
 
     [Fact]
+    public void FacadeRetry_ComposedInDefinition_FlowsIntoConsumerRegistration()
+    {
+        // The ergonomic path a ConsumerDefinition uses: consumer.Retry(r => ...) on the public façade.
+        var configurator = new CoreCfg.ConsumerDefinitionConfigurator<OrderConsumer>();
+        configurator.Retry(c => c.Interval(3, TimeSpan.FromMilliseconds(1)));
+
+        ConsumerRegistration merged = configurator.Merge(Reg());
+
+        merged.ConfigureRetry.Should().NotBeNull();
+        RetryPolicy? policy = RetryPolicyMaterializer.Materialize(merged.ConfigureRetry);
+        policy.Should().BeOfType<IntervalRetryPolicy>();
+        policy!.ShouldRetry(new InvalidOperationException(), attempt: 2).Should().BeTrue();
+        policy.ShouldRetry(new InvalidOperationException(), attempt: 3).Should().BeFalse();
+    }
+
+    [Fact]
     public void RetryCarrier_OnAbstractionsRecord_DoesNotReferenceCoreRetryPolicy()
     {
         System.Reflection.Assembly abstractionsAssembly = typeof(ConsumerRegistration).Assembly;

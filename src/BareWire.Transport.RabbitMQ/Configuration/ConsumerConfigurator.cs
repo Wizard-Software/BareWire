@@ -77,7 +77,7 @@ internal sealed class ConsumerConfigurator<TConsumer, TMessage> : IConsumerConfi
     /// idempotent on/off flags).
     /// </summary>
     /// <param name="configure">The retry-configuration delegate. Must not be <see langword="null"/>.</param>
-    internal void Retry(Action<IRetryConfigurator> configure)
+    public void Retry(Action<IRetryConfigurator> configure)
     {
         ArgumentNullException.ThrowIfNull(configure);
         _configureRetry = configure;
