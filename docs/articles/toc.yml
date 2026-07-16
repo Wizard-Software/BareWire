@@ -8,6 +8,8 @@
   href: topology.md
 - name: Consumer Routing Keys
   href: consumer-routing-keys.md
+- name: Consumer Definitions
+  href: consumer-definitions.md
 - name: Per-Key Consumer Ordering
   href: per-key-ordering.md
 - name: Flow Control
