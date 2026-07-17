@@ -102,4 +102,44 @@ public sealed class EndpointBinding
         SerializerOverrideType = SerializerOverrideType,
         DeserializerOverrideType = DeserializerOverrideType,
     };
+
+    /// <summary>
+    /// Creates a copy of this <see cref="EndpointBinding"/> with <see cref="Consumers"/> replaced and the
+    /// endpoint-level settings a <c>ConsumerDefinition&lt;TConsumer&gt;</c> applied through the <c>endpoint</c>
+    /// argument of its <c>Configure</c> method materialized in — prefetch, concurrency, the scalar retry
+    /// count/interval, and the per-endpoint serializer/deserializer overrides. Every other
+    /// <see langword="init"/>-only property is preserved unchanged. Used by the core's start-up discovery so
+    /// endpoint-level definition settings are honoured rather than dropped.
+    /// </summary>
+    /// <param name="consumers">The replacement consumer registrations for this endpoint.</param>
+    /// <param name="prefetchCount">The (possibly overridden) prefetch count.</param>
+    /// <param name="concurrentMessageLimit">The (possibly overridden) cross-key concurrency cap.</param>
+    /// <param name="retryCount">The (possibly overridden) endpoint retry attempt count.</param>
+    /// <param name="retryInterval">The (possibly overridden) endpoint retry interval.</param>
+    /// <param name="serializerOverrideType">The (possibly overridden) per-endpoint serializer type, or <see langword="null"/>.</param>
+    /// <param name="deserializerOverrideType">The (possibly overridden) per-endpoint deserializer type, or <see langword="null"/>.</param>
+    /// <returns>A new <see cref="EndpointBinding"/> carrying the merged consumers and endpoint settings.</returns>
+    internal EndpointBinding WithConsumersAndEndpointSettings(
+        IReadOnlyList<ConsumerRegistration> consumers,
+        int prefetchCount,
+        int concurrentMessageLimit,
+        int retryCount,
+        TimeSpan retryInterval,
+        Type? serializerOverrideType,
+        Type? deserializerOverrideType) => new()
+    {
+        EndpointName = EndpointName,
+        PrefetchCount = prefetchCount,
+        ConcurrentMessageLimit = concurrentMessageLimit,
+        Ordering = Ordering,
+        Consumers = consumers,
+        RawConsumers = RawConsumers,
+        SagaTypes = SagaTypes,
+        RetryCount = retryCount,
+        RetryInterval = retryInterval,
+        DeadLetterExchange = DeadLetterExchange,
+        DeadLetterRoutingKey = DeadLetterRoutingKey,
+        SerializerOverrideType = serializerOverrideType,
+        DeserializerOverrideType = deserializerOverrideType,
+    };
 }

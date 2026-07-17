@@ -104,4 +104,78 @@ public sealed class ConsumerDefinitionDiscoveryTests
         result[0].PrefetchCount.Should().Be(32);
         result[0].Consumers[0].AcceptUntyped.Should().BeTrue();
     }
+
+    // A definition that tunes the endpoint through the `endpoint` argument of Configure.
+    private sealed class EndpointTuningDefinition : ConsumerDefinition<OrderConsumer>
+    {
+        protected override void Configure(
+            IReceiveEndpointConfigurator endpoint,
+            IConsumerConfigurator<OrderConsumer> consumer)
+        {
+            endpoint.PrefetchCount = 64;
+            endpoint.ConcurrentMessageLimit = 4;
+            endpoint.RetryCount = 5;
+            endpoint.RetryInterval = TimeSpan.FromSeconds(2);
+        }
+    }
+
+    // A definition that (illegally) tries to register another consumer on the endpoint.
+    private sealed class NestedRegistrationDefinition : ConsumerDefinition<OrderConsumer>
+    {
+        protected override void Configure(
+            IReceiveEndpointConfigurator endpoint,
+            IConsumerConfigurator<OrderConsumer> consumer)
+            => endpoint.Consumer<OrderConsumer, OrderPlaced>();
+    }
+
+    // A definition that (illegally) tries to configure endpoint ordering.
+    private sealed class EndpointOrderingDefinition : ConsumerDefinition<OrderConsumer>
+    {
+        protected override void Configure(
+            IReceiveEndpointConfigurator endpoint,
+            IConsumerConfigurator<OrderConsumer> consumer)
+            => endpoint.OrderedByHeader("tenant");
+    }
+
+    [Fact]
+    public void ApplyToEndpoints_MaterializesEndpointLevelSettings_FromDefinition()
+    {
+        var services = new ServiceCollection()
+            .AddSingleton<ConsumerDefinition<OrderConsumer>, EndpointTuningDefinition>()
+            .BuildServiceProvider();
+        var endpoint = new EndpointBinding { EndpointName = "q", Consumers = [Reg()] };
+
+        var result = ConsumerDefinitionDiscovery.ApplyToEndpoints([endpoint], services);
+
+        result[0].PrefetchCount.Should().Be(64);
+        result[0].ConcurrentMessageLimit.Should().Be(4);
+        result[0].RetryCount.Should().Be(5);
+        result[0].RetryInterval.Should().Be(TimeSpan.FromSeconds(2));
+    }
+
+    [Fact]
+    public void ApplyToEndpoints_DefinitionRegisteringConsumerOnEndpoint_ThrowsNotSupported()
+    {
+        var services = new ServiceCollection()
+            .AddSingleton<ConsumerDefinition<OrderConsumer>, NestedRegistrationDefinition>()
+            .BuildServiceProvider();
+        var endpoint = new EndpointBinding { EndpointName = "q", Consumers = [Reg()] };
+
+        var act = () => ConsumerDefinitionDiscovery.ApplyToEndpoints([endpoint], services);
+
+        act.Should().Throw<NotSupportedException>().WithMessage("*cannot be configured from ConsumerDefinition*");
+    }
+
+    [Fact]
+    public void ApplyToEndpoints_DefinitionConfiguringEndpointOrdering_ThrowsNotSupported()
+    {
+        var services = new ServiceCollection()
+            .AddSingleton<ConsumerDefinition<OrderConsumer>, EndpointOrderingDefinition>()
+            .BuildServiceProvider();
+        var endpoint = new EndpointBinding { EndpointName = "q", Consumers = [Reg()] };
+
+        var act = () => ConsumerDefinitionDiscovery.ApplyToEndpoints([endpoint], services);
+
+        act.Should().Throw<NotSupportedException>().WithMessage("*cannot be configured from ConsumerDefinition*");
+    }
 }

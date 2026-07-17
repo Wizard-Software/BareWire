@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using BareWire.Abstractions.Configuration;
 using BareWire.Configuration;
 
@@ -27,10 +28,17 @@ internal static class ConsumerDefinitionDiscovery
 
     /// <summary>
     /// Applies any DI-registered <c>ConsumerDefinition&lt;TConsumer&gt;</c> to each entry in
-    /// <paramref name="registrations"/>, returning a list with the merged settings. When no registration has
-    /// a matching definition, the original <paramref name="registrations"/> instance is returned unchanged
-    /// (reference identity preserved — no allocation when discovery has nothing to apply).
+    /// <paramref name="registrations"/>, returning a list with the merged per-consumer settings. When no
+    /// registration has a matching definition, the original <paramref name="registrations"/> instance is
+    /// returned unchanged (reference identity preserved — no allocation when discovery has nothing to apply).
     /// </summary>
+    /// <remarks>
+    /// This overload merges only the <em>per-consumer</em> settings (routing keys, AcceptUntyped, envelope,
+    /// retry policy). Endpoint-level settings a definition applies through the <c>endpoint</c> argument are
+    /// materialized by <see cref="ApplyToEndpoints"/>, which owns the <see cref="EndpointBinding"/>; this
+    /// list-only helper discards them (there is no endpoint here). Unsupported endpoint operations still
+    /// throw via <see cref="CapturingReceiveEndpointConfigurator"/> rather than being silently ignored.
+    /// </remarks>
     /// <param name="registrations">The consumer registrations to apply discovered definitions to.</param>
     /// <param name="services">The service provider definitions are resolved from.</param>
     /// <returns>
@@ -40,6 +48,12 @@ internal static class ConsumerDefinitionDiscovery
     internal static IReadOnlyList<ConsumerRegistration> ApplyRegisteredDefinitions(
         IReadOnlyList<ConsumerRegistration> registrations,
         IServiceProvider services)
+        => ApplyRegisteredDefinitions(registrations, services, new CapturingReceiveEndpointConfigurator());
+
+    private static IReadOnlyList<ConsumerRegistration> ApplyRegisteredDefinitions(
+        IReadOnlyList<ConsumerRegistration> registrations,
+        IServiceProvider services,
+        IReceiveEndpointConfigurator endpoint)
     {
         ArgumentNullException.ThrowIfNull(registrations);
         ArgumentNullException.ThrowIfNull(services);
@@ -56,9 +70,20 @@ internal static class ConsumerDefinitionDiscovery
                 continue;
             }
 
-            var merged = (ConsumerRegistration)ApplyOneMethod
-                .MakeGenericMethod(registration.ConsumerType)
-                .Invoke(null, [definition, registration])!;
+            ConsumerRegistration merged;
+            try
+            {
+                merged = (ConsumerRegistration)ApplyOneMethod
+                    .MakeGenericMethod(registration.ConsumerType)
+                    .Invoke(null, [definition, registration, endpoint])!;
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is { } inner)
+            {
+                // A definition's Configure can throw (e.g. NotSupportedException for an endpoint operation a
+                // per-consumer definition cannot express); surface the real exception, not the reflection wrapper.
+                ExceptionDispatchInfo.Capture(inner).Throw();
+                throw; // unreachable — satisfies definite-assignment
+            }
 
             // Materialize the result list lazily — only once a definition actually changes something.
             result ??= [.. registrations];
@@ -69,17 +94,18 @@ internal static class ConsumerDefinitionDiscovery
     }
 
     /// <summary>
-    /// Applies <see cref="ApplyRegisteredDefinitions"/> to every <see cref="EndpointBinding.Consumers"/> list
-    /// across <paramref name="endpoints"/>, returning a list of endpoints with the merged consumer
-    /// registrations. Endpoints whose consumers are unaffected are returned unchanged, and when no endpoint
-    /// is affected the original <paramref name="endpoints"/> instance is returned (reference identity
-    /// preserved).
+    /// Applies discovered definitions to every <see cref="EndpointBinding.Consumers"/> list across
+    /// <paramref name="endpoints"/>, materializing both the merged per-consumer settings and the endpoint-level
+    /// settings a definition applied through the <c>endpoint</c> argument of its <c>Configure</c> method
+    /// (prefetch, concurrency, scalar retry, serializer/deserializer overrides). Endpoints whose consumers and
+    /// endpoint settings are unaffected are returned unchanged, and when no endpoint is affected the original
+    /// <paramref name="endpoints"/> instance is returned (reference identity preserved).
     /// </summary>
     /// <param name="endpoints">The endpoint bindings to apply discovered definitions to.</param>
     /// <param name="services">The service provider definitions are resolved from.</param>
     /// <returns>
-    /// <paramref name="endpoints"/> unchanged if no endpoint's consumers were affected; otherwise a new list
-    /// with the affected endpoints replaced by their <see cref="EndpointBinding.WithConsumers"/> copies.
+    /// <paramref name="endpoints"/> unchanged if no endpoint was affected; otherwise a new list with the
+    /// affected endpoints replaced by copies carrying the merged consumers and endpoint settings.
     /// </returns>
     internal static IReadOnlyList<EndpointBinding> ApplyToEndpoints(
         IReadOnlyList<EndpointBinding> endpoints,
@@ -92,35 +118,54 @@ internal static class ConsumerDefinitionDiscovery
         for (int i = 0; i < endpoints.Count; i++)
         {
             EndpointBinding endpoint = endpoints[i];
-            IReadOnlyList<ConsumerRegistration> merged = ApplyRegisteredDefinitions(endpoint.Consumers, services);
-            if (ReferenceEquals(merged, endpoint.Consumers))
+
+            // One capturer per endpoint, seeded from its current values and shared across every consumer's
+            // Configure call — the last definition to set an endpoint-level scalar wins.
+            var capturing = new CapturingReceiveEndpointConfigurator(endpoint);
+            IReadOnlyList<ConsumerRegistration> merged =
+                ApplyRegisteredDefinitions(endpoint.Consumers, services, capturing);
+
+            bool consumersChanged = !ReferenceEquals(merged, endpoint.Consumers);
+            if (!consumersChanged && !capturing.IsDirty)
             {
                 result?[i] = endpoint;
                 continue;
             }
 
             result ??= [.. endpoints];
-            result[i] = endpoint.WithConsumers(merged);
+            result[i] = endpoint.WithConsumersAndEndpointSettings(
+                merged,
+                capturing.PrefetchCount,
+                capturing.ConcurrentMessageLimit,
+                capturing.RetryCount,
+                capturing.RetryInterval,
+                capturing.CapturedSerializerOverrideType,
+                capturing.CapturedDeserializerOverrideType);
         }
 
         return result ?? endpoints;
     }
 
     /// <summary>
-    /// Invokes <paramref name="definition"/>'s <c>Configure</c> method through the internal invoker, then
-    /// merges the resulting per-consumer settings into <paramref name="existing"/>. Closed once per
-    /// registration via <see cref="ApplyOneMethod"/>.
+    /// Invokes <paramref name="definition"/>'s <c>Configure</c> method through the internal invoker — passing
+    /// <paramref name="endpoint"/> as the endpoint argument (so endpoint-level settings are captured) and a
+    /// per-consumer façade — then merges the resulting per-consumer settings into <paramref name="existing"/>.
+    /// Closed once per registration via <see cref="ApplyOneMethod"/>.
     /// </summary>
     /// <typeparam name="TConsumer">The consumer implementation type.</typeparam>
     /// <param name="definition">The resolved <c>ConsumerDefinition&lt;TConsumer&gt;</c> instance.</param>
     /// <param name="existing">The already-materialized registration to merge settings into.</param>
+    /// <param name="endpoint">The (capturing) endpoint configurator handed to <c>Configure</c>.</param>
     /// <returns>A new <see cref="ConsumerRegistration"/> carrying the merged settings.</returns>
-    private static ConsumerRegistration ApplyOne<TConsumer>(object definition, ConsumerRegistration existing)
+    private static ConsumerRegistration ApplyOne<TConsumer>(
+        object definition,
+        ConsumerRegistration existing,
+        IReceiveEndpointConfigurator endpoint)
         where TConsumer : class
     {
         var typedDefinition = (ConsumerDefinition<TConsumer>)definition;
         var configurator = new ConsumerDefinitionConfigurator<TConsumer>();
-        typedDefinition.ApplyConfiguration(new NoOpReceiveEndpointConfigurator(), configurator);
+        typedDefinition.ApplyConfiguration(endpoint, configurator);
         return configurator.Merge(existing);
     }
 }
