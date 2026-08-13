@@ -55,6 +55,9 @@ internal sealed class BareWireInstrumentation(BareWireMetrics metrics)
     public void RecordFailure(string endpoint, string messageType, string errorType)
         => metrics.RecordFailure(endpoint, messageType, errorType);
 
+    public void RecordRetryAttempt(string endpoint, string messageType, string errorType)
+        => metrics.RecordRetryAttempt(endpoint, messageType, errorType);
+
     public void RecordDeadLetter(string endpoint, string messageType)
         => metrics.RecordDeadLetter(endpoint, messageType);
 

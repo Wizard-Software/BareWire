@@ -2,6 +2,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Pipeline;
+using BareWire.Abstractions.Topology;
 using BareWire.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -230,6 +231,132 @@ public sealed class UntypedTrustBoundaryDiagnosticTests
         // Assert — every emitted warning carries only the endpoint name, never the routing-key value.
         logger.Events.Should()
             .OnlyContain(e => e.Level != LogLevel.Warning || !e.Message.Contains("secret.tenant.payload.key"));
+    }
+
+    // ── Materialized (definition-merged) overload — task 19.11 ──────────────────
+    //
+    // These tests exercise Run(IReadOnlyList<EndpointBinding>, TopologyDeclaration?, BusConfigurator,
+    // ILogger) — the overload that reads MATERIALIZED ConsumerDefinition<T>-merged flags from
+    // EndpointBinding.Consumers, which are invisible to the config-time
+    // Run(BusConfigurator, ILogger) overload exercised above.
+
+    [Fact]
+    public void Run_MaterializedAcceptUntypedWithMtEnvelope_NoSchemaValidation_WarnsBothAxes()
+    {
+        // Arrange — definition-merged AcceptUntyped + MassTransit-envelope flags, visible only via
+        // EndpointBinding.Consumers (materialized), not via configurator.ReceiveEndpoints.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        EndpointBinding binding = new()
+        {
+            EndpointName = "orders-foreign",
+            Consumers = [new ConsumerRegistration(typeof(FakeConsumer), typeof(FakeMessage),
+                AcceptUntyped: true, UseMassTransitEnvelope: true)],
+        };
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run([binding], optInTopology: null, configurator, logger);
+
+        // Assert — axis 1 (AcceptUntyped) AND axis 2 (MT envelope + AcceptUntyped) both fire.
+        logger.Events.Should().Contain(e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("orders-foreign")
+            && !e.Message.Contains("MassTransit envelope"));
+        logger.Events.Should().Contain(e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("orders-foreign")
+            && e.Message.Contains("MassTransit envelope"));
+    }
+
+    [Fact]
+    public void Run_MaterializedAcceptUntypedWithOptInTopology_NoSchemaValidation_WarnsTopologyAxis()
+    {
+        // Arrange — a materialized AcceptUntyped consumer plus a non-null bus-global
+        // TopologyDeclaration (19.9 merges opt-in consumer topology fragments here; publish-side
+        // ConfigureTopology/AutoDeclare also makes this non-null — the conservative over-warn is
+        // documented on the diagnostic).
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        EndpointBinding binding = new()
+        {
+            EndpointName = "orders-topology",
+            Consumers = [new ConsumerRegistration(typeof(FakeConsumer), typeof(FakeMessage), AcceptUntyped: true)],
+        };
+        TopologyDeclaration topology = new();
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run([binding], topology, configurator, logger);
+
+        // Assert — the topology-axis advisory fires, naming the endpoint.
+        logger.Events.Should().Contain(e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("orders-topology")
+            && e.Message.Contains("topology"));
+    }
+
+    [Fact]
+    public void Run_MaterializedAcceptUntypedWithoutOptInTopology_EmitsNoTopologyWarning()
+    {
+        // Arrange — same materialized AcceptUntyped consumer, but optInTopology is null (no opt-in
+        // topology anywhere on the bus). Axis 1 (AcceptUntyped) still fires; the topology axis must
+        // NOT — this is the negative case guarding against a false-negative-turned-always-on bug.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        EndpointBinding binding = new()
+        {
+            EndpointName = "orders-solo-untyped",
+            Consumers = [new ConsumerRegistration(typeof(FakeConsumer), typeof(FakeMessage), AcceptUntyped: true)],
+        };
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run([binding], optInTopology: null, configurator, logger);
+
+        // Assert — no topology-axis warning; only the axis-1 warning is present.
+        logger.Events.Should().NotContain(e => e.Level == LogLevel.Warning && e.Message.Contains("topology"));
+        logger.Events.Should().ContainSingle(e => e.Level == LogLevel.Warning);
+    }
+
+    [Fact]
+    public void Run_MaterializedDefaultPath_NoOptIn_EmitsNoWarning()
+    {
+        // Arrange — secure-by-default path: AcceptUntyped=false on every consumer, no opt-in topology.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        EndpointBinding binding = new()
+        {
+            EndpointName = "orders-default",
+            Consumers = [new ConsumerRegistration(typeof(FakeConsumer), typeof(FakeMessage))],
+        };
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run([binding], optInTopology: null, configurator, logger);
+
+        // Assert — default path unchanged: zero warnings.
+        logger.Events.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Run_MaterializedSchemaValidationMiddlewareRegistered_SuppressesAllAxes()
+    {
+        // Arrange — the same materialized AcceptUntyped + MT-envelope + opt-in-topology combination
+        // that trips every axis above, but with a registered SchemaValidation middleware: every axis
+        // must be silenced.
+        FakeLogger logger = new();
+        BusConfigurator configurator = new();
+        configurator.AddMiddleware<FakeSchemaValidationMiddleware>();
+        EndpointBinding binding = new()
+        {
+            EndpointName = "orders-suppressed",
+            Consumers = [new ConsumerRegistration(typeof(FakeConsumer), typeof(FakeMessage),
+                AcceptUntyped: true, UseMassTransitEnvelope: true)],
+        };
+        TopologyDeclaration topology = new();
+
+        // Act
+        UntypedTrustBoundaryDiagnostic.Run([binding], topology, configurator, logger);
+
+        // Assert — foreign-input validation present → no advisory, despite every opt-in being active.
+        logger.Events.Should().BeEmpty();
     }
 
     // ── Test doubles ────────────────────────────────────────────────────────────

@@ -28,6 +28,8 @@ internal sealed class NullInstrumentation : IBareWireInstrumentation
 
     public void RecordFailure(string endpoint, string messageType, string errorType) { }
 
+    public void RecordRetryAttempt(string endpoint, string messageType, string errorType) { }
+
     public void RecordDeadLetter(string endpoint, string messageType) { }
 
     public void RecordInflight(string endpoint, string messageType, int delta, int bytesDelta) { }

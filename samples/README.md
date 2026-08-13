@@ -180,6 +180,21 @@ Demonstrates three behaviors:
 POST /run   — publish 3 deliveries, wait for all consumers, return dispatch observations
 ```
 
+### ConsumerDefinitionShowcase
+
+`ConsumerDefinition<TConsumer>` — discovered purely through explicit DI registration (no assembly
+scanning) — colocating a retry policy and routing-key patterns next to the consumer, plus the
+opt-in transport-level `DeclareTopology` helper applied at endpoint registration.
+
+Demonstrates three behaviors:
+1. **Retry policy inside the definition** — `consumer.Retry(r => r.Exponential(4, 200 ms, 2 s))`, proven by a consumer that deliberately fails its first attempts.
+2. **Routing-key patterns inside the definition** — `consumer.RoutingKeys("transfer.eu.*", "transfer.eu.priority")` grouped with the retry policy rather than declared inline.
+3. **Opt-in transport topology** — `c.DeclareTopology(exchange, queue, bindingKey, ExchangeType.Topic, durable: false)`, a transport-level seam separate from the transport-agnostic definition.
+
+```
+POST /run   — publish 1 delivery, wait for the consumer to succeed after retrying, return the observation
+```
+
 ## Shared Projects
 
 - **BareWire.Samples.AppHost** — Aspire orchestrator for all samples (RabbitMQ + PostgreSQL + Dashboard)

@@ -10,6 +10,7 @@ internal sealed class BareWireMetrics : IDisposable
     private readonly Counter<long> _published;
     private readonly Counter<long> _consumed;
     private readonly Counter<long> _failed;
+    private readonly Counter<long> _retried;
     private readonly Counter<long> _deadLettered;
     private readonly Counter<long> _publishRejected;
 
@@ -38,6 +39,11 @@ internal sealed class BareWireMetrics : IDisposable
             "barewire.messages.failed",
             unit: null,
             description: "Number of message processing failures");
+
+        _retried = _meter.CreateCounter<long>(
+            "barewire.messages.retried",
+            unit: null,
+            description: "Number of message processing retry attempts");
 
         _deadLettered = _meter.CreateCounter<long>(
             "barewire.messages.dead_lettered",
@@ -110,6 +116,18 @@ internal sealed class BareWireMetrics : IDisposable
         };
 
         _failed.Add(1, tags);
+    }
+
+    internal void RecordRetryAttempt(string endpoint, string messageType, string errorType)
+    {
+        var tags = new TagList
+        {
+            { "endpoint", endpoint },
+            { "message_type", messageType },
+            { "error_type", errorType }
+        };
+
+        _retried.Add(1, tags);
     }
 
     internal void RecordDeadLetter(string endpoint, string messageType)

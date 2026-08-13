@@ -1,6 +1,8 @@
+using System.Reflection;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Serialization;
+using BareWire.Abstractions.Topology;
 
 namespace BareWire.Transport.RabbitMQ.Configuration;
 
@@ -10,6 +12,7 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     private readonly List<ConsumerRegistration> _consumerRegistrations = [];
     private readonly List<Type> _rawConsumerTypes = [];
     private readonly List<Type> _sagaTypes = [];
+    private readonly List<TopologyDeclaration> _consumerTopologyFragments = [];
 
     internal RabbitMqEndpointConfiguration(string queueName)
     {
@@ -23,6 +26,14 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
     internal IReadOnlyList<ConsumerRegistration> ConsumerRegistrations => _consumerRegistrations;
     internal IReadOnlyList<Type> RawConsumerTypes => _rawConsumerTypes;
     internal IReadOnlyList<Type> SagaTypes => _sagaTypes;
+
+    /// <summary>
+    /// The opt-in AMQP topology fragments declared by this endpoint's consumers via
+    /// <c>DeclareTopology</c>. Empty when no consumer opted in (manual topology unchanged). Merged into
+    /// <c>RabbitMqTransportOptions.Topology</c> at build time so the entities flow through the transport
+    /// adapter's topology-deployment path.
+    /// </summary>
+    internal IReadOnlyList<TopologyDeclaration> ConsumerTopologyFragments => _consumerTopologyFragments;
 
     internal Type? SerializerOverrideType { get; private set; }
     internal Type? DeserializerOverrideType { get; private set; }
@@ -51,6 +62,30 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
 
     public TimeSpan RetryInterval { get; set; } = TimeSpan.Zero;
 
+    /// <summary>
+    /// The open generic definition of the parameterless <see cref="Consumer{TConsumer, TMessage}()"/>
+    /// overload, cached once and closed via <see cref="MethodInfo.MakeGenericMethod"/> at startup by the
+    /// single-<see cref="IConsumer{T}"/> sugar overload — never per message.
+    /// </summary>
+    private static readonly MethodInfo TypedConsumerMethod = typeof(RabbitMqEndpointConfiguration)
+        .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        .Single(static m =>
+            m.Name == nameof(Consumer)
+            && m.IsGenericMethodDefinition
+            && m.GetGenericArguments().Length == 2
+            && m.GetParameters().Length == 0);
+
+    /// <inheritdoc />
+    public void Consumer<TConsumer>()
+        where TConsumer : class
+    {
+        // Infer TMessage from the consumer's single IConsumer<T> (fail-fast on none/multiple), then bake
+        // the closed Consumer<TConsumer, TMessage>() delegate ONCE at startup and delegate to it — mirrors
+        // the core configurator; the dispatch hot path stays reflection-free (ADR-003).
+        Type messageType = ConsumerMessageTypeInference.ResolveSingleMessageType(typeof(TConsumer));
+        TypedConsumerMethod.MakeGenericMethod(typeof(TConsumer), messageType).Invoke(this, null);
+    }
+
     public void Consumer<TConsumer, TMessage>()
         where TConsumer : class, IConsumer<TMessage>
         where TMessage : class
@@ -78,6 +113,13 @@ internal sealed class RabbitMqEndpointConfiguration : IReceiveEndpointConfigurat
         configure(configurator);
         _consumerTypes.Add(typeof(TConsumer));
         _consumerRegistrations.Add(configurator.Build());
+
+        // Opt-in AMQP topology is a SEPARATE, PARALLEL output from Build()/ConsumerRegistration: collect the
+        // fragment only when DeclareTopology was called (null == opt-in signal, manual topology unchanged).
+        if (configurator.BuildTopology() is { } topology)
+        {
+            _consumerTopologyFragments.Add(topology);
+        }
     }
 
     public void RawConsumer<T>() where T : class, IRawConsumer

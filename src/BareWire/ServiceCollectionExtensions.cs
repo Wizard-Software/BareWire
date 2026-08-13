@@ -194,7 +194,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<BusConfigurator>(),
             sp.GetRequiredService<ILogger<BareWireBusControl>>(),
             sp.GetService<TopologyDeclaration>(),
-            sp.GetService<IReadOnlyList<EndpointBinding>>() ?? [],
+            ConsumerDefinitionDiscovery.ApplyToEndpoints(sp.GetService<IReadOnlyList<EndpointBinding>>() ?? [], sp),
             sp.GetService<IDeserializerResolver>()
                 ?? new SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
             sp.GetRequiredService<IServiceScopeFactory>(),

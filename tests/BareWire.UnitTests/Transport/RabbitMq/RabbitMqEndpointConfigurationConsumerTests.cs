@@ -197,6 +197,101 @@ public sealed class RabbitMqEndpointConfigurationConsumerTests
         act.Should().Throw<ArgumentNullException>();
     }
 
+    // ── Definition-settings materialization (retry carrier + endpoint-level knobs) ──────────
+    // Parity with the ratified core ConsumerConfiguratorTests: the transport configurator is a
+    // separate internal impl with identical semantics, so it carries the definition settings
+    // (retry delegate + prefetch/concurrency knobs) bit-for-bit into ConsumerRegistration.
+
+    [Fact]
+    public void Build_WithRetryPrefetchAndConcurrency_MaterializesAllThreeBitForBit()
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+        Action<IRetryConfigurator> retry = r => r.Interval(3, TimeSpan.FromSeconds(1));
+
+        sut.Retry(retry);
+        sut.PrefetchCount(10);
+        sut.ConcurrentMessageLimit(4);
+
+        ConsumerRegistration registration = sut.Build();
+        registration.ConfigureRetry.Should().BeSameAs(retry); // bit-for-bit: same delegate reference
+        registration.PrefetchCount.Should().Be(10);
+        registration.ConcurrentMessageLimit.Should().Be(4);
+    }
+
+    [Fact]
+    public void Build_WithoutNewKnobs_LeavesThemNull()
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+
+        ConsumerRegistration registration = sut.Build();
+        registration.ConfigureRetry.Should().BeNull();
+        registration.PrefetchCount.Should().BeNull();
+        registration.ConcurrentMessageLimit.Should().BeNull();
+    }
+
+    [Fact]
+    public void Build_WithRoutingKeysAndNewKnobs_CoexistWithExistingMaterialization()
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+        sut.RoutingKey("x.y");
+        sut.AcceptUntyped();
+        sut.UseMassTransitEnvelope();
+        sut.PrefetchCount(5);
+
+        ConsumerRegistration registration = sut.Build();
+        registration.RoutingKeys.Should().Equal("x.y");
+        registration.AcceptUntyped.Should().BeTrue();
+        registration.UseMassTransitEnvelope.Should().BeTrue();
+        registration.PrefetchCount.Should().Be(5);
+    }
+
+    [Fact]
+    public void Retry_WithNull_Throws()
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+
+        Action act = () => sut.Retry(null!);
+
+        act.Should().Throw<ArgumentNullException>();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void PrefetchCount_WithNonPositive_Throws(int value)
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+
+        Action act = () => sut.PrefetchCount(value);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void ConcurrentMessageLimit_WithNonPositive_Throws(int value)
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+
+        Action act = () => sut.ConcurrentMessageLimit(value);
+
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void Retry_CalledTwice_LastWins()
+    {
+        ConsumerConfigurator<FakeConsumer, FakeMessage> sut = new();
+        Action<IRetryConfigurator> first = _ => { };
+        Action<IRetryConfigurator> second = _ => { };
+
+        sut.Retry(first);
+        sut.Retry(second);
+
+        sut.Build().ConfigureRetry.Should().BeSameAs(second);
+    }
+
     // ── Fake stub types ────────────────────────────────────────────────────────
 
     private sealed record FakeMessage;

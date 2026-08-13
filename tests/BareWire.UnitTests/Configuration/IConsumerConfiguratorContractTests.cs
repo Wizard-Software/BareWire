@@ -18,6 +18,10 @@ public sealed class IConsumerConfiguratorContractTests
 {
     private static readonly Type ConfiguratorType = typeof(IConsumerConfigurator<,>);
 
+    // The four message-agnostic methods were hoisted to the single-parameter façade; Type.GetMethod on an
+    // interface does not traverse base interfaces, so method-shape assertions target the façade directly.
+    private static readonly Type FacadeType = typeof(IConsumerConfigurator<>);
+
     [Fact]
     public void IConsumerConfigurator_IsPublicInterface()
     {
@@ -75,7 +79,7 @@ public sealed class IConsumerConfiguratorContractTests
     public void RoutingKey_IsVoidMethod_TakingSingleStringParameter()
     {
         // Arrange
-        var method = ConfiguratorType.GetMethod("RoutingKey");
+        var method = FacadeType.GetMethod("RoutingKey");
 
         // Assert
         method.Should().NotBeNull();
@@ -88,7 +92,7 @@ public sealed class IConsumerConfiguratorContractTests
     public void RoutingKeys_IsVoidMethod_TakingSingleParamsStringArrayParameter()
     {
         // Arrange
-        var method = ConfiguratorType.GetMethod("RoutingKeys");
+        var method = FacadeType.GetMethod("RoutingKeys");
 
         // Assert
         method.Should().NotBeNull();
@@ -103,7 +107,7 @@ public sealed class IConsumerConfiguratorContractTests
     public void AcceptUntyped_IsVoidMethod_TakingNoParameters()
     {
         // Arrange
-        var method = ConfiguratorType.GetMethod("AcceptUntyped");
+        var method = FacadeType.GetMethod("AcceptUntyped");
 
         // Assert
         method.Should().NotBeNull();

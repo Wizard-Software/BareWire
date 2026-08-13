@@ -192,6 +192,18 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
                 new Dictionary<Type, PublishRequestRegistration>(_publishRequestMappings);
         }
 
+        // Merge opt-in consumer topology fragments (declared via DeclareTopology on the transport seam) into
+        // the transport options' topology, so the exchange/queue/binding flow through the transport adapter's
+        // DeployTopologyAsync path (invariant b). Purely additive and disjoint from the publish-side mappings
+        // above. When no consumer opted in, options.Topology is left unchanged — null when ConfigureTopology
+        // was also never called (manual topology unchanged; ADR-002 not reversed).
+        TopologyDeclaration[] consumerTopologyFragments =
+            [.. _endpoints.SelectMany(static e => e.ConsumerTopologyFragments)];
+        if (consumerTopologyFragments.Length > 0)
+        {
+            options.Topology = MergeConsumerTopology(options.Topology, consumerTopologyFragments);
+        }
+
         return options;
     }
 
@@ -342,6 +354,48 @@ internal sealed class RabbitMqConfigurator : IRabbitMqConfigurator
         return topology is not null
             ? topology with { Exchanges = mergedExchanges }
             : new TopologyDeclaration { Exchanges = mergedExchanges };
+    }
+
+    /// <summary>
+    /// Concatenates opt-in consumer topology fragments onto an optional base topology, returning a NEW
+    /// <see cref="TopologyDeclaration"/> with the four entity lists (exchanges, queues, exchange-&gt;queue
+    /// bindings, exchange-&gt;exchange bindings) concatenated. Duplicate names are harmless — the transport
+    /// adapter's topology deployment is idempotent. The base topology (from <c>ConfigureTopology</c>) is
+    /// preserved verbatim when present.
+    /// </summary>
+    private static TopologyDeclaration MergeConsumerTopology(
+        TopologyDeclaration? topology,
+        IReadOnlyList<TopologyDeclaration> fragments)
+    {
+        IReadOnlyList<ExchangeDeclaration> baseExchanges = topology?.Exchanges ?? [];
+        IReadOnlyList<QueueDeclaration> baseQueues = topology?.Queues ?? [];
+        IReadOnlyList<ExchangeQueueBinding> baseExchangeQueueBindings = topology?.ExchangeQueueBindings ?? [];
+        IReadOnlyList<ExchangeExchangeBinding> baseExchangeExchangeBindings = topology?.ExchangeExchangeBindings ?? [];
+
+        IReadOnlyList<ExchangeDeclaration> exchanges =
+            [.. baseExchanges, .. fragments.SelectMany(static f => f.Exchanges)];
+        IReadOnlyList<QueueDeclaration> queues =
+            [.. baseQueues, .. fragments.SelectMany(static f => f.Queues)];
+        IReadOnlyList<ExchangeQueueBinding> exchangeQueueBindings =
+            [.. baseExchangeQueueBindings, .. fragments.SelectMany(static f => f.ExchangeQueueBindings)];
+        IReadOnlyList<ExchangeExchangeBinding> exchangeExchangeBindings =
+            [.. baseExchangeExchangeBindings, .. fragments.SelectMany(static f => f.ExchangeExchangeBindings)];
+
+        return topology is not null
+            ? topology with
+            {
+                Exchanges = exchanges,
+                Queues = queues,
+                ExchangeQueueBindings = exchangeQueueBindings,
+                ExchangeExchangeBindings = exchangeExchangeBindings,
+            }
+            : new TopologyDeclaration
+            {
+                Exchanges = exchanges,
+                Queues = queues,
+                ExchangeQueueBindings = exchangeQueueBindings,
+                ExchangeExchangeBindings = exchangeExchangeBindings,
+            };
     }
 
     private static void ValidateUri(string? uri)

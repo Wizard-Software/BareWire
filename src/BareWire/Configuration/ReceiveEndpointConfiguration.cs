@@ -1,6 +1,8 @@
+using System.Reflection;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Serialization;
+using BareWire.Bus;
 
 namespace BareWire.Configuration;
 
@@ -72,6 +74,30 @@ internal sealed class ReceiveEndpointConfiguration : IReceiveEndpointConfigurato
 
     /// <inheritdoc />
     public TimeSpan RetryInterval { get; set; } = TimeSpan.Zero;
+
+    /// <summary>
+    /// The open generic definition of the parameterless <see cref="Consumer{TConsumer, TMessage}()"/>
+    /// overload, cached once and closed via <see cref="MethodInfo.MakeGenericMethod"/> at startup by the
+    /// single-<see cref="IConsumer{T}"/> sugar overload — never per message.
+    /// </summary>
+    private static readonly MethodInfo TypedConsumerMethod = typeof(ReceiveEndpointConfiguration)
+        .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        .Single(static m =>
+            m.Name == nameof(Consumer)
+            && m.IsGenericMethodDefinition
+            && m.GetGenericArguments().Length == 2
+            && m.GetParameters().Length == 0);
+
+    /// <inheritdoc />
+    public void Consumer<TConsumer>()
+        where TConsumer : class
+    {
+        // Infer TMessage from the consumer's single IConsumer<T> (fail-fast on none/multiple), then bake
+        // the closed Consumer<TConsumer, TMessage>() delegate ONCE at startup and delegate to it — the
+        // dispatch hot path stays reflection-free (ADR-003).
+        Type messageType = ConsumerMessageTypeInference.ResolveSingleMessageType(typeof(TConsumer));
+        TypedConsumerMethod.MakeGenericMethod(typeof(TConsumer), messageType).Invoke(this, null);
+    }
 
     /// <inheritdoc />
     public void Consumer<TConsumer, TMessage>()

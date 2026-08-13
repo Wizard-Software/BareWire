@@ -38,9 +38,38 @@ namespace BareWire.Abstractions.Configuration;
 /// leave it <see langword="false"/> unless the consumer is intended to interoperate with a
 /// MassTransit-enveloped producer.
 /// </param>
+/// <param name="ConfigureRetry">
+/// Optional, default-off (defaults to <see langword="null"/>) deferred configuration of this
+/// consumer's retry policy, expressed as an <see cref="Action{T}"/> over the public
+/// <see cref="IRetryConfigurator"/> fluent contract. The delegate carries app-developer
+/// configuration captured once at endpoint setup, not per-message input. Keeping the carrier typed
+/// on the public contract — rather than an untyped handle (<c>object</c>/<c>Delegate</c>/<c>string</c>)
+/// — preserves IDE discoverability of the fluent surface (<c>Interval</c>/<c>Incremental</c>/
+/// <c>Exponential</c>/<c>Handle</c>/<c>Ignore</c>) while keeping <c>BareWire.Abstractions</c>
+/// dependency-free: the core <c>RetryPolicy</c> type never appears here. The core materializes the
+/// delegate at startup (new configurator, invoke delegate, <c>Build()</c> to a <c>RetryPolicy</c>),
+/// so <c>Build()</c> stays in the core. A <see langword="null"/> value means no retry policy.
+/// </param>
+/// <param name="PrefetchCount">
+/// Optional, default-off (defaults to <see langword="null"/>) endpoint-level prefetch limit — the
+/// maximum number of unacknowledged messages the broker may deliver to this consumer before waiting
+/// for settlement. A <see langword="null"/> value means the endpoint inherits its default and no
+/// per-consumer override is applied. Bounds validation (rejecting non-positive values) is applied by
+/// the core when this knob is materialized, not on this configuration record.
+/// </param>
+/// <param name="ConcurrentMessageLimit">
+/// Optional, default-off (defaults to <see langword="null"/>) endpoint-level concurrency limit — the
+/// maximum number of messages this consumer may process in parallel. A <see langword="null"/> value
+/// means the endpoint inherits its default and no per-consumer override is applied. Bounds validation
+/// (rejecting non-positive values) is applied by the core when this knob is materialized, not on this
+/// configuration record.
+/// </param>
 public sealed record ConsumerRegistration(
     Type ConsumerType,
     Type MessageType,
     IReadOnlyList<string>? RoutingKeys = null,
     bool AcceptUntyped = false,
-    bool UseMassTransitEnvelope = false);
+    bool UseMassTransitEnvelope = false,
+    Action<IRetryConfigurator>? ConfigureRetry = null,
+    int? PrefetchCount = null,
+    int? ConcurrentMessageLimit = null);

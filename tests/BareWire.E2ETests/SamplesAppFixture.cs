@@ -56,6 +56,9 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             // Consumer routing keys sample: one shared queue, three consumers, most-specific-wins
             // dispatch, and type-less interop via AcceptUntyped().
             "consumer-routing-keys",
+            // Consumer definition showcase: ConsumerDefinition<TConsumer> discovered via DI,
+            // colocating routing keys + retry policy, plus the opt-in DeclareTopology helper.
+            "consumer-definition-showcase",
         ];
 
         foreach (string resource in sampleResources)

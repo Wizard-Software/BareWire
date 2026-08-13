@@ -82,7 +82,9 @@ internal sealed partial class BareWireBusControl : IBusControl
         // boundary. Emit a warning naming the endpoint (no raw routing key — none exists at startup).
         // The bus only goes live here in StartAsync, so this is the right gate; DeployTopologyAsync
         // starts no consumers and is intentionally not covered.
-        UntypedTrustBoundaryDiagnostic.Run(_configurator, _logger);
+        // Task 19.11: read from the MATERIALIZED _endpointBindings/_topology (definition-merged
+        // ConsumerDefinition<T> flags are invisible to _configurator.ReceiveEndpoints).
+        UntypedTrustBoundaryDiagnostic.Run(_endpointBindings, _topology, _configurator, _logger);
 
         // After validation succeeds, the adapter is guaranteed non-null (the validator throws
         // otherwise). Capture it in a non-null local so the remainder of StartAsync stays

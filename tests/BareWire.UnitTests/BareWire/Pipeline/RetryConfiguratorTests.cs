@@ -22,6 +22,8 @@ public sealed class RetryConfiguratorTests
     }
 
     // MUT-914: Interval() body removal — must produce IntervalRetryPolicy
+    // Build() lives on the concrete RetryConfigurator (not on the public zero-dep IRetryConfigurator),
+    // so it is invoked on the concrete `sut` after configuring it fluently.
     [Fact]
     public void Interval_WhenCalled_BuildProducesIntervalRetryPolicy()
     {
@@ -29,7 +31,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut.Interval(3, TimeSpan.FromSeconds(1)).Build();
+        sut.Interval(3, TimeSpan.FromSeconds(1));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.Should().BeOfType<IntervalRetryPolicy>();
@@ -43,7 +46,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut.Interval(5, TimeSpan.FromSeconds(2)).Build();
+        sut.Interval(5, TimeSpan.FromSeconds(2));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.MaxRetries.Should().Be(5);
@@ -58,7 +62,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut.Interval(2, interval).Build();
+        sut.Interval(2, interval);
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.GetDelay(0).Should().Be(interval);
@@ -72,9 +77,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Incremental(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2))
-            .Build();
+        sut.Incremental(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.Should().BeOfType<IncrementalRetryPolicy>();
@@ -88,9 +92,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Incremental(4, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2))
-            .Build();
+        sut.Incremental(4, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.MaxRetries.Should().Be(4);
@@ -104,9 +107,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Incremental(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2))
-            .Build();
+        sut.Incremental(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.GetDelay(0).Should().Be(TimeSpan.FromSeconds(1));
@@ -121,9 +123,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Exponential(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30))
-            .Build();
+        sut.Exponential(3, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.Should().BeOfType<ExponentialRetryPolicy>();
@@ -137,9 +138,8 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Exponential(6, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30))
-            .Build();
+        sut.Exponential(6, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30));
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.MaxRetries.Should().Be(6);
@@ -153,10 +153,9 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Handle<InvalidOperationException>()
-            .Interval(3, TimeSpan.Zero)
-            .Build();
+        sut.Handle<InvalidOperationException>()
+            .Interval(3, TimeSpan.Zero);
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.HandledExceptions.Should().Contain(typeof(InvalidOperationException));
@@ -170,11 +169,10 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Handle<InvalidOperationException>()
+        sut.Handle<InvalidOperationException>()
             .Handle<TimeoutException>()
-            .Interval(3, TimeSpan.Zero)
-            .Build();
+            .Interval(3, TimeSpan.Zero);
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.HandledExceptions.Should().Contain(typeof(InvalidOperationException));
@@ -189,10 +187,9 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Ignore<ArgumentException>()
-            .Interval(3, TimeSpan.Zero)
-            .Build();
+        sut.Ignore<ArgumentException>()
+            .Interval(3, TimeSpan.Zero);
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.IgnoredExceptions.Should().Contain(typeof(ArgumentException));
@@ -206,11 +203,10 @@ public sealed class RetryConfiguratorTests
         var sut = new RetryConfigurator();
 
         // Act
-        RetryPolicy policy = sut
-            .Ignore<ArgumentException>()
+        sut.Ignore<ArgumentException>()
             .Ignore<OperationCanceledException>()
-            .Interval(3, TimeSpan.Zero)
-            .Build();
+            .Interval(3, TimeSpan.Zero);
+        RetryPolicy policy = sut.Build();
 
         // Assert
         policy.IgnoredExceptions.Should().Contain(typeof(ArgumentException));
@@ -269,7 +265,8 @@ public sealed class RetryConfiguratorTests
         // Arrange
         var fakeTime = new FakeTimeProvider();
         var sut = new RetryConfigurator(fakeTime);
-        RetryPolicy policy = sut.Interval(3, TimeSpan.FromSeconds(10)).Build();
+        sut.Interval(3, TimeSpan.FromSeconds(10));
+        RetryPolicy policy = sut.Build();
 
         using var cts = new CancellationTokenSource();
 
