@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\BareWire.AzureServiceBus\BareWire.AzureServiceBus.csproj" />
     <ProjectReference Include="..\..\src\BareWire.AWS.SQS\BareWire.AWS.SQS.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Google.PubSub\BareWire.Google.PubSub.csproj" />
+    <ProjectReference Include="..\..\src\BareWire.InMemory\BareWire.InMemory.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga\BareWire.Saga.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.EntityFramework\BareWire.Saga.EntityFramework.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Saga.Redis\BareWire.Saga.Redis.csproj" />

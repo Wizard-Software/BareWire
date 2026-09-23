@@ -54,6 +54,7 @@ public sealed class PublicApiTests
     [InlineData("BareWire.AzureServiceBus")]
     [InlineData("BareWire.AWS.SQS")]
     [InlineData("BareWire.Google.PubSub")]
+    [InlineData("BareWire.InMemory")]
     public void Bundle_PublicApi_ShouldMatchApproved(string assemblyName)
     {
         var assembly = BundleAssembly(assemblyName);
@@ -86,6 +87,7 @@ public sealed class PublicApiTests
             "BareWire.AzureServiceBus",
             "BareWire.AWS.SQS",
             "BareWire.Google.PubSub",
+            "BareWire.InMemory",
         })
         {
             var bundleApi = BundleAssembly(bundle).GeneratePublicApi(options);
@@ -100,6 +102,7 @@ public sealed class PublicApiTests
         "BareWire.AzureServiceBus" => typeof(BareWire.AzureServiceBus.ServiceCollectionExtensions).Assembly,
         "BareWire.AWS.SQS" => typeof(BareWire.AWS.SQS.ServiceCollectionExtensions).Assembly,
         "BareWire.Google.PubSub" => typeof(BareWire.Google.PubSub.ServiceCollectionExtensions).Assembly,
+        "BareWire.InMemory" => typeof(BareWire.InMemory.ServiceCollectionExtensions).Assembly,
         _ => throw new ArgumentOutOfRangeException(nameof(assemblyName), assemblyName, "Unknown bundle assembly."),
     };
 

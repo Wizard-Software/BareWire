@@ -48,6 +48,7 @@
     <Project Path="src/BareWire.AzureServiceBus/BareWire.AzureServiceBus.csproj" />
     <Project Path="src/BareWire.AWS.SQS/BareWire.AWS.SQS.csproj" />
     <Project Path="src/BareWire.Google.PubSub/BareWire.Google.PubSub.csproj" />
+    <Project Path="src/BareWire.InMemory/BareWire.InMemory.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/BareWire.Analyzers.Tests/BareWire.Analyzers.Tests.csproj" />

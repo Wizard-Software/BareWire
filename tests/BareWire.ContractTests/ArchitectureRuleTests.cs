@@ -639,13 +639,13 @@ public sealed class ArchitectureRuleTests
     // -------------------------------------------------------------------------
     // Rule 14: Single-call transport bundle layer (Feature 15 — ADR-028).
     //
-    // The five bundle packages (BareWire.{RabbitMQ|Kafka|AzureServiceBus|AWS.SQS|
-    // Google.PubSub}) form a NEW, separate layer that references BOTH the Core
-    // (BareWire) and the matching Transport (BareWire.Transport.*). The dependency
-    // direction is strictly one-way: a bundle may reference Core + Transport, but
-    // neither Core nor any Transport may reference a bundle. This proves the
-    // single-call ergonomics did NOT loosen the Core⊥Transport invariant — the
-    // bundle is an extra layer on top, not a back-edge.
+    // The six bundle packages (BareWire.{RabbitMQ|Kafka|AzureServiceBus|AWS.SQS|
+    // Google.PubSub|InMemory}) form a NEW, separate layer that references BOTH the
+    // Core (BareWire) and the matching Transport (BareWire.Transport.*). The
+    // dependency direction is strictly one-way: a bundle may reference Core +
+    // Transport, but neither Core nor any Transport may reference a bundle. This
+    // proves the single-call ergonomics did NOT loosen the Core⊥Transport
+    // invariant — the bundle is an extra layer on top, not a back-edge.
     // -------------------------------------------------------------------------
 
     /// <summary>Bundle assembly → the Transport assembly it must wrap.</summary>
@@ -656,6 +656,7 @@ public sealed class ArchitectureRuleTests
         (typeof(BareWire.AzureServiceBus.ServiceCollectionExtensions).Assembly, "BareWire.Transport.AzureServiceBus"),
         (typeof(BareWire.AWS.SQS.ServiceCollectionExtensions).Assembly, "BareWire.Transport.AWS.SQS"),
         (typeof(BareWire.Google.PubSub.ServiceCollectionExtensions).Assembly, "BareWire.Transport.Google.PubSub"),
+        (typeof(BareWire.InMemory.ServiceCollectionExtensions).Assembly, "BareWire.Transport.InMemory"),
     ];
 
     private static readonly string[] BundleNames =
@@ -665,6 +666,7 @@ public sealed class ArchitectureRuleTests
         "BareWire.AzureServiceBus",
         "BareWire.AWS.SQS",
         "BareWire.Google.PubSub",
+        "BareWire.InMemory",
     ];
 
     // Rule 14a: each bundle references BOTH the Core and its matching Transport.
@@ -722,6 +724,7 @@ public sealed class ArchitectureRuleTests
             "BareWire.Transport.AzureServiceBus",
             "BareWire.Transport.AWS.SQS",
             "BareWire.Transport.Google.PubSub",
+            "BareWire.Transport.InMemory",
         ];
 
         foreach (var transportName in transports)

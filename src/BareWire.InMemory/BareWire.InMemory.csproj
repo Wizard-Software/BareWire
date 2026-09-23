@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Single-call registration bundle for BareWire with the in-memory transport. References both the BareWire core and BareWire.Transport.InMemory and exposes AddBareWireWithInMemory.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.Transport.InMemory\BareWire.Transport.InMemory.csproj" />
+  </ItemGroup>
+
+</Project>
