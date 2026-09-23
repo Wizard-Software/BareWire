@@ -77,6 +77,37 @@ public sealed class InboundMessage : IDisposable
     }
 
     /// <summary>
+    /// Atomically takes the pooled buffer away from this instance, as if it had been disposed without
+    /// returning the buffer to the pool. A later <see cref="Dispose"/> is a no-op.
+    /// </summary>
+    /// <remarks>
+    /// Decided by the same flag as <see cref="Dispose"/>, so exactly one of them wins: either the
+    /// caller receives the buffer and becomes its owner, or the message had already been disposed and
+    /// its buffer is back in the pool. A consumer still processing the message may keep reading
+    /// <see cref="Body"/>, so the new owner must not return the buffer to the pool while that is possible.
+    /// </remarks>
+    /// <param name="buffer">
+    /// The detached buffer, or <see langword="null"/> when the body is not pooled or the call returned
+    /// <see langword="false"/>.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> when the message was not disposed yet and ownership moved to the caller;
+    /// otherwise <see langword="false"/>.
+    /// </returns>
+    internal bool TryDetachPooledBuffer(out byte[]? buffer)
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            buffer = null;
+            return false;
+        }
+
+        buffer = _pooledBuffer;
+        _pooledBuffer = null;
+        return true;
+    }
+
+    /// <summary>
     /// Returns the <see cref="ArrayPool{T}"/>-rented buffer (if any) back to
     /// <see cref="ArrayPool{T}.Shared"/>. Safe to call multiple times — subsequent calls are no-ops.
     /// </summary>

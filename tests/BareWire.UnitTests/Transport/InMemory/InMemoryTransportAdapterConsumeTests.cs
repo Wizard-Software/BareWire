@@ -190,6 +190,10 @@ public sealed class InMemoryTransportAdapterConsumeTests
         byte[] originalBuffer = original.PooledBuffer!;
         await AbandonAsync(consumer, cts);
 
+        // The release took the buffer away from the message, so a consumer disposing it late cannot hand
+        // the buffer back to the pool while the redelivery is being copied or read.
+        original.PooledBuffer.Should().BeNull();
+
         await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
         (await NextAsync(next)).Should().BeTrue();
         InboundMessage redelivered = next.Current;
@@ -271,6 +275,28 @@ public sealed class InMemoryTransportAdapterConsumeTests
         await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
         (await NextAsync(next)).Should().BeTrue();
         next.Current.MessageId.Should().Be("m-2");
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_UnsettledMessageDisposedAfterRelease_KeepsRedeliveryAndOriginalReadable()
+    {
+        InMemoryTransportAdapter adapter = OrdersAdapter();
+        InMemoryQueue queue = Queue(adapter, "orders");
+        Enqueue(queue, "m-1");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+
+        IAsyncEnumerator<InboundMessage> consumer = Consume(adapter, cts.Token);
+        (await NextAsync(consumer)).Should().BeTrue();
+        InboundMessage original = consumer.Current;
+        await AbandonAsync(consumer, cts);
+        original.Dispose();                                           // a lane finishing after the release
+
+        await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
+        (await NextAsync(next)).Should().BeTrue();
+        BodyOf(next.Current).Should().Be("m-1");
+        BodyOf(original).Should().Be("m-1");
+        adapter.DisposedUnsettledCount.Should().Be(0);
+        next.Current.Dispose();
     }
 
     // ── DisposeAsync: sweep the delivery map ──────────────────────────────────────────────────────

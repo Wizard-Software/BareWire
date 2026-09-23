@@ -154,32 +154,30 @@ internal sealed class InMemoryQueueRunner
         int disposedUnsettled = 0;
         foreach (KeyValuePair<ulong, InFlightDelivery> pair in owned)
         {
-            InMemoryDelivery delivery = pair.Value.Delivery;
-
-            // A message the consumer disposed without settling has already returned its buffer to the pool:
-            // its body can no longer be read, so the delivery cannot be requeued — drop it and free its slot.
-            if (pair.Value.Message.PooledBuffer is null)
+            // Taking the entry first makes a concurrent settlement a no-op; losing the race means the delivery
+            // was settled and its message owns the buffer as usual.
+            if (!_map.TryTake(pair.Key, out InFlightDelivery entry))
             {
-                if (_map.TryTake(pair.Key, out _))
-                {
-                    Queue.ReleaseSlot();
-                    disposedUnsettled++;
-                }
-
                 continue;
             }
 
+            // Consumers may still be processing (and disposing) messages on other threads, e.g. ordered lanes
+            // that drain after this enumerator ends. Detaching the buffer is atomic with the message's
+            // Dispose: if the consumer disposed first, the buffer is already back in the pool and the body
+            // can no longer be read, so the delivery is dropped and its slot freed.
+            if (!entry.Message.TryDetachPooledBuffer(out _))
+            {
+                Queue.ReleaseSlot();
+                disposedUnsettled++;
+                continue;
+            }
+
+            // The message can no longer return the buffer, but its consumer may still be reading the body.
+            // Copy for the redelivery and leave the original to the garbage collector instead of the pool.
+            InMemoryDelivery delivery = entry.Delivery;
             byte[] copy = ArrayPool<byte>.Shared.Rent(Math.Max(delivery.Length, 1));
             delivery.Body.Span.CopyTo(copy);
-
-            if (_map.TryTake(pair.Key, out _))
-            {
-                requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
-            }
-            else
-            {
-                ArrayPool<byte>.Shared.Return(copy);
-            }
+            requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
         }
 
         _diagnostics.DeliveriesDisposedUnsettled(Queue.Name, disposedUnsettled);

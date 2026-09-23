@@ -74,4 +74,89 @@ public sealed class InboundMessageTests
         // the Return path was executed and the reference was cleared.)
         message.PooledBuffer.Should().BeNull();
     }
+
+    [Fact]
+    public void TryDetachPooledBuffer_NotDisposed_ReturnsBufferAndClearsOwnership()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+
+        bool detached = message.TryDetachPooledBuffer(out byte[]? buffer);
+
+        detached.Should().BeTrue();
+        buffer.Should().BeSameAs(rentedBuffer);
+        message.PooledBuffer.Should().BeNull();
+        ArrayPool<byte>.Shared.Return(rentedBuffer);
+    }
+
+    [Fact]
+    public void TryDetachPooledBuffer_AfterDispose_ReturnsFalse()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.Dispose();
+
+        bool detached = message.TryDetachPooledBuffer(out byte[]? buffer);
+
+        detached.Should().BeFalse();
+        buffer.Should().BeNull();
+    }
+
+    [Fact]
+    public void TryDetachPooledBuffer_CalledTwice_SecondCallReturnsFalse()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.TryDetachPooledBuffer(out _).Should().BeTrue();
+
+        bool detachedAgain = message.TryDetachPooledBuffer(out byte[]? buffer);
+
+        detachedAgain.Should().BeFalse();
+        buffer.Should().BeNull();
+        ArrayPool<byte>.Shared.Return(rentedBuffer);
+    }
+
+    [Fact]
+    public void Dispose_AfterDetach_LeavesDetachedBufferContentIntact()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        rentedBuffer.AsSpan(0, 4).Fill(0x5A);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 4);
+        message.TryDetachPooledBuffer(out _).Should().BeTrue();
+
+        message.Dispose();
+
+        message.Body.ToArray().Should().Equal(0x5A, 0x5A, 0x5A, 0x5A);
+        ArrayPool<byte>.Shared.Return(rentedBuffer);
+    }
+
+    [Fact]
+    public async Task TryDetachPooledBuffer_RacingDispose_ExactlyOneWins()
+    {
+        for (int i = 0; i < 1_000; i++)
+        {
+            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(16);
+            InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 16);
+            using var start = new ManualResetEventSlim();
+
+            Task<bool> detach = Task.Run(() =>
+            {
+                start.Wait(TestContext.Current.CancellationToken);
+                return message.TryDetachPooledBuffer(out _);
+            }, TestContext.Current.CancellationToken);
+            Task dispose = Task.Run(() =>
+            {
+                start.Wait(TestContext.Current.CancellationToken);
+                message.Dispose();
+            }, TestContext.Current.CancellationToken);
+            start.Set();
+            await Task.WhenAll(detach, dispose);
+
+            message.PooledBuffer.Should().BeNull();
+            if (await detach)
+            {
+                ArrayPool<byte>.Shared.Return(rentedBuffer);
+            }
+        }
+    }
 }
