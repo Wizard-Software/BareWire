@@ -46,8 +46,8 @@ public sealed class InMemoryOutboxStoreClockTests
         // Act
         await store.MarkDeliveredAsync([entry.Id]);
 
-        // Assert
-        entry.DeliveredAt.Should().Be(T0 + TimeSpan.FromMinutes(5));
+        // Assert — the claimed batch carries a copy; the delivery stamp lands on the store's entry.
+        store.FindEntry(entry.Id)!.DeliveredAt.Should().Be(T0 + TimeSpan.FromMinutes(5));
     }
 
     [Fact]

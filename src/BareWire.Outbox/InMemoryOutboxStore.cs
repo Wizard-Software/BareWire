@@ -48,15 +48,22 @@ namespace BareWire.Outbox;
 /// sweep is in flight.
 /// </para>
 /// <para>
+/// <b>Buffer ownership.</b> The store owns the pooled body buffer of every entry it holds and
+/// returns it to the shared array pool exactly once — when a delivered entry is cleaned up, or
+/// when the store is disposed. Fetching pending entries never hands out a store-owned buffer:
+/// each returned entry is a copy carrying its own freshly rented buffer, which the caller owns
+/// and returns. Releasing a lock therefore never retains a caller's buffer and always reports an
+/// empty retained set, as the EF Core store does.
+/// </para>
+/// <para>
 /// <b>Entries orphaned by an exception or cancellation.</b> An entry claimed while fetching
 /// pending entries and never subsequently released or marked delivered — for example because
 /// sending its batch failed, or because a caller cancelled before releasing it or marking it
-/// delivered — is never handed out again by this store instance. The caller that claimed it may
-/// already have returned its pooled buffer to the shared array pool on that failure path, whether
-/// or not the entry actually reached the transport, so re-issuing it would risk dispatching a
-/// buffer that has since been reused for an unrelated message. Under per-key ordering, such an
-/// orphaned entry permanently blocks its key: every later entry for that key stays queued behind
-/// it, and that backlog continues to count toward the store's pending-message capacity.
+/// delivered — is never handed out again by this store instance, because the store cannot tell
+/// whether it reached the transport. Its store-owned buffer is still returned once, on dispose.
+/// Under per-key ordering, such an orphaned entry permanently blocks its key: every later entry
+/// for that key stays queued behind it, and that backlog continues to count toward the store's
+/// pending-message capacity.
 /// </para>
 /// </remarks>
 internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
@@ -276,12 +283,12 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         var result = new List<OutboxEntry>(newTake + retryTake);
         for (int j = 0; j < newTake; j++)
         {
-            result.Add(fresh[j]);
+            result.Add(CopyForDispatch(fresh[j]));
         }
 
         for (int j = 0; j < retryTake; j++)
         {
-            result.Add(retries[j]);
+            result.Add(CopyForDispatch(retries[j]));
         }
 
         return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(result);
@@ -367,27 +374,23 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         // This store has no lock column — "release" means re-enqueue so the entry is dispatched
         // again on the next poll. A nack defers the entry through the nack-deferral schedule and
         // increments its nack counter; an ordering-barrier release clears the deferral (the entry
-        // rejoins the "new" class) and leaves the counter untouched. The entry instance is still
-        // referenced from _all, so re-enqueuing keeps its pooled buffer alive; the returned set
-        // tells the dispatcher NOT to return those buffers to the ArrayPool. Delivered or unknown
-        // ids are skipped (idempotent). An id present in both lists is treated as a nack only —
-        // the nacked list is processed first and claims the id via `retained`, so the barrier
-        // pass below becomes a no-op for it.
+        // rejoins the "new" class) and leaves the counter untouched. The caller only ever held a
+        // copy of each entry (see CopyForDispatch), so no caller buffer is retained and the returned
+        // set is always empty. Delivered or unknown ids are skipped (idempotent). An id present in
+        // both lists is treated as a nack only — the nacked list is processed first and claims the
+        // id via `released`, so the barrier pass below becomes a no-op for it.
         //
         // Invariant: for every entry, NotBefore/NackCount are computed and assigned before that
         // entry's Enqueue call, and the Enqueue call is the last thing done for that entry.
-        // Nothing in this method may throw after the first Enqueue — a caller that does not
-        // receive the returned retained-buffer set cannot tell which buffers it must not return
-        // to the ArrayPool.
         DateTimeOffset now = _timeProvider.GetUtcNow();
         OutboxNackDeferralPlan? plan = nackedIds.Count > 0 ? _nackSchedule.CreatePlan() : null;
-        HashSet<long>? retained = null;
+        HashSet<long>? released = null;
 
         foreach (long id in nackedIds)
         {
             if (_all.TryGetValue(id, out OutboxEntry? entry)
                 && entry.Status == OutboxEntryStatus.Pending
-                && (retained ??= []).Add(id))
+                && (released ??= []).Add(id))
             {
                 TimeSpan deferral = plan!.GetDeferralForRow(entry.NackCount, entry.Id);
                 entry.NotBefore = AddSaturating(now, deferral);
@@ -400,14 +403,14 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         {
             if (_all.TryGetValue(id, out OutboxEntry? entry)
                 && entry.Status == OutboxEntryStatus.Pending
-                && (retained ??= []).Add(id))
+                && (released ??= []).Add(id))
             {
                 entry.NotBefore = null;
                 _pending.Enqueue(entry);
             }
         }
 
-        return ValueTask.FromResult<IReadOnlySet<long>>(retained ?? (IReadOnlySet<long>)FrozenSet<long>.Empty);
+        return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
     }
 
     public ValueTask CleanupAsync(
@@ -463,6 +466,37 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     {
         ArrayPool<byte>.Shared.Return(entry.PooledBody);
     }
+
+    // Hands the caller a copy of a claimed entry carrying its own freshly rented body buffer, so the
+    // caller can return that buffer to the pool on any path without touching the store-owned one.
+    private static OutboxEntry CopyForDispatch(OutboxEntry entry)
+    {
+        byte[] body = ArrayPool<byte>.Shared.Rent(entry.BodyLength);
+        entry.PooledBody.AsSpan(0, entry.BodyLength).CopyTo(body);
+
+        return new OutboxEntry
+        {
+            Id = entry.Id,
+            RoutingKey = entry.RoutingKey,
+            Headers = entry.Headers,
+            PooledBody = body,
+            BodyLength = entry.BodyLength,
+            ContentType = entry.ContentType,
+            CreatedAt = entry.CreatedAt,
+            DeliveredAt = entry.DeliveredAt,
+            Status = entry.Status,
+            OrderingKey = entry.OrderingKey,
+            NotBefore = entry.NotBefore,
+            NackCount = entry.NackCount,
+        };
+    }
+
+    /// <summary>
+    /// Returns the store-owned entry for <paramref name="id"/>, or <see langword="null"/> when the
+    /// store no longer holds it. A test hook: fetched batches carry copies, so observing the state a
+    /// release or delivery left behind needs the store's own instance.
+    /// </summary>
+    internal OutboxEntry? FindEntry(long id) => _all.TryGetValue(id, out OutboxEntry? entry) ? entry : null;
 
     // Promotes the ordering key from the message headers when PerKey mode is active.
     // Rules (parity with EfCoreOutboxStore):

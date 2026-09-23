@@ -58,9 +58,9 @@ public sealed class InMemoryOutboxStoreNackDeferralTests
 
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id], []);
 
-        retained.Should().BeEquivalentTo([id]);
-        entry.NackCount.Should().Be(1);
-        entry.NotBefore.Should().Be(T0 + ExpectedDeferral(Options, 0, id));
+        retained.Should().BeEmpty("the caller only ever holds a copy of the entry, so no caller buffer is retained");
+        store.FindEntry(id)!.NackCount.Should().Be(1);
+        store.FindEntry(id)!.NotBefore.Should().Be(T0 + ExpectedDeferral(Options, 0, id));
     }
 
     [Fact]
@@ -78,8 +78,8 @@ public sealed class InMemoryOutboxStoreNackDeferralTests
         DateTimeOffset t1 = clock.GetUtcNow();
         await store.ReleaseLockAsync([id], []);
 
-        entry.NackCount.Should().Be(2);
-        entry.NotBefore.Should().Be(t1 + ExpectedDeferral(Options, 1, id));
+        store.FindEntry(id)!.NackCount.Should().Be(2);
+        store.FindEntry(id)!.NotBefore.Should().Be(t1 + ExpectedDeferral(Options, 1, id));
     }
 
     [Fact]
@@ -96,8 +96,8 @@ public sealed class InMemoryOutboxStoreNackDeferralTests
 
         await store.ReleaseLockAsync([], [id]);
 
-        entry.NotBefore.Should().BeNull();
-        entry.NackCount.Should().Be(1);
+        store.FindEntry(id)!.NotBefore.Should().BeNull();
+        store.FindEntry(id)!.NackCount.Should().Be(1);
     }
 
     [Fact]
@@ -110,9 +110,9 @@ public sealed class InMemoryOutboxStoreNackDeferralTests
 
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id], [id]);
 
-        retained.Should().BeEquivalentTo([id]);
-        entry.NackCount.Should().Be(1, "the id in both lists must be treated as a single nack, not a nack plus a barrier release");
-        entry.NotBefore.Should().Be(T0 + ExpectedDeferral(Options, 0, id));
+        retained.Should().BeEmpty("the caller only ever holds a copy of the entry, so no caller buffer is retained");
+        store.FindEntry(id)!.NackCount.Should().Be(1, "the id in both lists must be treated as a single nack, not a nack plus a barrier release");
+        store.FindEntry(id)!.NotBefore.Should().Be(T0 + ExpectedDeferral(Options, 0, id));
     }
 
     // -------------------------------------------------------------------------
@@ -170,13 +170,13 @@ public sealed class InMemoryOutboxStoreNackDeferralTests
         clock.Advance(gap);
         await store.ReleaseLockAsync([id1], []);
 
-        claimed[0].NotBefore.Should().Be(claimed[2].NotBefore, "id 1 and id 3 land on the same schedule cell and must tie exactly");
+        store.FindEntry(id1)!.NotBefore.Should().Be(store.FindEntry(id3)!.NotBefore, "id 1 and id 3 land on the same schedule cell and must tie exactly");
 
         clock.Advance(TimeSpan.FromMilliseconds(100));
         await store.ReleaseLockAsync([id2], []);
 
-        (claimed[1].NotBefore > claimed[0].NotBefore).Should().BeTrue("id 2 was nacked strictly later than the tied pair");
-        (claimed[1].NotBefore > claimed[2].NotBefore).Should().BeTrue("id 2 was nacked strictly later than the tied pair");
+        (store.FindEntry(id2)!.NotBefore > store.FindEntry(id1)!.NotBefore).Should().BeTrue("id 2 was nacked strictly later than the tied pair");
+        (store.FindEntry(id2)!.NotBefore > store.FindEntry(id3)!.NotBefore).Should().BeTrue("id 2 was nacked strictly later than the tied pair");
 
         clock.Advance(TimeSpan.FromSeconds(3));
         IReadOnlyList<OutboxEntry> batch = await store.GetPendingAsync(10);
