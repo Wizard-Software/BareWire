@@ -191,32 +191,46 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     public ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
         IReadOnlyList<long> ids,
         CancellationToken cancellationToken = default)
+        => ReleaseLockAsync(ids, [], cancellationToken);
+
+    public ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+        IReadOnlyList<long> nackedIds,
+        IReadOnlyList<long> barrierReleasedIds,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        ArgumentNullException.ThrowIfNull(ids);
+        ArgumentNullException.ThrowIfNull(nackedIds);
+        ArgumentNullException.ThrowIfNull(barrierReleasedIds);
 
-        if (ids.Count == 0)
+        if (nackedIds.Count == 0 && barrierReleasedIds.Count == 0)
         {
             return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
         }
 
         // This store has no lock column — "release" means re-enqueue so the entry is dispatched
-        // again on the next poll. The entry instance is still referenced from _all, so re-enqueuing
-        // keeps its pooled buffer alive; the returned set tells the dispatcher NOT to return those
-        // buffers to the ArrayPool. Delivered or unknown ids are skipped (idempotent). In the
-        // dispatcher flow each id was removed from _pending by GetPendingAsync, so re-enqueue is 1:1.
+        // again on the next poll; nacked and barrier-released entries are not yet told apart here.
+        // The entry instance is still referenced from _all, so re-enqueuing keeps its pooled buffer
+        // alive; the returned set tells the dispatcher NOT to return those buffers to the ArrayPool.
+        // Delivered or unknown ids are skipped (idempotent). An id is re-enqueued at most once even
+        // when it appears in both lists — a second enqueue would dispatch it twice in one batch.
         HashSet<long>? retained = null;
-
-        foreach (long id in ids)
-        {
-            if (_all.TryGetValue(id, out OutboxEntry? entry) && entry.Status == OutboxEntryStatus.Pending)
-            {
-                _pending.Enqueue(entry);
-                (retained ??= []).Add(id);
-            }
-        }
+        ReEnqueue(nackedIds, ref retained);
+        ReEnqueue(barrierReleasedIds, ref retained);
 
         return ValueTask.FromResult<IReadOnlySet<long>>(retained ?? (IReadOnlySet<long>)FrozenSet<long>.Empty);
+    }
+
+    private void ReEnqueue(IReadOnlyList<long> ids, ref HashSet<long>? retained)
+    {
+        foreach (long id in ids)
+        {
+            if (_all.TryGetValue(id, out OutboxEntry? entry)
+                && entry.Status == OutboxEntryStatus.Pending
+                && (retained ??= []).Add(id))
+            {
+                _pending.Enqueue(entry);
+            }
+        }
     }
 
     public ValueTask CleanupAsync(

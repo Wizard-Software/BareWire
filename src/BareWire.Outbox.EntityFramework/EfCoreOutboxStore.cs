@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Collections.Frozen;
+using System.Linq.Expressions;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using BareWire.Abstractions.Transport;
 using Microsoft.EntityFrameworkCore;
@@ -14,6 +16,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
     private readonly OutboxOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly IOutboxJitterSource _jitterSource;
+    private OutboxNackDeferralSchedule? _nackSchedule;
 
     internal EfCoreOutboxStore(
         OutboxDbContext dbContext,
@@ -245,27 +248,70 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             .ConfigureAwait(false);
     }
 
-    public async ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+    public ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
         IReadOnlyList<long> ids,
         CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(ids);
+        => ReleaseLockAsync(ids, [], cancellationToken);
 
-        if (ids.Count == 0)
+    public async ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+        IReadOnlyList<long> nackedIds,
+        IReadOnlyList<long> barrierReleasedIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(nackedIds);
+        ArgumentNullException.ThrowIfNull(barrierReleasedIds);
+
+        if (nackedIds.Count == 0 && barrierReleasedIds.Count == 0)
         {
             return FrozenSet<long>.Empty;
         }
 
-        // Zero the lock on rows this instance still owns and has not yet delivered, so the next
-        // poll cycle re-claims them immediately. The LockedBy == _instanceId filter ensures an
-        // instance never releases another instance's claim (preserves the B4 no-double-delivery
-        // guarantee); DeliveredAt == null guards against a race with MarkDeliveredAsync.
+        IReadOnlyList<long> releasedIds = ResolveReleasedIds(nackedIds, barrierReleasedIds);
+
+        Expression<Func<OutboxMessage, DateTimeOffset?>>? deferredLockedAt = null;
+        Expression<Func<OutboxMessage, int>>? incrementedRetryCount = null;
+
+        if (nackedIds.Count > 0)
+        {
+            // Created lazily: this store is scoped per consume scope, and most scopes never nack.
+            _nackSchedule ??= OutboxNackDeferralSchedule.FromOptions(_options, _jitterSource);
+
+            // With both kinds in one call, only the nacked ids are deferred and counted; an id in both
+            // lists evaluates as nacked, so a rejected row is never released without its deferral.
+            Expression<Func<OutboxMessage, bool>>? isNacked = barrierReleasedIds.Count > 0
+                ? m => nackedIds.Contains(m.Id)
+                : null;
+
+            (deferredLockedAt, incrementedRetryCount) = BuildNackSetters(
+                _nackSchedule.CreatePlan(),
+                _timeProvider.GetUtcNow(),
+                isNacked);
+        }
+
+        // Both kinds are released by ONE statement, so there is no window in which the nacked head of an
+        // ordering key is already released while its barrier-held siblings are still owned by this
+        // instance (and would be re-sent ahead of it on the next cycle). The LockedBy == _instanceId
+        // filter ensures an instance never releases another instance's claim, which preserves the
+        // no-double-delivery guarantee across instances; DeliveredAt == null guards against a race with
+        // MarkDeliveredAsync. A nacked row gets LockedAt = now - OutboxLockTimeout + deferral, so the
+        // claim predicate LockedAt < now' - OutboxLockTimeout keeps it unclaimable until the deferral
+        // has elapsed; a barrier-released row gets LockedAt = null and is claimable on the next cycle.
         await _dbContext.Set<OutboxMessage>()
-            .Where(m => ids.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .Where(m => releasedIds.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
             .ExecuteUpdateAsync(
-                s => s
-                    .SetProperty(m => m.LockedAt, (DateTimeOffset?)null)
-                    .SetProperty(m => m.LockedBy, (string?)null),
+                setters =>
+                {
+                    setters.SetProperty(m => m.LockedBy, (string?)null);
+
+                    if (deferredLockedAt is null || incrementedRetryCount is null)
+                    {
+                        setters.SetProperty(m => m.LockedAt, (DateTimeOffset?)null);
+                        return;
+                    }
+
+                    setters.SetProperty(m => m.LockedAt, deferredLockedAt);
+                    setters.SetProperty(m => m.RetryCount, incrementedRetryCount);
+                },
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -273,6 +319,95 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         // retains no caller buffers — the dispatcher must return all of them.
         return FrozenSet<long>.Empty;
     }
+
+    private static IReadOnlyList<long> ResolveReleasedIds(
+        IReadOnlyList<long> nackedIds,
+        IReadOnlyList<long> barrierReleasedIds)
+    {
+        if (barrierReleasedIds.Count == 0)
+        {
+            return nackedIds;
+        }
+
+        if (nackedIds.Count == 0)
+        {
+            return barrierReleasedIds;
+        }
+
+        var union = new HashSet<long>(nackedIds);
+        union.UnionWith(barrierReleasedIds);
+        return [.. union];
+    }
+
+    // Builds the LockedAt and RetryCount setter values for nacked rows. When isNacked is given (a call
+    // that also carries barrier-released ids), rows it does not match keep LockedAt = null and their
+    // RetryCount unchanged.
+    //
+    // LockedAt is one flat conditional over the row's retry bucket (RetryCount == 0, == 1, ..., otherwise
+    // the escalation cap) and jitter bucket (Id % JitterBucketCount), which EF Core translates into a
+    // single CASE expression. Identity ids are positive, so SQL's Id % 4 equals the schedule's
+    // normalized jitter bucket. Every cell value is read through a StrongBox field — the shape the C#
+    // compiler emits for a captured variable — so EF Core sends it as a query parameter rather than
+    // inlining a literal: the SQL text and the EF Core query-cache key stay stable across releases (no
+    // re-translation per release, and prepared statements can be reused where the provider enables them).
+    //
+    // RetryCount saturates at int.MaxValue instead of overflowing: an overflowed value would make the
+    // row unreadable (or fail the whole statement) and stall this instance's dispatch.
+    private static (Expression<Func<OutboxMessage, DateTimeOffset?>> LockedAt,
+        Expression<Func<OutboxMessage, int>> RetryCount) BuildNackSetters(
+        OutboxNackDeferralPlan plan,
+        DateTimeOffset now,
+        Expression<Func<OutboxMessage, bool>>? isNacked)
+    {
+        ParameterExpression row = isNacked?.Parameters[0] ?? Expression.Parameter(typeof(OutboxMessage), "m");
+        MemberExpression retryCount = Expression.Property(row, nameof(OutboxMessage.RetryCount));
+        Expression jitterBucket = Expression.Modulo(
+            Expression.Property(row, nameof(OutboxMessage.Id)),
+            Expression.Constant((long)plan.JitterBucketCount));
+
+        int capRetryBucket = plan.RetryBucketCount - 1;
+        int lastJitterBucket = plan.JitterBucketCount - 1;
+
+        // Built from the innermost ELSE outwards, so the outermost test is (retry 0, jitter 0).
+        Expression lockedAt = Cell(plan, now, capRetryBucket, lastJitterBucket);
+        for (int retryBucket = capRetryBucket; retryBucket >= 0; retryBucket--)
+        {
+            int topJitterBucket = retryBucket == capRetryBucket ? lastJitterBucket - 1 : lastJitterBucket;
+            for (int bucket = topJitterBucket; bucket >= 0; bucket--)
+            {
+                Expression test = Expression.Equal(jitterBucket, Expression.Constant((long)bucket));
+                if (retryBucket < capRetryBucket)
+                {
+                    test = Expression.AndAlso(
+                        Expression.Equal(retryCount, Expression.Constant(retryBucket)),
+                        test);
+                }
+
+                lockedAt = Expression.Condition(test, Cell(plan, now, retryBucket, bucket), lockedAt);
+            }
+        }
+
+        Expression incremented = Expression.Condition(
+            Expression.LessThan(retryCount, Expression.Constant(int.MaxValue)),
+            Expression.Add(retryCount, Expression.Constant(1)),
+            retryCount);
+
+        if (isNacked is not null)
+        {
+            lockedAt = Expression.Condition(isNacked.Body, lockedAt, Expression.Constant(null, typeof(DateTimeOffset?)));
+            incremented = Expression.Condition(isNacked.Body, incremented, retryCount);
+        }
+
+        return (
+            Expression.Lambda<Func<OutboxMessage, DateTimeOffset?>>(lockedAt, row),
+            Expression.Lambda<Func<OutboxMessage, int>>(incremented, row));
+    }
+
+    private static MemberExpression Cell(OutboxNackDeferralPlan plan, DateTimeOffset now, int retryBucket, int jitterBucket)
+        => Expression.Field(
+            Expression.Constant(
+                new StrongBox<DateTimeOffset?>(plan.GetDeferredLockedAt(now, retryBucket, jitterBucket))),
+            nameof(StrongBox<DateTimeOffset?>.Value));
 
     public async ValueTask CleanupAsync(
         TimeSpan retention,

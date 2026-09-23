@@ -59,6 +59,44 @@ public sealed class InMemoryOutboxStoreTests
     }
 
     [Fact]
+    public async Task ReleaseLockAsync_NackedAndBarrierLists_ReEnqueuesBothAndRetainsBuffers()
+    {
+        // Arrange — save two messages and claim both (GetPendingAsync removes them from the queue).
+        await using var store = new InMemoryOutboxStore();
+        await store.SaveMessagesAsync([CreateMessage(), CreateMessage()]);
+        IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
+        firstBatch.Should().HaveCount(2);
+        long nacked = firstBatch[0].Id;
+        long barrierReleased = firstBatch[1].Id;
+
+        // Act — one row rejected by the transport, one held back only by the ordering barrier.
+        IReadOnlySet<long> retained = await store.ReleaseLockAsync([nacked], [barrierReleased]);
+
+        // Assert — this store makes no distinction yet: both are re-enqueued and both buffers retained.
+        retained.Should().BeEquivalentTo([nacked, barrierReleased]);
+        IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
+        secondBatch.Select(e => e.Id).Should().BeEquivalentTo([nacked, barrierReleased]);
+    }
+
+    [Fact]
+    public async Task ReleaseLockAsync_IdInBothLists_ReEnqueuesOnce()
+    {
+        // Arrange
+        await using var store = new InMemoryOutboxStore();
+        await store.SaveMessagesAsync([CreateMessage()]);
+        IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
+        long id = firstBatch.Should().ContainSingle().Which.Id;
+
+        // Act — the same id passed in both lists must not be enqueued twice (it would be sent twice).
+        IReadOnlySet<long> retained = await store.ReleaseLockAsync([id], [id]);
+
+        // Assert
+        retained.Should().BeEquivalentTo([id]);
+        IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
+        secondBatch.Should().ContainSingle().Which.Id.Should().Be(id);
+    }
+
+    [Fact]
     public async Task ReleaseLockAsync_DeliveredEntry_IsNotReEnqueued()
     {
         // Arrange — save, claim, and mark the entry delivered.

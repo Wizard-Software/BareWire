@@ -137,17 +137,23 @@ recovery burst.
 
 ### Nacked Rows (Partial Send Failures)
 
-Rows the broker does not confirm (nacks) are **explicitly released**: the dispatcher clears their
-per-instance lock as soon as the batch completes, so they are re-claimed on the **next poll cycle**
-(about one `PollingInterval` later) — **not** after `OutboxLockTimeout`. `OutboxLockTimeout` is only the
-fallback for a dispatcher that *crashes* mid-send (see [Crash Recovery](#crash-recovery)); a normal nack
-never waits for it.
+Rows the broker does not confirm (nacks) are **explicitly released** as soon as the batch completes —
+they never wait for `OutboxLockTimeout`, which is only the fallback for a dispatcher that *crashes*
+mid-send (see [Crash Recovery](#crash-recovery)). A released row is not re-claimed immediately, though:
+it is **deferred**, and no instance claims it again before its deferral has elapsed.
 
-Because a nack retries within ~`PollingInterval`, a persistently failing ("poison") row is re-sent
-roughly once per `PollingInterval` per instance, and during a broker outage every pending row nacks and
-is released each cycle — so retry load scales with the backlog at the poll cadence. Size
-`PollingInterval` for that worst case (and add poison-message handling upstream if a row can fail
-indefinitely) rather than assuming a slower `OutboxLockTimeout`-spaced retry.
+- The first deferral is one `PollingInterval`; each further rejection of the same row doubles it, up to
+  `OutboxLockTimeout`.
+- Each row gets up to +20% jitter on top of its deferral, so rows nacked together (e.g. during a broker
+  outage) do not all return in a single wave.
+- `RetryCount` counts how many times the broker rejected the row.
+- A permanently failing ("poison") row is therefore retried at most about once per `OutboxLockTimeout`
+  per row, instead of every poll cycle. Bounded retry / dead-lettering is not built in — add poison-message
+  handling upstream if a row can fail indefinitely.
+
+With `OrderingMode.PerKey`, rows the broker did not reject but that are held back only because an
+earlier row of the same key was nacked are released **immediately**, without a deferral and without
+incrementing `RetryCount`; the per-key ordering still keeps them behind that earlier row.
 
 ## Configuration Options
 
