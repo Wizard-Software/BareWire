@@ -1,5 +1,3 @@
-using BareWire.Outbox;
-
 namespace BareWire.Outbox.EntityFramework.Internal;
 
 // Pure batch arithmetic of the fair two-class claim. A claim cycle splits its effective capacity
@@ -44,15 +42,6 @@ internal static class OutboxFairClaimPlan
         }
 
         return Math.Max(1, effectiveBatchSize / 4);
-    }
-
-    // Turn of a contested single-slot batch. The EF store is created per dispatch scope, so it cannot
-    // carry an alternation bit between cycles; the turn is drawn instead from the shared randomness
-    // source, which gives each class the slot with probability one half per contested cycle.
-    internal static bool DrawSingleSlotRetryTurn(IOutboxJitterSource jitterSource)
-    {
-        ArgumentNullException.ThrowIfNull(jitterSource);
-        return jitterSource.NextDouble() < 0.5;
     }
 
     // Normalizes the affected-row count a claim statement reports. A negative count (for example a

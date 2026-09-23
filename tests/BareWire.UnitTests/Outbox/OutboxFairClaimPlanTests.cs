@@ -1,5 +1,4 @@
 using AwesomeAssertions;
-using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework.Internal;
 using Xunit;
 
@@ -68,20 +67,6 @@ public sealed class OutboxFairClaimPlanTests
         actual.Should().Be(0);
     }
 
-    // ── DrawSingleSlotRetryTurn ───────────────────────────────────────────────
-
-    [Theory]
-    [InlineData(0.0, true)]
-    [InlineData(0.4999, true)]
-    [InlineData(0.5, false)]
-    [InlineData(0.99, false)]
-    public void DrawSingleSlotRetryTurn_JitterValue_ReturnsTurnDecision(double jitterValue, bool expected)
-    {
-        bool actual = OutboxFairClaimPlan.DrawSingleSlotRetryTurn(new FakeJitterSource(jitterValue));
-
-        actual.Should().Be(expected);
-    }
-
     // ── ClampClaimed ──────────────────────────────────────────────────────────
 
     [Theory]
@@ -147,10 +132,5 @@ public sealed class OutboxFairClaimPlanTests
 
         newTake.Should().Be(expectedNewTake);
         retryTake.Should().Be(expectedRetryTake);
-    }
-
-    private sealed class FakeJitterSource(double value) : IOutboxJitterSource
-    {
-        public double NextDouble() => value;
     }
 }
