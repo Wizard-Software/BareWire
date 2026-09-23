@@ -154,10 +154,10 @@ public sealed class EfCoreOutboxStoreDialectClaimTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData(0.9, "new")]
-    [InlineData(0.1, "due")]
+    [InlineData(0, "new")]
+    [InlineData(1, "due")]
     public async Task GetPendingAsync_DueOrderedDialectSingleSlot_ServesClassOfTurn(
-        double jitterValue,
+        int priorTurns,
         string expectedFirstCallKind)
     {
         var dialect = new SqliteDueOrderedDialect();
@@ -166,7 +166,13 @@ public sealed class EfCoreOutboxStoreDialectClaimTests : IAsyncLifetime
         OutboxMessage dueRow = DueRow(5);
         await SeedAsync(newRow, dueRow);
 
-        EfCoreOutboxStore store = Store(dialect, "a", jitter: new FixedJitterSource(jitterValue));
+        var turn = new OutboxSingleSlotTurn();
+        for (int i = 0; i < priorTurns; i++)
+        {
+            turn.NextIsRetryTurn();
+        }
+
+        EfCoreOutboxStore store = Store(dialect, "a", turn: turn);
         IReadOnlyList<OutboxEntry> batch = await store.GetPendingAsync(1);
         try
         {
@@ -416,14 +422,16 @@ public sealed class EfCoreOutboxStoreDialectClaimTests : IAsyncLifetime
         string instance,
         TimeProvider? clock = null,
         IOutboxJitterSource? jitter = null,
-        OutboxOptions? options = null)
+        OutboxOptions? options = null,
+        OutboxSingleSlotTurn? turn = null)
         => new(
             _dbContext,
             new OutboxInstanceId(instance),
             dialect,
             options ?? _options,
             clock ?? new FakeTimeProvider(T0),
-            jitter ?? new FixedJitterSource(0.5));
+            jitter ?? new FixedJitterSource(0.5),
+            turn);
 
     private static void ReturnBuffers(IReadOnlyList<OutboxEntry> batch)
     {

@@ -3,6 +3,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Outbox;
 using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Time.Testing;
@@ -179,7 +180,7 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
         }
     }
 
-    // ── Single-slot batch: the contested turn alternates by jitter ────────────
+    // ── Single-slot batch: the contested turn alternates by turn ────────────
 
     [Fact]
     public async Task GetPendingAsync_SingleSlotBothClassesWaiting_AlternatesByTurn()
@@ -189,10 +190,10 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
         await SeedAsync(retryRow, newRowFirst);
 
         var clock = new FakeTimeProvider(T0);
-        var jitter = new ScriptedJitterSource(0.9, 0.1);
-        EfCoreOutboxStore store = Store("a", clock, jitter);
+        var turn = new OutboxSingleSlotTurn();
+        EfCoreOutboxStore store = Store("a", clock, new FixedJitterSource(0.5), turn: turn);
 
-        // First cycle: jitter 0.9 -> turn goes to the new class.
+        // First consultation of the shared turn -> new class.
         IReadOnlyList<OutboxEntry> first = await store.GetPendingAsync(1);
         try
         {
@@ -207,7 +208,7 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
         OutboxMessage newRowSecond = NewRow();
         await SeedAsync(newRowSecond);
 
-        // Second cycle: jitter 0.1 -> turn goes to the retry class, even though a new row waits.
+        // Second consultation of the shared turn -> retry class, even though a new row waits.
         IReadOnlyList<OutboxEntry> second = await store.GetPendingAsync(1);
         try
         {
@@ -222,18 +223,25 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
     // ── Single-slot batch: only one class waiting is always served ───────────
 
     [Theory]
-    [InlineData(0.1, true)]
-    [InlineData(0.1, false)]
-    [InlineData(0.9, true)]
-    [InlineData(0.9, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
     public async Task GetPendingAsync_SingleSlotOneClassOnly_ServesItRegardlessOfTurn(
-        double jitterValue,
+        bool retryTurnFirst,
         bool onlyNew)
     {
         OutboxMessage row = onlyNew ? NewRow() : DueRow(5);
         await SeedAsync(row);
 
-        EfCoreOutboxStore store = Store("a", new FakeTimeProvider(T0), new FixedJitterSource(jitterValue));
+        var turn = new OutboxSingleSlotTurn();
+        if (retryTurnFirst)
+        {
+            // Consult the turn once before the claim, so its state favors the retry class next.
+            turn.NextIsRetryTurn();
+        }
+
+        EfCoreOutboxStore store = Store("a", new FakeTimeProvider(T0), new FixedJitterSource(0.5), turn: turn);
         IReadOnlyList<OutboxEntry> batch = await store.GetPendingAsync(1);
         try
         {
@@ -502,14 +510,16 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
         string instance,
         TimeProvider clock,
         IOutboxJitterSource jitter,
-        OutboxOptions? options = null)
+        OutboxOptions? options = null,
+        OutboxSingleSlotTurn? turn = null)
         => new(
             _dbContext,
             new OutboxInstanceId(instance),
             new PostgresOutboxSqlDialect(),
             options ?? _options,
             clock,
-            jitter);
+            jitter,
+            turn);
 
     private static void ReturnBuffers(IReadOnlyList<OutboxEntry> batch)
     {
@@ -522,12 +532,5 @@ public sealed class EfCoreOutboxStoreFairClaimTests : IAsyncLifetime
     private sealed class FixedJitterSource(double value) : IOutboxJitterSource
     {
         public double NextDouble() => value;
-    }
-
-    private sealed class ScriptedJitterSource(params double[] values) : IOutboxJitterSource
-    {
-        private int _index;
-
-        public double NextDouble() => values[_index++];
     }
 }

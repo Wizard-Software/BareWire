@@ -174,7 +174,15 @@ Each claim cycle splits its batch between two classes of rows, so neither can st
 - Capacity one class leaves unused goes to the other (new rows top up an under-used retry share, retries
   fill the batch when few new rows are waiting).
 - With a batch capacity of **1** the batch cannot be split: when both classes are waiting, each cycle
-  gives the slot to one of them at random (probability one half each), so both keep making progress.
+  gives the slot to one of them, and successive contested cycles alternate between the two classes
+  (the first contested cycle of a process serves the new-rows class), so both keep making progress.
+  On a provider without a matching atomic dialect (the client-side fallback claim — SQLite, or any
+  provider used with `AllowNonAtomicProvider = true`), the alternation only advances when both classes
+  actually have candidates, so contested cycles alternate strictly. On the atomic dialect path
+  (PostgreSQL and custom dialects), the store cannot tell before claiming whether both classes are
+  waiting, so the alternation advances on every single-slot cycle regardless — a waiting class is
+  therefore served within at most two consecutive single-slot cycles. Either way the alternation is
+  per dispatcher process (one shared turn per service provider), not shared across processes.
 - **Carry-forward limit:** rows the instance still owns from an earlier cycle — for example a batch whose
   send threw and was never released — count against `N` while their lock is valid. An instance never
   holds more than `N` rows with a valid lock, so a failing instance does not claim a fresh batch on every

@@ -85,6 +85,12 @@ public static class ServiceCollectionExtensions
         // Randomness source for retry jitter (internal; defaults to Random.Shared).
         services.TryAddSingleton<IOutboxJitterSource>(SharedRandomOutboxJitterSource.Instance);
 
+        // Turn of a contested single-slot claim (internal). One singleton per service provider, shared
+        // by every EfCoreOutboxStore this process resolves, so the new-rows and due-retries classes
+        // alternate deterministically across dispatch cycles even though each cycle gets a fresh scoped
+        // store instance.
+        services.TryAddSingleton(_ => new OutboxSingleSlotTurn());
+
         // Register the EF Core store implementations as scoped — they depend on the
         // scoped OutboxDbContext and must not outlive it.
         // Factory lambdas are required because the implementation classes have internal constructors.
@@ -95,7 +101,8 @@ public static class ServiceCollectionExtensions
                 sp.GetRequiredService<IOutboxSqlDialect>(),
                 sp.GetRequiredService<OutboxOptions>(),
                 sp.GetRequiredService<TimeProvider>(),
-                sp.GetRequiredService<IOutboxJitterSource>()));
+                sp.GetRequiredService<IOutboxJitterSource>(),
+                sp.GetRequiredService<OutboxSingleSlotTurn>()));
 
         // Register the default SQL dialect for inbox upserts (PostgreSQL).
         // Users can replace this with a custom implementation for other database providers.

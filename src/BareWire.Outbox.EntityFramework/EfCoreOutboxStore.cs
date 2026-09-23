@@ -17,6 +17,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
     private readonly OutboxOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly IOutboxJitterSource _jitterSource;
+    private readonly OutboxSingleSlotTurn _singleSlotTurn;
     private OutboxNackDeferralSchedule? _nackSchedule;
 
     internal EfCoreOutboxStore(
@@ -25,7 +26,8 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
         IOutboxSqlDialect dialect,
         OutboxOptions options,
         TimeProvider? timeProvider = null,
-        IOutboxJitterSource? jitterSource = null)
+        IOutboxJitterSource? jitterSource = null,
+        OutboxSingleSlotTurn? singleSlotTurn = null)
     {
         ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(instanceId);
@@ -38,6 +40,12 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
         _options = options;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _jitterSource = jitterSource ?? SharedRandomOutboxJitterSource.Instance;
+        // Falls back to a private instance per store when no singleton is supplied (e.g. a directly
+        // constructed store in tests): the first single-slot cycle of that store instance always
+        // serves the new-rows class first. Production always resolves the DI singleton (see
+        // ServiceCollectionExtensions.AddBareWireOutbox), so every EfCoreOutboxStore of one process
+        // alternates through the same turn across dispatch cycles.
+        _singleSlotTurn = singleSlotTurn ?? new OutboxSingleSlotTurn();
     }
 
     // The clock every time-dependent operation of this store reads — exactly once per operation, so
@@ -46,6 +54,9 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
 
     // Randomness source for retry jitter.
     internal IOutboxJitterSource JitterSource => _jitterSource;
+
+    // Turn of a contested single-slot claim (see OutboxSingleSlotTurn).
+    internal OutboxSingleSlotTurn SingleSlotTurn => _singleSlotTurn;
 
     public ValueTask SaveMessagesAsync(
         IReadOnlyList<OutboundMessage> messages,
@@ -204,8 +215,9 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
         }
 
         // A single-slot cycle cannot tell before claiming whether both classes are waiting; an empty
-        // step simply hands its capacity to the next one, so the drawn turn only decides who goes first.
-        bool retryTurn = effective == 1 && OutboxFairClaimPlan.DrawSingleSlotRetryTurn(_jitterSource);
+        // step simply hands its capacity to the next one, so the alternating turn only decides who goes
+        // first.
+        bool retryTurn = effective == 1 && _singleSlotTurn.NextIsRetryTurn();
         int retryReserve = OutboxFairClaimPlan.GetRetryReserve(effective, retryTurn);
         BareWire.Abstractions.Outbox.OrderingMode mode = _options.OrderingMode;
 
@@ -325,7 +337,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
         bool retryTurn = effective == 1
             && fresh.Count > 0
             && retries.Count > 0
-            && OutboxFairClaimPlan.DrawSingleSlotRetryTurn(_jitterSource);
+            && _singleSlotTurn.NextIsRetryTurn();
         int retryReserve = OutboxFairClaimPlan.GetRetryReserve(effective, retryTurn);
         (int newTake, int retryTake) = OutboxFairClaimPlan.SplitCandidates(
             effective,
