@@ -35,9 +35,17 @@ internal sealed class InMemoryTransportAdapter(InMemoryTransportOptions options,
 
     /// <summary>
     /// Gets the sealed topology registry built from <see cref="Options"/> at construction time. Never
-    /// mutated afterwards — see <see cref="InMemoryTopologyInterpreter.BuildRegistry"/>.
+    /// mutated afterwards — see <see cref="InMemoryTopologyInterpreter.BuildRegistry"/>. Attached to
+    /// <see cref="Broker"/> immediately after it is built, so the broker's queues exist by the time
+    /// construction completes.
     /// </summary>
-    internal ExchangeRegistry Registry { get; } = InMemoryTopologyInterpreter.BuildRegistry(options);
+    internal ExchangeRegistry Registry { get; } = AttachRegistry(broker, InMemoryTopologyInterpreter.BuildRegistry(options));
+
+    private static ExchangeRegistry AttachRegistry(InMemoryBroker broker, ExchangeRegistry registry)
+    {
+        broker.AttachRegistry(registry);
+        return registry;
+    }
 
     /// <inheritdoc />
     public Task<IReadOnlyList<SendResult>> SendBatchAsync(

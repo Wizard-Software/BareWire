@@ -45,15 +45,19 @@ public sealed class InMemoryServiceCollectionExtensionsTests
     [Fact]
     public void AddBareWireInMemory_TwoContainers_DoNotShareQueues()
     {
-        using ServiceProvider first = Build();
-        using ServiceProvider second = Build();
+        using ServiceProvider first = Build(t => t.ConfigureTopology(topo => topo.DeclareQueue("orders")));
+        using ServiceProvider second = Build(t => t.ConfigureTopology(topo => topo.DeclareQueue("orders")));
+        _ = first.GetRequiredService<ITransportAdapter>();
+        _ = second.GetRequiredService<ITransportAdapter>();
         InMemoryBroker a = first.GetRequiredService<InMemoryBroker>();
         InMemoryBroker b = second.GetRequiredService<InMemoryBroker>();
         a.Should().NotBeSameAs(b);
-        a.TryAddQueue("orders").Should().BeTrue();
-        a.ContainsQueue("orders").Should().BeTrue();
-        b.ContainsQueue("orders").Should().BeFalse();
-        b.QueueCount.Should().Be(0);
+
+        a.TryGetQueue("orders", out InMemoryQueue? qa).Should().BeTrue();
+        b.TryGetQueue("orders", out InMemoryQueue? qb).Should().BeTrue();
+        qa.Should().NotBeSameAs(qb);
+        qa!.TryReserve().Should().Be(QueueReservationResult.Reserved);
+        qb!.Occupancy.Should().Be(0);
     }
 
     [Fact]

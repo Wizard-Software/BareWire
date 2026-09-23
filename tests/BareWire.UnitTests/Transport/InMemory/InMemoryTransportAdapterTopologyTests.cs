@@ -232,7 +232,8 @@ public sealed class InMemoryTransportAdapterTopologyTests
         act.Should().Throw<BareWireConfigurationException>();
         adapter.Registry.ContainsQueue("ghost").Should().BeFalse();
         adapter.Registry.Queues.Count.Should().Be(queuesBefore);
-        adapter.Broker.QueueCount.Should().Be(0);
+        adapter.Broker.ContainsQueue("ghost").Should().BeFalse();
+        adapter.Broker.QueueCount.Should().Be(queuesBefore);
     }
 
     [Fact]
