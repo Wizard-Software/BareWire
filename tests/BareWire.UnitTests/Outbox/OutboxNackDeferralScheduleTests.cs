@@ -166,7 +166,7 @@ public sealed class OutboxNackDeferralScheduleTests
                 TimeSpan baseDeferral = schedule.GetBaseDeferral(r);
                 TimeSpan deferral = plan.GetDeferral(r, j);
                 TimeSpan maxAllowed = baseDeferral +
-                    TimeSpan.FromTicks((long)Math.Floor(baseDeferral.Ticks * OutboxNackDeferralSchedule.MaxJitterFraction));
+                    TimeSpan.FromTicks((long)Math.Ceiling(baseDeferral.Ticks * OutboxNackDeferralSchedule.MaxJitterFraction));
 
                 deferral.Should().BeGreaterThanOrEqualTo(baseDeferral).And.BeGreaterThanOrEqualTo(P);
                 deferral.Should().BeLessThanOrEqualTo(maxAllowed);
@@ -182,7 +182,7 @@ public sealed class OutboxNackDeferralScheduleTests
         var plan = schedule.CreatePlan();
 
         TimeSpan deferral = plan.GetDeferral(plan.RetryBucketCount - 1, plan.JitterBucketCount - 1);
-        TimeSpan maxAllowed = L + TimeSpan.FromTicks((long)Math.Floor(L.Ticks * OutboxNackDeferralSchedule.MaxJitterFraction));
+        TimeSpan maxAllowed = L + TimeSpan.FromTicks((long)Math.Ceiling(L.Ticks * OutboxNackDeferralSchedule.MaxJitterFraction));
 
         deferral.Should().BeLessThanOrEqualTo(maxAllowed);
     }
@@ -211,6 +211,32 @@ public sealed class OutboxNackDeferralScheduleTests
             TimeSpan highest = plan.GetDeferral(r, plan.JitterBucketCount - 1);
 
             (highest - lowest).Should().BeGreaterThan(TimeSpan.FromTicks((long)(baseDeferral.Ticks * 0.1)));
+        }
+    }
+
+    [Theory]
+    [InlineData(1L, 0.0)]
+    [InlineData(1L, 0.999)]
+    [InlineData(2L, 0.5)]
+    [InlineData(3L, 0.999)]
+    [InlineData(7L, 0.0)]
+    [InlineData(10L, 0.999)]
+    [InlineData(19L, 0.5)]
+    public void GetDeferral_TickScalePollingInterval_ExtremeBucketsStillDiffer(long pollingTicks, double draw)
+    {
+        TimeSpan polling = TimeSpan.FromTicks(pollingTicks);
+        var schedule = new OutboxNackDeferralSchedule(polling, TimeSpan.FromTicks(3 * pollingTicks), new FixedJitterSource(draw));
+        var plan = schedule.CreatePlan();
+
+        for (int r = 0; r < plan.RetryBucketCount; r++)
+        {
+            TimeSpan baseDeferral = schedule.GetBaseDeferral(r);
+            TimeSpan lowest = plan.GetDeferral(r, 0);
+            TimeSpan highest = plan.GetDeferral(r, plan.JitterBucketCount - 1);
+
+            (highest - lowest).Ticks.Should().BeGreaterThan((long)(baseDeferral.Ticks * 0.1));
+            highest.Should().BeLessThanOrEqualTo(
+                baseDeferral + TimeSpan.FromTicks((long)Math.Ceiling(baseDeferral.Ticks * OutboxNackDeferralSchedule.MaxJitterFraction)));
         }
     }
 

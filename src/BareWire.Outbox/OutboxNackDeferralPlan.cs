@@ -104,7 +104,15 @@ internal sealed class OutboxNackDeferralPlan
             long baseTicks = schedule.GetBaseDeferral(retryBucket).Ticks;
             for (int jitterBucket = 0; jitterBucket < jitterBucketCount; jitterBucket++)
             {
-                long jitterTicks = (long)Math.Floor(baseTicks * jitterFractions[jitterBucket]);
+                // Round down for every bucket except the last, which rounds up: ceil(b * f_last) -
+                // floor(b * f_0) >= b * (f_last - f_0) > 10% of b, so the extreme-bucket spread
+                // survives whole-tick rounding even for tick-scale base deferrals (where flooring
+                // every bucket would collapse them into one). The cost is that the last bucket may
+                // exceed +20% of the base by less than one tick.
+                double scaledJitter = baseTicks * jitterFractions[jitterBucket];
+                long jitterTicks = jitterBucket == jitterBucketCount - 1
+                    ? (long)Math.Ceiling(scaledJitter)
+                    : (long)Math.Floor(scaledJitter);
 
                 // Saturate instead of wrapping: base + jitter must never overflow long.Ticks range.
                 jitterTicks = Math.Min(jitterTicks, long.MaxValue - baseTicks);

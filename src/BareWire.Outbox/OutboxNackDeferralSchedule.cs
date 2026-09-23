@@ -25,7 +25,9 @@ namespace BareWire.Outbox;
 /// spread survives for rows that are permanently at the escalation ceiling). Within one row of the
 /// deferral matrix the cells are non-decreasing across jitter buckets, and the two extreme buckets
 /// (bucket 0 and bucket <see cref="JitterBucketCount"/> − 1) always differ by more than 10% of the
-/// base deferral — regardless of the values drawn from the jitter source — so rows that were nacked
+/// base deferral — regardless of the values drawn from the jitter source, and including tick-scale
+/// base deferrals, because the last bucket's jitter is rounded up to a whole tick while the others
+/// are rounded down (so the +20% bound may be exceeded by less than one tick) — so rows that were nacked
 /// together in the same release do not all return for redispatch in a single wave. On the very
 /// first nacks, where the base deferral equals <c>PollingInterval</c>, the resulting spread is
 /// smaller than one polling step; the spread only becomes meaningful for rows past the low
