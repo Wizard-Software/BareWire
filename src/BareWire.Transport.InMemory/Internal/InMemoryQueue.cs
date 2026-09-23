@@ -217,14 +217,19 @@ internal sealed class InMemoryQueue
             }
         }
 
-        bool cleared = TryClearLatch(occupancyAfter);
-
         // A waiter may have been installed after the waiter-count check above yet re-checked occupancy
         // before the decrement landed: it saw a full queue and is now waiting for the slot just freed.
         // Both sides publish their counter with a full fence before reading the other one, so at least
-        // one of them observes the other — re-offer the freed slot to such a late waiter.
-        HandOffToLateWaiter();
-        return cleared;
+        // one of them observes the other — re-offer the freed slot to such a late waiter. A hand-off
+        // restores the occupancy this release started from, exactly like the direct hand-off above, so
+        // the latch is only considered once no waiter took the slot.
+        if (HandOffToLateWaiter())
+        {
+            return false;
+        }
+
+        // re-read rather than reuse occupancyAfter: a hand-off attempt may have run in between
+        return TryClearLatch(Volatile.Read(ref _occupancy));
     }
 
     /// <summary>
@@ -233,7 +238,8 @@ internal sealed class InMemoryQueue
     /// back on the waiter's behalf and grants it; when no live waiter is found after all (every counted
     /// waiter was abandoning at the same instant), gives the slot back and re-checks.
     /// </summary>
-    private void HandOffToLateWaiter()
+    /// <returns><see langword="true"/> when the freed slot was handed to a waiter.</returns>
+    private bool HandOffToLateWaiter()
     {
         SpinWait spinner = default;
         while (Volatile.Read(ref _waiterCount) > 0)
@@ -242,7 +248,7 @@ internal sealed class InMemoryQueue
             if (occupancy >= Capacity)
             {
                 // a concurrent reservation already consumed the freed slot; a later release serves the waiter
-                return;
+                return false;
             }
 
             if (Interlocked.CompareExchange(ref _occupancy, occupancy + 1, occupancy) != occupancy)
@@ -254,21 +260,24 @@ internal sealed class InMemoryQueue
             if (granted is not null)
             {
                 granted.Grant();
-                return;
+                return true;
             }
 
-            TryClearLatch(Interlocked.Decrement(ref _occupancy));
+            // give the slot back; ReleaseSlot considers the latch once this returns
+            Interlocked.Decrement(ref _occupancy);
             spinner.SpinOnce();
         }
+
+        return false;
     }
 
     /// <summary>
-    /// Clears the latch when <paramref name="occupancyAfter"/> is strictly below 50% of
+    /// Clears the latch when <paramref name="occupancy"/> is strictly below 50% of
     /// <see cref="Capacity"/>. Returns <see langword="true"/> when this call cleared it.
     /// </summary>
-    private bool TryClearLatch(int occupancyAfter) =>
+    private bool TryClearLatch(int occupancy) =>
         Volatile.Read(ref _latched) == 1
-        && 2L * occupancyAfter < Capacity
+        && 2L * occupancy < Capacity
         && Interlocked.CompareExchange(ref _latched, 0, 1) == 1;
 
     /// <summary>
