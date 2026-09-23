@@ -2,12 +2,15 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace BareWire.UnitTests.Outbox;
 
 public sealed class InMemoryOutboxStoreTests
 {
+    private static readonly DateTimeOffset T0 = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
     private static OutboundMessage CreateMessage(string routingKey = "test.routing.key")
         => new(
             routingKey: routingKey,
@@ -29,21 +32,24 @@ public sealed class InMemoryOutboxStoreTests
     public async Task ReleaseLockAsync_AfterGetPending_ReEnqueuesEntryAndRetainsBuffer()
     {
         // Arrange — save one message and claim it (GetPendingAsync removes it from the pending queue).
-        await using var store = new InMemoryOutboxStore();
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
         await store.SaveMessagesAsync([CreateMessage()]);
 
         IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
         firstBatch.Should().HaveCount(1);
         long id = firstBatch[0].Id;
 
-        // Act — a nack releases the lock, which for the in-memory store means re-enqueue.
+        // Act — a nack releases the lock, which for the in-memory store means re-enqueue, deferred
+        // until the nack-deferral schedule says the entry is claimable again.
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id]);
 
         // Assert — the re-enqueued entry still references its pooled buffer, so the store reports it
-        // as retained (the dispatcher must NOT return that buffer to the ArrayPool — R-5/GAP-1).
+        // as retained (the dispatcher must NOT return that buffer to the ArrayPool).
         retained.Should().BeEquivalentTo([id]);
 
-        // The released entry must be available again on the next poll.
+        // The released entry must be available again once the deferral has elapsed.
+        clock.Advance(TimeSpan.FromSeconds(40));
         IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
         secondBatch.Should().ContainSingle().Which.Id.Should().Be(id);
     }
@@ -62,7 +68,8 @@ public sealed class InMemoryOutboxStoreTests
     public async Task ReleaseLockAsync_NackedAndBarrierLists_ReEnqueuesBothAndRetainsBuffers()
     {
         // Arrange — save two messages and claim both (GetPendingAsync removes them from the queue).
-        await using var store = new InMemoryOutboxStore();
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
         await store.SaveMessagesAsync([CreateMessage(), CreateMessage()]);
         IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
         firstBatch.Should().HaveCount(2);
@@ -72,26 +79,35 @@ public sealed class InMemoryOutboxStoreTests
         // Act — one row rejected by the transport, one held back only by the ordering barrier.
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([nacked], [barrierReleased]);
 
-        // Assert — this store makes no distinction yet: both are re-enqueued and both buffers retained.
+        // Assert — both buffers are retained, but only the barrier-released row is claimable
+        // immediately: the nacked row is deferred by the nack-deferral schedule.
         retained.Should().BeEquivalentTo([nacked, barrierReleased]);
         IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
-        secondBatch.Select(e => e.Id).Should().BeEquivalentTo([nacked, barrierReleased]);
+        secondBatch.Should().ContainSingle("the nacked row is still deferred").Which.Id.Should().Be(barrierReleased);
+
+        // Once the deferral elapses, the nacked row is claimable too.
+        clock.Advance(TimeSpan.FromSeconds(40));
+        IReadOnlyList<OutboxEntry> thirdBatch = await store.GetPendingAsync(10);
+        thirdBatch.Should().ContainSingle().Which.Id.Should().Be(nacked);
     }
 
     [Fact]
     public async Task ReleaseLockAsync_IdInBothLists_ReEnqueuesOnce()
     {
         // Arrange
-        await using var store = new InMemoryOutboxStore();
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
         await store.SaveMessagesAsync([CreateMessage()]);
         IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
         long id = firstBatch.Should().ContainSingle().Which.Id;
 
         // Act — the same id passed in both lists must not be enqueued twice (it would be sent twice).
+        // The nacked list is processed first, so the id is treated as a nack, not a barrier release.
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id], [id]);
 
         // Assert
         retained.Should().BeEquivalentTo([id]);
+        clock.Advance(TimeSpan.FromSeconds(40));
         IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
         secondBatch.Should().ContainSingle().Which.Id.Should().Be(id);
     }
@@ -126,7 +142,7 @@ public sealed class InMemoryOutboxStoreTests
     }
 
     // -------------------------------------------------------------------------
-    // U7 — head-of-line per key + keyless passthrough (R7.7.5)
+    // Head-of-line per key + keyless passthrough
     // -------------------------------------------------------------------------
 
     [Fact]
@@ -212,7 +228,7 @@ public sealed class InMemoryOutboxStoreTests
     [Fact]
     public async Task GetPendingAsync_None_ReturnsAllPendingWithoutGrouping()
     {
-        // Default-OFF guard (§2.1): None mode must not apply any head-of-line filtering.
+        // Default-off guard: None mode must not apply any head-of-line filtering.
         await using var store = new InMemoryOutboxStore(); // default options = None
 
         await store.SaveMessagesAsync([

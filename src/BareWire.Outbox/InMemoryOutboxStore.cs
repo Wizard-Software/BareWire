@@ -6,15 +6,70 @@ using BareWire.Abstractions.Transport;
 
 namespace BareWire.Outbox;
 
+/// <summary>
+/// An in-process, non-durable outbox store backed by a concurrent queue of pending entries and a
+/// concurrent dictionary of all known entries.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Nack deferral and escalation.</b> A transport nack does not make its entry claimable again
+/// immediately. Releasing a nacked entry computes a "not before" instant from the store's
+/// nack-deferral schedule, escalating with every additional nack on the same entry, and stamps it
+/// on the entry together with an incremented nack counter. Releasing an entry through an ordering
+/// barrier, by contrast, clears the deferral and rejoins the immediately-claimable class without
+/// touching the nack counter — a barrier release means the transport never rejected the entry. A
+/// released entry always rejoins the queue at the tail; when both a nack and a barrier release
+/// target the same entry in one call, the nack wins.
+/// </para>
+/// <para>
+/// <b>Bounded sweep, no spin.</b> Fetching pending entries dequeues at most as many entries as
+/// were queued when the sweep began (a snapshot of the queue length taken up front), so a queue
+/// full of deferred entries returns an empty batch in one bounded pass instead of spinning.
+/// Every entry dequeued in the sweep that is not selected for the returned batch — because it is
+/// not yet due, because it is blocked behind the head of its ordering key, or because it lost the
+/// batch-size split below — is re-queued at the tail, in the order it was dequeued.
+/// </para>
+/// <para>
+/// <b>Class split.</b> Due candidates are split into a "new" class (never nacked, or most
+/// recently released by a barrier) ordered by id, and a "retry" class (due nacked entries)
+/// ordered by their deferred instant then by id. For a batch of two or more slots, a quarter of
+/// the batch (at least one slot) is reserved for due retries and the rest for new entries; a class
+/// with fewer candidates than its share leaves the unused slots to the other class. A backlog of
+/// repeatedly nacked entries therefore never starves new entries, and new entries never starve
+/// due retries. For a batch of exactly one, the two classes alternate across calls whenever both
+/// have candidates.
+/// </para>
+/// <para>
+/// This store is for development and testing only, not production use. It is driven by a single
+/// consumer: fetching pending entries, releasing a lock, and marking entries delivered are not
+/// safe to call concurrently with each other, though saving new messages and cleaning up
+/// delivered ones may run concurrently with all of them. Because a full sweep runs concurrently
+/// with saves, the store's pending-message capacity check is approximate, not exact, while a
+/// sweep is in flight.
+/// </para>
+/// <para>
+/// <b>Entries orphaned by an exception or cancellation.</b> An entry claimed while fetching
+/// pending entries and never subsequently released or marked delivered — for example because
+/// sending its batch failed, or because a caller cancelled before releasing it or marking it
+/// delivered — is never handed out again by this store instance. The caller that claimed it may
+/// already have returned its pooled buffer to the shared array pool on that failure path, whether
+/// or not the entry actually reached the transport, so re-issuing it would risk dispatching a
+/// buffer that has since been reused for an unrelated message. Under per-key ordering, such an
+/// orphaned entry permanently blocks its key: every later entry for that key stays queued behind
+/// it, and that backlog continues to count toward the store's pending-message capacity.
+/// </para>
+/// </remarks>
 internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
 {
     private readonly int _maxPendingMessages;
     private readonly OutboxOptions _options;
     private readonly TimeProvider _timeProvider;
     private readonly IOutboxJitterSource _jitterSource;
+    private readonly OutboxNackDeferralSchedule _nackSchedule;
     private readonly ConcurrentQueue<OutboxEntry> _pending = new();
     private readonly ConcurrentDictionary<long, OutboxEntry> _all = new();
     private long _nextId;
+    private bool _singleSlotRetryTurn;
     private bool _disposed;
 
     internal InMemoryOutboxStore(
@@ -35,6 +90,11 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         _maxPendingMessages = maxPendingMessages;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _jitterSource = jitterSource ?? SharedRandomOutboxJitterSource.Instance;
+
+        // Created eagerly (not lazily on the first nack) so invalid options fail fast at
+        // construction rather than surfacing as an exception deep inside ReleaseLockAsync, which
+        // would leave the entries being released orphaned outside _pending.
+        _nackSchedule = OutboxNackDeferralSchedule.FromOptions(_options, _jitterSource);
     }
 
     // The clock every time-dependent operation of this store reads — exactly once per operation.
@@ -97,75 +157,172 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         int batchSize,
         CancellationToken cancellationToken = default)
     {
+        // The cancellation token is checked exactly once, on entry. Nothing below this point may
+        // throw: every entry dequeued from _pending during the sweep is tracked in `swept` and is
+        // guaranteed to be re-queued by the finally block unless it was selected for the batch —
+        // an exception partway through the sweep must never strand a dequeued entry outside
+        // _pending.
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (_options.OrderingMode != OrderingMode.PerKey)
+        if (batchSize <= 0)
         {
-            // None: original path — no grouping, no extra allocation, bit-identical to pre-R7.7.
-            var batch = new List<OutboxEntry>(Math.Min(batchSize, _pending.Count));
+            return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>([]);
+        }
 
-            while (batch.Count < batchSize && _pending.TryDequeue(out OutboxEntry? entry))
+        DateTimeOffset now = _timeProvider.GetUtcNow();
+        bool perKey = _options.OrderingMode == OrderingMode.PerKey;
+
+        // PerKey: a keyed entry is claimable only when it is the head (lowest id) of its key
+        // group among all undelivered entries — including any entry currently deferred by a
+        // nack, so a deferred head still blocks its key. Keyless entries always pass through.
+        // This is an O(|_all|) scan, same cost as before this change.
+        Dictionary<string, long>? headIdPerKey = null;
+        if (perKey)
+        {
+            headIdPerKey = [];
+            foreach (OutboxEntry candidate in _all.Values)
             {
-                // Skip entries that were already delivered (e.g. by a concurrent dispatch call).
-                if (entry.Status == OutboxEntryStatus.Pending)
+                if (candidate.Status != OutboxEntryStatus.Pending || candidate.OrderingKey is null)
                 {
-                    batch.Add(entry);
+                    continue;
+                }
+
+                if (!headIdPerKey.TryGetValue(candidate.OrderingKey, out long currentHead) || candidate.Id < currentHead)
+                {
+                    headIdPerKey[candidate.OrderingKey] = candidate.Id;
                 }
             }
-
-            return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(batch);
         }
 
-        // PerKey: head-of-line enforcement per ordering key.
-        // A keyed row is claimable only when there is no strictly older undelivered row with the
-        // same key (i.e., the row must be the head of its key group). Keyless rows always pass
-        // through. Filter applied before the batch limit.
-        //
-        // Implementation: O(undelivered)/cycle — scans _all to find the minimum Id per key group
-        // among all undelivered entries, then dequeues from _pending and keeps only heads or
-        // keyless entries. This is test/dev only — NOT production. For production use PostgreSQL
-        // with the atomic FOR UPDATE SKIP LOCKED claim path in EfCoreOutboxStore.
-        Dictionary<string, long> headIdPerKey = _all
-            .Values
-            .Where(e => e.Status == OutboxEntryStatus.Pending && e.OrderingKey is not null)
-            .GroupBy(e => e.OrderingKey!)
-            .ToDictionary(g => g.Key, g => g.Min(e => e.Id));
+        // Bounded sweep: a snapshot of the queue length taken up front caps the number of
+        // dequeues, so a queue full of not-yet-due entries returns an empty batch instead of
+        // spinning.
+        int sweepCount = _pending.Count;
+        var swept = new List<OutboxEntry>(sweepCount);
+        var setAside = new List<OutboxEntry>();
+        var fresh = new List<OutboxEntry>();
+        var retries = new List<OutboxEntry>();
+        var seenIds = new HashSet<long>();
+        int newTake = 0;
+        int retryTake = 0;
 
-        // Drain candidates from the pending queue; re-enqueue blocked keyed rows for the next
-        // cycle (they are not yet the head of their key).
-        var perKeyBatch = new List<OutboxEntry>(Math.Min(batchSize, _pending.Count));
-        var blocked = new List<OutboxEntry>();
-
-        while (perKeyBatch.Count < batchSize && _pending.TryDequeue(out OutboxEntry? entry))
+        try
         {
-            if (entry.Status != OutboxEntryStatus.Pending)
+            for (int i = 0; i < sweepCount && _pending.TryDequeue(out OutboxEntry? entry); i++)
             {
-                continue;
+                swept.Add(entry);
+
+                if (entry.Status != OutboxEntryStatus.Pending || !seenIds.Add(entry.Id))
+                {
+                    // Already delivered elsewhere, or a duplicate id already seen in this sweep
+                    // (a caller releasing an id it never claimed could otherwise queue the same
+                    // entry twice) — drop, do not re-queue.
+                    continue;
+                }
+
+                if (perKey && entry.OrderingKey is not null
+                    && (!headIdPerKey!.TryGetValue(entry.OrderingKey, out long headId) || entry.Id != headId))
+                {
+                    setAside.Add(entry);
+                    continue;
+                }
+
+                if (entry.NotBefore is { } notBefore && notBefore >= now)
+                {
+                    setAside.Add(entry);
+                    continue;
+                }
+
+                (entry.NotBefore is null ? fresh : retries).Add(entry);
             }
 
-            if (entry.OrderingKey is null)
+            fresh.Sort(static (a, b) => a.Id.CompareTo(b.Id));
+            retries.Sort(static (a, b) =>
             {
-                // Keyless: always eligible.
-                perKeyBatch.Add(entry);
-            }
-            else if (headIdPerKey.TryGetValue(entry.OrderingKey, out long headId) && entry.Id == headId)
-            {
-                // This entry is the head of its key group.
-                perKeyBatch.Add(entry);
-            }
-            else
-            {
-                // Not the head — block and re-enqueue after this sweep.
-                blocked.Add(entry);
-            }
+                int byNotBefore = a.NotBefore!.Value.CompareTo(b.NotBefore!.Value);
+                return byNotBefore != 0 ? byNotBefore : a.Id.CompareTo(b.Id);
+            });
+
+            (newTake, retryTake) = SplitBatch(batchSize, fresh.Count, retries.Count);
         }
-
-        foreach (OutboxEntry blockedEntry in blocked)
+        finally
         {
-            _pending.Enqueue(blockedEntry);
+            // Every dequeued entry not selected for the batch — set aside, or a candidate that
+            // lost the split — goes back to the tail, in the order it was dequeued. Selected
+            // entries and dropped entries (non-Pending or a duplicate id) are the only ones
+            // excluded.
+            HashSet<OutboxEntry> requeue = new(setAside);
+            for (int j = newTake; j < fresh.Count; j++)
+            {
+                requeue.Add(fresh[j]);
+            }
+
+            for (int j = retryTake; j < retries.Count; j++)
+            {
+                requeue.Add(retries[j]);
+            }
+
+            // Remove (not just Contains) so an entry dequeued twice in one sweep — a duplicate queue
+            // slot — is re-queued once, not twice.
+            foreach (OutboxEntry entry in swept)
+            {
+                if (requeue.Remove(entry))
+                {
+                    _pending.Enqueue(entry);
+                }
+            }
         }
 
-        return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(perKeyBatch);
+        var result = new List<OutboxEntry>(newTake + retryTake);
+        for (int j = 0; j < newTake; j++)
+        {
+            result.Add(fresh[j]);
+        }
+
+        for (int j = 0; j < retryTake; j++)
+        {
+            result.Add(retries[j]);
+        }
+
+        return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(result);
+    }
+
+    // Splits a batch of batchSize slots between the "new" and due "retry" classes. For
+    // batchSize >= 2, at least GetRetryReserve(batchSize) slots go to due retries whenever any
+    // are waiting. For batchSize == 1, the two classes alternate across calls (via
+    // _singleSlotRetryTurn) whenever both have candidates in the same cycle; the first contested
+    // cycle serves the "new" class.
+    private (int NewTake, int RetryTake) SplitBatch(int batchSize, int freshCount, int retryCount)
+    {
+        if (batchSize == 1)
+        {
+            if (freshCount > 0 && retryCount > 0)
+            {
+                bool retryTurn = _singleSlotRetryTurn;
+                _singleSlotRetryTurn = !_singleSlotRetryTurn;
+                return retryTurn ? (0, 1) : (1, 0);
+            }
+
+            return freshCount > 0 ? (1, 0) : retryCount > 0 ? (0, 1) : (0, 0);
+        }
+
+        int reserve = GetRetryReserve(batchSize);
+        int retryTake = Math.Min(retryCount, batchSize - Math.Min(freshCount, batchSize - reserve));
+        int newTake = Math.Min(freshCount, batchSize - retryTake);
+        return (newTake, retryTake);
+    }
+
+    // Number of batch slots reserved for due retries in a batch of batchSize (>= 2).
+    private static int GetRetryReserve(int batchSize) => Math.Max(1, batchSize / 4);
+
+    // Saturating now + deferral: returns DateTimeOffset.MaxValue instead of overflowing when now
+    // is already within `deferral` of the maximum representable instant. `now` is normalized to UTC
+    // first: DateTimeOffset addition also range-checks the local clock time, so a positive offset
+    // could otherwise throw past the UTC-based guard.
+    private static DateTimeOffset AddSaturating(DateTimeOffset now, TimeSpan deferral)
+    {
+        DateTimeOffset utcNow = now.ToUniversalTime();
+        return deferral >= DateTimeOffset.MaxValue - utcNow ? DateTimeOffset.MaxValue : utcNow + deferral;
     }
 
     public ValueTask MarkDeliveredAsync(
@@ -208,29 +365,49 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         }
 
         // This store has no lock column — "release" means re-enqueue so the entry is dispatched
-        // again on the next poll; nacked and barrier-released entries are not yet told apart here.
-        // The entry instance is still referenced from _all, so re-enqueuing keeps its pooled buffer
-        // alive; the returned set tells the dispatcher NOT to return those buffers to the ArrayPool.
-        // Delivered or unknown ids are skipped (idempotent). An id is re-enqueued at most once even
-        // when it appears in both lists — a second enqueue would dispatch it twice in one batch.
+        // again on the next poll. A nack defers the entry through the nack-deferral schedule and
+        // increments its nack counter; an ordering-barrier release clears the deferral (the entry
+        // rejoins the "new" class) and leaves the counter untouched. The entry instance is still
+        // referenced from _all, so re-enqueuing keeps its pooled buffer alive; the returned set
+        // tells the dispatcher NOT to return those buffers to the ArrayPool. Delivered or unknown
+        // ids are skipped (idempotent). An id present in both lists is treated as a nack only —
+        // the nacked list is processed first and claims the id via `retained`, so the barrier
+        // pass below becomes a no-op for it.
+        //
+        // Invariant: for every entry, NotBefore/NackCount are computed and assigned before that
+        // entry's Enqueue call, and the Enqueue call is the last thing done for that entry.
+        // Nothing in this method may throw after the first Enqueue — a caller that does not
+        // receive the returned retained-buffer set cannot tell which buffers it must not return
+        // to the ArrayPool.
+        DateTimeOffset now = _timeProvider.GetUtcNow();
+        OutboxNackDeferralPlan? plan = nackedIds.Count > 0 ? _nackSchedule.CreatePlan() : null;
         HashSet<long>? retained = null;
-        ReEnqueue(nackedIds, ref retained);
-        ReEnqueue(barrierReleasedIds, ref retained);
 
-        return ValueTask.FromResult<IReadOnlySet<long>>(retained ?? (IReadOnlySet<long>)FrozenSet<long>.Empty);
-    }
-
-    private void ReEnqueue(IReadOnlyList<long> ids, ref HashSet<long>? retained)
-    {
-        foreach (long id in ids)
+        foreach (long id in nackedIds)
         {
             if (_all.TryGetValue(id, out OutboxEntry? entry)
                 && entry.Status == OutboxEntryStatus.Pending
                 && (retained ??= []).Add(id))
             {
+                TimeSpan deferral = plan!.GetDeferralForRow(entry.NackCount, entry.Id);
+                entry.NotBefore = AddSaturating(now, deferral);
+                entry.NackCount = entry.NackCount == int.MaxValue ? int.MaxValue : entry.NackCount + 1;
                 _pending.Enqueue(entry);
             }
         }
+
+        foreach (long id in barrierReleasedIds)
+        {
+            if (_all.TryGetValue(id, out OutboxEntry? entry)
+                && entry.Status == OutboxEntryStatus.Pending
+                && (retained ??= []).Add(id))
+            {
+                entry.NotBefore = null;
+                _pending.Enqueue(entry);
+            }
+        }
+
+        return ValueTask.FromResult<IReadOnlySet<long>>(retained ?? (IReadOnlySet<long>)FrozenSet<long>.Empty);
     }
 
     public ValueTask CleanupAsync(
@@ -288,7 +465,7 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     }
 
     // Promotes the ordering key from the message headers when PerKey mode is active.
-    // Rules (SEC-2 / §2.4 of the R7.7 plan — parity with EfCoreOutboxStore):
+    // Rules (parity with EfCoreOutboxStore):
     //   - Only active when OrderingMode == PerKey.
     //   - Key must be present, non-whitespace, and <= 256 characters.
     //   - Keys longer than 256 characters produce null (keyless) — NEVER truncated,
