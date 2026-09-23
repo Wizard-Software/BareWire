@@ -34,6 +34,9 @@ internal sealed class OutboxEntry
     internal DateTimeOffset? NotBefore { get; set; }
 
     // Number of transport nacks accumulated so far; drives the escalation bucket of the next
-    // deferral. Used only by InMemoryOutboxStore — the EF store leaves this at its default.
+    // deferral. InMemoryOutboxStore both reads and updates this field. The EF store never updates
+    // it (its own row columns are authoritative for the deferral schedule), but GetPendingAsync
+    // populates it from the row's RetryCount so the dispatcher's retry-observability logging can
+    // read a row's accumulated nack count from either store uniformly.
     internal int NackCount { get; set; }
 }

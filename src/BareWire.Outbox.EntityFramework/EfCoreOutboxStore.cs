@@ -9,7 +9,7 @@ using Microsoft.EntityFrameworkCore;
 
 namespace BareWire.Outbox.EntityFramework;
 
-internal sealed class EfCoreOutboxStore : IOutboxStore
+internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
 {
     private readonly OutboxDbContext _dbContext;
     private readonly string _instanceId;
@@ -147,7 +147,8 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 ContentType = row.ContentType,
                 CreatedAt = row.CreatedAt,
                 Status = OutboxEntryStatus.Pending,
-                OrderingKey = row.OrderingKey
+                OrderingKey = row.OrderingKey,
+                NackCount = row.RetryCount
             });
         }
 
@@ -599,6 +600,62 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             Expression.Constant(
                 new StrongBox<DateTimeOffset?>(plan.GetDeferredLockedAt(now, retryBucket, jitterBucket))),
             nameof(StrongBox<DateTimeOffset?>.Value));
+
+    // Reports the due instant of the oldest row in the retry-backlog class: still locked (LockedAt !=
+    // null), not delivered, and whose deferral (or, for an abandoned claim, the stale-lock timeout) has
+    // elapsed. Deliberately includes rows abandoned by a crashed instance (LockedBy no longer meaningful
+    // once staleCutoff has passed) — the gauge measures delay for the whole retry class, not only
+    // deferred nacks. A barrier-released row (LockedAt == null) is excluded by the filter itself. The
+    // minimum LockedAt among ALL still-locked rows is correct: a fresh claim always has a LockedAt at or
+    // after `now`, strictly later than any row whose deferral has already elapsed, so it can never be
+    // the minimum while a genuinely due row exists.
+    public async ValueTask<DateTimeOffset?> GetOldestDueRetryAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        DateTimeOffset staleCutoff = now - _options.OutboxLockTimeout;
+        DateTimeOffset? oldestLockedAt;
+
+        if (string.Equals(_dbContext.Database.ProviderName, _dialect.ProviderName, StringComparison.Ordinal))
+        {
+            // ORDER BY DeliveredAt, LockedAt mirrors the leading columns of IX_OutboxMessages_Claim
+            // (DeliveredAt, LockedAt, Id): DeliveredAt is constant within the filtered predicate, so this
+            // lets the provider read the filtered rows in index order instead of adding a Sort node for
+            // a plain ORDER BY LockedAt.
+            oldestLockedAt = await _dbContext.Set<OutboxMessage>()
+                .Where(m => m.DeliveredAt == null && m.LockedAt != null)
+                .OrderBy(m => m.DeliveredAt)
+                .ThenBy(m => m.LockedAt)
+                .Select(m => m.LockedAt)
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            // No matching dialect (e.g. SQLite in tests/dev): load the filtered LockedAt values and take
+            // the minimum client-side, the same cost class as ClaimClientSideAsync — paid only when a
+            // collector actually reads the gauge. LockedAt is compared client-side because not every EF
+            // Core provider translates nullable DateTimeOffset comparisons.
+            List<DateTimeOffset?> lockedAts = await _dbContext.Set<OutboxMessage>()
+                .Where(m => m.DeliveredAt == null && m.LockedAt != null)
+                .Select(m => m.LockedAt)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            oldestLockedAt = null;
+            foreach (DateTimeOffset? lockedAt in lockedAts)
+            {
+                if (oldestLockedAt is null || lockedAt < oldestLockedAt)
+                {
+                    oldestLockedAt = lockedAt;
+                }
+            }
+        }
+
+        return oldestLockedAt is { } value && value < staleCutoff
+            ? value + _options.OutboxLockTimeout
+            : null;
+    }
 
     public async ValueTask CleanupAsync(
         TimeSpan retention,

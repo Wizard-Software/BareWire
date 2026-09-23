@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Frozen;
+using System.Diagnostics.Metrics;
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Transport;
 using Microsoft.Extensions.DependencyInjection;
@@ -38,6 +39,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
     private readonly OutboxOptions _options;
     private readonly ILogger<OutboxDispatcher> _logger;
     private readonly IHostApplicationLifetime _lifetime;
+    private readonly TimeProvider _timeProvider;
 
     private CancellationTokenSource? _cts;
     private CancellationTokenRegistration _startedRegistration;
@@ -48,14 +50,27 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         ITransportAdapter adapter,
         OutboxOptions options,
         ILogger<OutboxDispatcher> logger,
-        IHostApplicationLifetime lifetime)
+        IHostApplicationLifetime lifetime,
+        TimeProvider? timeProvider = null,
+        IMeterFactory? meterFactory = null)
     {
         _scopeFactory = scopeFactory ?? throw new ArgumentNullException(nameof(scopeFactory));
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _lifetime = lifetime ?? throw new ArgumentNullException(nameof(lifetime));
+        _timeProvider = timeProvider ?? TimeProvider.System;
+
+        // The Meter, when a factory is supplied, is owned by that IMeterFactory (which caches instances
+        // by name) — RetryDiagnostics never disposes it.
+        RetryDiagnostics = new OutboxRetryDiagnostics(
+            _logger,
+            _timeProvider,
+            meterFactory?.Create(OutboxRetryDiagnostics.MeterName));
     }
+
+    // Exposed for tests — the dispatcher's rate-limited retry log, counter, and lazily sampled gauge.
+    internal OutboxRetryDiagnostics RetryDiagnostics { get; }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -216,6 +231,13 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
     {
         await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
         IOutboxStore store = scope.ServiceProvider.GetRequiredService<IOutboxStore>();
+
+        // Lazy gauge sampling: only when a metrics collector observed the gauge since the previous
+        // sample does this cycle pay for the extra query — see OutboxRetryDiagnostics.
+        if (RetryDiagnostics.TryConsumeAgeSampleRequest())
+        {
+            await SampleOldestDueRetryAsync(store, ct).ConfigureAwait(false);
+        }
 
         IReadOnlyList<OutboxEntry> pending = await store
             .GetPendingAsync(_options.DispatchBatchSize, ct)
@@ -378,6 +400,8 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
             if (nackedIds.Count > 0)
             {
+                (long rowId, int retryCount) = SelectReportedRetryRow(pending, results);
+                RetryDiagnostics.RowsReleasedForRetry(nackedIds.Count, rowId, retryCount);
                 LogPartialSendFailure(_logger, nackedIds.Count, pending.Count);
             }
 
@@ -398,6 +422,67 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         }
 
         return (pending.Count, confirmedCount, nackedCount);
+    }
+
+    // Picks the row to name in the rate-limited retry Warning: among the nacked entries (results[i] not
+    // confirmed — identical to nackedIds after any per-key regrouping, since every entry ahead of a
+    // group's first nacked id is provably confirmed), the one with the highest NackCount (ties broken by
+    // the lowest Id) — the most "poison" row, so it is the one an operator sees. Reported RetryCount is
+    // NackCount + 1 (saturated at int.MaxValue), matching what ReleaseLockAsync is about to persist.
+    // Single O(n) pass over indices — no LINQ, no intermediate list.
+    internal static (long RowId, int RetryCount) SelectReportedRetryRow(
+        IReadOnlyList<OutboxEntry> pending,
+        IReadOnlyList<SendResult> results)
+    {
+        bool found = false;
+        long bestRowId = 0;
+        int bestNackCount = 0;
+
+        for (int i = 0; i < pending.Count; i++)
+        {
+            if (results[i].IsConfirmed)
+            {
+                continue;
+            }
+
+            OutboxEntry entry = pending[i];
+            if (!found || entry.NackCount > bestNackCount || (entry.NackCount == bestNackCount && entry.Id < bestRowId))
+            {
+                found = true;
+                bestRowId = entry.Id;
+                bestNackCount = entry.NackCount;
+            }
+        }
+
+        int retryCount = bestNackCount == int.MaxValue ? int.MaxValue : bestNackCount + 1;
+        return (bestRowId, retryCount);
+    }
+
+    // Samples the retry backlog's oldest due instant, only when the store implements the optional probe
+    // capability. Any exception other than cancellation is logged at Debug and swallowed: a probe
+    // failure must not abort the batch — the claim/send/release path already surfaces store failures at
+    // Error through its own path.
+    private async ValueTask SampleOldestDueRetryAsync(IOutboxStore store, CancellationToken ct)
+    {
+        if (store is not IOutboxRetryBacklogProbe probe)
+        {
+            return;
+        }
+
+        try
+        {
+            DateTimeOffset now = _timeProvider.GetUtcNow();
+            DateTimeOffset? oldestDueAt = await probe.GetOldestDueRetryAsync(now, ct).ConfigureAwait(false);
+            RetryDiagnostics.RecordOldestDueRetry(oldestDueAt);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogRetryBacklogProbeFailed(_logger, ex);
+        }
     }
 
     [LoggerMessage(
@@ -433,10 +518,18 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         Message = "Error during outbox dispatch batch. Will retry on next tick.")]
     private static partial void LogDispatchError(ILogger logger, Exception ex);
 
+    // Debug, not Warning: OutboxRetryDiagnostics.RowsReleasedForRetry emits the single rate-limited
+    // Warning for released retries (with a representative row id and RetryCount). This entry stays at
+    // Debug for full per-batch diagnostics without a second, redundant Warning for the same event.
     [LoggerMessage(
-        Level = LogLevel.Warning,
+        Level = LogLevel.Debug,
         Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker; they were released for a deferred retry.")]
     private static partial void LogPartialSendFailure(ILogger logger, int nackedCount, int totalCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Debug,
+        Message = "Sampling the oldest due outbox retry failed; the sample was skipped.")]
+    private static partial void LogRetryBacklogProbeFailed(ILogger logger, Exception ex);
 
     [LoggerMessage(
         Level = LogLevel.Debug,

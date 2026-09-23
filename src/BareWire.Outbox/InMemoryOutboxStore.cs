@@ -66,7 +66,7 @@ namespace BareWire.Outbox;
 /// pending-message capacity.
 /// </para>
 /// </remarks>
-internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
+internal sealed class InMemoryOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe, IAsyncDisposable
 {
     private readonly int _maxPendingMessages;
     private readonly OutboxOptions _options;
@@ -411,6 +411,35 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
         }
 
         return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
+    }
+
+    /// <summary>
+    /// Returns the earliest <c>NotBefore</c> among pending entries whose deferred retry is already due
+    /// (<c>NotBefore &lt; now</c>) — the same "claimable" boundary <see cref="GetPendingAsync"/> uses —
+    /// or <see langword="null"/> when none is due. A barrier-released entry (<c>NotBefore == null</c>)
+    /// and a never-nacked entry are never due retries. Scans <c>_pending</c> (a lock-free snapshot, not
+    /// <c>_all</c>) so an orphaned claimed entry — never released, tracked only in <c>_all</c> — is
+    /// never counted.
+    /// </summary>
+    public ValueTask<DateTimeOffset?> GetOldestDueRetryAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        DateTimeOffset? oldest = null;
+        foreach (OutboxEntry entry in _pending)
+        {
+            if (entry.Status == OutboxEntryStatus.Pending
+                && entry.NotBefore is { } notBefore
+                && notBefore < now
+                && (oldest is null || notBefore < oldest))
+            {
+                oldest = notBefore;
+            }
+        }
+
+        return ValueTask.FromResult(oldest);
     }
 
     public ValueTask CleanupAsync(
