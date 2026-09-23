@@ -237,13 +237,13 @@ public sealed class InMemoryTransportAdapterTopologyTests
     }
 
     [Fact]
-    public void ConsumeAsync_DeclaredQueue_StillThrowsNotSupported()
+    public void ConsumeAsync_DeclaredQueue_ReturnsEnumerableWithoutThrowing()
     {
         InMemoryTransportAdapter adapter = Adapter(c => c.ConfigureTopology(t => t.DeclareQueue("orders")));
 
         Action act = () => adapter.ConsumeAsync("orders", new FlowControlOptions(), TestContext.Current.CancellationToken);
 
-        act.Should().Throw<NotSupportedException>();
+        act.Should().NotThrow();
     }
 
     [Fact]

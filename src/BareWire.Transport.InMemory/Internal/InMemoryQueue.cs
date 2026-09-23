@@ -42,6 +42,7 @@ internal sealed class InMemoryQueue
     private readonly Channel<InMemoryDelivery> _channel;
     private readonly TimeProvider _timeProvider;
     private readonly Lock _waitersLock = new();
+    private readonly Lock _requeueLock = new();
     private readonly LinkedList<ReserveWaiter> _waiters = new();
     private int _occupancy;
     private int _latched;
@@ -175,6 +176,90 @@ internal sealed class InMemoryQueue
                 "Every WriteReserved call must be paired with a prior reservation.");
         }
     }
+
+    /// <summary>
+    /// Puts <paramref name="deliveries"/> back at the head of this queue, in the given order, ahead of
+    /// every delivery that is in the channel when this call starts. Every delivery passed here MUST
+    /// already hold a reserved slot (for example a delivery handed to a consumer and never settled), so
+    /// <see cref="Occupancy"/> is not changed. Writing to the channel wakes any reader waiting for data.
+    /// </summary>
+    /// <remarks>
+    /// Implemented by draining the channel, writing <paramref name="deliveries"/>, then writing the
+    /// drained deliveries back in their original order. Requeues are serialized among themselves; the
+    /// publish and read paths take no additional lock, so a delivery published concurrently while the
+    /// channel is being drained may end up ahead of the requeued ones. This is an exceptional path; order
+    /// under concurrency is not guaranteed.
+    /// </remarks>
+    /// <param name="deliveries">The deliveries to requeue, oldest first. Must not be <see langword="null"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="deliveries"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The channel cannot hold the requeued deliveries together with the drained ones — at least one of
+    /// them was passed without a reservation. The drained deliveries are written back first, as far as
+    /// the channel allows.
+    /// </exception>
+    internal void RequeueAtHead(IReadOnlyList<InMemoryDelivery> deliveries)
+    {
+        ArgumentNullException.ThrowIfNull(deliveries);
+
+        if (deliveries.Count == 0)
+        {
+            return;
+        }
+
+        lock (_requeueLock)
+        {
+            ChannelReader<InMemoryDelivery> reader = _channel.Reader;
+            ChannelWriter<InMemoryDelivery> writer = _channel.Writer;
+            var drained = new List<InMemoryDelivery>(reader.Count);
+            while (reader.TryRead(out InMemoryDelivery? queued))
+            {
+                drained.Add(queued);
+            }
+
+            if ((long)deliveries.Count + drained.Count > Capacity)
+            {
+                WriteBack(writer, drained, 0);
+                throw RequeueOverflow();
+            }
+
+            for (int i = 0; i < deliveries.Count; i++)
+            {
+                if (!writer.TryWrite(deliveries[i]))
+                {
+                    WriteBack(writer, drained, 0);
+                    throw RequeueOverflow();
+                }
+            }
+
+            for (int i = 0; i < drained.Count; i++)
+            {
+                if (!writer.TryWrite(drained[i]))
+                {
+                    WriteBack(writer, drained, i + 1);
+                    throw RequeueOverflow();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Best-effort write-back of drained deliveries after a requeue found the channel over capacity, so
+    /// deliveries holding reserved slots are not silently lost before the invariant violation is reported.
+    /// </summary>
+    private static void WriteBack(ChannelWriter<InMemoryDelivery> writer, List<InMemoryDelivery> drained, int start)
+    {
+        for (int i = start; i < drained.Count; i++)
+        {
+            if (!writer.TryWrite(drained[i]))
+            {
+                return;
+            }
+        }
+    }
+
+    private InvalidOperationException RequeueOverflow() =>
+        new($"Queue '{Name}' cannot requeue deliveries at its head: the channel is at capacity. " +
+            "Every requeued delivery must still hold its reserved slot.");
 
     /// <summary>
     /// Releases one occupied slot after a delivery has been settled (acknowledged, rejected, or
