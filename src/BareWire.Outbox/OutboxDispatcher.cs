@@ -8,15 +8,30 @@ using Microsoft.Extensions.Logging;
 
 namespace BareWire.Outbox;
 
+/// <summary>
+/// Background service that claims pending outbox rows, sends them through the transport and records
+/// the outcome: confirmed rows are marked delivered, rejected rows are released for a deferred retry.
+/// </summary>
+/// <remarks>
+/// Delivery is at-least-once. With per-key ordering, confirmed siblings queued behind a rejected head
+/// of their key are held back by the ordering barrier: they are released without being marked
+/// delivered, so they are sent again on a later cycle even though the broker already accepted them.
+/// Consumers that must not observe such duplicates need inbox deduplication.
+/// </remarks>
 internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposable
 {
-    // Maximum number of back-to-back full+confirmed batches the polling loop drains before forcing a
+    // Maximum number of back-to-back full batches the polling loop drains before forcing a
     // PollingInterval pause. Caps the catch-up rate at MaxConsecutiveDrains × DispatchBatchSize per
     // PollingInterval, so a large backlog cannot turn the drain into an unbounded tight send loop that
     // churns one broker channel (and one DB row-claim UPDATE) per batch as fast as the process can spin.
     // It still raises the single-instance ceiling far above the ~DispatchBatchSize-per-PollingInterval of
     // a pure timer (10× at the defaults), just not without limit. Internal, not configurable by design.
-    private const int MaxConsecutiveDrains = 10;
+    internal const int MaxConsecutiveDrains = 10;
+
+    // Streak cap once the current drain streak has seen at least one transport nack. A deliberate
+    // backpressure trade-off: nacked rows are already deferred per row by the store, so draining cannot
+    // hot-retry them, but a struggling broker still gets half the catch-up burst of a healthy one.
+    internal const int MaxConsecutiveDrainsWithNacks = MaxConsecutiveDrains / 2;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ITransportAdapter _adapter;
@@ -102,26 +117,50 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         }
     }
 
+    // Drain rule: claim the next batch immediately (no PollingInterval pause) only when the batch came
+    // back full (more backlog is likely), at least half of it was confirmed (2 × Confirmed ≥ Claimed),
+    // and the drain streak is still under its cap — halved once the streak has seen a transport nack.
+    // The product is computed in long so it cannot overflow.
+    internal static bool ShouldDrainImmediately(
+        int claimed,
+        int confirmed,
+        int batchSize,
+        int consecutiveDrains,
+        bool streakHasNacks)
+    {
+        int streakCap = streakHasNacks ? MaxConsecutiveDrainsWithNacks : MaxConsecutiveDrains;
+
+        return claimed >= batchSize
+            && 2L * confirmed >= claimed
+            && consecutiveDrains < streakCap;
+    }
+
     private async Task RunPollingLoopAsync(CancellationToken ct)
     {
         // Relative-paced poll loop. Each iteration dispatches one batch, then decides how long to wait
         // before the next claim based on the OUTCOME — pacing is relative to this batch's completion,
         // never to a fixed timer grid:
-        //   - FULL batch, every row confirmed (no nacks) → claim again immediately (drain the backlog),
-        //     so a single instance is not capped at ~DispatchBatchSize per PollingInterval.
-        //   - anything else (empty, partial, fully nacked, or a transient error) → wait one
-        //     PollingInterval before the next claim.
-        // The relative delay is what makes nack pacing correct: a nack always backs off ~PollingInterval
-        // from the failure regardless of how long the preceding drain ran. A fixed PeriodicTimer grid
-        // would instead let a nack landing near a tick boundary retry almost immediately, hammering a
-        // struggling broker (nacked rows are released for retry, so the very next claim re-sends them).
-        // Counts consecutive immediate drains so a sustained backlog drains in bounded bursts
-        // (MaxConsecutiveDrains) rather than an unbounded tight loop. Reset whenever the loop pauses.
+        //   - FULL batch with at least half of it confirmed, streak under its cap → claim again
+        //     immediately (drain the backlog), so a single instance is not capped at
+        //     ~DispatchBatchSize per PollingInterval (see ShouldDrainImmediately).
+        //   - anything else (empty, partial, majority nacked, a transient error, or the streak cap
+        //     reached) → wait one PollingInterval before the next claim.
+        // Draining despite a minority of nacks cannot hot-retry the rejected rows: the store defers each
+        // nacked row (not claimable again before at least one PollingInterval), so an immediate re-claim
+        // only picks up fresh backlog. The relative delay still paces the loop itself: a pause always
+        // lasts ~PollingInterval from the end of the batch, regardless of how long a preceding drain ran.
+        // Counts consecutive immediate drains so a sustained backlog drains in bounded bursts rather than
+        // an unbounded tight loop; the cap is halved once the current streak has seen a transport nack.
+        // The streak state is reset whenever the loop pauses.
         int consecutiveDrains = 0;
+        bool streakHasNacks = false;
+        int streakBatches = 0;
+        int streakClaimed = 0;
+        int streakNacked = 0;
 
         while (!ct.IsCancellationRequested)
         {
-            (int Claimed, int Confirmed) batch;
+            (int Claimed, int Confirmed, int Nacked) batch;
             try
             {
                 batch = await DispatchBatchAsync(ct).ConfigureAwait(false);
@@ -137,27 +176,43 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 batch = default;
             }
 
-            // Drain immediately only on a full, fully-confirmed batch AND while under the burst cap;
-            // otherwise (empty, partial, fully nacked, transient error, or cap reached) pace the next
-            // claim by one PollingInterval. The cap bounds broker/DB churn during backlog recovery.
-            if (batch.Claimed >= _options.DispatchBatchSize
-                && batch.Confirmed == batch.Claimed
-                && consecutiveDrains < MaxConsecutiveDrains)
+            streakBatches++;
+            streakClaimed += batch.Claimed;
+            streakNacked += batch.Nacked;
+            streakHasNacks |= batch.Nacked > 0;
+
+            if (ShouldDrainImmediately(
+                    batch.Claimed,
+                    batch.Confirmed,
+                    _options.DispatchBatchSize,
+                    consecutiveDrains,
+                    streakHasNacks))
             {
                 consecutiveDrains++;
                 continue;
             }
 
+            if (streakNacked > 0)
+            {
+                LogDrainStreakNackShare(_logger, streakBatches, streakNacked, streakClaimed);
+            }
+
             consecutiveDrains = 0;
+            streakHasNacks = false;
+            streakBatches = 0;
+            streakClaimed = 0;
+            streakNacked = 0;
             await Task.Delay(_options.PollingInterval, ct).ConfigureAwait(false);
         }
     }
 
-    // Returns (Claimed, Confirmed): how many entries this cycle claimed and how many the broker
-    // confirmed. The polling loop drains again immediately only when a full batch was claimed (more
-    // backlog is likely) AND every claimed row was confirmed (no nacks), so any failure — partial or
-    // total — degrades to tick-paced retry rather than a hot re-claim loop on the released rows.
-    private async Task<(int Claimed, int Confirmed)> DispatchBatchAsync(CancellationToken ct)
+    // Returns (Claimed, Confirmed, Nacked) for one cycle:
+    //   - Claimed: rows claimed from the store.
+    //   - Confirmed: rows marked delivered. Confirmed siblings held back by the per-key ordering barrier
+    //     are NOT counted — they are released, not delivered, so they are no forward progress.
+    //   - Nacked: rows the transport rejected (counted from the send results only).
+    // The polling loop uses these to decide between an immediate drain and a PollingInterval pause.
+    private async Task<(int Claimed, int Confirmed, int Nacked)> DispatchBatchAsync(CancellationToken ct)
     {
         await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
         IOutboxStore store = scope.ServiceProvider.GetRequiredService<IOutboxStore>();
@@ -168,7 +223,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
         if (pending.Count == 0)
         {
-            return (0, 0);
+            return (0, 0, 0);
         }
 
         LogDispatching(_logger, pending.Count);
@@ -192,6 +247,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
         // — the store still references them. Empty for EF Core (fresh per-cycle buffers).
         IReadOnlySet<long> retainedByStore = FrozenSet<long>.Empty;
         int confirmedCount = 0;
+        int nackedCount = 0;
 
         try
         {
@@ -213,23 +269,28 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 }
             }
 
-            // R7.7.6 — Per-key barrier: when PerKey ordering is active and at least one entry was
-            // nacked, apply head-of-line blocking per key. Any confirmed sibling with a higher Id
-            // than the first nacked entry in its key group is moved to "release" — it must not be
-            // marked delivered until the nacked head is retried and confirmed. Keyless entries
-            // (OrderingKey == null) are always independent and are never blocked.
+            nackedCount = nackedIds.Count;
+
+            // Rows the transport accepted but that are held back only by the per-key ordering barrier.
+            // Kept apart from nackedIds: the store releases them without a deferral and without counting
+            // a retry. Empty (no allocation) unless the per-key barrier applies.
+            IReadOnlyList<long> barrierReleasedIds = Array.Empty<long>();
+
+            // Per-key barrier: when PerKey ordering is active and at least one entry was nacked, apply
+            // head-of-line blocking per key. Any confirmed sibling with a higher Id than the first nacked
+            // entry in its key group must not be marked delivered until the nacked head is retried and
+            // confirmed. Keyless entries (OrderingKey == null) are always independent and never blocked.
             //
-            // The None path is bit-identical to pre-R7.7.6: no Dictionary allocation, no extra
-            // branches taken — zero overhead on the default ordering mode.
+            // The None path takes no extra branches and allocates no Dictionary — zero overhead on the
+            // default ordering mode.
             if (_options.OrderingMode == OrderingMode.PerKey && nackedIds.Count > 0)
             {
-                // Rebuild confirmedIds and releaseIds applying per-key head-of-line blocking.
-                // Keyless entries (OrderingKey == null) are handled in a separate pre-pass so
-                // that the keyed dictionary uses non-nullable string keys (satisfying the
-                // notnull TKey constraint and avoiding any nullable-analysis noise).
+                // Rebuild the three lists applying per-key head-of-line blocking. Keyless entries
+                // (OrderingKey == null) are handled in a separate pre-pass so that the keyed dictionary
+                // uses non-nullable string keys (satisfying the notnull TKey constraint).
                 confirmedIds = new List<long>(pending.Count);
-                List<long> releaseIds = [];
-                int blockedCount = 0;
+                nackedIds = [];
+                List<long> blockedSiblingIds = [];
 
                 // Pre-pass: keyless entries are always independent — route them directly.
                 for (int i = 0; i < pending.Count; i++)
@@ -237,7 +298,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                     if (pending[i].OrderingKey is null)
                     {
                         if (results[i].IsConfirmed) confirmedIds.Add(ids[i]);
-                        else releaseIds.Add(ids[i]);
+                        else nackedIds.Add(ids[i]);
                     }
                 }
 
@@ -269,39 +330,31 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                         if (!confirmed && id < firstNackedId) firstNackedId = id;
                     }
 
-                    if (firstNackedId == long.MaxValue)
+                    foreach ((long id, bool confirmed) in group)
                     {
-                        // No nack in this group — all entries confirmed, no barrier.
-                        foreach ((long id, bool _) in group) confirmedIds.Add(id);
-                    }
-                    else
-                    {
-                        // Barrier at firstNackedId: entries strictly before it are confirmed;
-                        // entries at or after it are released (nacked head + blocked siblings).
-                        foreach ((long id, bool _) in group)
+                        if (id < firstNackedId)
                         {
-                            if (id < firstNackedId)
-                            {
-                                confirmedIds.Add(id);
-                            }
-                            else
-                            {
-                                releaseIds.Add(id);
-                                blockedCount++;
-                            }
+                            // Before the barrier (or no nack in this group): delivered.
+                            confirmedIds.Add(id);
                         }
-
-                        // The nacked head itself is not a "blocked sibling" — exclude it from
-                        // the count so the log reflects only the held-back confirmed siblings.
-                        blockedCount--;
+                        else if (!confirmed)
+                        {
+                            // Rejected by the transport: a nack (deferred retry).
+                            nackedIds.Add(id);
+                        }
+                        else
+                        {
+                            // Accepted by the transport but behind the nacked head: barrier sibling.
+                            blockedSiblingIds.Add(id);
+                        }
                     }
                 }
 
-                nackedIds = releaseIds;
+                barrierReleasedIds = blockedSiblingIds;
 
-                if (blockedCount > 0)
+                if (blockedSiblingIds.Count > 0)
                 {
-                    LogPerKeyBarrierApplied(_logger, blockedCount);
+                    LogPerKeyBarrierApplied(_logger, blockedSiblingIds.Count);
                 }
             }
 
@@ -312,11 +365,19 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
                 await store.MarkDeliveredAsync(confirmedIds, ct).ConfigureAwait(false);
             }
 
+            if (nackedIds.Count > 0 || barrierReleasedIds.Count > 0)
+            {
+                // Release this instance's claim on both kinds of rows in ONE store call, so neither waits
+                // for OutboxLockTimeout: nacked rows are deferred by the store's backoff schedule (not
+                // claimable again before their deferral elapses, RetryCount incremented); barrier siblings
+                // are released without a deferral and without counting a retry.
+                retainedByStore = await store
+                    .ReleaseLockAsync(nackedIds, barrierReleasedIds, ct)
+                    .ConfigureAwait(false);
+            }
+
             if (nackedIds.Count > 0)
             {
-                // Explicitly release the per-instance lock on nacked rows so they are re-claimed on
-                // the next poll cycle (~PollingInterval) instead of waiting for OutboxLockTimeout.
-                retainedByStore = await store.ReleaseLockAsync(nackedIds, ct).ConfigureAwait(false);
                 LogPartialSendFailure(_logger, nackedIds.Count, pending.Count);
             }
 
@@ -336,7 +397,7 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
             }
         }
 
-        return (pending.Count, confirmedCount);
+        return (pending.Count, confirmedCount, nackedCount);
     }
 
     [LoggerMessage(
@@ -374,11 +435,20 @@ internal sealed partial class OutboxDispatcher : IHostedService, IAsyncDisposabl
 
     [LoggerMessage(
         Level = LogLevel.Warning,
-        Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker; their locks were released for retry on the next poll cycle.")]
+        Message = "{NackedCount} of {TotalCount} outbox messages were not confirmed by the broker; they were released for a deferred retry.")]
     private static partial void LogPartialSendFailure(ILogger logger, int nackedCount, int totalCount);
 
     [LoggerMessage(
         Level = LogLevel.Debug,
-        Message = "Per-key ordering barrier applied: {BlockedCount} confirmed sibling(s) were held back due to a nacked head-of-line entry in their key group and will retry on the next poll cycle.")]
+        Message = "Per-key ordering barrier applied: {BlockedCount} confirmed sibling(s) behind a nacked head-of-line entry in their key group were released without deferral and will be sent again after the head of their key is delivered.")]
     private static partial void LogPerKeyBarrierApplied(ILogger logger, int blockedCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Debug,
+        Message = "Outbox drain streak ended after {BatchCount} batch(es): {NackedCount} of {ClaimedCount} claimed messages were nacked; the streak cap was halved.")]
+    private static partial void LogDrainStreakNackShare(
+        ILogger logger,
+        int batchCount,
+        int nackedCount,
+        int claimedCount);
 }

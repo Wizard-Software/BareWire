@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Testing;
@@ -71,6 +70,13 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
 
     private static EfCoreOutboxStore CreateStore(OutboxDbContext context, string instanceId, OutboxOptions options)
         => new(context, new OutboxInstanceId(instanceId), new PostgresOutboxSqlDialect(), options);
+
+    private static EfCoreOutboxStore CreateStore(
+        OutboxDbContext context,
+        string instanceId,
+        OutboxOptions options,
+        TimeProvider timeProvider)
+        => new(context, new OutboxInstanceId(instanceId), new PostgresOutboxSqlDialect(), options, timeProvider);
 
     private static OutboxOptions CreateOptions(TimeSpan? lockTimeout = null)
         => new()
@@ -315,12 +321,14 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         }
     }
 
-    // ── Test #3: Explicit release re-claims immediately (R7.6) ─────────────────
+    // ── Test #3: Explicit nack release defers the row, then another instance re-claims it ──
 
     /// <summary>
-    /// After a nack, <see cref="EfCoreOutboxStore.ReleaseLockAsync"/> must clear the row's lock so a
-    /// different instance re-claims it on the very next poll — without waiting for
-    /// <c>OutboxLockTimeout</c> to expire (R7.6, low-latency retry).
+    /// After a nack, <see cref="EfCoreOutboxStore.ReleaseLockAsync(IReadOnlyList{long}, CancellationToken)"/>
+    /// drops the instance's ownership and defers the row by the nack backoff: the row is not claimable
+    /// before its deferral elapses, and a different instance re-claims it right after — on the next poll
+    /// cycle, far below <c>OutboxLockTimeout</c>. Both instances share one manually advanced clock, so
+    /// the deferral is observed deterministically.
     /// </summary>
     [Fact]
     public async Task ReleaseLockAsync_AfterNack_RowReClaimedNextCycleWithoutWaitingForLockTimeout()
@@ -333,53 +341,73 @@ public sealed class OutboxClaimE2ETests : IAsyncLifetime
         OutboxOptions options = CreateOptions(lockTimeout: TimeSpan.FromSeconds(30));
         await SeedPendingRowsAsync(seedContext, count: 1);
 
+        var clock = new ManualTimeProvider(DateTimeOffset.UtcNow);
+
         await using OutboxDbContext contextA = CreateDbContext();
         await using OutboxDbContext contextB = CreateDbContext();
-        EfCoreOutboxStore storeA = CreateStore(contextA, "instance-A", options);
-        EfCoreOutboxStore storeB = CreateStore(contextB, "instance-B", options);
+        EfCoreOutboxStore storeA = CreateStore(contextA, "instance-A", options, clock);
+        EfCoreOutboxStore storeB = CreateStore(contextB, "instance-B", options, clock);
 
         // Act — instance A claims the row (a dispatch cycle), then releases it after a simulated nack.
         IReadOnlyList<OutboxEntry> claimed = await storeA.GetPendingAsync(10, CancellationToken.None);
         claimed.Should().HaveCount(1, "the seeded row must be claimable");
         long claimedId = claimed[0].Id;
 
-        var stopwatch = Stopwatch.StartNew();
         IReadOnlySet<long> retained = await storeA.ReleaseLockAsync([claimedId], CancellationToken.None);
 
+        IReadOnlyList<OutboxEntry> beforeDeferral = Array.Empty<OutboxEntry>();
         IReadOnlyList<OutboxEntry> reClaimed = Array.Empty<OutboxEntry>();
         try
         {
             // EF Core copies each row into a fresh per-cycle buffer, so it retains none.
             retained.Should().BeEmpty("EF Core retains no caller buffers");
 
-            // The lock must be cleared in the database.
+            // The nack release drops ownership but defers the row instead of unlocking it.
             await using (OutboxDbContext verifyContext = CreateDbContext())
             {
                 OutboxMessage row = await verifyContext.OutboxMessages
                     .AsNoTracking()
                     .SingleAsync(m => m.Id == claimedId);
-                row.LockedAt.Should().BeNull("ReleaseLockAsync must zero LockedAt");
-                row.LockedBy.Should().BeNull("ReleaseLockAsync must zero LockedBy");
+                row.LockedBy.Should().BeNull("the nack release drops this instance's ownership");
+                row.LockedAt.Should().NotBeNull("a nacked row is deferred, not unlocked");
+                row.RetryCount.Should().Be(1, "a transport nack counts one retry");
                 row.DeliveredAt.Should().BeNull("a nacked row must not be marked delivered");
             }
 
-            // A *different* instance must re-claim the row immediately — far below OutboxLockTimeout.
-            // Without the explicit release, instance B would see instance A's fresh (non-stale) lock
-            // and claim nothing until the 30 s timeout elapsed.
-            reClaimed = await storeB.GetPendingAsync(10, CancellationToken.None);
-            stopwatch.Stop();
+            // Before the deferral elapses no instance may claim the row — not even a different one.
+            beforeDeferral = await storeB.GetPendingAsync(10, CancellationToken.None);
+            beforeDeferral.Should().BeEmpty("a nacked row is not claimable before its deferral elapses");
 
-            reClaimed.Should().HaveCount(1,
-                "the released row must be re-claimable by another instance on the next poll");
+            // The first-nack deferral is one PollingInterval plus at most ~20% jitter, so two intervals
+            // are always enough — and still far below OutboxLockTimeout.
+            TimeSpan waited = options.PollingInterval * 2;
+            waited.Should().BeLessThan(options.OutboxLockTimeout,
+                "the row must return after its deferral, not after OutboxLockTimeout");
+            clock.Advance(waited);
+
+            // A *different* instance re-claims the row once the deferral has elapsed.
+            reClaimed = await storeB.GetPendingAsync(10, CancellationToken.None);
+            reClaimed.Should().ContainSingle(
+                "the deferred row must be re-claimable by another instance once its deferral elapsed");
             reClaimed[0].Id.Should().Be(claimedId);
-            stopwatch.Elapsed.Should().BeLessThan(options.OutboxLockTimeout,
-                "the row is re-claimed via explicit release, not by waiting for OutboxLockTimeout");
         }
         finally
         {
             ReturnBuffers(claimed);
+            ReturnBuffers(beforeDeferral);
             ReturnBuffers(reClaimed);
         }
+    }
+
+    // Manually advanced clock shared by several store instances, so deferral-based claim eligibility is
+    // observed deterministically instead of by sleeping in real time.
+    private sealed class ManualTimeProvider(DateTimeOffset start) : TimeProvider
+    {
+        private DateTimeOffset _utcNow = start;
+
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+
+        public void Advance(TimeSpan delta) => _utcNow += delta;
     }
 
     // ── Test #4: Release respects instance ownership (cross-instance guard) ────
