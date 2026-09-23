@@ -7,6 +7,9 @@ using BareWire.Transport.InMemory.Configuration;
 using BareWire.Transport.InMemory.Internal;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BareWire.Transport.InMemory;
 
@@ -36,6 +39,16 @@ public static class ServiceCollectionExtensions
     /// Call this method once per <see cref="IServiceCollection"/>. A second call on the same collection
     /// still validates its options but is otherwise ignored as a whole — it does not create a second
     /// in-memory broker, replace the per-type routing mappings, or merge the two configurations.
+    /// </para>
+    /// <para>
+    /// Also registers a hosted service that logs, once at startup, the transport's at-most-once delivery
+    /// guarantee (Warning in the Production environment, Information otherwise) and a warning when the
+    /// transactional outbox is enabled without an inbox for consumers of fanout or topic queues. The
+    /// hosted service only runs under a generic host (an <c>IHost</c> or ASP.NET Core application) that
+    /// starts registered <see cref="Microsoft.Extensions.Hosting.IHostedService"/> instances — starting
+    /// the bus directly via <c>IBusControl</c> without a generic host does not trigger it. A standard
+    /// EF Core outbox registration (<c>AddBareWireOutbox</c>) always registers an inbox alongside the
+    /// outbox, so the fanout warning is reserved for a custom outbox registration that omits the inbox.
     /// </para>
     /// </remarks>
     /// <param name="services">The <see cref="IServiceCollection"/> to register services into.</param>
@@ -119,6 +132,16 @@ public static class ServiceCollectionExtensions
             })
             .ToList();
         services.TryAddSingleton<IReadOnlyList<EndpointBinding>>(bindings);
+
+        // The probe reads `services` at hosted-service RESOLUTION time (not here), so a call to
+        // AddBareWireOutbox after AddBareWireInMemory is still detected — the collection is complete by
+        // then even though it is not complete now.
+        services.AddHostedService(sp => new InMemoryStartupDiagnostics(
+            sp.GetRequiredService<InMemoryTransportOptions>(),
+            (sp.GetRequiredService<ITransportAdapter>() as InMemoryTransportAdapter)?.Registry,
+            OutboxRegistrationProbe.Inspect(services),
+            sp.GetService<IHostEnvironment>(),
+            sp.GetService<ILogger<InMemoryStartupDiagnostics>>() ?? NullLogger<InMemoryStartupDiagnostics>.Instance));
 
         return services;
     }

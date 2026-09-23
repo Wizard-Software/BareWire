@@ -67,6 +67,25 @@ process memory only:
 When at-least-once delivery is required, use a broker-backed transport (RabbitMQ, Kafka, ...)
 instead of this one.
 
+## Startup diagnostics
+
+`AddBareWireInMemory` registers a hosted service that logs the delivery guarantee above exactly once
+at startup, so it is visible in the log stream without reading this document. The notice is logged at
+`Warning` only when the registered `IHostEnvironment.EnvironmentName` is exactly `"Production"`
+(case-insensitive); every other environment name — including a variant such as `"Prod"` or
+`"prod-eu"` — and the case where no `IHostEnvironment` is registered at all both log at
+`Information`. The hosted service runs only under a generic host (an `IHost` or an ASP.NET Core
+application) that starts registered hosted services; starting the bus directly through `IBusControl`
+without a generic host does not trigger this notice.
+
+A second, separate `Warning` is logged when the transactional outbox is registered without an inbox
+and at least one consumer queue is fed by a `Fanout` or `Topic` exchange — an outbox retry can
+re-deliver a message to a queue that already accepted it on a prior attempt, and without an inbox
+that redelivery is not deduplicated. The standard EF Core outbox registration
+(`BareWire.Outbox.EntityFramework`'s `AddBareWireOutbox`) always registers an inbox for every
+endpoint alongside the outbox, so this warning does not appear on that path — it is reserved for a
+custom outbox registration that registers the outbox store without an inbox store.
+
 ## Trust boundary
 
 All publishers and consumers wired through this transport share the trust boundary of the hosting

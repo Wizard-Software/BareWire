@@ -1,3 +1,4 @@
+using System.CodeDom.Compiler;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using AwesomeAssertions;
@@ -52,6 +53,18 @@ public sealed class InMemoryAssemblyReferenceTests
                     continue;
                 }
 
+                // The [LoggerMessage] source generator emits `static readonly` delegate-typed fields
+                // (an Action cache for a fixed-level message, a Func in a nested state struct for a
+                // dynamic-level one). They carry only GeneratedCodeAttribute (on the field or its
+                // declaring type) rather than CompilerGeneratedAttribute, but are immutable and
+                // generator-owned, so they do not violate the "no mutable static state" rule.
+                if (field.IsInitOnly
+                    && typeof(Delegate).IsAssignableFrom(field.FieldType)
+                    && IsGeneratedByLoggingMessageGenerator(field))
+                {
+                    continue;
+                }
+
                 bool isAllowedType = AllowedStaticFieldTypes.Contains(field.FieldType) || field.FieldType.IsEnum;
 
                 if (!field.IsInitOnly || !isAllowedType)
@@ -63,5 +76,13 @@ public sealed class InMemoryAssemblyReferenceTests
         }
 
         violations.Should().BeEmpty();
+    }
+
+    private static bool IsGeneratedByLoggingMessageGenerator(FieldInfo field)
+    {
+        GeneratedCodeAttribute? attribute = field.GetCustomAttribute<GeneratedCodeAttribute>()
+            ?? field.DeclaringType?.GetCustomAttribute<GeneratedCodeAttribute>();
+        return attribute is not null
+            && string.Equals(attribute.Tool, "Microsoft.Extensions.Logging.Generators", StringComparison.Ordinal);
     }
 }
