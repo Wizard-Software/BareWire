@@ -88,6 +88,11 @@ A row is claimable when:
 - `DeliveredAt IS NULL` — the row has not yet been delivered, AND
 - `LockedAt IS NULL` (unclaimed) OR `LockedAt < NOW() - OutboxLockTimeout` (lock expired)
 
+`NOW()` here is read on the application side from the `TimeProvider` registered in the DI container
+(`TimeProvider.System` unless you register your own before calling `AddBareWireOutbox`). That clock must
+track real UTC time with a zero offset, clock skew between instances must stay well below
+`OutboxLockTimeout`, and a test clock must never be registered in a production host.
+
 ### Crash Recovery
 
 If a dispatcher instance crashes between claiming rows and publishing them to the broker,

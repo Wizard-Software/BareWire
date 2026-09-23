@@ -43,6 +43,13 @@ public static class ServiceCollectionExtensions
     /// Thrown when the outbox configuration supplied via <paramref name="configureOutbox"/>
     /// contains invalid values (e.g. non-positive intervals, out-of-range batch size).
     /// </exception>
+    /// <remarks>
+    /// The outbox reads time from the <see cref="TimeProvider"/> registered in the container
+    /// (<see cref="TimeProvider.System"/> when none is registered) to stamp claims and to decide when
+    /// an abandoned claim may be taken over. That clock must track real UTC time with a zero offset,
+    /// and clock skew between instances must stay well below the outbox lock timeout. Never register
+    /// a test clock (for example a fake or frozen time provider) in a production host.
+    /// </remarks>
     public static IServiceCollection AddBareWireOutbox(
         this IServiceCollection services,
         Action<DbContextOptionsBuilder> configureDbContext,
@@ -71,6 +78,13 @@ public static class ServiceCollectionExtensions
         // without a matching dialect use a non-atomic client-side fallback (single-instance/testing).
         services.TryAddSingleton<IOutboxSqlDialect, PostgresOutboxSqlDialect>();
 
+        // Clock for claim timestamps and stale-lock expiry. Defaults to the system clock; register a
+        // TimeProvider BEFORE calling AddBareWireOutbox to override it (TryAdd keeps your registration).
+        services.TryAddSingleton(TimeProvider.System);
+
+        // Randomness source for retry jitter (internal; defaults to Random.Shared).
+        services.TryAddSingleton<IOutboxJitterSource>(SharedRandomOutboxJitterSource.Instance);
+
         // Register the EF Core store implementations as scoped — they depend on the
         // scoped OutboxDbContext and must not outlive it.
         // Factory lambdas are required because the implementation classes have internal constructors.
@@ -79,7 +93,9 @@ public static class ServiceCollectionExtensions
                 sp.GetRequiredService<OutboxDbContext>(),
                 sp.GetRequiredService<OutboxInstanceId>(),
                 sp.GetRequiredService<IOutboxSqlDialect>(),
-                sp.GetRequiredService<OutboxOptions>()));
+                sp.GetRequiredService<OutboxOptions>(),
+                sp.GetRequiredService<TimeProvider>(),
+                sp.GetRequiredService<IOutboxJitterSource>()));
 
         // Register the default SQL dialect for inbox upserts (PostgreSQL).
         // Users can replace this with a custom implementation for other database providers.

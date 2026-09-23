@@ -10,12 +10,18 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
 {
     private readonly int _maxPendingMessages;
     private readonly OutboxOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly IOutboxJitterSource _jitterSource;
     private readonly ConcurrentQueue<OutboxEntry> _pending = new();
     private readonly ConcurrentDictionary<long, OutboxEntry> _all = new();
     private long _nextId;
     private bool _disposed;
 
-    internal InMemoryOutboxStore(OutboxOptions? options = null, int maxPendingMessages = 10_000)
+    internal InMemoryOutboxStore(
+        OutboxOptions? options = null,
+        int maxPendingMessages = 10_000,
+        TimeProvider? timeProvider = null,
+        IOutboxJitterSource? jitterSource = null)
     {
         if (maxPendingMessages <= 0)
         {
@@ -27,7 +33,15 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
 
         _options = options ?? OutboxOptions.Default;
         _maxPendingMessages = maxPendingMessages;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _jitterSource = jitterSource ?? SharedRandomOutboxJitterSource.Instance;
     }
+
+    // The clock every time-dependent operation of this store reads — exactly once per operation.
+    internal TimeProvider TimeProvider => _timeProvider;
+
+    // Randomness source for retry jitter.
+    internal IOutboxJitterSource JitterSource => _jitterSource;
 
     public ValueTask SaveMessagesAsync(
         IReadOnlyList<OutboundMessage> messages,
@@ -48,7 +62,7 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
                 "Increase maxPendingMessages or ensure the outbox dispatcher is running.");
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _timeProvider.GetUtcNow();
 
         foreach (OutboundMessage message in messages)
         {
@@ -160,7 +174,7 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _timeProvider.GetUtcNow();
 
         foreach (long id in ids)
         {
@@ -211,7 +225,7 @@ internal sealed class InMemoryOutboxStore : IOutboxStore, IAsyncDisposable
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        DateTimeOffset cutoff = DateTimeOffset.UtcNow - retention;
+        DateTimeOffset cutoff = _timeProvider.GetUtcNow() - retention;
 
         foreach ((long id, OutboxEntry entry) in _all)
         {

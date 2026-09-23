@@ -12,12 +12,16 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
     private readonly string _instanceId;
     private readonly IOutboxSqlDialect _dialect;
     private readonly OutboxOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly IOutboxJitterSource _jitterSource;
 
     internal EfCoreOutboxStore(
         OutboxDbContext dbContext,
         OutboxInstanceId instanceId,
         IOutboxSqlDialect dialect,
-        OutboxOptions options)
+        OutboxOptions options,
+        TimeProvider? timeProvider = null,
+        IOutboxJitterSource? jitterSource = null)
     {
         ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(instanceId);
@@ -28,7 +32,16 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         _instanceId = instanceId.Value;
         _dialect = dialect;
         _options = options;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _jitterSource = jitterSource ?? SharedRandomOutboxJitterSource.Instance;
     }
+
+    // The clock every time-dependent operation of this store reads — exactly once per operation, so
+    // the claim timestamp and the stale-lock cutoff always derive from the same instant.
+    internal TimeProvider TimeProvider => _timeProvider;
+
+    // Randomness source for retry jitter.
+    internal IOutboxJitterSource JitterSource => _jitterSource;
 
     public ValueTask SaveMessagesAsync(
         IReadOnlyList<OutboundMessage> messages,
@@ -41,7 +54,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             return ValueTask.CompletedTask;
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _timeProvider.GetUtcNow();
 
         foreach (OutboundMessage message in messages)
         {
@@ -75,7 +88,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         int batchSize,
         CancellationToken cancellationToken = default)
     {
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _timeProvider.GetUtcNow();
         DateTimeOffset staleCutoff = now - _options.OutboxLockTimeout;
 
         // Use the configured dialect's atomic claim only when it targets the active EF Core
@@ -222,10 +235,12 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             return;
         }
 
+        DateTimeOffset deliveredAt = _timeProvider.GetUtcNow();
+
         await _dbContext.Set<OutboxMessage>()
             .Where(m => ids.Contains(m.Id))
             .ExecuteUpdateAsync(
-                s => s.SetProperty(m => m.DeliveredAt, DateTimeOffset.UtcNow),
+                s => s.SetProperty(m => m.DeliveredAt, deliveredAt),
                 cancellationToken)
             .ConfigureAwait(false);
     }
@@ -263,7 +278,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         TimeSpan retention,
         CancellationToken cancellationToken = default)
     {
-        DateTimeOffset cutoff = DateTimeOffset.UtcNow - retention;
+        DateTimeOffset cutoff = _timeProvider.GetUtcNow() - retention;
 
         await _dbContext.Set<OutboxMessage>()
             .Where(m => m.DeliveredAt != null && m.DeliveredAt < cutoff)
