@@ -164,14 +164,14 @@ public sealed class InMemoryServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public async Task SendBatchAsync_OnSkeletonAdapter_ThrowsNotSupportedException()
+    public async Task SendBatchAsync_WithEmptyBatch_ReturnsEmptyResults()
     {
         using ServiceProvider sp = Build();
         ITransportAdapter adapter = sp.GetRequiredService<ITransportAdapter>();
 
-        Func<Task> act = () => adapter.SendBatchAsync([]);
+        IReadOnlyList<SendResult> result = await adapter.SendBatchAsync([]);
 
-        await act.Should().ThrowAsync<NotSupportedException>();
+        result.Should().BeEmpty();
     }
 
     private sealed record OrderCreated(Guid Id);

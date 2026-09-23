@@ -96,6 +96,48 @@ broker-backed transport with its own access-control model. Sensitive payload con
 application-level encryption regardless of transport. Header name mapping and header allow-listing
 are not available on this transport; application headers pass through without filtering.
 
+## Sending
+
+`SendBatchAsync` accepts a batch of outbound messages and returns one `SendResult` per message, in the
+same order. Each message is validated and routed independently — a rejection of one message never
+affects the others.
+
+`IsConfirmed = true` means a copy of the body reached **every** target queue the message routed to. It
+is an admission signal, not a durability guarantee: in-memory delivery is explicitly at-most-once (see
+above). A fan-out message accepted by only some of its target queues is reported as `false` overall,
+but the copies that were accepted stay accepted — a partial fan-out failure is never rolled back.
+
+The specific rejection reason (`queue_full`, `cancelled`, `closed`, `oversized`, `undeclared_exchange`,
+`no_exchange`, `routing_key_too_long`, `internal_error`) is never returned to the caller — it is only
+observable through this adapter's logs and metrics, aggregated per (queue or declared exchange, reason)
+and throttled to one log entry per key per 60-second window, never logged per message. The `oversized`
+and `routing_key_too_long` reasons are only tagged with the exchange name when that exchange is declared
+in the topology — an undeclared, publisher-supplied exchange name never becomes a metric tag or a log
+key. Validation places no upper bound on `MaxMessageSize` itself; see "Memory bound" above for the
+resulting worst-case footprint.
+
+A full target queue with no active consumer latches itself immediately and rejects further sends without
+waiting — the "Publisher isolation when a consumer stalls" and "Queue capacity vs. burst" sections above
+already describe that latch, its 50%-occupancy release hysteresis, and the one-wait-per-call budget in
+full. To restate the one-wait rule precisely: a call waits **at most once**, for at most `SendTimeout`,
+no matter how many messages or target queues in the batch are full when it runs — every full queue
+reached before that one wait is spent is retried within the same shared budget; every one reached
+afterwards is rejected immediately, with no further waiting. `SendTimeout = TimeSpan.Zero` means "never
+wait": a full queue is always rejected immediately, and a queue that would otherwise be latched by a
+failed wait is only ever latched by `TryReserve` itself (full, no active consumer), never by a send call.
+
+Cancelling the call's token while its one wait is in flight never throws
+`OperationCanceledException`: the message that was waiting, its still-pending target queues, and every
+later message in the batch are reported as not confirmed, and the call returns normally. A token already
+cancelled before any message is processed does throw, however, since nothing has been admitted yet.
+
+Once the adapter is disposed, a send call — and any message of a call already in flight — reports
+`false` with reason `closed` instead of throwing `ObjectDisposedException`.
+
+The rejected-copies/messages counter (`barewire.inmemory.send.rejected`) is a provisional name and
+shape: a later subtask may fold it into a single, transport-wide rejection counter alongside the
+existing `barewire.inmemory.unroutable` counter.
+
 ## Sizing
 
 ### Queue capacity vs. burst

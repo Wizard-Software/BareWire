@@ -22,32 +22,57 @@ namespace BareWire.Transport.InMemory;
 /// <see cref="TransportAffinity.ConsistentHash"/> (as a <see cref="BareWireConfigurationException"/>).
 /// Once built, the topology is frozen: <see cref="DeployTopologyAsync"/> accepts only the same declaration
 /// (idempotent no-op) and rejects any other one, and <see cref="ConsumeAsync"/> refuses to start on an
-/// undeclared queue. Sending and settling messages are added by later subtasks and still throw
+/// undeclared queue. <see cref="SendBatchAsync"/> accepts a batch of outbound messages per its own
+/// remarks; settling messages is added by a later subtask and still throws
 /// <see cref="NotSupportedException"/>. Registered as an <see cref="ITransportAdapter"/> DI singleton
 /// by <c>AddBareWireInMemory</c>.
 /// </summary>
-/// <param name="options">The transport options the adapter was configured with.</param>
-/// <param name="broker">The container-scoped broker owning the queues.</param>
-/// <param name="logger">An optional logger; defaults to a no-op logger.</param>
-/// <param name="meter">An optional meter for the consume-path counters; no instruments when omitted.</param>
-internal sealed class InMemoryTransportAdapter(
-    InMemoryTransportOptions options,
-    InMemoryBroker broker,
-    ILogger<InMemoryTransportAdapter>? logger = null,
-    Meter? meter = null)
-    : ITransportAdapter, IDisposable, IAsyncDisposable
+internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable, IAsyncDisposable
 {
-    // Initialized first (field initializers run in declaration order), so an unsupported affinity fails
-    // before the topology registry is built.
-    private readonly FrozenDictionary<string, SemaphoreSlim> _singleActiveGates = BuildSingleActiveGates(options);
-
-    private readonly InMemoryConsumeDiagnostics _diagnostics =
-        new(logger ?? (ILogger)NullLogger<InMemoryTransportAdapter>.Instance, meter);
+    private readonly FrozenDictionary<string, SemaphoreSlim> _singleActiveGates;
+    private readonly InMemoryConsumeDiagnostics _diagnostics;
+    private readonly InMemorySendDiagnostics _sendDiagnostics;
+    private readonly InMemorySender _sender;
 
     // Never disposed: a runner's finally block may still observe it after shutdown. A cancellation token
     // source without a timer holds no unmanaged resource.
     private readonly CancellationTokenSource _shutdown = new();
     private int _disposed;
+
+    /// <param name="options">The transport options the adapter was configured with.</param>
+    /// <param name="broker">The container-scoped broker owning the queues.</param>
+    /// <param name="logger">An optional logger; defaults to a no-op logger.</param>
+    /// <param name="meter">An optional meter for the consume- and send-path counters; no instruments when omitted.</param>
+    /// <remarks>
+    /// An explicit constructor, not a primary one: <see cref="Registry"/> and the send-path collaborators
+    /// built from it (<see cref="Router"/>, the sender) must be assigned in the constructor BODY, after
+    /// <see cref="Registry"/> itself — a primary constructor's field/property initializers cannot
+    /// reference another instance member being initialized in the same constructor.
+    /// </remarks>
+    internal InMemoryTransportAdapter(
+        InMemoryTransportOptions options,
+        InMemoryBroker broker,
+        ILogger<InMemoryTransportAdapter>? logger = null,
+        Meter? meter = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(broker);
+
+        ILogger effectiveLogger = logger ?? (ILogger)NullLogger<InMemoryTransportAdapter>.Instance;
+
+        // Built first, so an unsupported affinity fails before the topology registry is built.
+        _singleActiveGates = BuildSingleActiveGates(options);
+        _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, meter);
+
+        Options = options;
+        Broker = broker;
+        Registry = AttachRegistry(broker, InMemoryTopologyInterpreter.BuildRegistry(options));
+        InFlight = new InMemoryDeliveryMap();
+
+        Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), meter);
+        _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, meter);
+        _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed);
+    }
 
     /// <inheritdoc />
     public string TransportName => "InMemory";
@@ -55,9 +80,9 @@ internal sealed class InMemoryTransportAdapter(
     /// <inheritdoc />
     public TransportCapabilities Capabilities => TransportCapabilities.None;
 
-    internal InMemoryTransportOptions Options { get; } = options;
+    internal InMemoryTransportOptions Options { get; }
 
-    internal InMemoryBroker Broker { get; } = broker;
+    internal InMemoryBroker Broker { get; }
 
     /// <summary>
     /// Gets the sealed topology registry built from <see cref="Options"/> at construction time. Never
@@ -65,16 +90,25 @@ internal sealed class InMemoryTransportAdapter(
     /// <see cref="Broker"/> immediately after it is built, so the broker's queues exist by the time
     /// construction completes.
     /// </summary>
-    internal ExchangeRegistry Registry { get; } = AttachRegistry(broker, InMemoryTopologyInterpreter.BuildRegistry(options));
+    internal ExchangeRegistry Registry { get; }
+
+    /// <summary>
+    /// Gets the router the send path resolves target queues with, built from <see cref="Registry"/> at
+    /// construction time. Exposed for tests; the send path never needs to look it up elsewhere.
+    /// </summary>
+    internal InMemoryRouter Router { get; }
 
     /// <summary>
     /// Gets the deliveries handed to consumers and not settled yet. Settlement, the shutdown sweep, and
     /// each runner's cleanup claim entries from it; see <see cref="TryTakeInFlight"/>.
     /// </summary>
-    internal InMemoryDeliveryMap InFlight { get; } = new();
+    internal InMemoryDeliveryMap InFlight { get; }
 
     /// <summary>Gets the number of unsettled deliveries dropped because the adapter shut down.</summary>
     internal long DroppedOnShutdownCount => _diagnostics.DroppedOnShutdownCount;
+
+    /// <summary>Gets the total number of rejected copies/messages recorded by the send path so far.</summary>
+    internal long SendRejectedCount => _sendDiagnostics.RejectedCount;
 
     /// <summary>
     /// Gets the number of deliveries dropped because the consumer disposed their messages without settling
@@ -113,12 +147,73 @@ internal sealed class InMemoryTransportAdapter(
         return gates.ToFrozenDictionary(StringComparer.Ordinal);
     }
 
+    private bool IsClosed() => Volatile.Read(ref _disposed) != 0;
+
     /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// Every message in <paramref name="messages"/> is validated and routed independently: a rejection of
+    /// one message (an unresolved exchange, an oversized body, an unroutable routing key with
+    /// <see cref="InMemoryTransportOptions.GuaranteedRouting"/> enabled, or a full destination queue)
+    /// never affects the others, and every element gets exactly one <see cref="SendResult"/>, in the same
+    /// order. <see cref="SendResult.IsConfirmed"/> means a copy of the body reached every one of that
+    /// message's target queues — an admission signal, not a durability guarantee (in-memory delivery is
+    /// explicitly at-most-once; see the project README). A fan-out message accepted by only some of its
+    /// target queues is reported as <see langword="false"/> overall; the copies that WERE accepted stay
+    /// accepted. The specific rejection reason is never returned to the caller — it is only observable
+    /// through this adapter's logs and metrics, aggregated and throttled, never logged per message.
+    /// </para>
+    /// <para>
+    /// The call waits at most once, for at most <see cref="InMemoryTransportOptions.SendTimeout"/>, no
+    /// matter how many messages or target queues in the batch are full — every full queue reached before
+    /// that one wait is spent is retried within the same shared budget; every one reached afterwards is
+    /// rejected immediately, without waiting. This adapter creates no <see cref="CancellationTokenSource"/>
+    /// for either path: the wait's timeout is a parameter of the target queue's own wait (backed by that
+    /// queue's <see cref="TimeProvider"/>), so the cost of that one wait — a timer, a promise, and a
+    /// queued waiter, roughly 900-975 bytes — is paid by the queue, at most once per call, and only when a
+    /// target queue is actually saturated; it is a real cost, not a free one, simply not one this method
+    /// incurs directly.
+    /// </para>
+    /// <para>
+    /// Cancelling <paramref name="cancellationToken"/> while the call's one wait is in flight never
+    /// throws <see cref="OperationCanceledException"/> from this method: the message that was waiting,
+    /// its still-pending target queues, and every later message in the batch are reported as not
+    /// confirmed, and the call returns normally. A token already cancelled before any message is
+    /// processed DOES throw — see below.
+    /// </para>
+    /// <para>
+    /// Once this adapter is disposed, this call — and any later message of a call already in flight —
+    /// reports <see langword="false"/> with reason <c>closed</c> instead of throwing
+    /// <see cref="ObjectDisposedException"/>. A write that races disposal and reaches a queue's channel a
+    /// moment too late leaves an unclaimed pooled buffer behind; reclaiming it is left to a future
+    /// graceful-drain subtask, not this one.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="messages"/>, or one of its elements, is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was already cancelled before any message was processed.
+    /// </exception>
     public Task<IReadOnlyList<SendResult>> SendBatchAsync(
         IReadOnlyList<OutboundMessage> messages,
-        CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException(
-            "The in-memory transport operation 'SendBatchAsync' is not implemented yet.");
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        for (int i = 0; i < messages.Count; i++)
+        {
+            if (messages[i] is null)
+            {
+                throw new ArgumentNullException(nameof(messages), $"The message at index {i} is null.");
+            }
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return messages.Count == 0
+            ? Task.FromResult<IReadOnlyList<SendResult>>(Array.Empty<SendResult>())
+            : _sender.SendAsync(messages, cancellationToken);
+    }
 
     /// <inheritdoc />
     /// <remarks>

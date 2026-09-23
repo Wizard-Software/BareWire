@@ -39,6 +39,18 @@ namespace BareWire.Transport.InMemory.Internal;
 /// </remarks>
 internal sealed class InMemoryQueue
 {
+    /// <summary>
+    /// The largest timeout <see cref="WaitToReserveAsync"/> ever passes to the underlying timed wait.
+    /// <see cref="Task.WaitAsync(TimeSpan, TimeProvider, CancellationToken)"/> throws
+    /// <see cref="ArgumentOutOfRangeException"/> for a timeout at or above roughly 49.7 days
+    /// (<see cref="uint.MaxValue"/> milliseconds); a caller-supplied timeout above this value is silently
+    /// clamped down to it, before a waiter is even enqueued, rather than letting that exception surface
+    /// after a waiter is already installed — which would otherwise strand it in the FIFO forever (a
+    /// permanent queue-slot leak the first release to reach it would hand a slot to, without anyone ever
+    /// observing the grant).
+    /// </summary>
+    internal static readonly TimeSpan MaxSupportedWaitTimeout = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     private readonly Channel<InMemoryDelivery> _channel;
     private readonly TimeProvider _timeProvider;
     private readonly Lock _waitersLock = new();
@@ -431,6 +443,12 @@ internal sealed class InMemoryQueue
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
 
+        // Clamp before anything below enqueues a waiter — see MaxSupportedWaitTimeout.
+        if (timeout > MaxSupportedWaitTimeout)
+        {
+            timeout = MaxSupportedWaitTimeout;
+        }
+
         QueueReservationResult fast = TryReserve();
         if (fast == QueueReservationResult.Reserved)
         {
@@ -478,8 +496,20 @@ internal sealed class InMemoryQueue
             return QueueWaitResult.Reserved;
         }
 
-        Task waitTask = waiter.Task.WaitAsync(timeout, _timeProvider, cancellationToken);
-        await waitTask.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        Task waitTask;
+        try
+        {
+            waitTask = waiter.Task.WaitAsync(timeout, _timeProvider, cancellationToken);
+            await waitTask.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+        catch (Exception)
+        {
+            // Defensive: timeout is already clamped to what the timer supports, so this is not expected
+            // to throw in practice. If it ever does, the waiter must not be left installed — a stranded
+            // live waiter would silently absorb the next released slot forever.
+            TryAbandon(waiter);
+            throw;
+        }
 
         if (waitTask.IsCompletedSuccessfully)
         {

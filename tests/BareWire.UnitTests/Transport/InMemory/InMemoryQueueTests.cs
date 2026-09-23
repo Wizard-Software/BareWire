@@ -372,4 +372,29 @@ public sealed class InMemoryQueueTests
         q.HasPendingSpaceWaiter.Should().BeFalse();
         q.LinkedWaiterCount.Should().Be(0);
     }
+
+    [Fact]
+    public async Task WaitToReserveAsync_WithMaxValueTimeout_CancelledWithoutLeakingWaiter()
+    {
+        var q = new InMemoryQueue("orders", capacity: 1);
+        await using IAsyncEnumerator<InMemoryDelivery> consumer = await StartConsumerAsync(q, TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+
+        ValueTask<QueueWaitResult> wait = q.WaitToReserveAsync(TimeSpan.MaxValue, cts.Token);
+        using var pollCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        pollCts.CancelAfter(TimeSpan.FromSeconds(10));
+        while (!q.HasPendingSpaceWaiter)
+        {
+            await Task.Delay(1, pollCts.Token);
+        }
+
+        await cts.CancelAsync();
+
+        (await wait).Should().Be(QueueWaitResult.Cancelled);
+        q.LinkedWaiterCount.Should().Be(0);
+
+        int occupancyBefore = q.Occupancy;
+        q.ReleaseSlot();
+        q.Occupancy.Should().Be(occupancyBefore - 1);
+    }
 }
