@@ -42,7 +42,7 @@ internal sealed class InMemoryQueue
     private readonly Channel<InMemoryDelivery> _channel;
     private readonly TimeProvider _timeProvider;
     private readonly Lock _waitersLock = new();
-    private readonly Queue<ReserveWaiter> _waiters = new();
+    private readonly LinkedList<ReserveWaiter> _waiters = new();
     private int _occupancy;
     private int _latched;
     private int _activeConsumers;
@@ -96,6 +96,22 @@ internal sealed class InMemoryQueue
     /// be physically dequeued for this to flip to <see langword="false"/>.
     /// </summary>
     internal bool HasPendingSpaceWaiter => Volatile.Read(ref _waiterCount) > 0;
+
+    /// <summary>
+    /// Gets the number of waiter entries physically linked in the FIFO, live or not. A test hook: an
+    /// abandoned waiter unlinks itself immediately, so this never exceeds the live waiters by more than
+    /// the ones abandoning at this very instant.
+    /// </summary>
+    internal int LinkedWaiterCount
+    {
+        get
+        {
+            lock (_waitersLock)
+            {
+                return _waiters.Count;
+            }
+        }
+    }
 
     /// <summary>
     /// Attempts to reserve one slot without waiting. On <see cref="QueueReservationResult.Reserved"/>
@@ -201,14 +217,59 @@ internal sealed class InMemoryQueue
             }
         }
 
-        bool cleared = false;
-        if (Volatile.Read(ref _latched) == 1 && 2L * occupancyAfter < Capacity)
-        {
-            cleared = Interlocked.CompareExchange(ref _latched, 0, 1) == 1;
-        }
+        bool cleared = TryClearLatch(occupancyAfter);
 
+        // A waiter may have been installed after the waiter-count check above yet re-checked occupancy
+        // before the decrement landed: it saw a full queue and is now waiting for the slot just freed.
+        // Both sides publish their counter with a full fence before reading the other one, so at least
+        // one of them observes the other — re-offer the freed slot to such a late waiter.
+        HandOffToLateWaiter();
         return cleared;
     }
+
+    /// <summary>
+    /// Re-offers a slot freed by <see cref="ReleaseSlot"/> to a waiter that was installed concurrently
+    /// with the release and would otherwise sleep until its timeout despite free space. Takes the slot
+    /// back on the waiter's behalf and grants it; when no live waiter is found after all (every counted
+    /// waiter was abandoning at the same instant), gives the slot back and re-checks.
+    /// </summary>
+    private void HandOffToLateWaiter()
+    {
+        SpinWait spinner = default;
+        while (Volatile.Read(ref _waiterCount) > 0)
+        {
+            int occupancy = Volatile.Read(ref _occupancy);
+            if (occupancy >= Capacity)
+            {
+                // a concurrent reservation already consumed the freed slot; a later release serves the waiter
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _occupancy, occupancy + 1, occupancy) != occupancy)
+            {
+                continue;
+            }
+
+            ReserveWaiter? granted = TryGrantToWaiter();
+            if (granted is not null)
+            {
+                granted.Grant();
+                return;
+            }
+
+            TryClearLatch(Interlocked.Decrement(ref _occupancy));
+            spinner.SpinOnce();
+        }
+    }
+
+    /// <summary>
+    /// Clears the latch when <paramref name="occupancyAfter"/> is strictly below 50% of
+    /// <see cref="Capacity"/>. Returns <see langword="true"/> when this call cleared it.
+    /// </summary>
+    private bool TryClearLatch(int occupancyAfter) =>
+        Volatile.Read(ref _latched) == 1
+        && 2L * occupancyAfter < Capacity
+        && Interlocked.CompareExchange(ref _latched, 0, 1) == 1;
 
     /// <summary>
     /// Dequeues waiters from the FIFO, in order, until one is successfully transitioned from pending to
@@ -225,17 +286,18 @@ internal sealed class InMemoryQueue
 
         lock (_waitersLock)
         {
-            while (_waiters.Count > 0)
+            while (_waiters.First is { } node)
             {
-                ReserveWaiter candidate = _waiters.Dequeue();
+                _waiters.RemoveFirst();
+                ReserveWaiter candidate = node.Value;
                 if (candidate.TryMarkGranted())
                 {
                     Interlocked.Decrement(ref _waiterCount);
                     return candidate;
                 }
 
-                // already abandoned by a concurrent timeout/cancellation — its count was decremented
-                // when it was abandoned; drop it from the FIFO and keep looking.
+                // abandoned by a concurrent timeout/cancellation that has not unlinked it yet — its count
+                // was decremented when it was abandoned; drop it from the FIFO and keep looking.
             }
         }
 
@@ -298,9 +360,8 @@ internal sealed class InMemoryQueue
         QueueReservationResult afterEnqueue = TryReserve();
         if (afterEnqueue == QueueReservationResult.Reserved)
         {
-            if (waiter.TryMarkAbandoned())
+            if (TryAbandon(waiter))
             {
-                Interlocked.Decrement(ref _waiterCount);
                 return QueueWaitResult.Reserved;
             }
 
@@ -313,9 +374,8 @@ internal sealed class InMemoryQueue
 
         if (afterEnqueue == QueueReservationResult.Latched)
         {
-            if (waiter.TryMarkAbandoned())
+            if (TryAbandon(waiter))
             {
-                Interlocked.Decrement(ref _waiterCount);
                 return QueueWaitResult.Latched;
             }
 
@@ -332,9 +392,8 @@ internal sealed class InMemoryQueue
             return QueueWaitResult.Reserved;
         }
 
-        if (waiter.TryMarkAbandoned())
+        if (TryAbandon(waiter))
         {
-            Interlocked.Decrement(ref _waiterCount);
             return waitTask.IsCanceled ? QueueWaitResult.Cancelled : QueueWaitResult.TimedOut;
         }
 
@@ -406,25 +465,43 @@ internal sealed class InMemoryQueue
 
     /// <summary>
     /// Creates a new waiter, enqueues it at the tail of the FIFO, and tracks it as live via
-    /// <see cref="_waiterCount"/>. Opportunistically purges abandoned entries at the head of the FIFO so
-    /// it never grows unbounded with dead waiters when many callers time out or are cancelled without an
-    /// intervening <see cref="ReleaseSlot"/> call.
+    /// <see cref="_waiterCount"/>. An abandoned waiter unlinks itself immediately (see
+    /// <see cref="TryAbandon"/>), so the FIFO never accumulates dead waiters behind a live head.
     /// </summary>
     private ReserveWaiter EnqueueWaiter()
     {
         var waiter = new ReserveWaiter();
         lock (_waitersLock)
         {
-            while (_waiters.Count > 0 && _waiters.Peek().IsAbandoned)
-            {
-                _waiters.Dequeue();
-            }
-
-            _waiters.Enqueue(waiter);
+            _waiters.AddLast(waiter.Node);
         }
 
         Interlocked.Increment(ref _waiterCount);
         return waiter;
+    }
+
+    /// <summary>
+    /// Transitions <paramref name="waiter"/> from pending to abandoned and unlinks it from the FIFO at
+    /// once. Returns <see langword="false"/> when a concurrent <see cref="ReleaseSlot"/> already granted
+    /// it a slot — the caller then owns that reservation and must not leak it.
+    /// </summary>
+    private bool TryAbandon(ReserveWaiter waiter)
+    {
+        if (!waiter.TryMarkAbandoned())
+        {
+            return false;
+        }
+
+        Interlocked.Decrement(ref _waiterCount);
+        lock (_waitersLock)
+        {
+            if (waiter.Node.List is not null)
+            {
+                _waiters.Remove(waiter.Node);
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -445,9 +522,12 @@ internal sealed class InMemoryQueue
 
         private int _state;
 
-        internal Task Task => _source.Task;
+        internal ReserveWaiter() => Node = new LinkedListNode<ReserveWaiter>(this);
 
-        internal bool IsAbandoned => Volatile.Read(ref _state) == Abandoned;
+        /// <summary>Gets the FIFO node carrying this waiter, so an abandoned waiter can unlink itself in O(1).</summary>
+        internal LinkedListNode<ReserveWaiter> Node { get; }
+
+        internal Task Task => _source.Task;
 
         /// <summary>
         /// Attempts to transition this waiter from pending to granted. Does not complete the underlying

@@ -325,4 +325,51 @@ public sealed class InMemoryQueueTests
         (await second).Should().Be(QueueWaitResult.TimedOut);
         (await third).Should().Be(QueueWaitResult.TimedOut);
     }
+
+    [Fact]
+    public async Task WaitToReserveAsync_CancelledBehindLiveWaiter_IsUnlinkedImmediately()
+    {
+        var time = new FakeTimeProvider();
+        var q = new InMemoryQueue("orders", capacity: 1, time);
+        await using IAsyncEnumerator<InMemoryDelivery> consumer = await StartConsumerAsync(q, TestContext.Current.CancellationToken);
+        using var cts = new CancellationTokenSource();
+
+        ValueTask<QueueWaitResult> head = q.WaitToReserveAsync(TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken);
+        ValueTask<QueueWaitResult> behind = q.WaitToReserveAsync(TimeSpan.FromSeconds(1), cts.Token);
+        q.LinkedWaiterCount.Should().Be(2);
+
+        await cts.CancelAsync();
+
+        (await behind).Should().Be(QueueWaitResult.Cancelled);
+        q.LinkedWaiterCount.Should().Be(1); // only the live head remains; the cancelled one did not linger
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        (await head).Should().Be(QueueWaitResult.TimedOut);
+        q.LinkedWaiterCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ReleaseSlot_RacingWaiterInstallation_NeverStrandsWaiterWhileSpaceIsFree()
+    {
+        var q = new InMemoryQueue("orders", capacity: 1);
+        await using IAsyncEnumerator<InMemoryDelivery> consumer = await StartConsumerAsync(q, TestContext.Current.CancellationToken);
+
+        // Each round races one release of the single occupied slot against one waiter being installed.
+        // Whichever side wins, the waiter must end up holding the slot promptly; a lost wake-up would
+        // leave it asleep until its timeout while the queue has free space.
+        for (int round = 0; round < 20_000; round++)
+        {
+            Task<QueueWaitResult> waiter = Task.Run(
+                () => q.WaitToReserveAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken).AsTask(),
+                TestContext.Current.CancellationToken);
+            Task release = Task.Run(() => q.ReleaseSlot(), TestContext.Current.CancellationToken);
+
+            await release;
+            (await waiter).Should().Be(QueueWaitResult.Reserved, $"round {round} must not strand the waiter");
+            q.Occupancy.Should().Be(1);
+        }
+
+        q.HasPendingSpaceWaiter.Should().BeFalse();
+        q.LinkedWaiterCount.Should().Be(0);
+    }
 }
