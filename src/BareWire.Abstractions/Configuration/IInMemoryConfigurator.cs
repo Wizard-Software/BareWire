@@ -201,14 +201,17 @@ public interface IInMemoryConfigurator
     /// <see cref="Exceptions.BareWireConfigurationException"/> is thrown. Passing
     /// <see cref="TimeSpan.Zero"/> means never wait — a full queue is rejected immediately.</para>
     /// <para>
-    /// A send call waits only for a queue that is both full and latched (see below) and has at least
-    /// one active consumer; it waits at most once per call, regardless of how many messages in the
-    /// batch target that queue. A full queue with no active consumer is rejected immediately without
-    /// waiting or latching. When the wait elapses without room becoming available, or when
-    /// <see cref="SendTimeout"/> is <see cref="TimeSpan.Zero"/>, the still-unaccepted messages are
-    /// rejected without latching. A full queue latches immediately when first rejected and stays
-    /// latched — rejecting further sends without waiting — until its occupancy drops back below half of
-    /// <see cref="QueueCapacity"/>. A rejected message never throws: it is reported as
+    /// A send call may wait for a full destination queue only when that queue is not latched (see
+    /// below), has at least one active consumer, and no wait has already happened in the same call — so
+    /// a call waits at most once, regardless of how many messages in the batch target full queues.
+    /// A full queue is <em>latched</em> in exactly two cases: when such a wait elapses without room
+    /// becoming available, or when the queue is full and has no active consumer (it is then rejected
+    /// immediately, without waiting). A latched queue rejects every further send immediately, without
+    /// waiting, and stays latched until its occupancy drops below half of <see cref="QueueCapacity"/>.
+    /// A full queue that is rejected only because <see cref="SendTimeout"/> is
+    /// <see cref="TimeSpan.Zero"/>, or because the call has already used its single wait, is rejected
+    /// <em>without</em> latching, so a healthy queue that is momentarily full during a burst is not
+    /// latched. A rejected message never throws: it is reported as
     /// <see cref="Transport.SendResult.IsConfirmed"/> equal to <see langword="false"/>, and a batch send
     /// call therefore takes at most roughly <see cref="SendTimeout"/> to return. Cancelling the caller's
     /// <see cref="System.Threading.CancellationToken"/> while a send call is waiting also resolves as
