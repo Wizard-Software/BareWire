@@ -24,6 +24,9 @@ namespace BareWire.E2ETests.Outbox;
 /// If Docker is unavailable the fixture initialization will throw and tests will show as failed
 /// with a clear message rather than silently passing.
 /// </remarks>
+// Shares the outbox schema (and its optional ordering index) with the other claim E2E class, so both
+// run in one collection instead of in parallel against the same database.
+[Collection("OutboxClaimSchema")]
 [Trait("Category", "requires-postgres")]
 public sealed class OutboxClaimE2ETests : IAsyncLifetime
 {
