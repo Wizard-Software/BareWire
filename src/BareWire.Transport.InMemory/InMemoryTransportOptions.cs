@@ -10,11 +10,19 @@ internal sealed class InMemoryTransportOptions
     internal const int DefaultQueueCapacity = 1_000;
     internal const int DefaultMaxMessageSize = 16 * 1024 * 1024;
     internal const int DefaultMaxRedeliveries = 20;
+    internal const int DefaultRouteCacheCapacity = 10_000;
     internal static readonly TimeSpan DefaultSendTimeout = TimeSpan.FromMilliseconds(100);
     internal static readonly TimeSpan DefaultDrainTimeout = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan DefaultDeferDelay = TimeSpan.FromSeconds(30);
 
     public int QueueCapacity { get; set; } = DefaultQueueCapacity;
+
+    /// <summary>
+    /// The maximum number of <c>(exchange, routingKey)</c> entries the in-memory router's route cache
+    /// holds before it is cleared and rebuilt lazily. Bounds the cache's memory footprint numerically
+    /// rather than by an eviction policy; see <c>InMemoryRouter</c> for the clearing behavior.
+    /// </summary>
+    public int RouteCacheCapacity { get; set; } = DefaultRouteCacheCapacity;
 
     public TimeSpan SendTimeout { get; set; } = DefaultSendTimeout;
 
@@ -112,6 +120,14 @@ internal sealed class InMemoryTransportOptions
                 optionName: nameof(DeferDelay),
                 optionValue: DeferDelay.ToString(),
                 expectedValue: "a value greater than TimeSpan.Zero when EnableDefer is on");
+        }
+
+        if (RouteCacheCapacity <= 0)
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(RouteCacheCapacity),
+                optionValue: RouteCacheCapacity.ToString(CultureInfo.InvariantCulture),
+                expectedValue: "a value greater than zero");
         }
     }
 }
