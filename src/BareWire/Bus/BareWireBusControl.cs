@@ -245,7 +245,11 @@ internal sealed partial class BareWireBusControl : IBusControl
     {
         IReadOnlyCollection<string> endpointNames = _flowController.GetAllEndpointNames();
 
-        List<EndpointHealthStatus> endpointStatuses = new(endpointNames.Count);
+        BusHealthStatus? transportHealth = _adapter is ITransportHealthSource healthSource
+            ? healthSource.GetHealth()
+            : null;
+
+        List<EndpointHealthStatus> endpointStatuses = new(endpointNames.Count + (transportHealth?.Endpoints.Count ?? 0));
         BusStatus worstStatus = BusStatus.Healthy;
 
         foreach (string endpointName in endpointNames)
@@ -258,6 +262,26 @@ internal sealed partial class BareWireBusControl : IBusControl
             endpointStatuses.Add(new EndpointHealthStatus(endpointName, status, Description: null));
         }
 
+        // Worst status contributed by the transport itself (aggregate and per-queue), tracked separately
+        // so that its description is only appended when the transport is the one reporting trouble.
+        BusStatus transportWorstStatus = BusStatus.Healthy;
+
+        if (transportHealth is not null)
+        {
+            endpointStatuses.AddRange(transportHealth.Endpoints);
+
+            transportWorstStatus = transportHealth.Status;
+
+            foreach (EndpointHealthStatus endpoint in transportHealth.Endpoints)
+            {
+                if (endpoint.Status > transportWorstStatus)
+                    transportWorstStatus = endpoint.Status;
+            }
+
+            if (transportWorstStatus > worstStatus)
+                worstStatus = transportWorstStatus;
+        }
+
         string description = worstStatus switch
         {
             BusStatus.Healthy => "All endpoints are operating normally.",
@@ -265,6 +289,13 @@ internal sealed partial class BareWireBusControl : IBusControl
             BusStatus.Unhealthy => "One or more endpoints are at capacity.",
             _ => "Unknown status.",
         };
+
+        if (transportHealth is not null
+            && transportWorstStatus != BusStatus.Healthy
+            && !string.IsNullOrWhiteSpace(transportHealth.Description))
+        {
+            description = $"{description} {transportHealth.Description}";
+        }
 
         return new BusHealthStatus(worstStatus, description, endpointStatuses);
     }
