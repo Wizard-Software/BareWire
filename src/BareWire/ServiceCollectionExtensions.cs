@@ -200,7 +200,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<IBareWireInstrumentation>(),
             sp.GetRequiredService<ILoggerFactory>(),
-            [.. sp.GetService<IEnumerable<ISagaMessageDispatcher>>() ?? []]));
+            [.. sp.GetService<IEnumerable<ISagaMessageDispatcher>>() ?? []],
+            sp.GetService<BusShutdownOptions>()));
 
         // IBusControl and IBus both resolve to the same BareWireBusControl singleton.
         services.AddSingleton<IBusControl>(sp => sp.GetRequiredService<BareWireBusControl>());

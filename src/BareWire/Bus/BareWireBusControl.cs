@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
@@ -27,11 +28,17 @@ internal sealed partial class BareWireBusControl : IBusControl
     private readonly Abstractions.Observability.IBareWireInstrumentation _instrumentation;
     private readonly ILoggerFactory _loggerFactory;
     private readonly IReadOnlyList<ISagaMessageDispatcher> _sagaDispatchers;
+    private readonly TimeSpan _drainTimeout;
 
     private readonly object _stateLock = new();
     private readonly List<Task> _consumeTasks = [];
     private CancellationTokenSource? _consumeCts;
     private bool _started;
+
+    // How often the graceful-drain quiescence check re-observes the publish loop and the
+    // transport's own accepted-message counters while waiting for them to settle. Applies only
+    // during shutdown, bounded by _drainTimeout — never on any hot path.
+    private static readonly TimeSpan QuiescencePollInterval = TimeSpan.FromMilliseconds(5);
 
     internal BareWireBusControl(
         BareWireBus bus,
@@ -45,7 +52,8 @@ internal sealed partial class BareWireBusControl : IBusControl
         IServiceScopeFactory scopeFactory,
         Abstractions.Observability.IBareWireInstrumentation instrumentation,
         ILoggerFactory loggerFactory,
-        IReadOnlyList<ISagaMessageDispatcher> sagaDispatchers)
+        IReadOnlyList<ISagaMessageDispatcher> sagaDispatchers,
+        BusShutdownOptions? shutdownOptions = null)
     {
         _bus = bus ?? throw new ArgumentNullException(nameof(bus));
 
@@ -63,6 +71,7 @@ internal sealed partial class BareWireBusControl : IBusControl
         _instrumentation = instrumentation ?? throw new ArgumentNullException(nameof(instrumentation));
         _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _sagaDispatchers = sagaDispatchers ?? [];
+        _drainTimeout = (shutdownOptions ?? new BusShutdownOptions()).DrainTimeout;
     }
 
     // ── IBusControl ───────────────────────────────────────────────────────────
@@ -201,6 +210,18 @@ internal sealed partial class BareWireBusControl : IBusControl
 
         LogBusStopping(_logger, _bus.BusId);
 
+        // When the transport adapter buffers accepted messages in process (for example the
+        // in-memory transport), cancelling consumer loops immediately would silently drop those
+        // messages. Let consumers and the publish loop keep running until a stable quiescence
+        // check passes, the drain time limit elapses, or the caller's own cancellation token is
+        // cancelled — whichever happens first. Adapters that do not implement this coordination
+        // protocol (broker-backed transports) are unaffected: the shutdown path below then runs
+        // exactly as it did before this drain step existed.
+        if (_adapter is IGracefulDrainTransport drainTransport && _consumeCts is not null)
+        {
+            await DrainBeforeCancellingConsumersAsync(drainTransport, cancellationToken).ConfigureAwait(false);
+        }
+
         // Cancel consume loops.
         if (_consumeCts is not null)
         {
@@ -227,6 +248,104 @@ internal sealed partial class BareWireBusControl : IBusControl
         await _bus.DisposeAsync().ConfigureAwait(false);
 
         LogBusStopped(_logger, _bus.BusId);
+    }
+
+    /// <summary>
+    /// Waits for a stable quiescence signal — the transport's accepted-message counters and the
+    /// publish loop both idle, checked twice in the same pass with no batch passing through in
+    /// between — before <see cref="StopAsync"/> cancels consumer loops, so in-flight work
+    /// (including a follow-up message published from a handler right before it acknowledges its
+    /// own message) has a chance to be accepted by the transport first. Bounded by
+    /// <see cref="_drainTimeout"/> or by <paramref name="cancellationToken"/>, whichever elapses
+    /// first. Any failure while draining is logged and swallowed — shutdown always proceeds to
+    /// cancelling consumer loops, it must never be blocked by a transport error.
+    /// </summary>
+    private async Task DrainBeforeCancellingConsumersAsync(
+        IGracefulDrainTransport drainTransport, CancellationToken cancellationToken)
+    {
+        long startTimestamp = Stopwatch.GetTimestamp();
+        LogDrainStarting(_logger, _bus.BusId, _drainTimeout.TotalMilliseconds);
+
+        CancellationTokenSource? budgetCts = null;
+        try
+        {
+            // The transport's own "timeout" argument is only a hint an adapter may or may not
+            // honour — this token is what actually enforces the limit, whether it is reached
+            // because DrainTimeout elapsed or because the caller cancelled cancellationToken.
+            // Every DrainAsync call is additionally awaited through WaitAsync(budget), so an
+            // adapter that ignores both its timeout and its token cannot stall shutdown.
+            budgetCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            budgetCts.CancelAfter(_drainTimeout);
+
+            while (true)
+            {
+                // (1) Wait for the transport's own accepted-message counters to reach zero.
+                await drainTransport.DrainAsync(RemainingBudget(), budgetCts.Token)
+                    .WaitAsync(budgetCts.Token).ConfigureAwait(false);
+                await ThrowIfBudgetExhaustedAsync(budgetCts).ConfigureAwait(false);
+
+                // (2) Snapshot the publish loop's idleness and batch epoch.
+                long epochBeforeRecheck = _bus.PublishBatchEpoch;
+                bool idle = _bus.IsPublishIdle;
+
+                if (idle)
+                {
+                    // (3) Re-check the transport's counters — a message accepted between (1) and
+                    // (2) must be drained again before quiescence can be declared.
+                    await drainTransport.DrainAsync(RemainingBudget(), budgetCts.Token)
+                        .WaitAsync(budgetCts.Token).ConfigureAwait(false);
+                    await ThrowIfBudgetExhaustedAsync(budgetCts).ConfigureAwait(false);
+
+                    // (4) Quiescence requires the publish loop to still be idle with no batch
+                    // having passed through it since (2) — closing the window where a follow-up
+                    // message could have been published and already sent between the two checks.
+                    if (_bus.IsPublishIdle && _bus.PublishBatchEpoch == epochBeforeRecheck)
+                        break;
+                }
+
+                await Task.Delay(QuiescencePollInterval, budgetCts.Token).ConfigureAwait(false);
+            }
+
+            double completedElapsedMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+            LogDrainCompleted(_logger, _bus.BusId, completedElapsedMs);
+        }
+        catch (OperationCanceledException) when (budgetCts is not null && budgetCts.IsCancellationRequested)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                double cancelledElapsedMs = Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+                LogDrainCancelled(_logger, _bus.BusId, cancelledElapsedMs);
+            }
+            else
+            {
+                LogDrainTimedOut(_logger, _bus.BusId, _drainTimeout.TotalMilliseconds);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogDrainError(_logger, _bus.BusId, ex);
+        }
+        finally
+        {
+            budgetCts?.Dispose();
+        }
+
+        TimeSpan RemainingBudget()
+        {
+            TimeSpan elapsed = Stopwatch.GetElapsedTime(startTimestamp);
+            TimeSpan remaining = _drainTimeout - elapsed;
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+
+        // A DrainAsync call that returned because its own timeout elapsed says nothing about the
+        // transport's counters, so an exhausted budget is treated as a timeout, never as quiescence.
+        async Task ThrowIfBudgetExhaustedAsync(CancellationTokenSource budget)
+        {
+            if (RemainingBudget() == TimeSpan.Zero)
+                await budget.CancelAsync().ConfigureAwait(false);
+
+            budget.Token.ThrowIfCancellationRequested();
+        }
     }
 
     public async Task DeployTopologyAsync(CancellationToken cancellationToken = default)
@@ -350,4 +469,22 @@ internal sealed partial class BareWireBusControl : IBusControl
 
     [LoggerMessage(Level = LogLevel.Error, Message = "Error during consume loop shutdown.")]
     private static partial void LogConsumeShutdownError(ILogger logger, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "BareWire bus {BusId} draining in-flight messages before stopping consumers (limit {DrainTimeoutMs} ms).")]
+    private static partial void LogDrainStarting(ILogger logger, Guid busId, double drainTimeoutMs);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "BareWire bus {BusId} drained in {ElapsedMs} ms.")]
+    private static partial void LogDrainCompleted(ILogger logger, Guid busId, double elapsedMs);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "BareWire bus {BusId} drain did not complete within {DrainTimeoutMs} ms; remaining messages are not delivered.")]
+    private static partial void LogDrainTimedOut(ILogger logger, Guid busId, double drainTimeoutMs);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "BareWire bus {BusId} drain was cancelled by the stop token after {ElapsedMs} ms.")]
+    private static partial void LogDrainCancelled(ILogger logger, Guid busId, double elapsedMs);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "BareWire bus {BusId} drain failed; continuing shutdown.")]
+    private static partial void LogDrainError(ILogger logger, Guid busId, Exception ex);
 }
