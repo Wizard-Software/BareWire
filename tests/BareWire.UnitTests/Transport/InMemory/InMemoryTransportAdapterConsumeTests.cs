@@ -190,9 +190,9 @@ public sealed class InMemoryTransportAdapterConsumeTests
         byte[] originalBuffer = original.PooledBuffer!;
         await AbandonAsync(consumer, cts);
 
-        // The release took the buffer away from the message, so a consumer disposing it late cannot hand
-        // the buffer back to the pool while the redelivery is being copied or read.
-        original.PooledBuffer.Should().BeNull();
+        // The release only pinned the body for the copy: the original still owns its buffer and returns it
+        // to the pool on its own Dispose.
+        original.PooledBuffer.Should().BeSameAs(originalBuffer);
 
         await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
         (await NextAsync(next)).Should().BeTrue();
@@ -278,7 +278,7 @@ public sealed class InMemoryTransportAdapterConsumeTests
     }
 
     [Fact]
-    public async Task ConsumeAsync_UnsettledMessageDisposedAfterRelease_KeepsRedeliveryAndOriginalReadable()
+    public async Task ConsumeAsync_UnsettledMessageDisposedAfterRelease_ReturnsOriginalBufferAndKeepsRedelivery()
     {
         InMemoryTransportAdapter adapter = OrdersAdapter();
         InMemoryQueue queue = Queue(adapter, "orders");
@@ -291,10 +291,10 @@ public sealed class InMemoryTransportAdapterConsumeTests
         await AbandonAsync(consumer, cts);
         original.Dispose();                                           // a lane finishing after the release
 
+        original.PooledBuffer.Should().BeNull();                      // back in the pool, not left to the GC
         await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
         (await NextAsync(next)).Should().BeTrue();
         BodyOf(next.Current).Should().Be("m-1");
-        BodyOf(original).Should().Be("m-1");
         adapter.DisposedUnsettledCount.Should().Be(0);
         next.Current.Dispose();
     }

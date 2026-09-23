@@ -162,21 +162,28 @@ internal sealed class InMemoryQueueRunner
             }
 
             // Consumers may still be processing (and disposing) messages on other threads, e.g. ordered lanes
-            // that drain after this enumerator ends. Detaching the buffer is atomic with the message's
-            // Dispose: if the consumer disposed first, the buffer is already back in the pool and the body
-            // can no longer be read, so the delivery is dropped and its slot freed.
-            if (!entry.Message.TryDetachPooledBuffer(out _))
+            // that drain after this enumerator ends. Pinning is atomic with the message's Dispose: if the
+            // consumer disposed first, the buffer is already back in the pool and the body can no longer be
+            // read, so the delivery is dropped and its slot freed. A Dispose that lands while the body is
+            // pinned leaves the buffer to the unpin, so it returns to the pool exactly once, after the copy.
+            if (!entry.Message.TryPinPooledBuffer())
             {
                 Queue.ReleaseSlot();
                 disposedUnsettled++;
                 continue;
             }
 
-            // The message can no longer return the buffer, but its consumer may still be reading the body.
-            // Copy for the redelivery and leave the original to the garbage collector instead of the pool.
             InMemoryDelivery delivery = entry.Delivery;
             byte[] copy = ArrayPool<byte>.Shared.Rent(Math.Max(delivery.Length, 1));
-            delivery.Body.Span.CopyTo(copy);
+            try
+            {
+                delivery.Body.Span.CopyTo(copy);
+            }
+            finally
+            {
+                entry.Message.UnpinPooledBuffer();
+            }
+
             requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
         }
 

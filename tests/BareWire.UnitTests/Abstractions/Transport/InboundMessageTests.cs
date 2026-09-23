@@ -76,62 +76,74 @@ public sealed class InboundMessageTests
     }
 
     [Fact]
-    public void TryDetachPooledBuffer_NotDisposed_ReturnsBufferAndClearsOwnership()
+    public void TryPinPooledBuffer_NotDisposed_ReturnsTrueAndKeepsBuffer()
     {
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
         InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
 
-        bool detached = message.TryDetachPooledBuffer(out byte[]? buffer);
+        bool pinned = message.TryPinPooledBuffer();
 
-        detached.Should().BeTrue();
-        buffer.Should().BeSameAs(rentedBuffer);
-        message.PooledBuffer.Should().BeNull();
-        ArrayPool<byte>.Shared.Return(rentedBuffer);
+        pinned.Should().BeTrue();
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
+        message.UnpinPooledBuffer();
+        message.Dispose();
     }
 
     [Fact]
-    public void TryDetachPooledBuffer_AfterDispose_ReturnsFalse()
+    public void TryPinPooledBuffer_AfterDispose_ReturnsFalse()
     {
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
         InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
         message.Dispose();
 
-        bool detached = message.TryDetachPooledBuffer(out byte[]? buffer);
-
-        detached.Should().BeFalse();
-        buffer.Should().BeNull();
+        message.TryPinPooledBuffer().Should().BeFalse();
     }
 
     [Fact]
-    public void TryDetachPooledBuffer_CalledTwice_SecondCallReturnsFalse()
+    public void TryPinPooledBuffer_AlreadyPinned_ReturnsFalse()
     {
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
         InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
-        message.TryDetachPooledBuffer(out _).Should().BeTrue();
+        message.TryPinPooledBuffer().Should().BeTrue();
 
-        bool detachedAgain = message.TryDetachPooledBuffer(out byte[]? buffer);
+        message.TryPinPooledBuffer().Should().BeFalse();
 
-        detachedAgain.Should().BeFalse();
-        buffer.Should().BeNull();
-        ArrayPool<byte>.Shared.Return(rentedBuffer);
+        message.UnpinPooledBuffer();
+        message.Dispose();
     }
 
     [Fact]
-    public void Dispose_AfterDetach_LeavesDetachedBufferContentIntact()
+    public void Dispose_WhilePinned_KeepsBufferUntilUnpin()
     {
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
         rentedBuffer.AsSpan(0, 4).Fill(0x5A);
         InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 4);
-        message.TryDetachPooledBuffer(out _).Should().BeTrue();
+        message.TryPinPooledBuffer().Should().BeTrue();
 
         message.Dispose();
 
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
         message.Body.ToArray().Should().Equal(0x5A, 0x5A, 0x5A, 0x5A);
-        ArrayPool<byte>.Shared.Return(rentedBuffer);
+        message.UnpinPooledBuffer();
+        message.PooledBuffer.Should().BeNull();
     }
 
     [Fact]
-    public async Task TryDetachPooledBuffer_RacingDispose_ExactlyOneWins()
+    public void UnpinPooledBuffer_WithoutDispose_LeavesMessageLiveForNormalDispose()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.TryPinPooledBuffer().Should().BeTrue();
+
+        message.UnpinPooledBuffer();
+
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
+        message.Dispose();
+        message.PooledBuffer.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task TryPinPooledBuffer_RacingDispose_ReturnsBufferExactlyOnceAfterBoth()
     {
         for (int i = 0; i < 1_000; i++)
         {
@@ -139,10 +151,13 @@ public sealed class InboundMessageTests
             InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 16);
             using var start = new ManualResetEventSlim();
 
-            Task<bool> detach = Task.Run(() =>
+            Task pinAndUnpin = Task.Run(() =>
             {
                 start.Wait(TestContext.Current.CancellationToken);
-                return message.TryDetachPooledBuffer(out _);
+                if (message.TryPinPooledBuffer())
+                {
+                    message.UnpinPooledBuffer();
+                }
             }, TestContext.Current.CancellationToken);
             Task dispose = Task.Run(() =>
             {
@@ -150,13 +165,9 @@ public sealed class InboundMessageTests
                 message.Dispose();
             }, TestContext.Current.CancellationToken);
             start.Set();
-            await Task.WhenAll(detach, dispose);
+            await Task.WhenAll(pinAndUnpin, dispose);
 
             message.PooledBuffer.Should().BeNull();
-            if (await detach)
-            {
-                ArrayPool<byte>.Shared.Return(rentedBuffer);
-            }
         }
     }
 }
