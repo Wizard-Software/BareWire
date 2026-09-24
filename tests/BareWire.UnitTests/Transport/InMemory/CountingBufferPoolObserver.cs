@@ -11,14 +11,16 @@ namespace BareWire.UnitTests.Transport.InMemory;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Scope: hook-rented buffers only.</b> A buffer handed to an <see cref="BareWire.Abstractions.Transport.InboundMessage"/>
-/// is returned by that message's own <c>Dispose()</c> directly to <see cref="System.Buffers.ArrayPool{T}.Shared"/>,
-/// never through <see cref="InMemoryBufferPool"/>. Likewise, a test fixture that enqueues a seed delivery
-/// via <c>ArrayPool&lt;byte&gt;.Shared.Rent</c> directly (bypassing the transport), or the send path's own
-/// direct <see cref="System.Buffers.ArrayPool{T}"/> use, never registers that buffer here either.
-/// <see cref="MarkReturnedByMessage"/> exists to close the loop for the FORMER case (a hook-rented buffer
-/// that ends up owned by a message and is returned on the message's own <c>Dispose()</c>); a buffer this
-/// observer never saw rented (the LATTER cases) is tolerated as a no-op rather than flagged — this
+/// <b>Scope: hook-rented buffers only.</b> The send path (<c>InMemorySender.Commit</c>) rents every buffer
+/// it needs through the owning adapter's <see cref="InMemoryBufferPool"/>, so this observer sees it —
+/// unless a test enqueues a seed delivery directly via <c>ArrayPool&lt;byte&gt;.Shared.Rent</c>, bypassing
+/// the transport entirely, which never registers that buffer here. A buffer handed to an
+/// <see cref="BareWire.Abstractions.Transport.InboundMessage"/> — whether it came from the send path, a
+/// settlement copy, or a redelivery — is returned by that message's own <c>Dispose()</c> directly to
+/// <see cref="System.Buffers.ArrayPool{T}.Shared"/>, never through <see cref="InMemoryBufferPool"/>.
+/// <see cref="MarkReturnedByMessage"/> exists to close the loop for that case (a hook-rented buffer that
+/// ends up owned by a message and is returned on the message's own <c>Dispose()</c>); a buffer this
+/// observer never saw rented (a directly seeded one) is tolerated as a no-op rather than flagged — this
 /// observer has no way to prove that call wrong, so it only flags what it CAN prove wrong: a buffer this
 /// observer knows was already closed out (returned, or marked returned-by-message) being marked again
 /// with no rent in between.

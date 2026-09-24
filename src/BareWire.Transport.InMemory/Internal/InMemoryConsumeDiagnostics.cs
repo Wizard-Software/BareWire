@@ -19,6 +19,12 @@ internal sealed partial class InMemoryConsumeDiagnostics
     /// <summary>The name of the counter of deliveries dropped during settlement.</summary>
     internal const string SettlementDroppedCounterName = "barewire.inmemory.settlement.dropped";
 
+    /// <summary>
+    /// The name of the counter of undelivered messages dropped from a queue's channel because the
+    /// transport was disposed while they were still sitting there, never handed to a consumer.
+    /// </summary>
+    internal const string DrainDroppedCounterName = "barewire.inmemory.deliveries.drain_dropped";
+
     private static readonly TimeSpan SettlementDropLogWindow = TimeSpan.FromSeconds(60);
     private static readonly int SettlementDropReasonCount = Enum.GetValues<SettlementDropReason>().Length;
 
@@ -28,8 +34,10 @@ internal sealed partial class InMemoryConsumeDiagnostics
     // Opt-in counters — created only when an external Meter is supplied by the composition root.
     private readonly Counter<long>? _droppedOnShutdownCounter;
     private readonly Counter<long>? _settlementDroppedCounter;
+    private readonly Counter<long>? _drainDroppedCounter;
     private long _droppedOnShutdownCount;
     private long _disposedUnsettledCount;
+    private long _drainDroppedCount;
     private readonly long[] _settlementDroppedCounts = new long[SettlementDropReasonCount];
 
     // Per-(queue, reason) log throttle state, populated lazily — queue names come from the sealed
@@ -55,6 +63,11 @@ internal sealed partial class InMemoryConsumeDiagnostics
             unit: "{delivery}",
             description: "PROVISIONAL — number of in-memory deliveries dropped during settlement. Tagged " +
                 "with the queue name and the drop reason.");
+        _drainDroppedCounter = meter?.CreateCounter<long>(
+            DrainDroppedCounterName,
+            unit: "{delivery}",
+            description: "Number of undelivered in-memory messages dropped from a queue's channel because " +
+                "the transport was disposed while they were still sitting there. Tagged with the queue name.");
     }
 
     /// <summary>Gets the total number of deliveries dropped on shutdown so far.</summary>
@@ -103,6 +116,33 @@ internal sealed partial class InMemoryConsumeDiagnostics
         "In-memory transport shut down with {Count} unsettled delivery(ies) on queue '{QueueName}'; they were " +
         "dropped and their queue slots released. In-memory delivery is not durable across shutdown.")]
     private static partial void LogDroppedOnShutdown(ILogger logger, int count, string queueName);
+
+    /// <summary>Gets the total number of undelivered messages dropped on drain (queue close) so far.</summary>
+    internal long DrainDroppedCount => Interlocked.Read(ref _drainDroppedCount);
+
+    /// <summary>
+    /// Records that <paramref name="count"/> undelivered messages of <paramref name="queueName"/> were
+    /// dropped from that queue's channel because the transport was disposed while they were still sitting
+    /// there, never handed to a consumer. A no-op when <paramref name="count"/> is not positive. Called
+    /// once per queue, at the very end of <c>Dispose</c>'s own shutdown sequence, so it reports a single
+    /// aggregated warning rather than one per dropped message.
+    /// </summary>
+    internal void DeliveriesDroppedOnDrain(string queueName, int count)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        Interlocked.Add(ref _drainDroppedCount, count);
+        _drainDroppedCounter?.Add(count, new KeyValuePair<string, object?>("queue", queueName));
+        LogDrainDropped(_logger, count, queueName);
+    }
+
+    [LoggerMessage(Level = LogLevel.Warning, Message =
+        "In-memory transport was disposed with {Count} undelivered message(s) on queue '{QueueName}'; they " +
+        "were dropped and their buffers returned to the pool. In-memory delivery is not durable across shutdown.")]
+    private static partial void LogDrainDropped(ILogger logger, int count, string queueName);
 
     /// <summary>Gets the total number of deliveries dropped during settlement for <paramref name="reason"/>.</summary>
     internal long SettlementDroppedCount(SettlementDropReason reason) =>

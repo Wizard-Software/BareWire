@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using BareWire.Abstractions.Transport;
 
 namespace BareWire.Transport.InMemory.Internal;
 
@@ -92,5 +93,38 @@ internal sealed class InMemoryDeliveryMap
 
         taken.Sort(static (x, y) => x.Key.CompareTo(y.Key));
         return taken.ConvertAll(static pair => pair.Value);
+    }
+
+    /// <summary>
+    /// Removes and returns every entry whose message was disposed by its consumer without being settled
+    /// — <see cref="InFlightDelivery.Message"/>'s <see cref="InboundMessage.PooledBuffer"/> is already
+    /// <see langword="null"/>, so its body can no longer be read or requeued. A non-invasive probe: a
+    /// runner's own cleanup (<see cref="InMemoryQueueRunner"/>) only claims such an entry once its
+    /// enumeration ends, so this method is what lets a drain notice — and reclaim the queue slot of — a
+    /// delivery abandoned mid-enumeration, on every polling iteration rather than only at the end.
+    /// </summary>
+    /// <returns>
+    /// The claimed entries, in no particular order. The result list is allocated lazily — only once the
+    /// first match is found — so a call that claims nothing (the common case: most polling iterations of
+    /// a drain find nothing released this way) costs one dictionary scan and never allocates a list with
+    /// capacity for anything.
+    /// </returns>
+    internal List<InFlightDelivery> TakeReleasedByConsumer()
+    {
+        List<InFlightDelivery>? released = null;
+        foreach (KeyValuePair<ulong, InFlightDelivery> candidate in _entries)
+        {
+            if (candidate.Value.Message.PooledBuffer is not null)
+            {
+                continue;
+            }
+
+            if (_entries.TryRemove(candidate.Key, out InFlightDelivery entry))
+            {
+                (released ??= []).Add(entry);
+            }
+        }
+
+        return released ?? [];
     }
 }

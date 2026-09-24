@@ -17,4 +17,10 @@ internal enum QueueWaitResult
 
     /// <summary>The latch was observed set (now or earlier). The caller must reject and never retry.</summary>
     Latched,
+
+    /// <summary>
+    /// The queue was closed because the adapter is being disposed; reject with reason "closed", no slot
+    /// held.
+    /// </summary>
+    Closed,
 }

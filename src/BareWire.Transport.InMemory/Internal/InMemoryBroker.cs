@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 
 namespace BareWire.Transport.InMemory.Internal;
@@ -94,6 +95,13 @@ internal sealed class InMemoryBroker(InMemoryTransportOptions options)
 
     /// <summary>Gets the number of queues currently registered on this broker instance.</summary>
     internal int QueueCount => Volatile.Read(ref _state)?.Queues.Count ?? 0;
+
+    /// <summary>
+    /// Gets every queue currently registered on this broker instance, in no particular order. Empty
+    /// (never <see langword="default"/>) before <see cref="AttachRegistry"/> has run.
+    /// </summary>
+    internal ImmutableArray<InMemoryQueue> Queues =>
+        Volatile.Read(ref _state)?.Queues.Values ?? ImmutableArray<InMemoryQueue>.Empty;
 
     private sealed record BrokerState(ExchangeRegistry Registry, FrozenDictionary<string, InMemoryQueue> Queues);
 }

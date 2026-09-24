@@ -36,6 +36,21 @@ namespace BareWire.Transport.InMemory.Internal;
 /// deliveries still counts; a cancelled reader stops counting immediately, before its enumerator is
 /// disposed.
 /// </para>
+/// <para>
+/// <b>Close.</b> <see cref="Close"/> is a one-way transition: once <see cref="IsClosed"/> is set, no
+/// waiter in <see cref="WaitToReserveAsync"/> is ever granted a slot again — every waiter queued at the
+/// moment of the call, and every call that observes the flag afterwards, resolves with
+/// <see cref="QueueWaitResult.Closed"/> instead. A reservation taken directly through
+/// <see cref="TryReserve"/> is still honored even after closing (this queue does not gate admission
+/// itself), but the write it produces is dropped on arrival: <see cref="WriteReserved"/> and both
+/// <see cref="RequeueAtHead(InMemoryDelivery)"/> overloads check the flag after a successful write and,
+/// when set, immediately drop that delivery — returning its buffer to the pool supplied to
+/// <see cref="Close"/> and releasing its slot — rather than leaving it reachable in the channel. A drop
+/// caused by such a late write that loses the race with a concurrent close AFTER the owning adapter has
+/// already finished disposing is still counted toward <see cref="TakeDroppedAfterClose"/>, but is never
+/// logged — only <c>Dispose</c> reports a single aggregated warning per queue, at the point it reads that
+/// counter, and there is no later moment to log a subsequent drop against.
+/// </para>
 /// </remarks>
 internal sealed class InMemoryQueue
 {
@@ -60,6 +75,10 @@ internal sealed class InMemoryQueue
     private int _latched;
     private int _activeConsumers;
     private int _waiterCount;
+    private int _closed;
+    private InMemoryBufferPool? _closedPool;
+    private int _droppedAfterClose;
+    private int _invariantViolationCount;
 
     /// <param name="name">The queue's name. Must not be null or empty.</param>
     /// <param name="capacity">The queue's capacity. Must be greater than zero.</param>
@@ -100,6 +119,21 @@ internal sealed class InMemoryQueue
 
     /// <summary>Gets whether at least one consumer is currently active.</summary>
     internal bool HasActiveConsumer => ActiveConsumerCount > 0;
+
+    /// <summary>
+    /// Gets whether this queue has been closed by <see cref="Close"/>. See this type's <c>Close</c>
+    /// remarks for the full set of consequences.
+    /// </summary>
+    internal bool IsClosed => Volatile.Read(ref _closed) != 0;
+
+    /// <summary>
+    /// Gets the number of times <see cref="DropLate"/> caught an invariant violation while dropping a
+    /// late write instead of letting it propagate to the caller of <see cref="WriteReserved"/> or
+    /// <see cref="RequeueAtHead(InMemoryDelivery)"/>. A test hook: always zero in the absence of a prior
+    /// bug elsewhere that already broke this queue's "channel item count is less than or equal to
+    /// <see cref="Occupancy"/>" invariant.
+    /// </summary>
+    internal int InvariantViolationCount => Volatile.Read(ref _invariantViolationCount);
 
     /// <summary>
     /// Gets whether at least one live (not yet granted, and not abandoned by a timeout or cancellation)
@@ -187,6 +221,11 @@ internal sealed class InMemoryQueue
                 $"Queue '{Name}' failed to write a reserved delivery: the channel is at capacity. " +
                 "Every WriteReserved call must be paired with a prior reservation.");
         }
+
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            DropLate();
+        }
     }
 
     /// <summary>
@@ -252,6 +291,11 @@ internal sealed class InMemoryQueue
                 }
             }
         }
+
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            DropLate();
+        }
     }
 
     /// <summary>
@@ -310,6 +354,11 @@ internal sealed class InMemoryQueue
                 }
             }
         }
+
+        if (Volatile.Read(ref _closed) != 0)
+        {
+            DropLate();
+        }
     }
 
     /// <summary>
@@ -330,6 +379,130 @@ internal sealed class InMemoryQueue
     private InvalidOperationException RequeueOverflow() =>
         new($"Queue '{Name}' cannot requeue deliveries at its head: the channel is at capacity. " +
             "Every requeued delivery must still hold its reserved slot.");
+
+    /// <summary>
+    /// Closes this queue: from this call on, no waiter in <see cref="WaitToReserveAsync"/> is ever
+    /// granted a slot again. Every waiter currently queued is resolved with
+    /// <see cref="QueueWaitResult.Closed"/> — without ever being handed a slot — and unlinked from the
+    /// FIFO. Idempotent: a call that finds the queue already closed does nothing further (the pool and
+    /// the waiter sweep already ran on the first, winning call).
+    /// </summary>
+    /// <param name="pool">
+    /// The pool <see cref="DropRemaining"/> and <see cref="DropLate"/> return every buffer this queue
+    /// drops after this call to. Stored before the closed flag is published, so any caller that observes
+    /// the flag set is guaranteed to see this value.
+    /// </param>
+    internal void Close(InMemoryBufferPool pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+
+        _closedPool = pool;
+        if (Interlocked.Exchange(ref _closed, 1) != 0)
+        {
+            return;
+        }
+
+        List<ReserveWaiter>? closed = null;
+        lock (_waitersLock)
+        {
+            while (_waiters.First is { } node)
+            {
+                _waiters.RemoveFirst();
+                ReserveWaiter candidate = node.Value;
+                if (candidate.TryMarkClosed())
+                {
+                    Interlocked.Decrement(ref _waiterCount);
+                    (closed ??= []).Add(candidate);
+                }
+
+                // Already granted or abandoned by a concurrent caller: that caller already adjusted
+                // _waiterCount itself, so this sweep only needs to finish unlinking it from the FIFO.
+            }
+        }
+
+        if (closed is not null)
+        {
+            // complete outside the waiters lock: continuations run asynchronously
+            // (RunContinuationsAsynchronously), but there is no reason to hold the lock while scheduling.
+            foreach (ReserveWaiter waiter in closed)
+            {
+                waiter.CompleteClosed();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drains every delivery currently sitting in this queue's channel, returning each one's buffer to
+    /// the pool supplied to <see cref="Close"/> before releasing its reserved slot, and adds the number
+    /// dropped this way to the running total reported by <see cref="TakeDroppedAfterClose"/>. The channel
+    /// itself is never completed — <see cref="WriteReserved"/> and <see cref="RequeueAtHead(InMemoryDelivery)"/>
+    /// must keep accepting (and immediately dropping) a write that loses the race with a concurrent close
+    /// rather than throwing. Safe to call repeatedly: once the channel is empty, further calls are no-ops
+    /// that return zero.
+    /// </summary>
+    /// <returns>The number of deliveries dropped by this call.</returns>
+    internal int DropRemaining()
+    {
+        // Guaranteed non-null: Close(pool) always stores the pool before publishing the closed flag, and
+        // every caller reaching this method (Dispose, or WriteReserved/RequeueAtHead through DropLate)
+        // only does so after observing that flag set.
+        InMemoryBufferPool pool = _closedPool!;
+
+        int dropped = 0;
+        lock (_requeueLock)
+        {
+            ChannelReader<InMemoryDelivery> reader = _channel.Reader;
+            while (reader.TryRead(out InMemoryDelivery? delivery))
+            {
+                pool.Return(delivery.Buffer);
+                ReleaseSlot();
+                dropped++;
+            }
+        }
+
+        if (dropped > 0)
+        {
+            Interlocked.Add(ref _droppedAfterClose, dropped);
+        }
+
+        return dropped;
+    }
+
+    /// <summary>
+    /// Atomically reads and resets the running total of deliveries dropped by <see cref="DropRemaining"/>
+    /// (directly, or through <see cref="DropLate"/>) since the last call. <c>Dispose</c> calls this once
+    /// per queue, at the very end of its own shutdown sequence, to report a single aggregated warning.
+    /// </summary>
+    /// <returns>The number of deliveries dropped since the previous call.</returns>
+    internal int TakeDroppedAfterClose() => Interlocked.Exchange(ref _droppedAfterClose, 0);
+
+    /// <summary>
+    /// Drops every delivery currently in the channel after a write lost the race with a concurrent
+    /// <see cref="Close"/> — called by <see cref="WriteReserved"/> and both <see cref="RequeueAtHead(InMemoryDelivery)"/>
+    /// overloads once they observe the closed flag set right after a successful write. Calls only
+    /// <see cref="DropRemaining"/>: no callback, no logging, no metric — those belong to <c>Dispose</c>,
+    /// which reads the aggregated count later through <see cref="TakeDroppedAfterClose"/>. Never lets an
+    /// exception reach its caller: a write that already completed successfully must return normally, or
+    /// the caller's own error-handling path could return the same buffer to the pool a second time.
+    /// <see cref="MethodImplOptions.NoInlining"/> keeps this rare, defensive path out of the hot,
+    /// per-write inline body.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void DropLate()
+    {
+        try
+        {
+            DropRemaining();
+        }
+        catch (InvalidOperationException)
+        {
+            // This can only happen after a prior bug elsewhere already broke the "channel item count is
+            // less than or equal to Occupancy" invariant (for example ReleaseSlot finding no occupied
+            // slot to release). Counted for diagnosis, never logged or exposed as a metric — this method
+            // must stay free of any dependency a rare defensive catch could turn into a second failure.
+            Interlocked.Increment(ref _invariantViolationCount);
+        }
+    }
 
     /// <summary>
     /// Releases one occupied slot after a delivery has been settled (acknowledged, rejected, or
@@ -494,7 +667,8 @@ internal sealed class InMemoryQueue
     /// MUST follow with exactly one <see cref="WriteReserved"/>; <see cref="QueueWaitResult.TimedOut"/>
     /// when no slot became available in time; <see cref="QueueWaitResult.Cancelled"/> when
     /// <paramref name="cancellationToken"/> was cancelled; <see cref="QueueWaitResult.Latched"/> when the
-    /// latch was observed set.
+    /// latch was observed set; <see cref="QueueWaitResult.Closed"/> when this queue was, or became while
+    /// waiting, closed by <see cref="Close"/> — no slot is ever held in that case.
     /// </returns>
     internal async ValueTask<QueueWaitResult> WaitToReserveAsync(
         TimeSpan timeout, CancellationToken cancellationToken = default)
@@ -505,6 +679,13 @@ internal sealed class InMemoryQueue
         if (timeout > MaxSupportedWaitTimeout)
         {
             timeout = MaxSupportedWaitTimeout;
+        }
+
+        // (a) Checked before anything else creates a waiter: a queue closed before this call started
+        // must always reject, regardless of whether TryReserve below would otherwise have succeeded.
+        if (IsClosed)
+        {
+            return QueueWaitResult.Closed;
         }
 
         QueueReservationResult fast = TryReserve();
@@ -525,6 +706,21 @@ internal sealed class InMemoryQueue
 
         ReserveWaiter waiter = EnqueueWaiter();
 
+        // (b) Checked immediately after enqueuing, before the re-check TryReserve below: Close publishes
+        // its flag before sweeping the FIFO under the same lock EnqueueWaiter uses to add to it, and reads
+        // the flag only after releasing that lock — so either this call sees the flag here, or Close's own
+        // sweep sees the waiter just linked. Either way, neither side loses the race and strands a waiter.
+        if (IsClosed)
+        {
+            if (TryAbandon(waiter))
+            {
+                return QueueWaitResult.Closed;
+            }
+
+            // the waiter was already granted a slot, or already marked closed, by a concurrent caller.
+            return waiter.WasClosed ? QueueWaitResult.Closed : QueueWaitResult.Reserved;
+        }
+
         // re-check after enqueuing: protects against a release signalled between the failed TryReserve
         // above and the waiter's installation (a lost-wakeup guard).
         QueueReservationResult afterEnqueue = TryReserve();
@@ -535,11 +731,12 @@ internal sealed class InMemoryQueue
                 return QueueWaitResult.Reserved;
             }
 
-            // the waiter was already granted a slot by a concurrent ReleaseSlot: the caller would now
-            // hold two reservations for one logical request. Release the one just reserved above (it may
-            // be handed straight to the next waiter) and return Reserved for the one the waiter owns.
+            // the waiter was already granted a slot, or closed, by a concurrent caller: the caller of this
+            // method would now hold two reservations (or a stale one) for one logical request. Release the
+            // one just reserved above (it may be handed straight to the next waiter) and report the
+            // waiter's own outcome instead.
             ReleaseSlot();
-            return QueueWaitResult.Reserved;
+            return waiter.WasClosed ? QueueWaitResult.Closed : QueueWaitResult.Reserved;
         }
 
         if (afterEnqueue == QueueReservationResult.Latched)
@@ -549,11 +746,16 @@ internal sealed class InMemoryQueue
                 return QueueWaitResult.Latched;
             }
 
-            // the waiter was granted a slot concurrently, an instant before the latch was observed set:
-            // the caller owns that reservation and must not leak it.
-            return QueueWaitResult.Reserved;
+            // the waiter was granted a slot, or closed, concurrently, an instant before the latch was
+            // observed set: the caller owns that outcome and must not leak it.
+            return waiter.WasClosed ? QueueWaitResult.Closed : QueueWaitResult.Reserved;
         }
 
+        // (c) waiter.Task is Task<bool> (true = granted, false = closed), but the timed wait below is
+        // awaited on the non-generic Task base with ConfigureAwaitOptions.SuppressThrowing — awaiting a
+        // Task<TResult> with that option throws ArgumentOutOfRangeException at run time. waitTask MUST
+        // stay typed as the base Task; once it completes successfully, the actual outcome is read back
+        // from waiter.Task.Result instead.
         Task waitTask;
         try
         {
@@ -571,7 +773,7 @@ internal sealed class InMemoryQueue
 
         if (waitTask.IsCompletedSuccessfully)
         {
-            return QueueWaitResult.Reserved;
+            return waiter.Task.Result ? QueueWaitResult.Reserved : QueueWaitResult.Closed;
         }
 
         if (TryAbandon(waiter))
@@ -579,9 +781,9 @@ internal sealed class InMemoryQueue
             return waitTask.IsCanceled ? QueueWaitResult.Cancelled : QueueWaitResult.TimedOut;
         }
 
-        // the slot was granted concurrently with the timeout/cancellation: the caller owns it now and
-        // must not leak it.
-        return QueueWaitResult.Reserved;
+        // the slot was granted, or the queue was closed, concurrently with the timeout/cancellation: the
+        // caller owns that outcome now and must not leak it.
+        return waiter.WasClosed ? QueueWaitResult.Closed : QueueWaitResult.Reserved;
     }
 
     /// <summary>
@@ -698,8 +900,9 @@ internal sealed class InMemoryQueue
         private const int Pending = 0;
         private const int Granted = 1;
         private const int Abandoned = 2;
+        private const int Closed = 3;
 
-        private readonly TaskCompletionSource _source =
+        private readonly TaskCompletionSource<bool> _source =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private int _state;
@@ -709,7 +912,13 @@ internal sealed class InMemoryQueue
         /// <summary>Gets the FIFO node carrying this waiter, so an abandoned waiter can unlink itself in O(1).</summary>
         internal LinkedListNode<ReserveWaiter> Node { get; }
 
-        internal Task Task => _source.Task;
+        /// <summary>
+        /// Gets the underlying task. Its result distinguishes a grant (<see langword="true"/>, set by
+        /// <see cref="Grant"/>) from a close (<see langword="false"/>, set by <see cref="CompleteClosed"/>)
+        /// — a task that completes successfully at all means a slot was reserved for a grant, but never
+        /// for a close.
+        /// </summary>
+        internal Task<bool> Task => _source.Task;
 
         /// <summary>
         /// Attempts to transition this waiter from pending to granted. Does not complete the underlying
@@ -718,17 +927,36 @@ internal sealed class InMemoryQueue
         internal bool TryMarkGranted() => Interlocked.CompareExchange(ref _state, Granted, Pending) == Pending;
 
         /// <summary>
-        /// Completes the underlying task after a successful <see cref="TryMarkGranted"/>. Kept separate
-        /// so <see cref="ReleaseSlot"/> can complete it after releasing the waiters lock.
+        /// Completes the underlying task with <see langword="true"/> after a successful
+        /// <see cref="TryMarkGranted"/>. Kept separate so <see cref="ReleaseSlot"/> can complete it after
+        /// releasing the waiters lock.
         /// </summary>
-        internal void Grant() => _source.TrySetResult();
+        internal void Grant() => _source.TrySetResult(true);
 
         /// <summary>
         /// Attempts to transition this waiter from pending to abandoned. Returns <see langword="false"/>
-        /// when the waiter was already granted a slot by a concurrent <see cref="ReleaseSlot"/> — the
-        /// caller then owns that reservation and must not leak it.
+        /// when the waiter was already granted a slot by a concurrent <see cref="ReleaseSlot"/>, or
+        /// already closed by a concurrent <see cref="Close"/> — the caller must then inspect
+        /// <see cref="WasClosed"/> to tell which, since either way it must not leak a reservation it does
+        /// not actually hold.
         /// </summary>
         internal bool TryMarkAbandoned() => Interlocked.CompareExchange(ref _state, Abandoned, Pending) == Pending;
+
+        /// <summary>
+        /// Attempts to transition this waiter from pending to closed. Returns <see langword="false"/>
+        /// when the waiter was already granted a slot, or already abandoned, by a concurrent caller.
+        /// </summary>
+        internal bool TryMarkClosed() => Interlocked.CompareExchange(ref _state, Closed, Pending) == Pending;
+
+        /// <summary>Gets whether this waiter's state is <see cref="Closed"/>.</summary>
+        internal bool WasClosed => Volatile.Read(ref _state) == Closed;
+
+        /// <summary>
+        /// Completes the underlying task with <see langword="false"/> after a successful
+        /// <see cref="TryMarkClosed"/>, so <see cref="WaitToReserveAsync"/> reports
+        /// <see cref="QueueWaitResult.Closed"/> without this waiter ever having reserved a slot.
+        /// </summary>
+        internal void CompleteClosed() => _source.TrySetResult(false);
     }
 
     private sealed class ConsumerRegistration(InMemoryQueue queue)

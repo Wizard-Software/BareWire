@@ -132,7 +132,11 @@ later message in the batch are reported as not confirmed, and the call returns n
 cancelled before any message is processed does throw, however, since nothing has been admitted yet.
 
 Once the adapter is disposed, a send call — and any message of a call already in flight — reports
-`false` with reason `closed` instead of throwing `ObjectDisposedException`.
+`false` with reason `closed` instead of throwing `ObjectDisposedException`. A send that is waiting
+for queue capacity at that moment completes immediately with reason `closed` rather than waiting
+out `SendTimeout`. Messages still sitting in a queue when the adapter is disposed are dropped, with
+one `Warning` per queue carrying the number of dropped messages and the
+`barewire.inmemory.deliveries.drain_dropped` counter, and their buffers are returned to the pool.
 
 The rejected-copies/messages counter (`barewire.inmemory.send.rejected`) is a provisional name and
 shape: a later subtask may fold it into a single, transport-wide rejection counter alongside the

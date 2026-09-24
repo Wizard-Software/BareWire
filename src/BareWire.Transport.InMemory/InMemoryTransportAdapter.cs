@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Collections.Immutable;
 using System.Diagnostics.Metrics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
@@ -27,11 +28,22 @@ namespace BareWire.Transport.InMemory;
 /// <c>Reject</c>, and <c>Requeue</c> (with a redelivery limit falling back to dead-lettering) are always
 /// available; <c>Defer</c> throws <see cref="NotSupportedException"/> unless
 /// <see cref="InMemoryTransportOptions.DeferEnabled"/> is on, in which case it schedules a delayed
-/// redelivery instead. Registered as an <see cref="ITransportAdapter"/> DI singleton by
-/// <c>AddBareWireInMemory</c>.
+/// redelivery instead. Also implements <see cref="IGracefulDrainTransport"/>, letting the bus wait —
+/// bounded by a timeout and a cancellation token — for every queue with an active consumer to empty
+/// before that consumer is cancelled during a graceful shutdown. Registered as an
+/// <see cref="ITransportAdapter"/> DI singleton by <c>AddBareWireInMemory</c>.
 /// </summary>
-internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable, IAsyncDisposable
+internal sealed class InMemoryTransportAdapter
+    : ITransportAdapter, IGracefulDrainTransport, IDisposable, IAsyncDisposable
 {
+    /// <summary>
+    /// The interval <see cref="DrainAsync"/> polls at while waiting for every active queue to drain. A
+    /// fixed, non-configurable constant — small enough to keep the drain's tail latency low, large enough
+    /// to keep polling cost negligible against the two counters it checks (a queue's occupancy and the
+    /// delivery map's disposed-unsettled entries).
+    /// </summary>
+    internal static readonly TimeSpan DrainPollInterval = TimeSpan.FromMilliseconds(10);
+
     private readonly FrozenDictionary<string, SemaphoreSlim> _singleActiveGates;
     private readonly InMemoryConsumeDiagnostics _diagnostics;
     private readonly InMemorySendDiagnostics _sendDiagnostics;
@@ -89,7 +101,7 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
 
         Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), meter);
         _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, meter);
-        _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed);
+        _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed, BufferPool);
         _deferScheduler = options.DeferEnabled
             ? new InMemoryDeferScheduler(_timeProvider, BufferPool, _diagnostics)
             : null;
@@ -155,6 +167,12 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// is off. A test hook.
     /// </summary>
     internal int PendingDeferCount => _deferScheduler?.PendingCount ?? 0;
+
+    /// <summary>
+    /// Gets the number of undelivered messages dropped from queues after they were closed by
+    /// <see cref="Dispose"/>. A test hook.
+    /// </summary>
+    internal long DrainDroppedCount => _diagnostics.DrainDroppedCount;
 
     private static ExchangeRegistry AttachRegistry(InMemoryBroker broker, ExchangeRegistry registry)
     {
@@ -222,11 +240,13 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// processed DOES throw — see below.
     /// </para>
     /// <para>
-    /// Once this adapter is disposed, this call — and any later message of a call already in flight —
-    /// reports <see langword="false"/> with reason <c>closed</c> instead of throwing
-    /// <see cref="ObjectDisposedException"/>. A write that races disposal and reaches a queue's channel a
-    /// moment too late leaves an unclaimed pooled buffer behind; reclaiming it is left to a future
-    /// graceful-drain subtask, not this one.
+    /// Once this adapter is disposed, every queue is closed: a call already waiting for room on a target
+    /// queue is woken immediately and reports <see langword="false"/> with reason <c>closed</c> instead of
+    /// waiting out the rest of <see cref="InMemoryTransportOptions.SendTimeout"/>, and so does this call —
+    /// and any later message of a call already in flight — instead of throwing
+    /// <see cref="ObjectDisposedException"/>. A copy that races disposal and reaches a queue's channel a
+    /// moment too late is dropped by that queue on arrival: its buffer is returned to <see cref="BufferPool"/>
+    /// and its slot released, the same way as every other delivery <see cref="Dispose"/> drops.
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException">
@@ -335,16 +355,170 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         return InFlight.TryTake(message.DeliveryTag, out entry);
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// Waits only for queues with an active consumer (<see cref="InMemoryQueue.HasActiveConsumer"/>) to
+    /// reach zero <see cref="InMemoryQueue.Occupancy"/> — a dead-letter queue, or any other queue nobody
+    /// is currently consuming from, is skipped, because nothing would ever drain it. The set of active
+    /// queues is re-evaluated on every poll, not fixed at the start of the call. A delivery a consumer
+    /// disposed without settling it — its buffer already back in the pool — is claimed and its slot
+    /// released on every iteration (see <see cref="SweepReleasedByConsumer"/>), so it never strands the
+    /// drain until the timeout the way it would if only a runner's own end-of-enumeration cleanup ever
+    /// noticed it. A delivery scheduled for a deferred redelivery still holds its queue's slot for as
+    /// long as it is pending, so it still counts toward that queue's occupancy.
+    /// </para>
+    /// <para>
+    /// Elapsing <paramref name="timeout"/> is a normal, non-throwing return — messages still queued at
+    /// that point are not delivered (at-most-once), matching this adapter's own <c>closed</c> semantics
+    /// elsewhere. Cancelling <paramref name="cancellationToken"/> instead throws
+    /// <see cref="OperationCanceledException"/>. Returns an already-completed <see cref="Task"/>, without
+    /// allocating a <see cref="CancellationTokenSource"/> or a timer, whenever every active queue is
+    /// already drained — including once this adapter has been disposed.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is negative and not <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public Task DrainAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        if (timeout < TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(timeout), timeout,
+                "The drain timeout must not be negative, unless it is Timeout.InfiniteTimeSpan (wait indefinitely).");
+        }
+
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        SweepReleasedByConsumer();
+        return IsDrained() ? Task.CompletedTask : DrainSlowAsync(timeout, cancellationToken);
+    }
+
     /// <summary>
-    /// Shuts the adapter down: stops every running consume enumeration, cancels every pending deferred
-    /// redelivery (see <see cref="InMemoryDeferScheduler.Dispose"/>), and drops every delivery still in
-    /// flight, releasing its queue slot (never its buffer, which belongs to the message), with one warning
-    /// log and one counter increment per affected queue. Idempotent.
+    /// The polling path <see cref="DrainAsync"/> falls back to once the fast, synchronous check finds at
+    /// least one active queue not yet drained. Polls every <see cref="DrainPollInterval"/>, sweeping
+    /// <see cref="InFlight"/> and re-checking <see cref="IsDrained"/> after each wait, until either every
+    /// active queue is drained, <paramref name="timeout"/> elapses, <paramref name="cancellationToken"/>
+    /// is cancelled, or this adapter is disposed while the wait is in progress.
+    /// </summary>
+    private async Task DrainSlowAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        TimeSpan clamped = timeout > InMemoryQueue.MaxSupportedWaitTimeout
+            ? InMemoryQueue.MaxSupportedWaitTimeout
+            : timeout;
+
+        async Task PollUntilDrainedAsync(CancellationToken pollToken)
+        {
+            while (true)
+            {
+                if (Volatile.Read(ref _disposed) != 0)
+                {
+                    return;
+                }
+
+                await Task.Delay(DrainPollInterval, _timeProvider, pollToken).ConfigureAwait(false);
+
+                SweepReleasedByConsumer();
+                if (IsDrained())
+                {
+                    return;
+                }
+            }
+        }
+
+        if (clamped == Timeout.InfiniteTimeSpan)
+        {
+            await PollUntilDrainedAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        using var timeoutCts = new CancellationTokenSource(clamped, _timeProvider);
+        using CancellationTokenSource linked =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+        try
+        {
+            await PollUntilDrainedAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // The timeout elapsed, not the caller: a normal, non-throwing return (at-most-once) —
+            // matching IGracefulDrainTransport's contract. Cancelling cancellationToken itself is not
+            // caught here and propagates as OperationCanceledException, as documented on DrainAsync.
+        }
+    }
+
+    /// <summary>
+    /// Claims every entry of <see cref="InFlight"/> whose message was disposed by its consumer without
+    /// being settled and releases its queue slot, so such a delivery never strands
+    /// <see cref="DrainAsync"/> until its timeout. Two phases, in order: every claimed entry's slot is
+    /// released first, and only once every one of them has been released is the per-queue count reported
+    /// to <see cref="_diagnostics"/> — so a throwing diagnostics listener can never leave a claimed entry
+    /// with its slot still held, which would otherwise leak occupancy that no later drain could ever
+    /// observe being freed.
+    /// </summary>
+    private void SweepReleasedByConsumer()
+    {
+        List<InFlightDelivery> released = InFlight.TakeReleasedByConsumer();
+        if (released.Count == 0)
+        {
+            return;
+        }
+
+        var perQueue = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (InFlightDelivery entry in released)
+        {
+            entry.Queue.ReleaseSlot();
+            perQueue[entry.Queue.Name] = perQueue.GetValueOrDefault(entry.Queue.Name) + 1;
+        }
+
+        foreach (KeyValuePair<string, int> dropped in perQueue)
+        {
+            _diagnostics.DeliveriesDisposedUnsettled(dropped.Key, dropped.Value);
+        }
+    }
+
+    /// <summary>
+    /// Gets whether every queue with an active consumer currently has zero <see cref="InMemoryQueue.Occupancy"/>.
+    /// A queue nobody is consuming from (a dead-letter queue included) never affects this result.
+    /// </summary>
+    private bool IsDrained()
+    {
+        foreach (InMemoryQueue queue in Broker.Queues)
+        {
+            if (queue.HasActiveConsumer && queue.Occupancy != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Shuts the adapter down: closes every queue — waking any sender still waiting for room with
+    /// <c>closed</c> instead of leaving it to wait out its timeout — stops every running consume
+    /// enumeration, cancels every pending deferred redelivery (see <see cref="InMemoryDeferScheduler.Dispose"/>),
+    /// and drops every delivery still sitting in a queue's channel or still handed to a consumer and
+    /// unsettled, releasing its queue slot and returning its buffer to <see cref="BufferPool"/>, with one
+    /// aggregated warning log and one metric measurement per affected queue. Idempotent.
     /// </summary>
     /// <remarks>
-    /// A <c>Requeue</c> or dead-letter write that races this call and reaches a queue's channel a moment
-    /// too late leaves an unclaimed pooled buffer behind; reclaiming it is left to a future graceful-drain
-    /// subtask, not this one — see the similar note on <see cref="SendBatchAsync"/>.
+    /// Every buffer this adapter is still holding on to at the moment it is disposed — sitting in a
+    /// queue's channel, or handed to a consumer and never settled — is returned to <see cref="BufferPool"/>
+    /// exactly once before this method returns (or, if a diagnostics listener itself throws, before that
+    /// exception propagates): every queue is closed and drained, and every in-flight delivery is released,
+    /// entirely before this method reports what was dropped. A <c>Requeue</c> or dead-letter write that
+    /// races this call and reaches a queue's channel a moment too late is dropped by that queue on arrival
+    /// the same way, and counted toward the same per-queue total — see the similar note on
+    /// <see cref="SendBatchAsync"/>.
     /// </remarks>
     public void Dispose()
     {
@@ -354,24 +528,37 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         }
 
         _shutdown.Cancel();
+
+        ImmutableArray<InMemoryQueue> queues = Broker.Queues;
+
+        foreach (InMemoryQueue queue in queues)
+        {
+            queue.Close(BufferPool);
+        }
+
+        foreach (InMemoryQueue queue in queues)
+        {
+            queue.DropRemaining();
+        }
+
         _deferScheduler?.Dispose();
 
-        List<InFlightDelivery> remaining = InFlight.TakeAll();
-        if (remaining.Count == 0)
-        {
-            return;
-        }
-
-        var droppedPerQueue = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (InFlightDelivery entry in remaining)
+        var droppedOnShutdownPerQueue = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (InFlightDelivery entry in InFlight.TakeAll())
         {
             entry.Queue.ReleaseSlot();
-            droppedPerQueue[entry.Queue.Name] = droppedPerQueue.GetValueOrDefault(entry.Queue.Name) + 1;
+            droppedOnShutdownPerQueue[entry.Queue.Name] =
+                droppedOnShutdownPerQueue.GetValueOrDefault(entry.Queue.Name) + 1;
         }
 
-        foreach (KeyValuePair<string, int> dropped in droppedPerQueue)
+        foreach (KeyValuePair<string, int> dropped in droppedOnShutdownPerQueue)
         {
             _diagnostics.DeliveriesDroppedOnShutdown(dropped.Key, dropped.Value);
+        }
+
+        foreach (InMemoryQueue queue in queues)
+        {
+            _diagnostics.DeliveriesDroppedOnDrain(queue.Name, queue.TakeDroppedAfterClose());
         }
     }
 

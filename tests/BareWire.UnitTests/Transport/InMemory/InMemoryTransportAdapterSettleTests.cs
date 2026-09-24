@@ -647,16 +647,26 @@ public sealed class InMemoryTransportAdapterSettleTests
             await adapter.SendBatchAsync([published], TestContext.Current.CancellationToken);
         results.Should().ContainSingle(r => r.IsConfirmed);
 
-        // q1: Ack. The original buffer was rented by the send path, outside the hook.
+        // q1: Ack. The original buffer is now rented by the send path THROUGH the hook (the pool the
+        // sender commits through is the adapter's own), so the observer sees the rent; the message's own
+        // Dispose() still returns it directly to the shared pool, not through the hook, so the observer
+        // must be told about that return explicitly — immediately, before the next settlement that rents.
         (InboundMessage m1, IAsyncEnumerator<InboundMessage> e1) = await ReceiveOneAsync(adapter, "q1");
+        byte[]? sentBuffer = m1.PooledBuffer;
         await adapter.SettleAsync(SettlementAction.Ack, m1);
         m1.Dispose();
+        m1.PooledBuffer.Should().BeNull();
+        observer.MarkReturnedByMessage(sentBuffer!);
         await e1.DisposeAsync();
 
-        // q2: Nack -> dead-letters to q2-dlq (a hook-rented copy) -> Ack.
+        // q2: Nack -> dead-letters to q2-dlq (a hook-rented copy) -> Ack. The original buffer is also
+        // hook-rented now (the send path fans out through the pool), so its disposal must be marked too.
         (InboundMessage m2, IAsyncEnumerator<InboundMessage> e2) = await ReceiveOneAsync(adapter, "q2");
+        byte[]? q2SentBuffer = m2.PooledBuffer;
         await adapter.SettleAsync(SettlementAction.Nack, m2);
         m2.Dispose();
+        m2.PooledBuffer.Should().BeNull();
+        observer.MarkReturnedByMessage(q2SentBuffer!);
         await e2.DisposeAsync();
 
         (InboundMessage dead2, IAsyncEnumerator<InboundMessage> deadEnumerator) = await ReceiveOneAsync(adapter, "q2-dlq");
@@ -666,10 +676,14 @@ public sealed class InMemoryTransportAdapterSettleTests
         observer.MarkReturnedByMessage(deadBuffer!);
         await deadEnumerator.DisposeAsync();
 
-        // q3: Requeue (a hook-rented copy) -> read the redelivery on the same enumerator -> Ack.
+        // q3: Requeue (a hook-rented copy) -> read the redelivery on the same enumerator -> Ack. The
+        // original buffer is also hook-rented now, so its disposal must be marked too.
         (InboundMessage m3, IAsyncEnumerator<InboundMessage> e3) = await ReceiveOneAsync(adapter, "q3");
+        byte[]? q3SentBuffer = m3.PooledBuffer;
         await adapter.SettleAsync(SettlementAction.Requeue, m3);
         m3.Dispose();
+        m3.PooledBuffer.Should().BeNull();
+        observer.MarkReturnedByMessage(q3SentBuffer!);
         (await e3.MoveNextAsync().AsTask().WaitAsync(WaitTimeout, TestContext.Current.CancellationToken))
             .Should().BeTrue();
         InboundMessage redelivered3 = e3.Current;

@@ -1,4 +1,3 @@
-using System.Buffers;
 using BareWire.Abstractions.Transport;
 
 namespace BareWire.Transport.InMemory.Internal;
@@ -53,6 +52,13 @@ namespace BareWire.Transport.InMemory.Internal;
 /// latch this type sets itself — <see cref="InMemoryQueue.TryLatch"/>, after this call's one wait for
 /// that queue times out — is the only latch event this type logs, once, throttled per queue.
 /// </para>
+/// <para>
+/// <b>Closing.</b> When the call's one wait resolves with <see cref="QueueWaitResult.Closed"/> — the
+/// owning adapter was disposed while this call was waiting for room — the queue loop stops immediately,
+/// without waiting on any further target queue of the same message, and that message together with every
+/// later one in the batch is reported not confirmed with reason <c>closed</c>, the same way as a call that
+/// finds the adapter already closed before it ever waited. No exception is thrown.
+/// </para>
 /// </remarks>
 internal sealed class InMemorySender
 {
@@ -61,6 +67,7 @@ internal sealed class InMemorySender
     private readonly InMemoryTransportOptions _options;
     private readonly InMemorySendDiagnostics _diagnostics;
     private readonly Func<bool> _isClosed;
+    private readonly InMemoryBufferPool _pool;
     private long _lastTag;
 
     /// <param name="broker">Resolves target queue instances by name. Must not be <see langword="null"/>.</param>
@@ -71,24 +78,32 @@ internal sealed class InMemorySender
     /// Returns whether the owning adapter has been disposed. Called before every message and once more
     /// after this call's one wait, if it had one. Must not be <see langword="null"/>.
     /// </param>
+    /// <param name="pool">
+    /// The owning adapter's buffer pool — every rent this sender performs on the caller's behalf goes
+    /// through it (rather than <see cref="System.Buffers.ArrayPool{T}.Shared"/> directly), so a test-time
+    /// observer attached to that pool sees every one of them. Must not be <see langword="null"/>.
+    /// </param>
     internal InMemorySender(
         InMemoryBroker broker,
         InMemoryRouter router,
         InMemoryTransportOptions options,
         InMemorySendDiagnostics diagnostics,
-        Func<bool> isClosed)
+        Func<bool> isClosed,
+        InMemoryBufferPool pool)
     {
         ArgumentNullException.ThrowIfNull(broker);
         ArgumentNullException.ThrowIfNull(router);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(diagnostics);
         ArgumentNullException.ThrowIfNull(isClosed);
+        ArgumentNullException.ThrowIfNull(pool);
 
         _broker = broker;
         _router = router;
         _options = options;
         _diagnostics = diagnostics;
         _isClosed = isClosed;
+        _pool = pool;
     }
 
     /// <summary>
@@ -284,8 +299,9 @@ internal sealed class InMemorySender
     {
         long start = TimeProvider.System.GetTimestamp();
         bool cancelled = false;
+        bool closed = false;
 
-        for (int q = 0; q < pending.FullQueues.Count && !cancelled; q++)
+        for (int q = 0; q < pending.FullQueues.Count && !cancelled && !closed; q++)
         {
             InMemoryQueue queue = pending.FullQueues[q];
             TimeSpan remaining = RemainingBudget(start);
@@ -328,7 +344,17 @@ internal sealed class InMemorySender
                 case QueueWaitResult.Cancelled:
                     cancelled = true;
                     break;
+
+                case QueueWaitResult.Closed:
+                    closed = true;
+                    break;
             }
+        }
+
+        if (closed)
+        {
+            MarkClosed(results, index, tagStart);
+            return results;
         }
 
         if (cancelled)
@@ -400,16 +426,16 @@ internal sealed class InMemorySender
     }
 
     /// <summary>
-    /// Rents a buffer sized to <paramref name="body"/> (at least one byte, so a zero-length body still
-    /// gets a private buffer rather than the shared empty array — see <see cref="ArrayPool{T}.Rent"/>),
-    /// copies the body into it, and writes it to <paramref name="queue"/>'s already-reserved slot. On any
-    /// failure before the write succeeds, the rented buffer is returned to the pool and the reservation is
-    /// released before the exception propagates — the caller (<see cref="ProcessMessage"/> or
+    /// Rents a buffer sized to <paramref name="body"/> through <see cref="_pool"/> (at least one byte, so
+    /// a zero-length body still gets a private buffer rather than the shared empty array), copies the body
+    /// into it, and writes it to <paramref name="queue"/>'s already-reserved slot. On any failure before
+    /// the write succeeds, the rented buffer is returned to the pool and the reservation is released before
+    /// the exception propagates — the caller (<see cref="ProcessMessage"/> or
     /// <see cref="ContinueAfterWaitAsync"/>) maps it to <see cref="SendRejectionReason.InternalError"/>.
     /// </summary>
-    private static void Commit(InMemoryQueue queue, ReadOnlySpan<byte> body, InMemoryHeaderSet headers)
+    private void Commit(InMemoryQueue queue, ReadOnlySpan<byte> body, InMemoryHeaderSet headers)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Max(body.Length, 1));
+        byte[] buffer = _pool.Rent(body.Length);
         bool written = false;
         try
         {
@@ -421,7 +447,7 @@ internal sealed class InMemorySender
         {
             if (!written)
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                _pool.Return(buffer);
                 queue.ReleaseSlot();
             }
         }
