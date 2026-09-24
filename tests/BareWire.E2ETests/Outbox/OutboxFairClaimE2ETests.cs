@@ -12,6 +12,7 @@ using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
 using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -73,9 +74,20 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
     /// </summary>
     /// <remarks>
     /// With the built-in dialect the top-up step runs the same new-rows statement as the first step,
-    /// only with the smaller top-up limit, so it is planned here with such a limit. A plain EXPLAIN
-    /// plans from the table statistics and the parameter values, not from rows claimed earlier in the
-    /// same cycle.
+    /// only with a smaller limit; the limit used for the "topup" case here (7) is illustrative of a
+    /// small top-up remainder, not derived from what a real first and second claim step would have
+    /// left over against this table. A plain EXPLAIN plans from the table's ANALYZE statistics and the
+    /// given parameter values — it never reflects rows a real claim earlier in the same cycle would
+    /// have taken, because no row is ever actually claimed here.
+    /// <para>
+    /// The "topup" case additionally proves, from one real <see cref="EfCoreOutboxStore.GetPendingAsync"/>
+    /// call in an isolated seed, that the statement <see cref="EfCoreOutboxStore"/> itself sends for its
+    /// top-up step is textually identical to the one it sends for its new-rows step — so a future change
+    /// that routes the top-up step through the OR-predicate <see cref="IOutboxSqlDialect.GetClaimSql"/>
+    /// shape instead of <see cref="INewRowsClaimSql.GetNewRowsClaimSql"/> would fail this test, even
+    /// though the EXPLAIN plan itself is always built from a direct dialect call, not from what that
+    /// real claim executed.
+    /// </para>
     /// </remarks>
     [Theory]
     [InlineData("new", OrderingMode.None)]
@@ -96,6 +108,21 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
 
         try
         {
+            // Run before the 100 000-row seed below so this isolated capture never competes for the
+            // due-retry class with that dataset's huge stale-locked backlog — see
+            // CaptureActualNewAndTopUpCommandTextsAsync for why that competition would prevent the
+            // top-up step from ever running.
+            if (shape == "topup")
+            {
+                (string newRowsCommandText, string topUpCommandText) =
+                    await CaptureActualNewAndTopUpCommandTextsAsync(mode);
+
+                topUpCommandText.Should().Be(newRowsCommandText,
+                    "EfCoreOutboxStore's actual top-up statement must be the same statement shape as " +
+                    "its new-rows statement; this must fail if the top-up step ever falls back to the " +
+                    "OR-predicate IOutboxSqlDialect.GetClaimSql shape instead");
+            }
+
             await SeedBulkClaimRowsAsync(seedContext, marker, mode == OrderingMode.PerKey);
             await seedContext.Database.ExecuteSqlRawAsync("ANALYZE \"OutboxMessages\"");
 
@@ -209,7 +236,7 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
     private static EfCoreOutboxStore CreateStore(OutboxDbContext context, string instanceId, OutboxOptions options)
         => new(context, new OutboxInstanceId(instanceId), new PostgresOutboxSqlDialect(), options);
 
-    private static OutboxOptions CreateOptions(TimeSpan? lockTimeout = null)
+    private static OutboxOptions CreateOptions(TimeSpan? lockTimeout = null, OrderingMode orderingMode = OrderingMode.None)
         => new()
         {
             PollingInterval = TimeSpan.FromSeconds(1),
@@ -217,7 +244,85 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
             OutboxRetention = TimeSpan.FromDays(7),
             InboxRetention = TimeSpan.FromDays(8),
             InboxLockTimeout = TimeSpan.FromSeconds(30),
+            OrderingMode = orderingMode,
+            OrderingKeyHeaderName = orderingMode == OrderingMode.PerKey ? "x-ordering-key" : null,
         };
+
+    // Captures EfCoreOutboxStore's actual "new" and "top-up" claim command texts from one real
+    // GetPendingAsync call against a small, self-contained seed, so the "topup" theory case can assert
+    // the store's real top-up statement — not just the dialect call this test file builds for the
+    // EXPLAIN plan — matches its new-rows statement shape.
+    //
+    // Deliberately run against a marker-scoped seed of exactly the new-rows reservation with zero due
+    // rows: with batchSize 10, OutboxFairClaimPlan.GetRetryReserve reserves 2 slots for due retries
+    // (max(1, 10 / 4)), leaving a new-rows reservation of 8. Seeding exactly 8 fresh rows and no due
+    // rows lets the new-rows step fully fill its reservation while the due step's 2-slot reserve goes
+    // unclaimed (nothing is due) — exactly OutboxFairClaimPlan.ShouldTopUp's trigger condition, so a
+    // third (top-up) claim statement always runs. This must run before this test method's own
+    // 100 000-row seed: that dataset's huge stale-locked backlog would let the due step fill its whole
+    // reserve every time, and OutboxFairClaimPlan.ShouldTopUp never triggers once both classes are
+    // fully served in one cycle.
+    private async Task<(string NewRowsCommandText, string TopUpCommandText)> CaptureActualNewAndTopUpCommandTextsAsync(
+        OrderingMode mode)
+    {
+        const int batchSize = 10;
+        const int newRowCount = 8;
+        string marker = $"fair-claim-topup-shape-{Guid.NewGuid():N}";
+
+        var interceptor = new ClaimCommandTextInterceptor();
+        var optionsBuilder = new DbContextOptionsBuilder<OutboxDbContext>();
+        optionsBuilder.UseNpgsql(_connectionString!);
+        optionsBuilder.AddInterceptors(interceptor);
+        await using var context = new OutboxDbContext(optionsBuilder.Options);
+
+        await SeedMarkedRowsAsync(context, marker, newRowCount);
+
+        OutboxOptions options = CreateOptions(orderingMode: mode);
+        var store = new EfCoreOutboxStore(context, new OutboxInstanceId(marker), new PostgresOutboxSqlDialect(), options);
+
+        interceptor.Reset();
+        IReadOnlyList<OutboxEntry> claimed = Array.Empty<OutboxEntry>();
+        try
+        {
+            claimed = await store.GetPendingAsync(batchSize);
+        }
+        finally
+        {
+            ReturnBuffers(claimed);
+        }
+
+        // Snapshot before cleanup: MarkMarkedRowsDeliveredAsync issues its own UPDATE "OutboxMessages"
+        // statement against this same interceptor-attached context.
+        IReadOnlyList<string> commandTexts = [.. interceptor.CommandTexts];
+        await MarkMarkedRowsDeliveredAsync(context, marker);
+
+        commandTexts.Should().HaveCount(3,
+            "seeding exactly the new-rows reservation with no due rows must produce a new, a due, and " +
+            "a top-up claim statement, in that order");
+
+        return (commandTexts[0], commandTexts[2]);
+    }
+
+    // Captures every non-query (UPDATE) command text sent through the attached context, in order.
+    // Mirrors EfCoreOutboxStoreReleaseTests.NonQueryCommandCounter.
+    private sealed class ClaimCommandTextInterceptor : DbCommandInterceptor
+    {
+        private readonly List<string> _commandTexts = [];
+
+        public IReadOnlyList<string> CommandTexts => _commandTexts;
+
+        public void Reset() => _commandTexts.Clear();
+
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            _commandTexts.Add(command.CommandText);
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
+        }
+    }
 
     // Creates a DbContext that includes the ordering model customizer so schema creation via
     // EnsureCreatedAsync also creates IX_OutboxMessages_Ordering, and makes sure that index exists

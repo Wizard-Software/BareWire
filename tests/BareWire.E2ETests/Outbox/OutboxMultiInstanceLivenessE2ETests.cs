@@ -335,6 +335,86 @@ public sealed class OutboxMultiInstanceLivenessE2ETests : IAsyncLifetime
         fresh.Should().OnlyContain(id => ledger.AckCount(id) == 1);
     }
 
+    // ── Test 4: one transient rejection behind a poison cohort ────────────────
+
+    /// <summary>
+    /// A row rejected by the transport exactly once (a transient failure) must still be redelivered
+    /// despite a permanently rejected ("poison") cohort with lower ids competing for the same
+    /// retry-class capacity every cycle.
+    /// </summary>
+    [Fact]
+    public async Task GetPendingAsync_TransientRejectionBehindPoisonCohort_RedeliversEveryRowWithinBound()
+    {
+        const int poisonCount = 12; // P — lower ids, rejected on every attempt.
+        const int transientCount = 4; // K — higher ids, rejected on exactly their first attempt.
+        OutboxOptions options = CreateOptions(TimeSpan.FromSeconds(30));
+        var clock = new ManualClock(DateTimeOffset.UtcNow);
+
+        IReadOnlyList<long> poison = await SeedRowsAsync("p0-transient-poison", poisonCount, clock);
+        await MakeDueRetriesAsync(poison, options, clock);
+        IReadOnlyList<long> transient = await SeedRowsAsync("p0-transient-fresh", transientCount, clock);
+
+        // A row's first-ever nack always uses the deferral schedule's bucket-0 deferral, whose minimum
+        // is exactly PollingInterval (retryCount == 0, zero jitter) — see OutboxNackDeferralSchedule.
+        // The claim predicate compares LockedAt with a strict "<", so even that minimum deferral can
+        // never have already elapsed after exactly one clock tick; two ticks are always required,
+        // regardless of jitter. Never derived from production code — this is the schedule's documented
+        // contract, hard-coded here as this scenario's "claim latency" term.
+        const int firstDeferralCycles = 2;
+
+        // R_eff, the retry class's effective capacity per cycle: the poison cohort has already been
+        // pushed into the due-retry class before this loop starts (MakeDueRetriesAsync above), so from
+        // cycle 1 there is no new-row backlog left to compete with it — every transient row is claimed
+        // as "new" well before the retry class would ever need more than its RetryShare reserve, and
+        // once poison and transient rows share the retry class, the effective capacity is never less
+        // than the RetryShare reserve (it can only be more, when the new-rows step leaves capacity
+        // unclaimed). RetryShare is therefore a safe, worst-case-only floor for R_eff.
+        int bound = firstDeferralCycles + (int)Math.Ceiling((poisonCount + transientCount) / (double)RetryShare); // 10
+
+        var ledger = new DeliveryLedger();
+        var poisonSet = poison.ToHashSet();
+        var transientSet = transient.ToHashSet();
+        var firstNackCycle = new Dictionary<long, int>();
+
+        bool Accept(OutboxEntry e) => !poisonSet.Contains(e.Id) && e.NackCount >= 1;
+
+        for (int cycle = 1; cycle <= 2 * bound && await CountUndeliveredAsync(transient) > 0; cycle++)
+        {
+            clock.Advance(options.PollingInterval);
+            CycleResult result = await RunCycleAsync("live-instance", options, clock, cycle, Accept, ledger);
+
+            foreach (long id in result.NackedIds.Where(transientSet.Contains))
+            {
+                firstNackCycle.TryAdd(id, cycle);
+            }
+
+            // Sensitivity: a transient row cannot be redelivered in the cycle immediately after its
+            // first nack — see firstDeferralCycles above.
+            foreach (long id in result.AckedIds.Where(transientSet.Contains))
+            {
+                firstNackCycle.Should().ContainKey(id, "a transient row must be nacked once before it can be delivered");
+                (cycle - firstNackCycle[id]).Should().BeGreaterThanOrEqualTo(firstDeferralCycles,
+                    "a transient row cannot be redelivered before its first-nack deferral has elapsed");
+            }
+        }
+
+        (await CountUndeliveredAsync(transient)).Should().Be(0, "every transiently rejected row must eventually be delivered");
+        transient.Should().OnlyContain(id => ledger.DeliveredInCycle(id) <= bound, $"bound = {bound} cycles");
+        transient.Should().OnlyContain(id => ledger.AckCount(id) == 1, "no transiently rejected row may be delivered twice");
+
+        IReadOnlyDictionary<long, OutboxMessage> transientRows = await ReadRowsAsync(transient);
+        transientRows.Values.Should().OnlyContain(row => row.RetryCount == 1,
+            "each transiently rejected row must carry exactly its one scripted nack");
+
+        // The poison cohort stayed active and kept being retried throughout the run.
+        (await CountUndeliveredAsync(poison)).Should().Be(poisonCount,
+            "the poison cohort must stay undelivered — it is rejected on every attempt");
+
+        IReadOnlyDictionary<long, OutboxMessage> poisonRows = await ReadRowsAsync(poison);
+        poisonRows.Values.Should().OnlyContain(row => row.RetryCount >= 2,
+            "the poison cohort must have been rejected again multiple times across the run");
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private OutboxDbContext CreateDbContext()
