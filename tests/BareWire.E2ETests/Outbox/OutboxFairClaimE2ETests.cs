@@ -65,16 +65,25 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
     // ── Claim SQL must use the ordered index, never a Sort ────────────────────
 
     /// <summary>
-    /// Against a ~100 000-row table, both the "new" and "due retry" single-class claim statements
-    /// must be served by an ordered scan of <c>IX_OutboxMessages_Claim</c> — the whole reason those
-    /// statements exist instead of the combined public claim statement, whose OR predicate the
-    /// planner cannot serve from that index in order.
+    /// Against a ~100 000-row table, every statement of the three-step claim cycle — new rows ("new"),
+    /// due retries ("due") and the top-up with new rows ("topup") — must be served by an ordered scan
+    /// of <c>IX_OutboxMessages_Claim</c> without a Sort node — the whole reason those statements exist
+    /// instead of the combined public claim statement, whose OR predicate the planner cannot serve
+    /// from that index in order.
     /// </summary>
+    /// <remarks>
+    /// With the built-in dialect the top-up step runs the same new-rows statement as the first step,
+    /// only with the smaller top-up limit, so it is planned here with such a limit. A plain EXPLAIN
+    /// plans from the table statistics and the parameter values, not from rows claimed earlier in the
+    /// same cycle.
+    /// </remarks>
     [Theory]
     [InlineData("new", OrderingMode.None)]
     [InlineData("new", OrderingMode.PerKey)]
     [InlineData("due", OrderingMode.None)]
     [InlineData("due", OrderingMode.PerKey)]
+    [InlineData("topup", OrderingMode.None)]
+    [InlineData("topup", OrderingMode.PerKey)]
     public async Task ClaimSql_HundredThousandRows_UsesOrderedClaimIndexScanWithoutSort(string shape, OrderingMode mode)
     {
         string marker = $"fair-claim-explain-{Guid.NewGuid():N}";
@@ -94,9 +103,15 @@ public sealed class OutboxFairClaimE2ETests : IAsyncLifetime
             DateTimeOffset staleCutoff = now - options.OutboxLockTimeout;
             var dialect = new PostgresOutboxSqlDialect();
 
-            FormattableString sql = shape == "new"
-                ? dialect.GetNewRowsClaimSql("explain-instance", now, 100, mode)
-                : dialect.GetDueOrderedRetryClaimSql("explain-instance", now, staleCutoff, 100, mode);
+            // The top-up limit is the capacity left after the first two steps, always a small remainder
+            // of the batch.
+            FormattableString sql = shape switch
+            {
+                "new" => dialect.GetNewRowsClaimSql("explain-instance", now, 100, mode),
+                "due" => dialect.GetDueOrderedRetryClaimSql("explain-instance", now, staleCutoff, 100, mode),
+                "topup" => dialect.GetNewRowsClaimSql("explain-instance", now, 7, mode),
+                _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown claim step shape."),
+            };
 
             IReadOnlyList<string> planLines = await RenderExplainPlanAsync(seedContext, sql);
             string planText = string.Join('\n', planLines);
