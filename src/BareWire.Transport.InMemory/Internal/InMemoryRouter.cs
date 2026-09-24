@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Collections.Immutable;
-using System.Diagnostics.Metrics;
 using System.Runtime.InteropServices;
 using System.Text;
 using BareWire.Abstractions;
@@ -47,9 +46,9 @@ internal sealed partial class InMemoryRouter
     private readonly ILogger<InMemoryRouter> _logger;
     private readonly TimeProvider _timeProvider;
 
-    // Opt-in, dimensionless-on-creation counter — created only when an external Meter is supplied by
-    // the composition root (mirrors the RabbitMQ request-client pattern). null = no instrument, no cost.
-    private readonly Counter<long>? _unroutableCounter;
+    // Opt-in — created only when an external Meter is supplied by the composition root, through the
+    // adapter's single InMemoryTransportMetrics owner. null = no instrument, no cost.
+    private readonly InMemoryTransportMetrics? _metrics;
 
     // Built once in the constructor from the immutable registry snapshot — never mutated afterwards.
     private readonly FrozenDictionary<string, ExchangeNode> _exchanges;
@@ -60,12 +59,13 @@ internal sealed partial class InMemoryRouter
     private readonly ConcurrentDictionary<(string Exchange, string RoutingKey), ImmutableArray<string>> _cache = new();
     private int _cacheCount;
     private long _unroutableCount;
+    private long _logFailureCount;
 
     internal InMemoryRouter(
         ExchangeRegistry registry,
         InMemoryTransportOptions options,
         ILogger<InMemoryRouter> logger,
-        Meter? meter = null,
+        InMemoryTransportMetrics? metrics = null,
         TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(registry);
@@ -76,14 +76,7 @@ internal sealed partial class InMemoryRouter
         _options = options;
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
-
-        // The instrument name/shape is provisional — it may later be folded into a
-        // shared per-reason rejection counter.
-        _unroutableCounter = meter?.CreateCounter<long>(
-            "barewire.inmemory.unroutable",
-            unit: "{message}",
-            description: "PROVISIONAL — number of in-memory messages that matched no binding. Tagged only " +
-                "with the declared exchange name; never the routing key.");
+        _metrics = metrics;
 
         _exchanges = BuildExchangeIndex(registry);
         _defaultExchangeRoutes = _exchanges[ExchangeRegistry.DefaultExchangeName].DefaultExchangeRoutes!;
@@ -126,6 +119,14 @@ internal sealed partial class InMemoryRouter
 
     /// <summary>Gets the total number of <see cref="ReportUnroutable"/> calls made against this router.</summary>
     internal long UnroutableCount => Interlocked.Read(ref _unroutableCount);
+
+    /// <summary>
+    /// Gets the number of metric or logger calls from this instance that threw and were suppressed — see
+    /// the explicit catch-and-count guard in <see cref="ReportUnroutable"/>. Without this guard, a
+    /// throwing logger there would unwind into the send path's per-message exception boundary and get
+    /// mapped to <c>internal_error</c> for the very message already being reported as <c>unroutable</c>.
+    /// </summary>
+    internal long LogFailureCount => Interlocked.Read(ref _logFailureCount);
 
     /// <summary>
     /// Resolves the target queues for <paramref name="exchange"/> and <paramref name="routingKey"/>,
@@ -310,15 +311,28 @@ internal sealed partial class InMemoryRouter
         }
 
         Interlocked.Increment(ref _unroutableCount);
-        _unroutableCounter?.Add(1, new KeyValuePair<string, object?>("exchange", exchange));
 
-        if (node.TryEnterLogWindow(_timeProvider, UnroutableLogWindow, out int suppressedCount))
+        // Caught and counted explicitly, never left to propagate: this method is called from the send
+        // path's per-message exception boundary (InMemorySender.ProcessMessage), which maps any escaping
+        // exception to SendRejectionReason.InternalError for the same message already being reported as
+        // unroutable here — a throwing metrics listener or logger would otherwise double-count one
+        // rejection under two reasons.
+        try
         {
-            // The routing key is logged as structured state, not string-interpolated into text —
-            // a caller-controlled routing key may contain CR/LF, which a text-formatting sink (not this
-            // logger) could render as forged extra log lines. The throttle above already bounds the
-            // volume, so no further sanitization is applied here.
-            LogUnroutable(_logger, exchange, routingKey, suppressedCount);
+            _metrics?.RecordExchangeRejected("unroutable", exchange);
+
+            if (node.TryEnterLogWindow(_timeProvider, UnroutableLogWindow, out int suppressedCount))
+            {
+                // The routing key is logged as structured state, not string-interpolated into text —
+                // a caller-controlled routing key may contain CR/LF, which a text-formatting sink (not
+                // this logger) could render as forged extra log lines. The throttle above already bounds
+                // the volume, so no further sanitization is applied here.
+                LogUnroutable(_logger, exchange, routingKey, suppressedCount);
+            }
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
         }
 
         return !_options.GuaranteedRouting;

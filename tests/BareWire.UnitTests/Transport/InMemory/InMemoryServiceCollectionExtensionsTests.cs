@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
@@ -9,6 +10,7 @@ using BareWire.Transport.InMemory;
 using BareWire.Transport.InMemory.Internal;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Time.Testing;
 using NSubstitute;
 
 namespace BareWire.UnitTests.Transport.InMemory;
@@ -172,6 +174,151 @@ public sealed class InMemoryServiceCollectionExtensionsTests
         IReadOnlyList<SendResult> result = await adapter.SendBatchAsync([]);
 
         result.Should().BeEmpty();
+    }
+
+    // ── Adapter observability wiring: logger + meter resolved from DI, TimeProvider never is ─────────
+
+    [Fact]
+    public async Task AddBareWireInMemory_WhenMeterFactoryAndLoggerRegistered_AdapterEmitsMetricsOnBareWireMeter()
+    {
+        using var meterFactory = new TestMeterFactory();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<IMeterFactory>(meterFactory);
+        services.AddBareWireInMemory(t =>
+        {
+            t.MaxMessageSize(16);
+            t.ConfigureTopology(topo =>
+            {
+                topo.DeclareExchange("ex", ExchangeType.Direct);
+                topo.DeclareQueue("q");
+                topo.BindExchangeToQueue("ex", "q", "k");
+            });
+        });
+
+        using ServiceProvider sp = services.BuildServiceProvider();
+        ITransportAdapter adapter = sp.GetRequiredService<ITransportAdapter>();
+
+        // AddBareWireInMemory's adapter factory resolved the IMeterFactory and created exactly one
+        // meter, named "BareWire" (the same meter BareWire.Observability registers its instruments on).
+        Meter meter = meterFactory.CreatedMeters.Should().ContainSingle().Which;
+        meter.Name.Should().Be(InMemoryTransportMetrics.MeterName);
+
+        var measurements = new List<(string Reason, string? Exchange)>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, l) =>
+        {
+            // Filters on the exact Meter instance this test's factory created — not merely on the
+            // shared "BareWire" name — so this test cannot pick up instruments from another test's
+            // meter of the same name running concurrently.
+            if (ReferenceEquals(instrument.Meter, meter)
+                && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
+            {
+                l.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
+        {
+            string? reason = null;
+            string? exchange = null;
+            foreach (KeyValuePair<string, object?> tag in tags)
+            {
+                switch (tag.Key)
+                {
+                    case "reason": reason = tag.Value as string; break;
+                    case "exchange": exchange = tag.Value as string; break;
+                }
+            }
+
+            for (long i = 0; i < value; i++)
+            {
+                measurements.Add((reason ?? string.Empty, exchange));
+            }
+        });
+        listener.Start();
+
+        var oversized = new OutboundMessage(
+            "k", new Dictionary<string, string> { ["BW-Exchange"] = "ex" }, new byte[17], "");
+        IReadOnlyList<SendResult> result =
+            await adapter.SendBatchAsync([oversized], TestContext.Current.CancellationToken);
+
+        result.Single().IsConfirmed.Should().BeFalse();
+        measurements.Should().ContainSingle(x => x.Reason == "oversized" && x.Exchange == "ex");
+    }
+
+    [Fact]
+    public async Task AddBareWireInMemory_WhenNoMeterFactoryRegistered_ResolvesAdapterWithoutInstruments()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBareWireInMemory(t => t.ConfigureTopology(topo => topo.DeclareQueue("q")));
+
+        using ServiceProvider sp = services.BuildServiceProvider();
+
+        // No IMeterFactory was registered, so sp.GetService<IMeterFactory>() returns null and the
+        // adapter factory passes meter: null — today's opt-in, zero-cost-when-unused behaviour: the
+        // adapter still resolves and functions normally, it simply creates no instrument.
+        sp.GetService<IMeterFactory>().Should().BeNull();
+        ITransportAdapter adapter = sp.GetRequiredService<ITransportAdapter>();
+
+        IReadOnlyList<SendResult> result =
+            await adapter.SendBatchAsync([ToQueue("q")], TestContext.Current.CancellationToken);
+
+        result.Single().IsConfirmed.Should().BeTrue();
+    }
+
+    [Fact]
+    public void AddBareWireInMemory_WhenTimeProviderRegistered_AdapterDoesNotUseIt()
+    {
+        var fakeTimeProvider = new FakeTimeProvider();
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<TimeProvider>(fakeTimeProvider);
+        services.AddBareWireInMemory(_ => { });
+
+        using ServiceProvider sp = services.BuildServiceProvider();
+
+        // AddBareWireInMemory never resolves TimeProvider from the container: a FakeTimeProvider
+        // registered by a test host (which never advances on its own) would otherwise freeze the
+        // adapter's defer timers and drain polling. The adapter must still be driven by its own
+        // default (TimeProvider.System), not by whatever TimeProvider happens to be registered.
+        var adapter = (InMemoryTransportAdapter)sp.GetRequiredService<ITransportAdapter>();
+
+        adapter.EffectiveTimeProvider.Should().NotBeSameAs(fakeTimeProvider);
+        adapter.EffectiveTimeProvider.Should().BeSameAs(TimeProvider.System);
+    }
+
+    private static OutboundMessage ToQueue(string queue) =>
+        new(queue, new Dictionary<string, string> { ["BW-Exchange"] = string.Empty }, new byte[8], "");
+
+    /// <summary>
+    /// A real <see cref="IMeterFactory"/> — not a substitute — so <c>AddBareWireInMemory</c>'s
+    /// <c>sp.GetService&lt;IMeterFactory&gt;()?.Create(...)</c> call exercises the same code path a
+    /// host's own metrics registration would. Tracks every <see cref="Meter"/> it creates so a test can
+    /// scope a <see cref="MeterListener"/> to exactly the instance this factory produced, and disposes
+    /// every created meter itself — mirroring the real <see cref="IMeterFactory"/> contract, under which
+    /// the factory (not the caller of <c>Create</c>) owns the meters it hands out.
+    /// </summary>
+    private sealed class TestMeterFactory : IMeterFactory
+    {
+        private readonly List<Meter> _created = [];
+
+        internal IReadOnlyList<Meter> CreatedMeters => _created;
+
+        public Meter Create(MeterOptions options)
+        {
+            var meter = new Meter(options);
+            _created.Add(meter);
+            return meter;
+        }
+
+        public void Dispose()
+        {
+            foreach (Meter meter in _created)
+            {
+                meter.Dispose();
+            }
+        }
     }
 
     private sealed record OrderCreated(Guid Id);

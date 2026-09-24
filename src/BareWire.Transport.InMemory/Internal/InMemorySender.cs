@@ -47,10 +47,11 @@ namespace BareWire.Transport.InMemory.Internal;
 /// </para>
 /// <para>
 /// <b>Queue latching.</b> A target queue's "full, no active consumer" case latches itself, inside
-/// <see cref="InMemoryQueue.TryReserve"/>, before this sender ever sees it — that latch is not
-/// distinguishable from one already set by an earlier caller and is never logged per message. The one
-/// latch this type sets itself — <see cref="InMemoryQueue.TryLatch"/>, after this call's one wait for
-/// that queue times out — is the only latch event this type logs, once, throttled per queue.
+/// <see cref="InMemoryQueue.TryReserve"/>, before this sender ever sees it. The one latch this type sets
+/// itself — <see cref="InMemoryQueue.TryLatch"/>, after this call's one wait for that queue times out —
+/// covers the same latch episode as the self-latching case: this type never logs either directly, since
+/// the queue's own latch-episode tracking (see <c>IInMemoryQueueLatchObserver</c>) reports one aggregated
+/// <c>Warning</c>/<c>Information</c> pair per episode regardless of which path set the latch.
 /// </para>
 /// <para>
 /// <b>Closing.</b> When the call's one wait resolves with <see cref="QueueWaitResult.Closed"/> — the
@@ -251,7 +252,7 @@ internal sealed class InMemorySender
                         break;
 
                     case QueueReservationResult.Latched:
-                        _diagnostics.CopyRejected(queue.Name, SendRejectionReason.QueueFull);
+                        _diagnostics.CopyRejected(queue, SendRejectionReason.QueueFull);
                         anyRejected = true;
                         break;
 
@@ -262,7 +263,7 @@ internal sealed class InMemorySender
                         }
                         else
                         {
-                            _diagnostics.CopyRejected(queue.Name, SendRejectionReason.QueueFull);
+                            _diagnostics.CopyRejected(queue, SendRejectionReason.QueueFull);
                             anyRejected = true;
                         }
 
@@ -327,17 +328,13 @@ internal sealed class InMemorySender
                     break;
 
                 case QueueWaitResult.TimedOut:
-                    if (queue.TryLatch())
-                    {
-                        _diagnostics.QueueLatchedAfterWait(queue);
-                    }
-
-                    _diagnostics.CopyRejected(queue.Name, SendRejectionReason.QueueFull);
+                    queue.TryLatch();
+                    _diagnostics.CopyRejected(queue, SendRejectionReason.QueueFull);
                     pending.AnyCopyRejected = true;
                     break;
 
                 case QueueWaitResult.Latched:
-                    _diagnostics.CopyRejected(queue.Name, SendRejectionReason.QueueFull);
+                    _diagnostics.CopyRejected(queue, SendRejectionReason.QueueFull);
                     pending.AnyCopyRejected = true;
                     break;
 

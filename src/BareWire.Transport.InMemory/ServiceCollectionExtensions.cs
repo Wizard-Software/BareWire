@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Routing;
@@ -50,6 +51,17 @@ public static class ServiceCollectionExtensions
     /// EF Core outbox registration (<c>AddBareWireOutbox</c>) always registers an inbox alongside the
     /// outbox, so the fanout warning is reserved for a custom outbox registration that omits the inbox.
     /// </para>
+    /// <para>
+    /// The adapter's logger and metrics are both resolved from the container, and both are optional: an
+    /// unregistered <see cref="ILogger{TCategoryName}"/> of <see cref="InMemoryTransportAdapter"/> falls
+    /// back to a no-op logger, and an unregistered <see cref="IMeterFactory"/> leaves every instrument
+    /// uncreated — today's behavior. When an <see cref="IMeterFactory"/> is registered, the meter it
+    /// creates (named <c>"BareWire"</c>, the same meter <c>BareWire.Observability</c> registers its own
+    /// instruments on) is owned and disposed by that factory, never by this adapter. The adapter's
+    /// <see cref="TimeProvider"/> is deliberately <em>not</em> resolved from the container: it drives
+    /// defer-timer and drain-polling delays, and a test <c>FakeTimeProvider</c> registered in a host
+    /// container would freeze both — the adapter keeps its own default (<see cref="TimeProvider.System"/>).
+    /// </para>
     /// </remarks>
     /// <param name="services">The <see cref="IServiceCollection"/> to register services into.</param>
     /// <param name="configure">
@@ -96,7 +108,13 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton(sp => new InMemoryBroker(sp.GetRequiredService<InMemoryTransportOptions>()));
         services.TryAddSingleton<ITransportAdapter>(sp => new InMemoryTransportAdapter(
             sp.GetRequiredService<InMemoryTransportOptions>(),
-            sp.GetRequiredService<InMemoryBroker>()));
+            sp.GetRequiredService<InMemoryBroker>(),
+            logger: sp.GetService<ILogger<InMemoryTransportAdapter>>(),
+            meter: sp.GetService<IMeterFactory>()?.Create(InMemoryTransportMetrics.MeterName)));
+            // TimeProvider is intentionally NOT resolved here — see the remarks above: it drives the
+            // adapter's defer timers and drain polling/timeouts, and a FakeTimeProvider registered for
+            // tests elsewhere in the same container would freeze both. The adapter keeps its own
+            // default (TimeProvider.System).
 
         // Register topology so the core bus can deploy it on startup.
         if (options.Topology is not null)

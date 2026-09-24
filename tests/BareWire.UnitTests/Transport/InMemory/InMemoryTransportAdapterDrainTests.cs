@@ -71,9 +71,10 @@ public sealed class InMemoryTransportAdapterDrainTests
 
     /// <summary>
     /// Attaches a <see cref="MeterListener"/> to <paramref name="meter"/>'s
-    /// <see cref="InMemoryConsumeDiagnostics.DrainDroppedCounterName"/> instrument, appending every
-    /// measurement (queue name, count) to <paramref name="measurements"/>. Dispose the returned listener
-    /// (or let its <see langword="using"/> scope end) once the test is done observing.
+    /// <see cref="InMemoryTransportMetrics.RejectedCounterName"/> instrument, appending every
+    /// <c>reason == "drain_dropped"</c> measurement (queue name, count) to <paramref name="measurements"/>.
+    /// Dispose the returned listener (or let its <see langword="using"/> scope end) once the test is done
+    /// observing.
     /// </summary>
     private static MeterListener ListenDrainDropped(Meter meter, List<(string Queue, long Count)> measurements)
     {
@@ -81,7 +82,7 @@ public sealed class InMemoryTransportAdapterDrainTests
         listener.InstrumentPublished = (instrument, l) =>
         {
             if (ReferenceEquals(instrument.Meter, meter)
-                && instrument.Name == InMemoryConsumeDiagnostics.DrainDroppedCounterName)
+                && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }
@@ -89,12 +90,19 @@ public sealed class InMemoryTransportAdapterDrainTests
         listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
         {
             string queueName = string.Empty;
+            string? reason = null;
             foreach (KeyValuePair<string, object?> tag in tags)
             {
-                if (tag.Key == "queue")
+                switch (tag.Key)
                 {
-                    queueName = (string)tag.Value!;
+                    case "queue": queueName = (string)tag.Value!; break;
+                    case "reason": reason = tag.Value as string; break;
                 }
+            }
+
+            if (reason != "drain_dropped")
+            {
+                return;
             }
 
             lock (measurements)
@@ -108,8 +116,8 @@ public sealed class InMemoryTransportAdapterDrainTests
 
     /// <summary>
     /// Attaches a <see cref="MeterListener"/> whose measurement callback throws for every
-    /// <see cref="InMemoryConsumeDiagnostics.DrainDroppedCounterName"/> measurement — proves a listener's
-    /// own failure never prevents buffers already returned before that point from staying returned.
+    /// <see cref="InMemoryTransportMetrics.RejectedCounterName"/> measurement — proves a listener's own
+    /// failure never prevents buffers already returned before that point from staying returned.
     /// </summary>
     private static MeterListener ListenDrainDroppedThrowing(Meter meter)
     {
@@ -117,7 +125,7 @@ public sealed class InMemoryTransportAdapterDrainTests
         listener.InstrumentPublished = (instrument, l) =>
         {
             if (ReferenceEquals(instrument.Meter, meter)
-                && instrument.Name == InMemoryConsumeDiagnostics.DrainDroppedCounterName)
+                && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }

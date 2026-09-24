@@ -34,7 +34,7 @@ namespace BareWire.Transport.InMemory;
 /// <see cref="ITransportAdapter"/> DI singleton by <c>AddBareWireInMemory</c>.
 /// </summary>
 internal sealed class InMemoryTransportAdapter
-    : ITransportAdapter, IGracefulDrainTransport, IDisposable, IAsyncDisposable
+    : ITransportAdapter, IGracefulDrainTransport, ITransportHealthSource, IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// The interval <see cref="DrainAsync"/> polls at while waiting for every active queue to drain. A
@@ -51,6 +51,16 @@ internal sealed class InMemoryTransportAdapter
     private readonly InMemorySettlement _settlement;
     private readonly InMemoryDeferScheduler? _deferScheduler;
     private readonly TimeProvider _timeProvider;
+
+    // This adapter's single instrument owner (see InMemoryTransportMetrics) and the broker's queues it
+    // was built from — read once, right after AttachRegistry, so every declared queue already exists.
+    // Kept as fields for later collaborators (gauges, health) that read the same queue set.
+    private readonly InMemoryTransportMetrics _metrics;
+    private readonly ImmutableArray<InMemoryQueue> _queues;
+
+    // Owns every latch-episode and health-transition log/metric derived from this adapter's queues; see
+    // InMemoryQueueDiagnostics. Registered as every queue's latch observer in the constructor.
+    private readonly InMemoryQueueDiagnostics _queueDiagnostics;
 
     // Never disposed: a runner's finally block may still observe it after shutdown. A cancellation token
     // source without a timer holds no unmanaged resource.
@@ -91,7 +101,6 @@ internal sealed class InMemoryTransportAdapter
 
         // Built first, so an unsupported affinity fails before the topology registry is built.
         _singleActiveGates = BuildSingleActiveGates(options);
-        _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, meter, _timeProvider);
         BufferPool = new InMemoryBufferPool(bufferPoolObserver);
 
         Options = options;
@@ -99,8 +108,23 @@ internal sealed class InMemoryTransportAdapter
         Registry = AttachRegistry(broker, InMemoryTopologyInterpreter.BuildRegistry(options));
         InFlight = new InMemoryDeliveryMap();
 
-        Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), meter);
-        _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, meter);
+        // The broker's queues exist only once AttachRegistry above has run. InMemoryTransportMetrics is
+        // this adapter's single instrument owner, built once here and shared by every collaborator below —
+        // no other type in this package creates an instrument of its own.
+        _queues = broker.Queues;
+        _metrics = new InMemoryTransportMetrics(meter, _queues);
+
+        // Every queue's latch observer, wired here so every latch episode from this point on — including
+        // one triggered by a message sent moments after construction — is observed.
+        _queueDiagnostics = new InMemoryQueueDiagnostics(effectiveLogger, _queues, _metrics, _timeProvider);
+        foreach (InMemoryQueue queue in _queues)
+        {
+            queue.SetLatchObserver(_queueDiagnostics);
+        }
+
+        _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, _metrics, _timeProvider);
+        Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), _metrics);
+        _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, _metrics);
         _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed, BufferPool);
         _deferScheduler = options.DeferEnabled
             ? new InMemoryDeferScheduler(_timeProvider, BufferPool, _diagnostics)
@@ -113,6 +137,45 @@ internal sealed class InMemoryTransportAdapter
 
     /// <inheritdoc />
     public TransportCapabilities Capabilities => TransportCapabilities.None;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Reports every declared queue's health independently — <see cref="BusStatus.Degraded"/> once its
+    /// occupancy reaches at least 90% of its capacity, <see cref="BusStatus.Healthy"/> otherwise — with the
+    /// aggregate status being the worst of the per-queue ones. Every read is a <see cref="Volatile"/> read
+    /// of a plain counter (<see cref="InMemoryQueue.Occupancy"/>, <see cref="InMemoryQueue.Capacity"/>):
+    /// no lock, no channel-count read, no dictionary enumeration. Each queue's health TRANSITION is also
+    /// reported to <see cref="_queueDiagnostics"/> for its own, separately-hysteresed logging — see
+    /// <see cref="InMemoryQueueDiagnostics.ReportHealth"/> — but the status returned HERE is always exact,
+    /// with no hysteresis of its own.
+    /// </remarks>
+    public BusHealthStatus GetHealth()
+    {
+        var endpoints = new List<EndpointHealthStatus>(_queues.Length);
+        BusStatus aggregate = BusStatus.Healthy;
+        int degradedCount = 0;
+
+        foreach (InMemoryQueue queue in _queues)
+        {
+            int occupancy = queue.Occupancy;
+            int capacity = queue.Capacity;
+            BusStatus status = (long)occupancy * 10 >= (long)capacity * 9 ? BusStatus.Degraded : BusStatus.Healthy;
+            if (status == BusStatus.Degraded)
+            {
+                degradedCount++;
+                aggregate = BusStatus.Degraded;
+            }
+
+            endpoints.Add(new EndpointHealthStatus(queue.Name, status, $"occupancy {occupancy} of {capacity}"));
+            _queueDiagnostics.ReportHealth(queue, occupancy, capacity);
+        }
+
+        string description = aggregate == BusStatus.Healthy
+            ? "All in-memory queues are below 90% of capacity."
+            : $"{degradedCount} in-memory queue(s) at or above 90% of capacity.";
+
+        return new BusHealthStatus(aggregate, description, endpoints);
+    }
 
     internal InMemoryTransportOptions Options { get; }
 
@@ -173,6 +236,23 @@ internal sealed class InMemoryTransportAdapter
     /// <see cref="Dispose"/>. A test hook.
     /// </summary>
     internal long DrainDroppedCount => _diagnostics.DrainDroppedCount;
+
+    /// <summary>
+    /// Gets the number of metric or logger calls from this adapter's queue latch-episode/health
+    /// diagnostics collaborator (<see cref="InMemoryQueueDiagnostics"/>) that threw and were suppressed. A
+    /// test hook.
+    /// </summary>
+    internal long QueueDiagnosticsLogFailureCount => _queueDiagnostics.LogFailureCount;
+
+    /// <summary>
+    /// Gets this adapter's time source — the one actually driving defer timers and drain polling. A
+    /// test hook proving that <c>AddBareWireInMemory</c> never resolves <see cref="TimeProvider"/> from
+    /// the dependency injection container (see the remarks on <c>ServiceCollectionExtensions.AddBareWireInMemory</c>):
+    /// even with a <see cref="TimeProvider"/> registered elsewhere in the same container, this property
+    /// still reports <see cref="TimeProvider.System"/> unless a caller passed one explicitly to the
+    /// constructor.
+    /// </summary>
+    internal TimeProvider EffectiveTimeProvider => _timeProvider;
 
     private static ExchangeRegistry AttachRegistry(InMemoryBroker broker, ExchangeRegistry registry)
     {

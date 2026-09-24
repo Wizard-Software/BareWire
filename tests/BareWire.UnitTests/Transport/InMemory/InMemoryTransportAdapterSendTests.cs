@@ -112,14 +112,14 @@ public sealed class InMemoryTransportAdapterSendTests
         }
     }
 
-    // MeterListener collecting (reason, queue/exchange tag) of "barewire.inmemory.send.rejected"
+    // MeterListener collecting (reason, queue/exchange tag) of "barewire.inmemory.messages.rejected"
     private static List<(string Reason, string? Queue, string? Exchange)> ListenRejected(Meter meter)
     {
         var recorded = new List<(string, string?, string?)>();
         var listener = new MeterListener();
         listener.InstrumentPublished = (instrument, l) =>
         {
-            if (ReferenceEquals(instrument.Meter, meter) && instrument.Name == InMemorySendDiagnostics.RejectedCounterName)
+            if (ReferenceEquals(instrument.Meter, meter) && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }

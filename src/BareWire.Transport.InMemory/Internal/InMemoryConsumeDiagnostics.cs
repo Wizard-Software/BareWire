@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Transport.InMemory.Internal;
@@ -8,74 +7,69 @@ namespace BareWire.Transport.InMemory.Internal;
 /// Logging and metrics for the in-memory consume path: reports deliveries that were handed to a
 /// consumer, never settled, and dropped because the transport shut down, as well as deliveries dropped
 /// during settlement (dead-letter fan-out with no accepting target, a redelivery limit reached with no
-/// dead-letter exchange, and similar). The log side is temporary and minimal — a later subtask folds it
-/// into the transport's final logging/metrics shape.
+/// dead-letter exchange, and similar). Every drop is reported to the shared
+/// <see cref="InMemoryTransportMetrics"/> owner — this type creates no instrument of its own.
 /// </summary>
 internal sealed partial class InMemoryConsumeDiagnostics
 {
-    /// <summary>The name of the counter of deliveries dropped on shutdown.</summary>
-    internal const string DroppedOnShutdownCounterName = "barewire.inmemory.deliveries.dropped_on_shutdown";
-
-    /// <summary>The name of the counter of deliveries dropped during settlement.</summary>
-    internal const string SettlementDroppedCounterName = "barewire.inmemory.settlement.dropped";
-
-    /// <summary>
-    /// The name of the counter of undelivered messages dropped from a queue's channel because the
-    /// transport was disposed while they were still sitting there, never handed to a consumer.
-    /// </summary>
-    internal const string DrainDroppedCounterName = "barewire.inmemory.deliveries.drain_dropped";
-
     private static readonly TimeSpan SettlementDropLogWindow = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan ShutdownDropLogWindow = TimeSpan.FromSeconds(60);
     private static readonly int SettlementDropReasonCount = Enum.GetValues<SettlementDropReason>().Length;
 
     private readonly ILogger _logger;
     private readonly TimeProvider _timeProvider;
 
-    // Opt-in counters — created only when an external Meter is supplied by the composition root.
-    private readonly Counter<long>? _droppedOnShutdownCounter;
-    private readonly Counter<long>? _settlementDroppedCounter;
-    private readonly Counter<long>? _drainDroppedCounter;
+    // Opt-in — created only when an external Meter is supplied by the composition root, through the
+    // adapter's single InMemoryTransportMetrics owner. null = no instrument, no cost.
+    private readonly InMemoryTransportMetrics? _metrics;
+
     private long _droppedOnShutdownCount;
     private long _disposedUnsettledCount;
     private long _drainDroppedCount;
+    private long _logFailureCount;
     private readonly long[] _settlementDroppedCounts = new long[SettlementDropReasonCount];
 
     // Per-(queue, reason) log throttle state, populated lazily — queue names come from the sealed
     // topology, so this dictionary's key set is bounded by the number of declared queues.
     private readonly ConcurrentDictionary<string, ThrottleState[]> _settlementThrottle = new(StringComparer.Ordinal);
 
+    // Per-queue log throttle state for DeliveriesDroppedOnShutdown — populated lazily, same bound as above.
+    private readonly ConcurrentDictionary<string, ThrottleState> _shutdownDropThrottle = new(StringComparer.Ordinal);
+
     /// <param name="logger">The logger to report dropped deliveries to. Must not be <see langword="null"/>.</param>
-    /// <param name="meter">An optional meter; when supplied, dropped deliveries are also counted on it.</param>
+    /// <param name="metrics">
+    /// The adapter's single instrument owner; when supplied (non-<see langword="null"/>, built from a
+    /// non-<see langword="null"/> meter), dropped deliveries are also counted on it.
+    /// </param>
     /// <param name="timeProvider">The time source used to throttle settlement-drop logs. Defaults to <see cref="TimeProvider.System"/>.</param>
-    internal InMemoryConsumeDiagnostics(ILogger logger, Meter? meter = null, TimeProvider? timeProvider = null)
+    internal InMemoryConsumeDiagnostics(ILogger logger, InMemoryTransportMetrics? metrics = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _droppedOnShutdownCounter = meter?.CreateCounter<long>(
-            DroppedOnShutdownCounterName,
-            unit: "{delivery}",
-            description: "Number of in-memory deliveries handed to a consumer, never settled, and dropped " +
-                "because the transport shut down. Tagged with the queue name.");
-        _settlementDroppedCounter = meter?.CreateCounter<long>(
-            SettlementDroppedCounterName,
-            unit: "{delivery}",
-            description: "PROVISIONAL — number of in-memory deliveries dropped during settlement. Tagged " +
-                "with the queue name and the drop reason.");
-        _drainDroppedCounter = meter?.CreateCounter<long>(
-            DrainDroppedCounterName,
-            unit: "{delivery}",
-            description: "Number of undelivered in-memory messages dropped from a queue's channel because " +
-                "the transport was disposed while they were still sitting there. Tagged with the queue name.");
+        _metrics = metrics;
     }
 
     /// <summary>Gets the total number of deliveries dropped on shutdown so far.</summary>
     internal long DroppedOnShutdownCount => Interlocked.Read(ref _droppedOnShutdownCount);
 
     /// <summary>
+    /// Gets the number of metric or logger calls from this instance that threw and were suppressed — see
+    /// the explicit catch-and-count guard on every method below. A throwing <c>MeterListener</c> callback
+    /// or logging provider must never crash the caller, including the defer scheduler's own timer thread
+    /// (see <see cref="DeferredRedeliveryFailed"/>).
+    /// </summary>
+    internal long LogFailureCount => Interlocked.Read(ref _logFailureCount);
+
+    /// <summary>
     /// Records that <paramref name="count"/> unsettled deliveries of <paramref name="queueName"/> were
-    /// dropped because the transport shut down.
+    /// dropped because the transport shut down. The counter and the metric are updated on every call —
+    /// several individual calls (one per delivery) can happen in a short burst from the deferred-redelivery
+    /// paths racing shutdown — but the <see cref="LogLevel.Warning"/> log is throttled per queue so a burst
+    /// never produces one log entry per message; the adapter's own aggregated per-queue call at the end of
+    /// <c>Dispose</c> is unaffected in the common case, since it is normally the first (and only) call for
+    /// that queue.
     /// </summary>
     internal void DeliveriesDroppedOnShutdown(string queueName, int count)
     {
@@ -85,8 +79,33 @@ internal sealed partial class InMemoryConsumeDiagnostics
         }
 
         Interlocked.Add(ref _droppedOnShutdownCount, count);
-        _droppedOnShutdownCounter?.Add(count, new KeyValuePair<string, object?>("queue", queueName));
-        LogDroppedOnShutdown(_logger, count, queueName);
+
+        // A throwing metrics listener or logging provider must never propagate out of Dispose — caught
+        // and counted explicitly instead, the same pattern InMemorySendDiagnostics uses for its own log
+        // calls.
+        try
+        {
+            _metrics?.RecordQueueRejected("drain_dropped", queueName, count);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
+
+        ThrottleState state = _shutdownDropThrottle.GetOrAdd(queueName, static _ => new ThrottleState());
+        if (!state.TryEnterLogWindow(_timeProvider, ShutdownDropLogWindow, out int suppressedCount))
+        {
+            return;
+        }
+
+        try
+        {
+            LogDroppedOnShutdown(_logger, count, queueName, suppressedCount);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     /// <summary>Gets the total number of deliveries dropped because their message was disposed unsettled.</summary>
@@ -104,7 +123,15 @@ internal sealed partial class InMemoryConsumeDiagnostics
         }
 
         Interlocked.Add(ref _disposedUnsettledCount, count);
-        LogDisposedUnsettled(_logger, count, queueName);
+
+        try
+        {
+            LogDisposedUnsettled(_logger, count, queueName);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Warning, Message =
@@ -114,8 +141,9 @@ internal sealed partial class InMemoryConsumeDiagnostics
 
     [LoggerMessage(Level = LogLevel.Warning, Message =
         "In-memory transport shut down with {Count} unsettled delivery(ies) on queue '{QueueName}'; they were " +
-        "dropped and their queue slots released. In-memory delivery is not durable across shutdown.")]
-    private static partial void LogDroppedOnShutdown(ILogger logger, int count, string queueName);
+        "dropped and their queue slots released. In-memory delivery is not durable across shutdown. " +
+        "{SuppressedCount} earlier occurrence(s) for this queue were suppressed since the last log entry.")]
+    private static partial void LogDroppedOnShutdown(ILogger logger, int count, string queueName, int suppressedCount);
 
     /// <summary>Gets the total number of undelivered messages dropped on drain (queue close) so far.</summary>
     internal long DrainDroppedCount => Interlocked.Read(ref _drainDroppedCount);
@@ -135,8 +163,24 @@ internal sealed partial class InMemoryConsumeDiagnostics
         }
 
         Interlocked.Add(ref _drainDroppedCount, count);
-        _drainDroppedCounter?.Add(count, new KeyValuePair<string, object?>("queue", queueName));
-        LogDrainDropped(_logger, count, queueName);
+
+        try
+        {
+            _metrics?.RecordQueueRejected("drain_dropped", queueName, count);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
+
+        try
+        {
+            LogDrainDropped(_logger, count, queueName);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Warning, Message =
@@ -165,10 +209,15 @@ internal sealed partial class InMemoryConsumeDiagnostics
         }
 
         Interlocked.Add(ref _settlementDroppedCounts[(int)reason], count);
-        _settlementDroppedCounter?.Add(
-            count,
-            new KeyValuePair<string, object?>("queue", queueName),
-            new KeyValuePair<string, object?>("reason", reason.ToTagValue()));
+
+        try
+        {
+            _metrics?.RecordQueueRejected(reason.ToTagValue(), queueName, count);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
 
         ThrottleState[] states = _settlementThrottle.GetOrAdd(queueName, static _ => CreateThrottleStates());
         if (!states[(int)reason].TryEnterLogWindow(_timeProvider, SettlementDropLogWindow, out int suppressedCount))
@@ -176,7 +225,14 @@ internal sealed partial class InMemoryConsumeDiagnostics
             return;
         }
 
-        LogSettlementDropped(_logger, count, queueName, reason.ToTagValue(), suppressedCount);
+        try
+        {
+            LogSettlementDropped(_logger, count, queueName, reason.ToTagValue(), suppressedCount);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     private static ThrottleState[] CreateThrottleStates()
@@ -205,15 +261,35 @@ internal sealed partial class InMemoryConsumeDiagnostics
     /// <summary>
     /// Records that a deferred redelivery to <paramref name="queueName"/> failed because the target
     /// queue's channel rejected the write — an invariant violation, since a deferred redelivery always
-    /// already holds a reserved slot. Logged at <see cref="LogLevel.Error"/>, never throttled: this is an
-    /// exceptional path, not a routine drop.
+    /// already holds a reserved slot. Increments the shared rejected-messages metric with reason
+    /// <c>internal_error</c> BEFORE logging, then logs at <see cref="LogLevel.Error"/>, never throttled:
+    /// this is an exceptional path, not a routine drop.
     /// </summary>
     internal void DeferredRedeliveryFailed(string queueName, Exception exception)
     {
         ArgumentNullException.ThrowIfNull(queueName);
         ArgumentNullException.ThrowIfNull(exception);
 
-        LogDeferredRedeliveryFailed(_logger, queueName, exception);
+        // Runs on the defer scheduler's own timer thread: a throwing metrics listener or logging provider
+        // must never escape here, or it would crash that background thread and silently stop future
+        // deferred redeliveries. Caught and counted explicitly instead of left to propagate.
+        try
+        {
+            _metrics?.RecordQueueRejected("internal_error", queueName);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
+
+        try
+        {
+            LogDeferredRedeliveryFailed(_logger, queueName, exception);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Error, Message =

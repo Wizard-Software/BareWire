@@ -336,21 +336,31 @@ public sealed class InMemoryTransportAdapterConsumeTests
         listener.InstrumentPublished = (instrument, l) =>
         {
             if (ReferenceEquals(instrument.Meter, meter)
-                && instrument.Name == InMemoryConsumeDiagnostics.DroppedOnShutdownCounterName)
+                && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }
         };
         listener.SetMeasurementEventCallback<long>((_, value, tags, _) =>
         {
-            recorded += value;
+            string? reason = null;
+            string? queue = null;
             foreach (KeyValuePair<string, object?> tag in tags)
             {
-                if (tag.Key == "queue")
+                switch (tag.Key)
                 {
-                    recordedQueue = tag.Value as string;
+                    case "reason": reason = tag.Value as string; break;
+                    case "queue": queue = tag.Value as string; break;
                 }
             }
+
+            if (reason != "drain_dropped")
+            {
+                return;
+            }
+
+            recorded += value;
+            recordedQueue = queue;
         });
         listener.Start();
 

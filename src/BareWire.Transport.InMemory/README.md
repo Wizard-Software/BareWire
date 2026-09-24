@@ -135,12 +135,9 @@ Once the adapter is disposed, a send call — and any message of a call already 
 `false` with reason `closed` instead of throwing `ObjectDisposedException`. A send that is waiting
 for queue capacity at that moment completes immediately with reason `closed` rather than waiting
 out `SendTimeout`. Messages still sitting in a queue when the adapter is disposed are dropped, with
-one `Warning` per queue carrying the number of dropped messages and the
-`barewire.inmemory.deliveries.drain_dropped` counter, and their buffers are returned to the pool.
-
-The rejected-copies/messages counter (`barewire.inmemory.send.rejected`) is a provisional name and
-shape: a later subtask may fold it into a single, transport-wide rejection counter alongside the
-existing `barewire.inmemory.unroutable` counter.
+one `Warning` per queue carrying the number of dropped messages and reason `drain_dropped` on the
+shared rejected-messages counter (see "Metrics, logging and health" below), and their buffers are
+returned to the pool.
 
 ## Settlement
 
@@ -200,6 +197,56 @@ another action.
 `OrderedBy` (with any `TransportAffinity`, including `SingleActiveConsumer`) rejects a deferred
 redelivery from ever reordering its stream, so combining the two throws a configuration exception when
 the transport is registered, before any message is ever consumed.
+
+## Metrics, logging and health
+
+Every instrument this transport creates is reported on one meter, named `BareWire` — the same meter
+`BareWire.Observability` registers its own bus-level instruments on. The meter is created only when an
+`IMeterFactory` is registered in the dependency-injection container (for example via OpenTelemetry's
+`AddMetrics()`); without one, this transport creates no instrument at all and every metric call below
+is a no-op, matching the rest of BareWire's opt-in, zero-cost-when-unused observability. Add
+`AddMeter("BareWire")` to an OpenTelemetry `MeterProviderBuilder` to export it.
+
+| Instrument | Type | Unit | Tags |
+|---|---|---|---|
+| `barewire.inmemory.queue.occupancy` | Observable gauge (`int`) | `{message}` | `queue` |
+| `barewire.inmemory.queue.capacity` | Observable gauge (`int`) | `{message}` | `queue` |
+| `barewire.inmemory.queue.latched` | Observable gauge (`int`, 0 or 1) | `{latch}` | `queue` |
+| `barewire.inmemory.queue.latch_episodes` | Counter (`long`) | `{episode}` | `queue` |
+| `barewire.inmemory.messages.rejected` | Counter (`long`) | `{message}` | `reason`, and at most one of `queue` or `exchange` |
+
+**Tags are only ever `queue`, `exchange`, and `reason` — never a publisher-supplied routing key or
+message ID.** A `queue` or `exchange` tag value always comes from this transport's own sealed
+topology (a declared queue or exchange name), never from caller-controlled, unbounded-cardinality
+input; a rejection with no queue or exchange that has any meaning for the batch (the adapter was
+closed, or the call was cancelled) carries `reason` alone. Log entries, by contrast, do carry
+metadata beyond those three fields — a routing key, or an undeclared, publisher-supplied exchange
+name — but never a message body, its headers, or its message ID.
+
+`barewire.inmemory.messages.rejected`'s `reason` tag is one of: `queue_full`, `cancelled`, `closed`,
+`oversized`, `undeclared_exchange`, `no_exchange`, `routing_key_too_long`, `internal_error` (the
+`SendBatchAsync` rejection reasons — see "Sending" above), `no_dlx`, `dlx_full`, `unroutable`,
+`max_redeliveries` (the settlement drop reasons — see "Dead-lettering" above), and `drain_dropped`
+(messages dropped when the adapter is disposed — see "Sending" above).
+
+Logging is aggregated, never one entry per message:
+
+- A queue's "full" latch logs one throttled `Warning` when it opens (at most once per queue per
+  60-second window, carrying how many earlier episodes in that window were suppressed) and, only for
+  an episode whose `Warning` was actually logged, exactly one `Information` when it closes — with the
+  number of rejected copies and the episode's duration.
+- A validation failure or an unexpected exception on the send path logs one throttled `Error` per
+  (declared exchange or queue, reason) pair, at most once per 60-second window.
+- An unroutable message logs one throttled `Warning` per exchange, at most once per 60-second window.
+- A settlement drop (dead-lettering failure, or a redelivery limit reached with no dead-letter
+  exchange) logs one throttled `Warning` per (queue, reason) pair, at most once per 60-second window.
+
+`GetHealth()` (surfaced through the bus health check) reports a queue `Degraded` once its occupancy
+reaches at least 90% of its capacity, `Healthy` otherwise, on every call — with no hysteresis of its
+own. The LOG of that transition, however, is hysteresed separately from the reported status: a
+`Warning` is logged the moment occupancy first reaches 90%, and the matching `Information` recovery is
+logged only once occupancy drops back below 80% — the 80–90% band logs nothing in either direction, so
+a queue oscillating across the 90% line alone does not flood the log.
 
 ## Sizing
 

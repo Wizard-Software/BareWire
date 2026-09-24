@@ -215,7 +215,7 @@ public sealed class InMemoryTransportAdapterSettleTests
         listener.InstrumentPublished = (instrument, l) =>
         {
             if (ReferenceEquals(instrument.Meter, meter)
-                && instrument.Name == InMemoryConsumeDiagnostics.SettlementDroppedCounterName)
+                && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }
@@ -240,7 +240,7 @@ public sealed class InMemoryTransportAdapterSettleTests
         });
         listener.Start();
 
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, new InMemoryTransportMetrics(meter, []));
         diagnostics.SettlementDropped("orders", SettlementDropReason.DeadLetterQueueFull);
 
         diagnostics.SettlementDroppedCount(SettlementDropReason.DeadLetterQueueFull).Should().Be(1);
@@ -252,7 +252,7 @@ public sealed class InMemoryTransportAdapterSettleTests
     {
         var time = new FakeTimeProvider();
         var logger = new WarningCountingLogger();
-        var diagnostics = new InMemoryConsumeDiagnostics(logger, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(logger, metrics: null, timeProvider: time);
 
         for (int i = 0; i < 5; i++)
         {
@@ -268,7 +268,7 @@ public sealed class InMemoryTransportAdapterSettleTests
     {
         var time = new FakeTimeProvider();
         var logger = new WarningCountingLogger();
-        var diagnostics = new InMemoryConsumeDiagnostics(logger, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(logger, metrics: null, timeProvider: time);
 
         diagnostics.SettlementDropped("orders", SettlementDropReason.NoDeadLetterExchange);
         time.Advance(TimeSpan.FromSeconds(61));

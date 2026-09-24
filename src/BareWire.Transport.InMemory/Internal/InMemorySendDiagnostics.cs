@@ -1,21 +1,18 @@
 using System.Collections.Frozen;
-using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.Transport.InMemory.Internal;
 
 /// <summary>
-/// Logging and metrics for the in-memory send path: a rejected-copy/message counter, and throttled,
-/// aggregated logs — never one log entry per message. The throttle keys are a fixed, frozen table built
-/// once from the topology's declared queue and exchange names (plus an empty-name bucket for reasons
-/// that never carry a name) — a publisher-supplied name never becomes a throttle key or a metric tag; see
-/// <see cref="MessageRejected"/>.
+/// Logging and metrics for the in-memory send path: rejections are reported to the shared
+/// <see cref="InMemoryTransportMetrics"/> owner, and throttled, aggregated logs — never one log entry per
+/// message — are emitted for validation failures and unprocessed batches. The throttle keys are a fixed,
+/// frozen table built once from the topology's declared queue and exchange names (plus an empty-name
+/// bucket for reasons that never carry a name) — a publisher-supplied name never becomes a throttle key or
+/// a metric tag; see <see cref="MessageRejected"/>.
 /// </summary>
 internal sealed partial class InMemorySendDiagnostics
 {
-    /// <summary>The name of the rejected copies/messages counter. PROVISIONAL — may later be folded into a shared rejection counter.</summary>
-    internal const string RejectedCounterName = "barewire.inmemory.send.rejected";
-
     private const int MaxLoggedNameLength = 256;
     private static readonly TimeSpan LogWindow = TimeSpan.FromSeconds(60);
     private static readonly int ReasonCount = Enum.GetValues<SendRejectionReason>().Length;
@@ -24,9 +21,9 @@ internal sealed partial class InMemorySendDiagnostics
     private readonly TimeProvider _timeProvider;
     private readonly FrozenDictionary<string, ThrottleState[]> _throttleTable;
 
-    // Opt-in, dimensionless-on-creation counter — created only when an external Meter is supplied by the
-    // composition root. null = no instrument, no cost.
-    private readonly Counter<long>? _rejectedCounter;
+    // Opt-in — created only when an external Meter is supplied by the composition root, through the
+    // adapter's single InMemoryTransportMetrics owner. null = no instrument, no cost.
+    private readonly InMemoryTransportMetrics? _metrics;
 
     private long _rejectedCount;
     private long _logFailureCount;
@@ -36,10 +33,13 @@ internal sealed partial class InMemorySendDiagnostics
     /// The sealed topology snapshot this send path routes against — its declared queue and exchange
     /// names seed the frozen log-throttle table built once here. Must not be <see langword="null"/>.
     /// </param>
-    /// <param name="meter">An optional meter; when supplied, rejections are also counted on it.</param>
+    /// <param name="metrics">
+    /// The adapter's single instrument owner; when supplied (non-<see langword="null"/>, built from a
+    /// non-<see langword="null"/> meter), rejections are also counted on it.
+    /// </param>
     /// <param name="timeProvider">The time source for log throttling. Defaults to <see cref="TimeProvider.System"/>.</param>
     internal InMemorySendDiagnostics(
-        ILogger logger, ExchangeRegistry registry, Meter? meter = null, TimeProvider? timeProvider = null)
+        ILogger logger, ExchangeRegistry registry, InMemoryTransportMetrics? metrics = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(registry);
@@ -47,14 +47,7 @@ internal sealed partial class InMemorySendDiagnostics
         _logger = logger;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _throttleTable = BuildThrottleTable(registry);
-
-        // The instrument name/shape is provisional — see RejectedCounterName.
-        _rejectedCounter = meter?.CreateCounter<long>(
-            RejectedCounterName,
-            unit: "{message}",
-            description: "PROVISIONAL — number of in-memory send copies/messages rejected before or during " +
-                "admission. Tagged with 'reason' always, and either 'queue' or 'exchange' when applicable — " +
-                "the exchange tag is present only when the exchange is declared in the topology.");
+        _metrics = metrics;
     }
 
     /// <summary>Gets the total number of rejected copies/messages recorded so far, regardless of the meter.</summary>
@@ -66,19 +59,29 @@ internal sealed partial class InMemorySendDiagnostics
     /// <summary>
     /// Records that one fan-out copy of an otherwise-accepted message was rejected because its target
     /// queue was full (latched, or full and the wait for it failed). Metric only — a per-copy log would
-    /// violate the "never log per message" rule; see <see cref="QueueLatchedAfterWait"/> for the one
-    /// aggregated log this path can trigger.
+    /// violate the "never log per message" rule; the latch episode itself (see
+    /// <c>IInMemoryQueueLatchObserver</c>) is what logs a single aggregated <c>Warning</c>/<c>Information</c>
+    /// pair for the whole episode, regardless of which path set the latch.
     /// </summary>
-    /// <param name="queueName">The target queue's declared name.</param>
+    /// <param name="queue">The target queue. Also records the rejected copy on the queue itself.</param>
     /// <param name="reason">The rejection reason (expected to be <see cref="SendRejectionReason.QueueFull"/>).</param>
-    internal void CopyRejected(string queueName, SendRejectionReason reason)
+    internal void CopyRejected(InMemoryQueue queue, SendRejectionReason reason)
     {
-        ArgumentNullException.ThrowIfNull(queueName);
+        ArgumentNullException.ThrowIfNull(queue);
 
+        queue.RecordRejectedCopy();
         Interlocked.Increment(ref _rejectedCount);
-        _rejectedCounter?.Add(1,
-            new KeyValuePair<string, object?>("reason", reason.ToTag()),
-            new KeyValuePair<string, object?>("queue", queueName));
+        try
+        {
+            _metrics?.RecordQueueRejected(reason.ToTag(), queue.Name);
+        }
+        catch (Exception)
+        {
+            // A throwing MeterListener callback must never reach the send path's per-message exception
+            // boundary, where this copy would be counted a second time as internal_error — caught and
+            // counted explicitly instead.
+            Interlocked.Increment(ref _logFailureCount);
+        }
     }
 
     /// <summary>
@@ -111,15 +114,14 @@ internal sealed partial class InMemorySendDiagnostics
         ArgumentNullException.ThrowIfNull(routingKey);
 
         Interlocked.Increment(ref _rejectedCount);
-        if (declaredExchange is not null)
+        try
         {
-            _rejectedCounter?.Add(1,
-                new KeyValuePair<string, object?>("reason", reason.ToTag()),
-                new KeyValuePair<string, object?>("exchange", declaredExchange));
+            _metrics?.RecordExchangeRejected(reason.ToTag(), declaredExchange);
         }
-        else
+        catch (Exception)
         {
-            _rejectedCounter?.Add(1, new KeyValuePair<string, object?>("reason", reason.ToTag()));
+            // Same explicit handling as the log call below: a throwing MeterListener never fails a send.
+            Interlocked.Increment(ref _logFailureCount);
         }
 
         string scope = declaredExchange ?? string.Empty;
@@ -159,7 +161,15 @@ internal sealed partial class InMemorySendDiagnostics
         }
 
         Interlocked.Add(ref _rejectedCount, count);
-        _rejectedCounter?.Add(count, new KeyValuePair<string, object?>("reason", reason.ToTag()));
+        try
+        {
+            _metrics?.RecordRejected(reason.ToTag(), count);
+        }
+        catch (Exception)
+        {
+            // Same explicit handling as the log call below: a throwing MeterListener never fails a send.
+            Interlocked.Increment(ref _logFailureCount);
+        }
 
         if (!TryEnterLogWindow(string.Empty, reason, out int suppressedCount))
         {
@@ -176,31 +186,6 @@ internal sealed partial class InMemorySendDiagnostics
             {
                 LogMessagesSkippedCancelled(_logger, count, suppressedCount);
             }
-        }
-        catch (Exception)
-        {
-            Interlocked.Increment(ref _logFailureCount);
-        }
-    }
-
-    /// <summary>
-    /// Records that <paramref name="queue"/> was latched because the call's one wait for it failed
-    /// (timed out). Throttled <see cref="LogLevel.Warning"/> — the latch a full queue sets on its own,
-    /// with no active consumer, never logs here (indistinguishable per message; see the send algorithm's
-    /// design notes).
-    /// </summary>
-    internal void QueueLatchedAfterWait(InMemoryQueue queue)
-    {
-        ArgumentNullException.ThrowIfNull(queue);
-
-        if (!TryEnterLogWindow(queue.Name, SendRejectionReason.QueueFull, out int suppressedCount))
-        {
-            return;
-        }
-
-        try
-        {
-            LogQueueLatchedAfterWait(_logger, queue.Name, queue.Occupancy, queue.Capacity, suppressedCount);
         }
         catch (Exception)
         {
@@ -275,13 +260,6 @@ internal sealed partial class InMemorySendDiagnostics
         "In-memory transport rejected {Count} message(s) because the send call was cancelled. " +
         "{SuppressedCount} earlier occurrence(s) were suppressed since the last log entry.")]
     private static partial void LogMessagesSkippedCancelled(ILogger logger, int count, int suppressedCount);
-
-    [LoggerMessage(Level = LogLevel.Warning, Message =
-        "In-memory queue '{QueueName}' latched after a failed wait for space: occupancy {Occupancy} of " +
-        "{Capacity}. {SuppressedCount} earlier occurrence(s) for this queue were suppressed since the " +
-        "last log entry.")]
-    private static partial void LogQueueLatchedAfterWait(
-        ILogger logger, string queueName, int occupancy, int capacity, int suppressedCount);
 
     /// <summary>
     /// Per-(scope, reason) log throttle state: logs at most once per <see cref="LogWindow"/>, reporting

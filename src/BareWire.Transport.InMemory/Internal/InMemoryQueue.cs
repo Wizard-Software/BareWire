@@ -31,6 +31,22 @@ namespace BareWire.Transport.InMemory.Internal;
 /// release brings occupancy strictly below 50% of <see cref="Capacity"/>.
 /// </para>
 /// <para>
+/// <b>Latch episodes.</b> The thread that wins the 0→1 latch transition — and whose immediate re-check
+/// does not revert it — and the thread that wins the 1→0 transition are each notified exactly once,
+/// through an optional <see cref="IInMemoryQueueLatchObserver"/> registered via
+/// <see cref="SetLatchObserver"/>: <see cref="IInMemoryQueueLatchObserver.OnLatchSet"/> for the open,
+/// <see cref="IInMemoryQueueLatchObserver.OnLatchCleared"/> for the matching close, both carrying the
+/// same <see cref="InMemoryLatchEpisode"/> snapshot. Both notifications fire outside a short internal
+/// lock taken only at the transition itself (the <see cref="TryReserve"/> fast path with free space is
+/// untouched), and the close notification always fires after the occupancy counter change that
+/// triggered it. A latch transition that reverts on its own immediate re-check (see <see cref="TryLatch"/>)
+/// also closes any episode that happens to be open at that point — defends against the transient flag
+/// itself briefly reading as set to an unrelated observer racing the same transition. Every open has
+/// exactly one matching close, even under concurrent transitions: opening only happens while
+/// <c>!open &amp;&amp; IsLatched</c>, and closing only while <c>open &amp;&amp; !IsLatched</c>, both
+/// checked under the same lock.
+/// </para>
+/// <para>
 /// <b>Active consumer.</b> A consumer counts as active from the moment its <see cref="ReadAllAsync"/>
 /// enumerator starts running until it is cancelled, faults, or completes — a suspended handler between
 /// deliveries still counts; a cancelled reader stops counting immediately, before its enumerator is
@@ -79,6 +95,11 @@ internal sealed class InMemoryQueue
     private InMemoryBufferPool? _closedPool;
     private int _droppedAfterClose;
     private int _invariantViolationCount;
+    private long _rejectedCopyCount;
+    private readonly Lock _latchEpisodeLock = new();
+    private bool _latchEpisodeOpen;
+    private InMemoryLatchEpisode? _currentLatchEpisode;
+    private IInMemoryQueueLatchObserver? _latchObserver;
 
     /// <param name="name">The queue's name. Must not be null or empty.</param>
     /// <param name="capacity">The queue's capacity. Must be greater than zero.</param>
@@ -134,6 +155,29 @@ internal sealed class InMemoryQueue
     /// <see cref="Occupancy"/>" invariant.
     /// </summary>
     internal int InvariantViolationCount => Volatile.Read(ref _invariantViolationCount);
+
+    /// <summary>
+    /// Gets the number of fan-out copies rejected against this queue because it was full or latched,
+    /// recorded via <see cref="RecordRejectedCopy"/>. Read with <c>Interlocked.Read(ref long)</c> —
+    /// this queue never resets it.
+    /// </summary>
+    internal long RejectedCopyCount => Interlocked.Read(ref _rejectedCopyCount);
+
+    /// <summary>
+    /// Records that one fan-out copy of a message was rejected against this queue because it was full or
+    /// latched. Called by the send path's diagnostics after it observes such a rejection — this queue
+    /// itself never calls it.
+    /// </summary>
+    internal void RecordRejectedCopy() => Interlocked.Increment(ref _rejectedCopyCount);
+
+    /// <summary>
+    /// Registers <paramref name="observer"/> to be notified of every latch episode this queue opens and
+    /// closes from now on. "Last observer wins": a later call replaces any observer registered earlier,
+    /// with no coordination between the two — the owning adapter is expected to call this once, at
+    /// construction, for every queue it owns. <see langword="null"/> stops notifying entirely. Never
+    /// throws.
+    /// </summary>
+    internal void SetLatchObserver(IInMemoryQueueLatchObserver? observer) => Volatile.Write(ref _latchObserver, observer);
 
     /// <summary>
     /// Gets whether at least one live (not yet granted, and not abandoned by a timeout or cancellation)
@@ -603,10 +647,20 @@ internal sealed class InMemoryQueue
     /// Clears the latch when <paramref name="occupancy"/> is strictly below 50% of
     /// <see cref="Capacity"/>. Returns <see langword="true"/> when this call cleared it.
     /// </summary>
-    private bool TryClearLatch(int occupancy) =>
-        Volatile.Read(ref _latched) == 1
-        && 2L * occupancy < Capacity
-        && Interlocked.CompareExchange(ref _latched, 0, 1) == 1;
+    private bool TryClearLatch(int occupancy)
+    {
+        bool cleared =
+            Volatile.Read(ref _latched) == 1
+            && 2L * occupancy < Capacity
+            && Interlocked.CompareExchange(ref _latched, 0, 1) == 1;
+
+        if (cleared)
+        {
+            TryCloseLatchEpisode();
+        }
+
+        return cleared;
+    }
 
     /// <summary>
     /// Dequeues waiters from the FIFO, in order, until one is successfully transitioned from pending to
@@ -841,10 +895,101 @@ internal sealed class InMemoryQueue
         if (2L * Volatile.Read(ref _occupancy) < Capacity)
         {
             Interlocked.CompareExchange(ref _latched, 0, 1);
+
+            // ABA guard: this call's own set-then-immediately-revert may have raced a concurrent
+            // ReleaseSlot's own close attempt for a DIFFERENT (already-open) episode in a way that left
+            // it unable to close (see this type's remarks on latch episodes) — closing here as well is a
+            // no-op whenever there is nothing open, and closes it correctly whenever there is.
+            TryCloseLatchEpisode();
             return false;
         }
 
+        // Won the 0→1 transition and the immediate re-check did not revert it: this call — and only this
+        // call — opens the episode.
+        TryOpenLatchEpisode();
         return true;
+    }
+
+    /// <summary>
+    /// Opens a new latch episode and notifies the registered <see cref="IInMemoryQueueLatchObserver"/>,
+    /// but only when none is already open for a currently-set latch — see this type's remarks on latch
+    /// episodes for the exact race-safety rule. A no-op when no observer is registered.
+    /// </summary>
+    private void TryOpenLatchEpisode()
+    {
+        IInMemoryQueueLatchObserver? observer;
+        InMemoryLatchEpisode episode;
+        lock (_latchEpisodeLock)
+        {
+            if (_latchEpisodeOpen || !IsLatched)
+            {
+                return;
+            }
+
+            observer = Volatile.Read(ref _latchObserver);
+            episode = new InMemoryLatchEpisode
+            {
+                StartTimestamp = SafeGetTimestamp(observer),
+                RejectedCopiesAtStart = RejectedCopyCount,
+            };
+
+            _currentLatchEpisode = episode;
+            _latchEpisodeOpen = true;
+        }
+
+        observer?.OnLatchSet(this, episode);
+    }
+
+    /// <summary>
+    /// Closes the currently open latch episode and notifies the registered
+    /// <see cref="IInMemoryQueueLatchObserver"/>, but only when one is actually open for a currently-clear
+    /// latch — see this type's remarks on latch episodes for the exact race-safety rule. A no-op when no
+    /// episode is open, or when no observer is registered.
+    /// </summary>
+    private void TryCloseLatchEpisode()
+    {
+        IInMemoryQueueLatchObserver? observer;
+        InMemoryLatchEpisode? episode;
+        lock (_latchEpisodeLock)
+        {
+            if (!_latchEpisodeOpen || IsLatched)
+            {
+                return;
+            }
+
+            observer = Volatile.Read(ref _latchObserver);
+            episode = _currentLatchEpisode;
+            _currentLatchEpisode = null;
+            _latchEpisodeOpen = false;
+        }
+
+        if (episode is not null)
+        {
+            observer?.OnLatchCleared(this, episode);
+        }
+    }
+
+    /// <summary>
+    /// Calls <paramref name="observer"/>'s <see cref="IInMemoryQueueLatchObserver.GetTimestamp"/>,
+    /// defensively: that member is documented to never throw, but a misbehaving implementation must never
+    /// be able to corrupt this queue's own latch-episode bookkeeping. Returns zero for a
+    /// <see langword="null"/> observer or a throwing call.
+    /// </summary>
+    private static long SafeGetTimestamp(IInMemoryQueueLatchObserver? observer)
+    {
+        if (observer is null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return observer.GetTimestamp();
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
     }
 
     /// <summary>

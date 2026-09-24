@@ -29,7 +29,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void Schedule_WhenDelayElapses_WritesRedeliveryToQueue()
     {
         var time = new FakeTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         using var scheduler = new InMemoryDeferScheduler(time, new InMemoryBufferPool(), diagnostics);
         InMemoryQueue queue = Queue();
         queue.TryReserve().Should().Be(QueueReservationResult.Reserved);
@@ -51,7 +51,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void TrySchedule_WhenDelayAboveTimerLimit_ThrowsBeforeTakingOwnership()
     {
         var time = new FakeTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         using var scheduler = new InMemoryDeferScheduler(time, new InMemoryBufferPool(), diagnostics);
         InMemoryQueue queue = Queue();
         queue.TryReserve().Should().Be(QueueReservationResult.Reserved);
@@ -71,7 +71,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void TrySchedule_WhenArmingTimerFails_ReleasesSlotAndReturnsBufferExactlyOnce()
     {
         var time = new FailingArmTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         var observer = new CountingBufferPoolObserver();
         var pool = new InMemoryBufferPool(observer);
         using var scheduler = new InMemoryDeferScheduler(time, pool, diagnostics);
@@ -97,7 +97,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void Dispose_WithPendingDeliveries_ReleasesSlotsAndReturnsBuffersExactlyOnce()
     {
         var time = new FakeTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         var observer = new CountingBufferPoolObserver();
         var pool = new InMemoryBufferPool(observer);
         var scheduler = new InMemoryDeferScheduler(time, pool, diagnostics);
@@ -129,7 +129,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void Schedule_AfterDispose_ReturnsFalse()
     {
         var time = new FakeTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         var scheduler = new InMemoryDeferScheduler(time, new InMemoryBufferPool(), diagnostics);
         scheduler.Dispose();
 
@@ -154,7 +154,7 @@ public sealed class InMemoryDeferSchedulerTests
         const int iterations = 200;
         for (int i = 0; i < iterations; i++)
         {
-            var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+            var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
             var scheduler = new InMemoryDeferScheduler(time, pool, diagnostics);
             InMemoryQueue queue = Queue();
             queue.TryReserve().Should().Be(QueueReservationResult.Reserved);
@@ -200,7 +200,7 @@ public sealed class InMemoryDeferSchedulerTests
     public void TimerCallback_WhenWriteFails_ReturnsBufferAndReleasesSlotWithoutThrowing()
     {
         var time = new FakeTimeProvider();
-        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, metrics: null, timeProvider: time);
         var observer = new CountingBufferPoolObserver();
         var pool = new InMemoryBufferPool(observer);
         using var scheduler = new InMemoryDeferScheduler(time, pool, diagnostics);

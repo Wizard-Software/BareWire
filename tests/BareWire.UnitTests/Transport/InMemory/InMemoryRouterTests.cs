@@ -30,7 +30,9 @@ public sealed class InMemoryRouterTests
         ILogger<InMemoryRouter>? logger = null,
         Meter? meter = null,
         TimeProvider? timeProvider = null) =>
-        new(InMemoryTopologyInterpreter.BuildRegistry(options), options, logger ?? NullLogger<InMemoryRouter>.Instance, meter, timeProvider);
+        new(
+            InMemoryTopologyInterpreter.BuildRegistry(options), options, logger ?? NullLogger<InMemoryRouter>.Instance,
+            new InMemoryTransportMetrics(meter, []), timeProvider);
 
     // ── Direct / Fanout / Topic ──────────────────────────────────────────────
 
@@ -479,14 +481,14 @@ public sealed class InMemoryRouterTests
     }
 
     [Fact]
-    public void ReportUnroutable_WithMeter_IncrementsUnroutableCounterWithExchangeTagOnly()
+    public void ReportUnroutable_WithMeter_IncrementsSharedRejectedCounterWithReasonAndExchangeTags()
     {
         using var meter = new Meter("BareWire.Tests." + Guid.NewGuid());
         List<KeyValuePair<string, object?>[]> measurements = [];
         using var listener = new MeterListener();
         listener.InstrumentPublished = (instrument, l) =>
         {
-            if (instrument.Meter == meter)
+            if (ReferenceEquals(instrument.Meter, meter) && instrument.Name == InMemoryTransportMetrics.RejectedCounterName)
             {
                 l.EnableMeasurementEvents(instrument);
             }
@@ -501,8 +503,9 @@ public sealed class InMemoryRouterTests
         listener.RecordObservableInstruments();
 
         KeyValuePair<string, object?>[] tags = measurements.Should().ContainSingle().Which;
-        tags.Select(static t => t.Key).Should().BeEquivalentTo(["exchange"]);
-        tags.Single().Value.Should().Be("orders");
+        tags.Select(static t => t.Key).Should().BeEquivalentTo(["reason", "exchange"]);
+        tags.Single(static t => t.Key == "reason").Value.Should().Be("unroutable");
+        tags.Single(static t => t.Key == "exchange").Value.Should().Be("orders");
     }
 
     [Fact]
