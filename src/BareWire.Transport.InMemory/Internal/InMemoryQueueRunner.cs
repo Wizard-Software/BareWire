@@ -27,9 +27,10 @@ namespace BareWire.Transport.InMemory.Internal;
 /// still being processed (for example by per-key ordering lanes during a stop, or across a single-active
 /// consumer handover). Those messages are requeued and may be processed twice; a late settlement of the
 /// original finds no map entry and must be a no-op. A message the consume loop disposed without settling it
-/// (its buffer already back in the pool) is detected and dropped with a warning instead of being copied. In
-/// the narrow window where such a message is disposed while the copy is being taken, the copy may still read
-/// a buffer already returned to the pool — a known limit the adapter cannot observe.
+/// (its buffer already back in the pool) is detected and dropped with a warning instead of being copied.
+/// Pinning the body (<see cref="InMemoryBodyCopier"/>) closes the race between the two: a dispose that
+/// arrives while the copy is in progress waits for the unpin to return the buffer, so the copy never reads
+/// memory already back in the pool.
 /// </para>
 /// </remarks>
 internal sealed class InMemoryQueueRunner
@@ -38,6 +39,7 @@ internal sealed class InMemoryQueueRunner
     private readonly SemaphoreSlim? _singleActiveGate;
     private readonly CancellationToken _shutdownToken;
     private readonly InMemoryConsumeDiagnostics _diagnostics;
+    private readonly InMemoryBufferPool _pool;
 
     /// <param name="queue">The queue to consume.</param>
     /// <param name="map">The adapter's delivery map.</param>
@@ -46,23 +48,27 @@ internal sealed class InMemoryQueueRunner
     /// one runner holds the gate; the others wait on it in standby without counting as active consumers.
     /// </param>
     /// <param name="diagnostics">Reports deliveries dropped on shutdown.</param>
+    /// <param name="pool">The pool this runner's requeue-on-abandon copies are rented from and returned to.</param>
     /// <param name="shutdownToken">Cancelled when the adapter shuts down.</param>
     internal InMemoryQueueRunner(
         InMemoryQueue queue,
         InMemoryDeliveryMap map,
         SemaphoreSlim? singleActiveGate,
         InMemoryConsumeDiagnostics diagnostics,
+        InMemoryBufferPool pool,
         CancellationToken shutdownToken)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(map);
         ArgumentNullException.ThrowIfNull(diagnostics);
+        ArgumentNullException.ThrowIfNull(pool);
 
         Queue = queue;
         _map = map;
         _singleActiveGate = singleActiveGate;
         _shutdownToken = shutdownToken;
         _diagnostics = diagnostics;
+        _pool = pool;
     }
 
     /// <summary>Gets the queue this runner consumes.</summary>
@@ -162,11 +168,10 @@ internal sealed class InMemoryQueueRunner
             }
 
             // Consumers may still be processing (and disposing) messages on other threads, e.g. ordered lanes
-            // that drain after this enumerator ends. Pinning is atomic with the message's Dispose: if the
-            // consumer disposed first, the buffer is already back in the pool and the body can no longer be
-            // read, so the delivery is dropped and its slot freed. A Dispose that lands while the body is
-            // pinned leaves the buffer to the unpin, so it returns to the pool exactly once, after the copy.
-            if (!entry.Message.TryPinPooledBuffer())
+            // that drain after this enumerator ends. InMemoryBodyCopier pins the body atomically with the
+            // message's Dispose: if the consumer disposed first, the buffer is already back in the pool and
+            // the body can no longer be read, so the delivery is dropped and its slot freed instead of copied.
+            if (!InMemoryBodyCopier.TryCopy(entry, _pool, out byte[] copy))
             {
                 Queue.ReleaseSlot();
                 disposedUnsettled++;
@@ -174,16 +179,6 @@ internal sealed class InMemoryQueueRunner
             }
 
             InMemoryDelivery delivery = entry.Delivery;
-            byte[] copy = ArrayPool<byte>.Shared.Rent(Math.Max(delivery.Length, 1));
-            try
-            {
-                delivery.Body.Span.CopyTo(copy);
-            }
-            finally
-            {
-                entry.Message.UnpinPooledBuffer();
-            }
-
             requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
         }
 
@@ -196,7 +191,7 @@ internal sealed class InMemoryQueueRunner
             foreach (InMemoryDelivery copied in requeue)
             {
                 Queue.ReleaseSlot();
-                ArrayPool<byte>.Shared.Return(copied.Buffer);
+                _pool.Return(copied.Buffer);
             }
 
             _diagnostics.DeliveriesDroppedOnShutdown(Queue.Name, requeue.Count);

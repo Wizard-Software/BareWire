@@ -122,6 +122,21 @@ internal sealed class InMemoryTransportOptions
                 expectedValue: "a value greater than TimeSpan.Zero when EnableDefer is on");
         }
 
+        if (DeferEnabled)
+        {
+            foreach (InMemoryEndpointConfiguration endpoint in EndpointConfigurations)
+            {
+                if (endpoint.Ordering is not null)
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: "EnableDefer",
+                        optionValue: $"receive endpoint '{endpoint.QueueName}' declares ordering",
+                        expectedValue: "Defer disabled, or no ordering declared on any receive endpoint " +
+                            "(deferred redelivery breaks per-key order)");
+                }
+            }
+        }
+
         if (RouteCacheCapacity <= 0)
         {
             throw new BareWireConfigurationException(

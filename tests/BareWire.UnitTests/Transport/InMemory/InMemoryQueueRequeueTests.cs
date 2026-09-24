@@ -106,7 +106,17 @@ public sealed class InMemoryQueueRequeueTests
     {
         var queue = new InMemoryQueue("orders", 4);
 
-        Action act = () => queue.RequeueAtHead(null!);
+        Action act = () => queue.RequeueAtHead((IReadOnlyList<InMemoryDelivery>)null!);
+
+        act.Should().Throw<ArgumentNullException>();
+    }
+
+    [Fact]
+    public void RequeueAtHead_SingleDelivery_NullDelivery_ThrowsArgumentNullException()
+    {
+        var queue = new InMemoryQueue("orders", 4);
+
+        Action act = () => queue.RequeueAtHead((InMemoryDelivery)null!);
 
         act.Should().Throw<ArgumentNullException>();
     }

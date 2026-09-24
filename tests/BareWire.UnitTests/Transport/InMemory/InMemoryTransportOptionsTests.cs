@@ -1,11 +1,19 @@
 using AwesomeAssertions;
+using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Transport.InMemory;
+using BareWire.Transport.InMemory.Configuration;
 
 namespace BareWire.UnitTests.Transport.InMemory;
 
 public sealed class InMemoryTransportOptionsTests
 {
+    private static InMemoryEndpointConfiguration OrderedEndpoint(string queueName, TransportAffinity affinity)
+    {
+        var endpoint = new InMemoryEndpointConfiguration(queueName);
+        endpoint.OrderedBy(configure => configure.By<object>(static m => m).TransportAffinity(affinity));
+        return endpoint;
+    }
     [Fact]
     public void Constructor_Defaults_MatchDocumentedValues()
     {
@@ -97,4 +105,46 @@ public sealed class InMemoryTransportOptionsTests
     public void Validate_WhenDeferDisabledAndDeferDelayZero_DoesNotThrow() =>
         new InMemoryTransportOptions { DeferEnabled = false, DeferDelay = TimeSpan.Zero }
             .Invoking(o => o.Validate()).Should().NotThrow();
+
+    [Theory]
+    [InlineData(TransportAffinity.None)]
+    [InlineData(TransportAffinity.SingleActiveConsumer)]
+    public void Validate_WhenDeferEnabledAndAnEndpointDeclaresOrdering_ThrowsConfigurationException(
+        TransportAffinity affinity)
+    {
+        var o = new InMemoryTransportOptions
+        {
+            DeferEnabled = true,
+            EndpointConfigurations = [OrderedEndpoint("orders", affinity)],
+        };
+
+        o.Invoking(x => x.Validate()).Should().Throw<BareWireConfigurationException>()
+            .Which.OptionName.Should().Be("EnableDefer");
+    }
+
+    [Fact]
+    public void Validate_WhenDeferEnabledAndNoEndpointDeclaresOrdering_DoesNotThrow()
+    {
+        var o = new InMemoryTransportOptions
+        {
+            DeferEnabled = true,
+            EndpointConfigurations = [new InMemoryEndpointConfiguration("orders")],
+        };
+
+        o.Invoking(x => x.Validate()).Should().NotThrow();
+    }
+
+    [Theory]
+    [InlineData(TransportAffinity.None)]
+    [InlineData(TransportAffinity.SingleActiveConsumer)]
+    public void Validate_WhenDeferDisabledAndAnEndpointDeclaresOrdering_DoesNotThrow(TransportAffinity affinity)
+    {
+        var o = new InMemoryTransportOptions
+        {
+            DeferEnabled = false,
+            EndpointConfigurations = [OrderedEndpoint("orders", affinity)],
+        };
+
+        o.Invoking(x => x.Validate()).Should().NotThrow();
+    }
 }

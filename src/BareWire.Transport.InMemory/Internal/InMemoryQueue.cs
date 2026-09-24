@@ -255,6 +255,64 @@ internal sealed class InMemoryQueue
     }
 
     /// <summary>
+    /// Puts <paramref name="delivery"/> back at the head of this queue, ahead of every delivery that is in
+    /// the channel when this call starts. <paramref name="delivery"/> MUST already hold a reserved slot,
+    /// so <see cref="Occupancy"/> is not changed. A single-delivery overload of
+    /// <see cref="RequeueAtHead(IReadOnlyList{InMemoryDelivery})"/> for the common per-message requeue
+    /// case (settlement's <c>Requeue</c> action), so that case does not need to allocate a one-element
+    /// list just to call the list overload.
+    /// </summary>
+    /// <remarks>
+    /// Same O(queue depth) cost and the same drain-under-lock-then-write-back implementation as the list
+    /// overload — a bounded <see cref="System.Threading.Channels.Channel{T}"/> has no cheaper "prepend"
+    /// operation. Bounded by <c>InMemoryTransportOptions.MaxRedeliveries</c> in practice, since every
+    /// <c>Requeue</c> past that limit dead-letters instead of calling this method again.
+    /// </remarks>
+    /// <param name="delivery">The delivery to requeue. Must not be <see langword="null"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="delivery"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The channel cannot hold <paramref name="delivery"/> together with the drained ones — it was passed
+    /// without a matching reservation. The drained deliveries are written back first, as far as the
+    /// channel allows.
+    /// </exception>
+    internal void RequeueAtHead(InMemoryDelivery delivery)
+    {
+        ArgumentNullException.ThrowIfNull(delivery);
+
+        lock (_requeueLock)
+        {
+            ChannelReader<InMemoryDelivery> reader = _channel.Reader;
+            ChannelWriter<InMemoryDelivery> writer = _channel.Writer;
+            var drained = new List<InMemoryDelivery>(reader.Count);
+            while (reader.TryRead(out InMemoryDelivery? queued))
+            {
+                drained.Add(queued);
+            }
+
+            if (1L + drained.Count > Capacity)
+            {
+                WriteBack(writer, drained, 0);
+                throw RequeueOverflow();
+            }
+
+            if (!writer.TryWrite(delivery))
+            {
+                WriteBack(writer, drained, 0);
+                throw RequeueOverflow();
+            }
+
+            for (int i = 0; i < drained.Count; i++)
+            {
+                if (!writer.TryWrite(drained[i]))
+                {
+                    WriteBack(writer, drained, i + 1);
+                    throw RequeueOverflow();
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Best-effort write-back of drained deliveries after a requeue found the channel over capacity, so
     /// deliveries holding reserved slots are not silently lost before the invariant violation is reported.
     /// </summary>

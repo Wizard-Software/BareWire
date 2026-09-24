@@ -138,6 +138,65 @@ The rejected-copies/messages counter (`barewire.inmemory.send.rejected`) is a pr
 shape: a later subtask may fold it into a single, transport-wide rejection counter alongside the
 existing `barewire.inmemory.unroutable` counter.
 
+## Settlement
+
+`SettleAsync` mirrors RabbitMQ's settlement map — the same five actions, the same dead-lettering
+behavior for a rejected message, and the same opt-in for delayed redelivery:
+
+| Action | Behavior |
+|---|---|
+| `Ack` | Releases the source queue's slot. The message's own `Dispose()` returns its buffer — settlement never touches it. |
+| `Nack` / `Reject` | Dead-letters the message (see below), or drops it with a `Warning` log and a metric when no dead-letter target accepts it. |
+| `Requeue` | Puts a copy back at the head of the source queue with an incremented redelivery count, reusing the same reserved slot — unless `MaxRedeliveries` is already reached, in which case it dead-letters instead. |
+| `Defer` | Throws `NotSupportedException` unless `EnableDefer()` is configured. With it, schedules a copy for write-back to the same, already-reserved slot after `DeferDelay` — see "Deferred redelivery" below. |
+
+### Dead-lettering
+
+A queue declared with a `DeadLetterExchange` queue argument routes a `Nack`, a `Reject`, or a
+`Requeue` past `MaxRedeliveries` to that exchange, exactly like RabbitMQ:
+
+- The routing key is the `DeadLetterRoutingKey` override when one is declared, or the message's
+  original routing key otherwise.
+- Admission to every dead-letter target queue is **non-blocking** — settlement never waits for
+  capacity. A full or latched target queue simply rejects the new dead-letter; it is dropped with a
+  `Warning` log and a metric instead of being retried or blocking the settling consumer.
+- A fan-out dead-letter exchange copies the body to every target queue that has room; a queue with no
+  room gets no copy.
+- A dead-lettered message keeps its original `BW-Exchange` and `BW-RoutingKey` headers (the ones
+  stamped when it was first published), not the dead-letter exchange's own name — this differs from
+  RabbitMQ's `x-death` header chain, which this transport does not implement. Its redelivery count is
+  reset to zero, as it is a fresh delivery on its new queue.
+
+A drop during settlement is reported with one of these reasons (a log field and a metric tag, never
+the message body or headers): `no_dlx` (no dead-letter exchange declared), `dlx_full` (every target
+queue was full or latched), `unroutable` (the declared dead-letter exchange matched no binding for the
+resolved routing key), or `max_redeliveries` (a `Requeue` past the limit with no dead-letter exchange
+declared).
+
+**Dead-letter loop caveat.** A dead-letter exchange that routes back to its own source queue creates a
+loop: `MaxRedeliveries` bounds a `Requeue` loop on a single queue, but it does **not** bound a
+`Nack`/`Reject` → dead-letter → `Nack`/`Reject` loop across queues, because a fresh dead-letter always
+starts at redelivery count zero. This is the same behavior as RabbitMQ — avoid pointing a queue's
+dead-letter exchange back at itself (directly, or through a chain of exchanges) unless every consumer
+in that chain eventually acknowledges instead of rejecting.
+
+`Requeue`'s cost is proportional to the source queue's current depth (it drains and rewrites the
+underlying channel to insert at the head) — bounded in practice by `MaxRedeliveries`, since every
+`Requeue` past that limit dead-letters instead of requeuing again.
+
+### Deferred redelivery
+
+`EnableDefer(delay)` opts a whole in-memory transport into the `Defer` settlement action: a deferred
+delivery holds its queue's reserved slot for `delay`, then is written back to the same queue with an
+incremented redelivery count — never checked against `MaxRedeliveries`. Without `EnableDefer()`,
+`Defer` always throws `NotSupportedException` and leaves the delivery in flight, settleable with
+another action.
+
+`EnableDefer()` is **incompatible with per-key ordering**: a receive endpoint that declares
+`OrderedBy` (with any `TransportAffinity`, including `SingleActiveConsumer`) rejects a deferred
+redelivery from ever reordering its stream, so combining the two throws a configuration exception when
+the transport is registered, before any message is ever consumed.
+
 ## Sizing
 
 ### Queue capacity vs. burst
@@ -223,7 +282,7 @@ or `MaxMessageSize` when large message bodies or many queues are expected.
 | `MaxMessageSize` | `16 MiB` (`16777216` bytes) | must be greater than zero |
 | `MaxRedeliveries` | `20` | must be greater than zero |
 | `DrainTimeout` | `10 s` | must be greater than `TimeSpan.Zero` |
-| `DeferEnabled` / `DeferDelay` | off / `30 s` | when enabled, `DeferDelay` must be greater than `TimeSpan.Zero` |
+| `DeferEnabled` / `DeferDelay` | off / `30 s` | when enabled, `DeferDelay` must be greater than `TimeSpan.Zero`, and no receive endpoint may declare `OrderedBy` (see "Deferred redelivery" above) |
 | `GuaranteedRouting` | off | — |
 | `AutoDeclareEndpointQueues` | off (manual topology) | — |
 | `DefaultExchange` | unset | — |

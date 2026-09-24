@@ -23,9 +23,12 @@ namespace BareWire.Transport.InMemory;
 /// Once built, the topology is frozen: <see cref="DeployTopologyAsync"/> accepts only the same declaration
 /// (idempotent no-op) and rejects any other one, and <see cref="ConsumeAsync"/> refuses to start on an
 /// undeclared queue. <see cref="SendBatchAsync"/> accepts a batch of outbound messages per its own
-/// remarks; settling messages is added by a later subtask and still throws
-/// <see cref="NotSupportedException"/>. Registered as an <see cref="ITransportAdapter"/> DI singleton
-/// by <c>AddBareWireInMemory</c>.
+/// remarks. <see cref="SettleAsync"/> fully mirrors RabbitMQ's settlement map — <c>Ack</c>, <c>Nack</c>,
+/// <c>Reject</c>, and <c>Requeue</c> (with a redelivery limit falling back to dead-lettering) are always
+/// available; <c>Defer</c> throws <see cref="NotSupportedException"/> unless
+/// <see cref="InMemoryTransportOptions.DeferEnabled"/> is on, in which case it schedules a delayed
+/// redelivery instead. Registered as an <see cref="ITransportAdapter"/> DI singleton by
+/// <c>AddBareWireInMemory</c>.
 /// </summary>
 internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable, IAsyncDisposable
 {
@@ -33,6 +36,9 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     private readonly InMemoryConsumeDiagnostics _diagnostics;
     private readonly InMemorySendDiagnostics _sendDiagnostics;
     private readonly InMemorySender _sender;
+    private readonly InMemorySettlement _settlement;
+    private readonly InMemoryDeferScheduler? _deferScheduler;
+    private readonly TimeProvider _timeProvider;
 
     // Never disposed: a runner's finally block may still observe it after shutdown. A cancellation token
     // source without a timer holds no unmanaged resource.
@@ -43,6 +49,14 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// <param name="broker">The container-scoped broker owning the queues.</param>
     /// <param name="logger">An optional logger; defaults to a no-op logger.</param>
     /// <param name="meter">An optional meter for the consume- and send-path counters; no instruments when omitted.</param>
+    /// <param name="timeProvider">
+    /// An optional time source used to throttle settlement-drop logs (and, once implemented, deferred
+    /// redelivery). Defaults to <see cref="TimeProvider.System"/>.
+    /// </param>
+    /// <param name="bufferPoolObserver">
+    /// An optional test hook notified of every rent and return this adapter's own buffer pool
+    /// (<see cref="BufferPool"/>) performs. <see langword="null"/> in production.
+    /// </param>
     /// <remarks>
     /// An explicit constructor, not a primary one: <see cref="Registry"/> and the send-path collaborators
     /// built from it (<see cref="Router"/>, the sender) must be assigned in the constructor BODY, after
@@ -53,16 +67,20 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         InMemoryTransportOptions options,
         InMemoryBroker broker,
         ILogger<InMemoryTransportAdapter>? logger = null,
-        Meter? meter = null)
+        Meter? meter = null,
+        TimeProvider? timeProvider = null,
+        IInMemoryBufferPoolObserver? bufferPoolObserver = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(broker);
 
         ILogger effectiveLogger = logger ?? (ILogger)NullLogger<InMemoryTransportAdapter>.Instance;
+        _timeProvider = timeProvider ?? TimeProvider.System;
 
         // Built first, so an unsupported affinity fails before the topology registry is built.
         _singleActiveGates = BuildSingleActiveGates(options);
-        _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, meter);
+        _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, meter, _timeProvider);
+        BufferPool = new InMemoryBufferPool(bufferPoolObserver);
 
         Options = options;
         Broker = broker;
@@ -72,6 +90,10 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), meter);
         _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, meter);
         _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed);
+        _deferScheduler = options.DeferEnabled
+            ? new InMemoryDeferScheduler(_timeProvider, BufferPool, _diagnostics)
+            : null;
+        _settlement = new InMemorySettlement(options, Registry, broker, Router, BufferPool, _deferScheduler, _diagnostics);
     }
 
     /// <inheritdoc />
@@ -104,6 +126,14 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// </summary>
     internal InMemoryDeliveryMap InFlight { get; }
 
+    /// <summary>
+    /// Gets the single choke point every rent and return this adapter performs on its own behalf —
+    /// settlement copies and each consume runner's requeue-on-abandon copies — goes through. One instance
+    /// per adapter; a buffer handed to an <see cref="InboundMessage"/> is returned by that message's own
+    /// <see cref="InboundMessage.Dispose"/> without going through this pool.
+    /// </summary>
+    internal InMemoryBufferPool BufferPool { get; }
+
     /// <summary>Gets the number of unsettled deliveries dropped because the adapter shut down.</summary>
     internal long DroppedOnShutdownCount => _diagnostics.DroppedOnShutdownCount;
 
@@ -115,6 +145,16 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// them, so their bodies could not be requeued.
     /// </summary>
     internal long DisposedUnsettledCount => _diagnostics.DisposedUnsettledCount;
+
+    /// <summary>Gets the number of deliveries dropped during settlement for <paramref name="reason"/>.</summary>
+    internal long SettlementDroppedCount(SettlementDropReason reason) => _diagnostics.SettlementDroppedCount(reason);
+
+    /// <summary>
+    /// Gets the number of deferred redeliveries currently pending — scheduled by a <c>Defer</c> settlement
+    /// and not yet written back or dropped. Always zero when <see cref="InMemoryTransportOptions.DeferEnabled"/>
+    /// is off. A test hook.
+    /// </summary>
+    internal int PendingDeferCount => _deferScheduler?.PendingCount ?? 0;
 
     private static ExchangeRegistry AttachRegistry(InMemoryBroker broker, ExchangeRegistry registry)
     {
@@ -265,7 +305,7 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         }
 
         _singleActiveGates.TryGetValue(endpointName, out SemaphoreSlim? gate);
-        var runner = new InMemoryQueueRunner(queue, InFlight, gate, _diagnostics, _shutdown.Token);
+        var runner = new InMemoryQueueRunner(queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token);
         return runner.RunAsync(cancellationToken);
     }
 
@@ -274,12 +314,17 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     /// The minimal lookup settlement builds on.
     /// </summary>
     /// <remarks>
-    /// Settlement must call this first — before any cancellation check or validation that could throw —
-    /// because the consume loop may settle with an already cancelled token during shutdown. A
-    /// <see langword="false"/> result means the delivery was already requeued or dropped by its runner's
-    /// cleanup or the shutdown sweep: settlement is then a no-op (no slot release, no buffer access). The
-    /// message owns its buffer: an acknowledgement never touches it, and any path that puts the delivery
-    /// back on a queue copies the body.
+    /// <see cref="SettleAsync"/> validates its arguments and its settlement action — a null message, an
+    /// unknown <see cref="SettlementAction"/> value, or <c>Defer</c> without
+    /// <see cref="InMemoryTransportOptions.DeferEnabled"/> — BEFORE calling this method, so a rejected
+    /// settlement call never claims the entry: the delivery stays in flight and can still be settled by
+    /// another (valid) call, or reclaimed later by the runner's own cleanup or the shutdown sweep. Once a
+    /// call reaches this method its action is known-valid, and this is the first potentially-failing step
+    /// — settlement never checks the caller's cancellation token, here or anywhere else, because it never
+    /// waits for anything. A <see langword="false"/> result means the delivery was already requeued or
+    /// dropped by its runner's cleanup or the shutdown sweep: settlement is then a no-op (no slot release,
+    /// no buffer access). The message owns its buffer: an acknowledgement never touches it, and any path
+    /// that puts the delivery back on a queue copies the body.
     /// </remarks>
     /// <param name="message">The inbound message being settled.</param>
     /// <param name="entry">The claimed entry, when found.</param>
@@ -291,10 +336,16 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     }
 
     /// <summary>
-    /// Shuts the adapter down: stops every running consume enumeration and drops every delivery still in
+    /// Shuts the adapter down: stops every running consume enumeration, cancels every pending deferred
+    /// redelivery (see <see cref="InMemoryDeferScheduler.Dispose"/>), and drops every delivery still in
     /// flight, releasing its queue slot (never its buffer, which belongs to the message), with one warning
     /// log and one counter increment per affected queue. Idempotent.
     /// </summary>
+    /// <remarks>
+    /// A <c>Requeue</c> or dead-letter write that races this call and reaches a queue's channel a moment
+    /// too late leaves an unclaimed pooled buffer behind; reclaiming it is left to a future graceful-drain
+    /// subtask, not this one — see the similar note on <see cref="SendBatchAsync"/>.
+    /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -303,6 +354,7 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
         }
 
         _shutdown.Cancel();
+        _deferScheduler?.Dispose();
 
         List<InFlightDelivery> remaining = InFlight.TakeAll();
         if (remaining.Count == 0)
@@ -331,12 +383,73 @@ internal sealed class InMemoryTransportAdapter : ITransportAdapter, IDisposable,
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// Mirrors RabbitMQ's settlement map: <see cref="SettlementAction.Ack"/> only releases the source
+    /// queue's slot (the message's own <see cref="InboundMessage.Dispose"/> returns its buffer);
+    /// <see cref="SettlementAction.Nack"/> and <see cref="SettlementAction.Reject"/> dead-letter (a
+    /// declared <c>x-dead-letter-exchange</c> on the source queue, or the delivery is dropped with a
+    /// <see cref="LogLevel.Warning"/> log and a counter); <see cref="SettlementAction.Requeue"/> puts a
+    /// copy back at the head of the source queue with an incremented redelivery count, unless
+    /// <see cref="InMemoryTransportOptions.MaxRedeliveries"/> is already reached, in which case it
+    /// dead-letters instead. <see cref="SettlementAction.Defer"/> throws <see cref="NotSupportedException"/>
+    /// when <see cref="InMemoryTransportOptions.DeferEnabled"/> is off; when it is on, a copy is scheduled
+    /// for write-back to the same, already-reserved slot after <see cref="InMemoryTransportOptions.DeferDelay"/>
+    /// — never checked against <see cref="InMemoryTransportOptions.MaxRedeliveries"/>. Configuring
+    /// <c>EnableDefer()</c> together with a receive endpoint that declares per-key ordering is rejected at
+    /// startup, since a deferred redelivery would otherwise reorder that endpoint's stream.
+    /// </para>
+    /// <para>
+    /// This method is never <see langword="async"/> and never waits for anything — it always returns an
+    /// already-completed <see cref="Task"/>, and <paramref name="cancellationToken"/> is never checked.
+    /// Argument and action validation happens before the delivery is claimed from <see cref="InFlight"/>;
+    /// see <see cref="TryTakeInFlight"/>.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="action"/> is not a known <see cref="SettlementAction"/>.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="action"/> is <see cref="SettlementAction.Defer"/> and
+    /// <see cref="InMemoryTransportOptions.DeferEnabled"/> is off.
+    /// </exception>
     public Task SettleAsync(
         SettlementAction action,
         InboundMessage message,
-        CancellationToken cancellationToken = default) =>
-        throw new NotSupportedException(
-            "The in-memory transport operation 'SettleAsync' is not implemented yet.");
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+
+        switch (action)
+        {
+            case SettlementAction.Ack:
+            case SettlementAction.Nack:
+            case SettlementAction.Reject:
+            case SettlementAction.Requeue:
+                break;
+
+            case SettlementAction.Defer when !Options.DeferEnabled:
+                throw new NotSupportedException(
+                    "The in-memory transport operation 'Defer' requires EnableDefer() on the in-memory " +
+                    "configurator. The delivery was left in flight and can still be settled with another action.");
+
+            case SettlementAction.Defer:
+                // DeferEnabled is on: falls through to the common claim-and-settle path below, exactly
+                // like Ack/Nack/Reject/Requeue. _settlement.Settle routes it to _deferScheduler, which is
+                // guaranteed non-null whenever DeferEnabled is on (see the constructor).
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(action), action, "Unknown settlement action.");
+        }
+
+        if (!TryTakeInFlight(message, out InFlightDelivery entry))
+        {
+            return Task.CompletedTask;
+        }
+
+        _settlement.Settle(action, entry);
+        return Task.CompletedTask;
+    }
 
     /// <inheritdoc />
     /// <remarks>
