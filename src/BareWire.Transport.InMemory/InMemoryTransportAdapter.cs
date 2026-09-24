@@ -28,13 +28,16 @@ namespace BareWire.Transport.InMemory;
 /// <c>Reject</c>, and <c>Requeue</c> (with a redelivery limit falling back to dead-lettering) are always
 /// available; <c>Defer</c> throws <see cref="NotSupportedException"/> unless
 /// <see cref="InMemoryTransportOptions.DeferEnabled"/> is on, in which case it schedules a delayed
-/// redelivery instead. Also implements <see cref="IGracefulDrainTransport"/>, letting the bus wait —
-/// bounded by a timeout and a cancellation token — for every queue with an active consumer to empty
-/// before that consumer is cancelled during a graceful shutdown. Registered as an
-/// <see cref="ITransportAdapter"/> DI singleton by <c>AddBareWireInMemory</c>.
+/// redelivery instead. Also implements <see cref="INativeMessageScheduler"/> unconditionally (see
+/// <see cref="ScheduleAsync"/>), so <c>BareWire.Saga</c>'s <c>SchedulingStrategy.Auto</c> schedules saga
+/// timeouts through this adapter's own scheduler instead of a strategy that would deploy topology at
+/// runtime, and <see cref="IGracefulDrainTransport"/>, letting the bus wait — bounded by a timeout and a
+/// cancellation token — for every queue with an active consumer to empty before that consumer is
+/// cancelled during a graceful shutdown. Registered as an <see cref="ITransportAdapter"/> DI singleton by
+/// <c>AddBareWireInMemory</c>.
 /// </summary>
 internal sealed class InMemoryTransportAdapter
-    : ITransportAdapter, IGracefulDrainTransport, ITransportHealthSource, IDisposable, IAsyncDisposable
+    : ITransportAdapter, INativeMessageScheduler, IGracefulDrainTransport, ITransportHealthSource, IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// The interval <see cref="DrainAsync"/> polls at while waiting for every active queue to drain. A
@@ -50,6 +53,7 @@ internal sealed class InMemoryTransportAdapter
     private readonly InMemorySender _sender;
     private readonly InMemorySettlement _settlement;
     private readonly InMemoryDeferScheduler? _deferScheduler;
+    private readonly InMemoryMessageScheduler _messageScheduler;
     private readonly TimeProvider _timeProvider;
 
     // This adapter's single instrument owner (see InMemoryTransportMetrics) and the broker's queues it
@@ -79,6 +83,11 @@ internal sealed class InMemoryTransportAdapter
     /// An optional test hook notified of every rent and return this adapter's own buffer pool
     /// (<see cref="BufferPool"/>) performs. <see langword="null"/> in production.
     /// </param>
+    /// <param name="maxPendingScheduled">
+    /// The cap on the number of native-scheduled messages (see <see cref="ScheduleAsync"/>) held pending
+    /// at once. Defaults to <see cref="InMemoryMessageScheduler.DefaultMaxPending"/>; a test hook — there
+    /// is no public option for it (see the package README's "Scheduled delivery" section).
+    /// </param>
     /// <remarks>
     /// An explicit constructor, not a primary one: <see cref="Registry"/> and the send-path collaborators
     /// built from it (<see cref="Router"/>, the sender) must be assigned in the constructor BODY, after
@@ -91,7 +100,8 @@ internal sealed class InMemoryTransportAdapter
         ILogger<InMemoryTransportAdapter>? logger = null,
         Meter? meter = null,
         TimeProvider? timeProvider = null,
-        IInMemoryBufferPoolObserver? bufferPoolObserver = null)
+        IInMemoryBufferPoolObserver? bufferPoolObserver = null,
+        int maxPendingScheduled = InMemoryMessageScheduler.DefaultMaxPending)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(broker);
@@ -130,13 +140,23 @@ internal sealed class InMemoryTransportAdapter
             ? new InMemoryDeferScheduler(_timeProvider, BufferPool, _diagnostics)
             : null;
         _settlement = new InMemorySettlement(options, Registry, broker, Router, BufferPool, _deferScheduler, _diagnostics);
+        _messageScheduler = new InMemoryMessageScheduler(
+            _timeProvider, BufferPool, Router, _sender, options,
+            new DelegatingLogger<InMemoryMessageScheduler>(effectiveLogger), _shutdown.Token, maxPendingScheduled);
     }
 
     /// <inheritdoc />
     public string TransportName => "InMemory";
 
     /// <inheritdoc />
-    public TransportCapabilities Capabilities => TransportCapabilities.None;
+    /// <remarks>
+    /// Always <see cref="TransportCapabilities.NativeScheduling"/>: this adapter implements
+    /// <see cref="INativeMessageScheduler"/> unconditionally, so <c>BareWire.Saga</c>'s
+    /// <c>SchedulingStrategy.Auto</c> selects the native schedule provider for the in-memory transport
+    /// instead of one that would call <see cref="DeployTopologyAsync"/> at runtime — see
+    /// <see cref="ScheduleAsync"/> for what "native" means on an in-memory, single-process transport.
+    /// </remarks>
+    public TransportCapabilities Capabilities => TransportCapabilities.NativeScheduling;
 
     /// <inheritdoc />
     /// <remarks>
@@ -232,6 +252,18 @@ internal sealed class InMemoryTransportAdapter
     internal int PendingDeferCount => _deferScheduler?.PendingCount ?? 0;
 
     /// <summary>
+    /// Gets the number of native-scheduled messages (see <see cref="ScheduleAsync"/>) currently pending —
+    /// scheduled and not yet delivered, cancelled, or dropped. A test hook.
+    /// </summary>
+    internal int PendingScheduledCount => _messageScheduler.PendingCount;
+
+    /// <summary>
+    /// Gets the number of fired scheduled messages whose delivery was not confirmed — never retried; see
+    /// <see cref="ScheduleAsync"/>'s remarks. A test hook.
+    /// </summary>
+    internal long ScheduledDeliveryFailedCount => _messageScheduler.DeliveryFailedCount;
+
+    /// <summary>
     /// Gets the number of undelivered messages dropped from queues after they were closed by
     /// <see cref="Dispose"/>. A test hook.
     /// </summary>
@@ -243,6 +275,12 @@ internal sealed class InMemoryTransportAdapter
     /// test hook.
     /// </summary>
     internal long QueueDiagnosticsLogFailureCount => _queueDiagnostics.LogFailureCount;
+
+    /// <summary>
+    /// Gets the number of logger calls from this adapter's native-scheduled-delivery collaborator
+    /// (<see cref="InMemoryMessageScheduler"/>) that threw and were suppressed. A test hook.
+    /// </summary>
+    internal long ScheduledDeliveryLogFailureCount => _messageScheduler.LogFailureCount;
 
     /// <summary>
     /// Gets this adapter's time source — the one actually driving defer timers and drain polling. A
@@ -591,6 +629,7 @@ internal sealed class InMemoryTransportAdapter
     /// aggregated warning log and one metric measurement per affected queue. Idempotent.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Every buffer this adapter is still holding on to at the moment it is disposed — sitting in a
     /// queue's channel, or handed to a consumer and never settled — is returned to <see cref="BufferPool"/>
     /// exactly once before this method returns (or, if a diagnostics listener itself throws, before that
@@ -599,6 +638,20 @@ internal sealed class InMemoryTransportAdapter
     /// races this call and reaches a queue's channel a moment too late is dropped by that queue on arrival
     /// the same way, and counted toward the same per-queue total — see the similar note on
     /// <see cref="SendBatchAsync"/>.
+    /// </para>
+    /// <para>
+    /// One exception to "every buffer is returned before this method returns": a native-scheduled message
+    /// (see <see cref="ScheduleAsync"/>) whose timer had already fired and started re-sending through
+    /// <see cref="InMemorySender.SendAsync"/> at the moment this method runs. <see cref="InMemoryMessageScheduler.Dispose"/>
+    /// only claims and sweeps entries still sitting in its own pending map — it does not wait for a fire
+    /// already in flight to finish. That fire's buffer is still returned to <see cref="BufferPool"/>
+    /// exactly once, from its own asynchronous completion (classified as a shutdown drop, not a delivery
+    /// failure, once it observes this adapter's shutdown token cancelled), just not necessarily before this
+    /// method itself returns — a moment later, on whatever thread that fire's continuation resumes on. This
+    /// adapter does not track in-flight fires to wait for them here; documenting the gap is deemed
+    /// sufficient given how narrow the window is (the fire's own send call observes the cancelled shutdown
+    /// token almost immediately).
+    /// </para>
     /// </remarks>
     public void Dispose()
     {
@@ -622,6 +675,7 @@ internal sealed class InMemoryTransportAdapter
         }
 
         _deferScheduler?.Dispose();
+        _messageScheduler.Dispose();
 
         var droppedOnShutdownPerQueue = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (InFlightDelivery entry in InFlight.TakeAll())
@@ -765,6 +819,62 @@ internal sealed class InMemoryTransportAdapter
                     "(the in-memory topology cannot change at runtime)");
         }
 
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// "Native" here means this adapter's own <see cref="InMemoryMessageScheduler"/>, not a broker-side
+    /// feature — the in-memory transport has no broker. The destination is resolved once, at schedule
+    /// time, against the sealed topology this adapter was built with (the <c>BW-Exchange</c> header, or
+    /// <see cref="ExchangeRegistry.DefaultExchangeName"/> when absent): an unresolvable destination throws
+    /// <see cref="BareWireTransportException"/> here rather than deploying topology at runtime, and a
+    /// delay beyond the <see cref="ITimer"/> due-time limit (about 49.7 days) throws
+    /// <see cref="ArgumentOutOfRangeException"/> — both before this call takes ownership of anything.
+    /// </para>
+    /// <para>
+    /// No queue slot is reserved while the message is pending: once its due time is reached, the copy
+    /// goes through the ordinary <see cref="SendBatchAsync"/> path and is subject to the same queue
+    /// capacity, <see cref="InMemoryTransportOptions.SendTimeout"/>, and rejection behavior as any other
+    /// send, with no retry on a rejection. The number of pending scheduled messages is bounded
+    /// independently of any queue's own capacity; see the package README's "Scheduled delivery" section.
+    /// A message still pending when this adapter is disposed is dropped, never delivered — in-memory
+    /// scheduled delivery has no persistence across a process restart, the same as every other delivery
+    /// on this transport.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="message"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ObjectDisposedException">The adapter has been disposed.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The delay until <paramref name="scheduledEnqueueTime"/> exceeds the in-memory timer's due-time limit.
+    /// </exception>
+    /// <exception cref="BareWireTransportException">
+    /// The destination does not resolve to any queue in the sealed topology, the body exceeds
+    /// <see cref="InMemoryTransportOptions.MaxMessageSize"/>, or the pending-message cap is reached.
+    /// </exception>
+    public Task<ScheduledMessageToken> ScheduleAsync(
+        OutboundMessage message,
+        DateTimeOffset scheduledEnqueueTime,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        return Task.FromResult(_messageScheduler.Schedule(message, scheduledEnqueueTime, cancellationToken));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Best-effort and idempotent: a <paramref name="token"/> naming an unknown id, an id whose message
+    /// already fired, or an id whose stored destination does not match <paramref name="token"/>'s own is
+    /// silently a no-op — never an exception. Cancelling a token issued by another adapter instance (or a
+    /// forged one) is safe for the same reason; see <see cref="INativeMessageScheduler"/>'s remarks on
+    /// <see cref="ScheduledMessageToken.Destination"/> not being a security token.
+    /// </remarks>
+    public Task CancelScheduledAsync(ScheduledMessageToken token, CancellationToken cancellationToken = default)
+    {
+        _messageScheduler.Cancel(token);
         return Task.CompletedTask;
     }
 }

@@ -198,6 +198,56 @@ another action.
 redelivery from ever reordering its stream, so combining the two throws a configuration exception when
 the transport is registered, before any message is ever consumed.
 
+### Scheduled delivery (saga timeouts)
+
+This transport implements native scheduled delivery: a message can be scheduled for a future enqueue
+time and later cancelled, entirely in-process, without ever deploying topology at runtime. This is what
+lets a saga's `Schedule` (a timeout) work against this transport — the alternative delay strategy would
+otherwise call `DeployTopologyAsync` the first time a timeout is scheduled, which this transport always
+rejects once its topology is sealed.
+
+The destination is resolved once, at scheduling time, against the same sealed topology every other send
+uses: the queue named by the routing key on the default exchange, or — when the scheduling caller
+supplies one — the exchange named by the message's own exchange header. A destination that does not
+resolve to any declared queue is rejected immediately, with a clear error naming it; a delay longer than
+roughly 49.7 days (the underlying timer's own due-time limit) is rejected the same way. Both rejections
+happen before anything is scheduled — no timer is armed and no message body is copied — so a caller that
+catches the error still owns everything it passed in and nothing is left dangling.
+
+No queue slot is reserved while a message is pending — only a slot in this scheduler's own, separately
+bounded pending set (10,000 messages by default; a further schedule call is rejected once it is full).
+That slot is held from `ScheduleAsync` until the copy has actually finished being re-sent, not just until
+the due time is reached — a message whose timer just fired and is still being handed to the send path
+still counts toward the 10,000-message cap for the (typically sub-millisecond) duration of that hand-off.
+Once a message's due time is reached, the copy is sent through the transport's ordinary send path and is
+subject to the exact same rules as any other send: queue capacity, `SendTimeout`, and rejection with a
+throttled, aggregated log entry (never one entry per message, and keyed by the validated exchange — the
+default exchange or a declared one — never the publisher-supplied routing key, which has unbounded
+cardinality) when the destination queue has no room. A rejected fired message is **never retried** —
+scheduled delivery on this transport is at-most-once, the same as every other delivery here. A burst of
+messages that all come due around the same time, above what their destination queue can absorb, can
+therefore lose some of them outright.
+
+Every scheduled-but-undelivered message is held only in process memory: it is lost, with no delivery
+attempt at all, if the process restarts or the transport is disposed before its due time — the same
+delivery guarantee as the rest of this transport (see "Delivery guarantee" above), just deferred a bit
+further into the future. A schedule token returned by this transport is an opaque handle used to
+identify and cancel the pending entry — **not** a permission or a security credential.
+
+Cancellation is **best-effort**: a schedule token that names an already-delivered, already-cancelled, or
+unknown entry is silently ignored rather than raising an error. Combined with the fact that this
+transport has no persistence, a consumer of scheduled messages (a saga's timeout handler, in
+particular) must treat every delivery as something that might arrive **even though it was meant to have
+been cancelled** — a state machine that reacts to a timeout must first check whether it is still in a
+state that actually expects one, and ignore it otherwise, rather than assuming cancellation is a
+guarantee.
+
+A destination or pending-limit rejection at scheduling time surfaces as a thrown exception from the call
+that tried to schedule the message — for a saga, that is ordinarily the same call that is processing the
+event which triggered the timeout, so the event is not lost: it is retried by the transport's normal
+redelivery mechanics, or dead-lettered once those are exhausted, exactly like any other processing
+failure.
+
 ## Metrics, logging and health
 
 Every instrument this transport creates is reported on one meter, named `BareWire` — the same meter
@@ -324,6 +374,19 @@ in the shared pool after the queues drain, so memory may remain high until the r
 under memory pressure; a requeued or deferred message briefly holds a second copy of its body. Lower `QueueCapacity`
 or `MaxMessageSize` when large message bodies or many queues are expected.
 
+Scheduled-but-undelivered messages (see "Scheduled delivery (saga timeouts)" above) add a further,
+independent term: they sit outside any queue's own `QueueCapacity × MaxMessageSize` bound entirely,
+for as long as their delay lasts (up to roughly 49.7 days). The worst case for that term is
+
+```
+pending scheduled message limit × MaxMessageSize
+```
+
+rounded up the same way by the pool's power-of-two buffer sizing. At the defaults (10,000 pending
+messages × the default 16 MiB `MaxMessageSize`) that worst case is on the order of 150+ GiB — size the
+pending limit and `MaxMessageSize` together deliberately when scheduled delivery is in active use, the
+same way you would size `QueueCapacity`.
+
 ## Configuration defaults
 
 | Option | Default | Validation rule (checked at registration) |
@@ -332,6 +395,7 @@ or `MaxMessageSize` when large message bodies or many queues are expected.
 | `SendTimeout` | `100 ms` | must be greater than or equal to `TimeSpan.Zero` (`Zero` = never wait) |
 | `MaxMessageSize` | `16 MiB` (`16777216` bytes) | must be greater than zero |
 | `MaxRedeliveries` | `20` | must be greater than zero |
+| Pending scheduled message limit | `10,000` | internal — no public option; see "Scheduled delivery (saga timeouts)" above |
 | `DrainTimeout` | `10 s` | must be greater than `TimeSpan.Zero` |
 | `DeferEnabled` / `DeferDelay` | off / `30 s` | when enabled, `DeferDelay` must be greater than `TimeSpan.Zero` and at most about 49.7 days (the timer due-time limit), and no receive endpoint may declare `OrderedBy` (see "Deferred redelivery" above) |
 | `GuaranteedRouting` | off | — |

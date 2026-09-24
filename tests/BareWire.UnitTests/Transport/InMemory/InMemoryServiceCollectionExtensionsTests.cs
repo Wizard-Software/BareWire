@@ -26,12 +26,13 @@ public sealed class InMemoryServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public void AddBareWireInMemory_Registered_ResolvesAdapterWithNoCapabilities()
+    public void AddBareWireInMemory_Registered_ResolvesAdapterWithNativeSchedulingCapability()
     {
         using ServiceProvider sp = Build();
         ITransportAdapter adapter = sp.GetRequiredService<ITransportAdapter>();
         adapter.Should().BeOfType<InMemoryTransportAdapter>();
-        adapter.Capabilities.Should().Be(TransportCapabilities.None);
+        adapter.Capabilities.Should().Be(TransportCapabilities.NativeScheduling);
+        adapter.Should().BeAssignableTo<INativeMessageScheduler>();
         adapter.TransportName.Should().Be("InMemory");
     }
 
