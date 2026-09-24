@@ -15,6 +15,10 @@ internal sealed class InMemoryTransportOptions
     internal static readonly TimeSpan DefaultDrainTimeout = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan DefaultDeferDelay = TimeSpan.FromSeconds(30);
 
+    // The largest due time an ITimer accepts (0xFFFFFFFE ms, about 49.7 days); a longer DeferDelay would
+    // make the deferral timer throw after the pending redelivery was already created.
+    internal static readonly TimeSpan MaxDeferDelay = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     public int QueueCapacity { get; set; } = DefaultQueueCapacity;
 
     /// <summary>
@@ -120,6 +124,14 @@ internal sealed class InMemoryTransportOptions
                 optionName: nameof(DeferDelay),
                 optionValue: DeferDelay.ToString(),
                 expectedValue: "a value greater than TimeSpan.Zero when EnableDefer is on");
+        }
+
+        if (DeferEnabled && DeferDelay > MaxDeferDelay)
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(DeferDelay),
+                optionValue: DeferDelay.ToString(),
+                expectedValue: $"a value no greater than {MaxDeferDelay} when EnableDefer is on");
         }
 
         if (DeferEnabled)

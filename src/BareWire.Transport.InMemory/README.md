@@ -282,7 +282,7 @@ or `MaxMessageSize` when large message bodies or many queues are expected.
 | `MaxMessageSize` | `16 MiB` (`16777216` bytes) | must be greater than zero |
 | `MaxRedeliveries` | `20` | must be greater than zero |
 | `DrainTimeout` | `10 s` | must be greater than `TimeSpan.Zero` |
-| `DeferEnabled` / `DeferDelay` | off / `30 s` | when enabled, `DeferDelay` must be greater than `TimeSpan.Zero`, and no receive endpoint may declare `OrderedBy` (see "Deferred redelivery" above) |
+| `DeferEnabled` / `DeferDelay` | off / `30 s` | when enabled, `DeferDelay` must be greater than `TimeSpan.Zero` and at most about 49.7 days (the timer due-time limit), and no receive endpoint may declare `OrderedBy` (see "Deferred redelivery" above) |
 | `GuaranteedRouting` | off | — |
 | `AutoDeclareEndpointQueues` | off (manual topology) | — |
 | `DefaultExchange` | unset | — |

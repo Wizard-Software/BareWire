@@ -72,7 +72,10 @@ internal sealed class InMemoryDeferScheduler : IDisposable
     /// The redelivery to write back. MUST already hold a reserved slot on <paramref name="queue"/> (the
     /// same slot the original delivery held).
     /// </param>
-    /// <param name="delay">The delay before the redelivery is written back. Must not be negative.</param>
+    /// <param name="delay">
+    /// The delay before the redelivery is written back. Must not be negative nor greater than
+    /// <see cref="InMemoryTransportOptions.MaxDeferDelay"/>.
+    /// </param>
     /// <returns>
     /// <see langword="true"/> when ownership of <paramref name="redelivery"/> was transferred to this
     /// scheduler — see this type's remarks; the caller must not touch the queue slot or the buffer again.
@@ -80,12 +83,16 @@ internal sealed class InMemoryDeferScheduler : IDisposable
     /// the caller must release the slot and return the buffer itself.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="queue"/> or <paramref name="redelivery"/> is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="delay"/> is negative.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="delay"/> is negative or greater than <see cref="InMemoryTransportOptions.MaxDeferDelay"/>.
+    /// Thrown before any entry is created, so the caller still owns the slot and the buffer.
+    /// </exception>
     internal bool TrySchedule(InMemoryQueue queue, InMemoryDelivery redelivery, TimeSpan delay)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(redelivery);
         ArgumentOutOfRangeException.ThrowIfLessThan(delay, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(delay, InMemoryTransportOptions.MaxDeferDelay);
 
         // Nothing has been created yet: the caller still owns the slot and the buffer and must clean up.
         if (Volatile.Read(ref _disposed) != 0)
@@ -116,7 +123,24 @@ internal sealed class InMemoryDeferScheduler : IDisposable
             return true;
         }
 
-        pending.Timer.Change(delay, Timeout.InfiniteTimeSpan);
+        try
+        {
+            pending.Timer.Change(delay, Timeout.InfiniteTimeSpan);
+        }
+        catch
+        {
+            // Arming failed after the entry was published. Ownership already moved to this scheduler, so
+            // retire the entry here (unless Dispose()'s sweep claimed it first) before the exception
+            // propagates — otherwise the slot and the buffer would stay held until Dispose().
+            if (_pending.TryRemove(id, out _))
+            {
+                pending.Timer.Dispose();
+                ReleaseAndReturn(pending);
+            }
+
+            throw;
+        }
+
         return true;
     }
 

@@ -102,6 +102,28 @@ public sealed class InMemoryTransportOptionsTests
     }
 
     [Fact]
+    public void Validate_WhenDeferEnabledAndDeferDelayAboveTimerLimit_ThrowsConfigurationException()
+    {
+        var o = new InMemoryTransportOptions
+        {
+            DeferEnabled = true,
+            DeferDelay = InMemoryTransportOptions.MaxDeferDelay + TimeSpan.FromMilliseconds(1),
+        };
+        o.Invoking(x => x.Validate()).Should().Throw<BareWireConfigurationException>()
+            .Which.OptionName.Should().Be(nameof(InMemoryTransportOptions.DeferDelay));
+    }
+
+    [Fact]
+    public void Validate_WhenDeferEnabledAndDeferDelayAtTimerLimit_DoesNotThrow() =>
+        new InMemoryTransportOptions { DeferEnabled = true, DeferDelay = InMemoryTransportOptions.MaxDeferDelay }
+            .Invoking(o => o.Validate()).Should().NotThrow();
+
+    [Fact]
+    public void Validate_WhenDeferDisabledAndDeferDelayAboveTimerLimit_DoesNotThrow() =>
+        new InMemoryTransportOptions { DeferEnabled = false, DeferDelay = TimeSpan.MaxValue }
+            .Invoking(o => o.Validate()).Should().NotThrow();
+
+    [Fact]
     public void Validate_WhenDeferDisabledAndDeferDelayZero_DoesNotThrow() =>
         new InMemoryTransportOptions { DeferEnabled = false, DeferDelay = TimeSpan.Zero }
             .Invoking(o => o.Validate()).Should().NotThrow();

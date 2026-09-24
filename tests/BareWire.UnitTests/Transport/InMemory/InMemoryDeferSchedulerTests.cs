@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 using AwesomeAssertions;
+using BareWire.Transport.InMemory;
 using BareWire.Transport.InMemory.Internal;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
@@ -44,6 +45,52 @@ public sealed class InMemoryDeferSchedulerTests
         time.Advance(TimeSpan.FromSeconds(1));
         scheduler.PendingCount.Should().Be(0); // due -> written back
         queue.Occupancy.Should().Be(1); // same reserved slot, reused — never released
+    }
+
+    [Fact]
+    public void TrySchedule_WhenDelayAboveTimerLimit_ThrowsBeforeTakingOwnership()
+    {
+        var time = new FakeTimeProvider();
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        using var scheduler = new InMemoryDeferScheduler(time, new InMemoryBufferPool(), diagnostics);
+        InMemoryQueue queue = Queue();
+        queue.TryReserve().Should().Be(QueueReservationResult.Reserved);
+        InMemoryDelivery delivery = Delivery();
+
+        scheduler.Invoking(s => s.TrySchedule(
+                queue, delivery, InMemoryTransportOptions.MaxDeferDelay + TimeSpan.FromMilliseconds(1)))
+            .Should().Throw<ArgumentOutOfRangeException>();
+
+        scheduler.PendingCount.Should().Be(0);
+        queue.Occupancy.Should().Be(1); // still the caller's slot — nothing was claimed
+        queue.ReleaseSlot();
+        ArrayPool<byte>.Shared.Return(delivery.Buffer);
+    }
+
+    [Fact]
+    public void TrySchedule_WhenArmingTimerFails_ReleasesSlotAndReturnsBufferExactlyOnce()
+    {
+        var time = new FailingArmTimeProvider();
+        var diagnostics = new InMemoryConsumeDiagnostics(NullLogger.Instance, meter: null, timeProvider: time);
+        var observer = new CountingBufferPoolObserver();
+        var pool = new InMemoryBufferPool(observer);
+        using var scheduler = new InMemoryDeferScheduler(time, pool, diagnostics);
+        InMemoryQueue queue = Queue();
+        queue.TryReserve().Should().Be(QueueReservationResult.Reserved);
+        InMemoryDelivery delivery = Delivery();
+        byte[] hooked = pool.Rent(delivery.Length);
+        delivery.Body.Span.CopyTo(hooked);
+        var pending = new InMemoryDelivery(hooked, delivery.Length, delivery.Headers);
+        ArrayPool<byte>.Shared.Return(delivery.Buffer);
+
+        scheduler.Invoking(s => s.TrySchedule(queue, pending, TimeSpan.FromSeconds(30)))
+            .Should().Throw<InvalidOperationException>();
+
+        scheduler.PendingCount.Should().Be(0);
+        queue.Occupancy.Should().Be(0); // slot released by the scheduler, not left until Dispose
+        observer.Returned.Should().Be(1);
+        observer.Outstanding.Should().Be(0);
+        observer.Violations.Should().BeEmpty();
     }
 
     [Fact]
@@ -180,5 +227,23 @@ public sealed class InMemoryDeferSchedulerTests
         fire.Should().NotThrow();
         scheduler.PendingCount.Should().Be(0);
         observer.Returned.Should().Be(1); // the pending copy came back through the pool
+    }
+
+    private sealed class FailingArmTimeProvider : TimeProvider
+    {
+        public override ITimer CreateTimer(
+            TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) => new FailingArmTimer();
+
+        private sealed class FailingArmTimer : ITimer
+        {
+            public bool Change(TimeSpan dueTime, TimeSpan period) =>
+                throw new InvalidOperationException("Simulated timer arming failure.");
+
+            public void Dispose()
+            {
+            }
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 }
