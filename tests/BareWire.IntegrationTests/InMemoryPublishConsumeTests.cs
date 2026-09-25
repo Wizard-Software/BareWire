@@ -7,8 +7,8 @@ using BareWire.Testing;
 namespace BareWire.IntegrationTests;
 
 /// <summary>
-/// Integration tests for the publish-side pipeline and transport-level routing
-/// using <see cref="BareWireTestHarness"/> and <see cref="InMemoryTransportAdapter"/> directly.
+/// Integration tests for the publish-side pipeline and transport-level routing using
+/// <see cref="BareWireTestHarness"/> and its underlying in-memory transport adapter directly.
 /// No external broker is required.
 /// </summary>
 public sealed class InMemoryPublishConsumeTests : IAsyncDisposable
@@ -50,11 +50,11 @@ public sealed class InMemoryPublishConsumeTests : IAsyncDisposable
         // (which matches by typeof(T).FullName) cannot be used for raw messages.
         // This test exercises the transport adapter directly, observing the MessageSent event.
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
-        await using InMemoryTransportAdapter adapter = new();
+        await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync(cancellationToken: cts.Token);
 
         byte[] payloadBytes = Encoding.UTF8.GetBytes("{\"type\":\"raw\"}");
         OutboundMessage? capturedMessage = null;
-        adapter.MessageSent += msg => capturedMessage = msg;
+        harness.Adapter.MessageSent += msg => capturedMessage = msg;
 
         OutboundMessage outbound = new(
             routingKey: string.Empty,
@@ -63,7 +63,7 @@ public sealed class InMemoryPublishConsumeTests : IAsyncDisposable
             contentType: "application/json");
 
         // Act
-        IReadOnlyList<SendResult> results = await adapter.SendBatchAsync([outbound], cts.Token);
+        IReadOnlyList<SendResult> results = await harness.Adapter.SendBatchAsync([outbound], cts.Token);
 
         // Assert — message is confirmed and the event fired with the correct metadata
         results.Should().HaveCount(1);
@@ -74,14 +74,16 @@ public sealed class InMemoryPublishConsumeTests : IAsyncDisposable
         capturedMessage.Body.Length.Should().Be(payloadBytes.Length);
     }
 
-    // ── Transport-level tests (InMemoryTransportAdapter directly) ─────────────
+    // ── Transport-level tests (harness's in-memory transport adapter directly) ─
 
     [Fact]
     public async Task SendBatchAsync_Message_IsAvailableViaConsumeAsync()
     {
         // Arrange
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
-        await using InMemoryTransportAdapter adapter = new();
+        await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync(
+            null, null, null, t => t.ConfigureTopology(topo => topo.DeclareQueue("orders")), cts.Token);
+        ObservingTransportAdapter adapter = harness.Adapter;
 
         byte[] body = Encoding.UTF8.GetBytes("{\"orderId\":\"ORD-042\",\"amount\":12.50}");
         OutboundMessage outbound = new(
@@ -123,7 +125,15 @@ public sealed class InMemoryPublishConsumeTests : IAsyncDisposable
     {
         // Arrange
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
-        await using InMemoryTransportAdapter adapter = new();
+        await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync(
+            null, null, null,
+            t => t.ConfigureTopology(topo =>
+            {
+                topo.DeclareQueue("orders");
+                topo.DeclareQueue("payments");
+            }),
+            cts.Token);
+        ObservingTransportAdapter adapter = harness.Adapter;
 
         byte[] ordersBody = Encoding.UTF8.GetBytes("{\"queue\":\"orders\"}");
         byte[] paymentsBody = Encoding.UTF8.GetBytes("{\"queue\":\"payments\"}");

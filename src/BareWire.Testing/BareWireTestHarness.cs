@@ -3,26 +3,24 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
-using BareWire.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Bus;
-using BareWire.Configuration;
-using BareWire.FlowControl;
-using BareWire;
-using BareWire.Pipeline;
-using BareWire.Routing;
+using BareWire.InMemory;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+
 namespace BareWire.Testing;
 
 /// <summary>
-/// A test harness that wires up a fully functional in-process <see cref="IBus"/> backed by
-/// <see cref="InMemoryTransportAdapter"/>. No external broker is required.
+/// A test harness that wires up a fully functional in-process <see cref="IBus"/> backed by the real
+/// in-memory transport, in a private dependency-injection container isolated from any other harness
+/// instance. No external broker is required.
 /// </summary>
 /// <remarks>
-/// Obtain an instance via <see cref="CreateAsync"/>. The harness starts the bus automatically
-/// and stops it when disposed.
+/// Obtain an instance via <see cref="CreateAsync(Action{IBusConfigurator}?, IRoutingKeyResolver?, IExchangeResolver?, CancellationToken)"/>.
+/// The harness starts the bus automatically and stops it when disposed.
 /// <para>
 /// Use <see cref="Bus"/> to publish or send messages. Use <see cref="WaitForPublishAsync{T}"/>
 /// or <see cref="WaitForSendAsync{T}"/> to observe outbound messages without polling.
@@ -30,34 +28,44 @@ namespace BareWire.Testing;
 /// </remarks>
 public sealed class BareWireTestHarness : IAsyncDisposable
 {
-    private readonly InMemoryTransportAdapter _adapter;
-    private readonly BareWireBusControl _busControl;
+    private readonly ServiceProvider _provider;
+    private readonly ObservingTransportAdapter _adapter;
+    private readonly IBusControl _busControl;
     private readonly IRoutingKeyResolver _routingKeyResolver;
 
-    private BareWireTestHarness(InMemoryTransportAdapter adapter, BareWireBusControl busControl, IRoutingKeyResolver routingKeyResolver)
+    private BareWireTestHarness(
+        ServiceProvider provider,
+        ObservingTransportAdapter adapter,
+        IBusControl busControl,
+        IRoutingKeyResolver routingKeyResolver)
     {
+        _provider = provider;
         _adapter = adapter;
         _busControl = busControl;
         _routingKeyResolver = routingKeyResolver;
     }
 
     /// <summary>
-    /// Gets the underlying <see cref="InMemoryTransportAdapter"/> for direct inspection of
-    /// outbound messages including headers (e.g. <c>BW-Exchange</c>).
+    /// Gets the decorator wrapping the in-memory transport adapter, for direct inspection of
+    /// outbound messages (including headers) and of the transport's optional coordination seams.
     /// </summary>
-    internal InMemoryTransportAdapter Adapter => _adapter;
+    internal ObservingTransportAdapter Adapter => _adapter;
+
+    /// <summary>Gets the harness's private service provider (test-only access to its registrations).</summary>
+    internal IServiceProvider Services => _provider;
 
     /// <summary>
     /// Gets the running <see cref="IBus"/> backed by the in-memory transport.
     /// </summary>
-    public IBus Bus => _busControl;
+    public IBus Bus => (IBus)_busControl;
 
     /// <summary>
     /// Creates a new <see cref="BareWireTestHarness"/>, starts the bus, and returns the harness.
     /// </summary>
     /// <param name="configure">
-    /// An optional callback that receives an <see cref="IBusConfigurator"/> to apply
-    /// custom configuration. Currently a placeholder — full DI-based wiring is completed in Phase 1.15.
+    /// An optional callback that receives an <see cref="IBusConfigurator"/> to apply custom bus
+    /// configuration (middleware, outbound serializer mappings) in the harness's private container.
+    /// The harness observes outbound messages only — it does not host consumers or sagas.
     /// </param>
     /// <param name="routingKeyResolver">
     /// An optional <see cref="IRoutingKeyResolver"/> to override the default fallback resolver.
@@ -69,68 +77,78 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     /// </param>
     /// <param name="cancellationToken">A token to cancel the startup sequence.</param>
     /// <returns>A started <see cref="BareWireTestHarness"/> ready for use in tests.</returns>
-    public static async Task<BareWireTestHarness> CreateAsync(
+    public static Task<BareWireTestHarness> CreateAsync(
         Action<IBusConfigurator>? configure = null,
         IRoutingKeyResolver? routingKeyResolver = null,
         IExchangeResolver? exchangeResolver = null,
         CancellationToken cancellationToken = default)
+        => CreateAsync(configure, routingKeyResolver, exchangeResolver, transport: null, cancellationToken);
+
+    /// <summary>
+    /// Creates a new <see cref="BareWireTestHarness"/> whose in-memory transport topology is further
+    /// configured by <paramref name="transport"/> (for example to declare extra queues needed by an
+    /// isolation or transport-level test) before the topology is frozen at bus startup.
+    /// </summary>
+    internal static async Task<BareWireTestHarness> CreateAsync(
+        Action<IBusConfigurator>? configure,
+        IRoutingKeyResolver? routingKeyResolver,
+        IExchangeResolver? exchangeResolver,
+        Action<IInMemoryConfigurator>? transport,
+        CancellationToken cancellationToken)
     {
-        InMemoryTransportAdapter adapter = new();
+        ServiceCollection services = new();
 
-        // Minimal no-op serializer and deserializer for testing — tests typically call PublishAsync
-        // with a message that round-trips through the in-memory transport without real serialization.
-        IMessageSerializer serializer = new NoOpMessageSerializer();
-        IMessageDeserializer deserializer = new NoOpMessageDeserializer();
-        IDeserializerResolver deserializerResolver = new SingleDeserializerResolver(deserializer);
+        // NullLoggerFactory/NullLogger<> so the harness produces no log output by default.
+        services.AddSingleton<ILoggerFactory>(NullLoggerFactory.Instance);
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
 
-        // Use NullLoggerFactory so the harness produces no log output by default.
-        ILoggerFactory loggerFactory = NullLoggerFactory.Instance;
+        // Registered via TryAdd into this fresh, private container — a default registration, not a
+        // global replacement. Tests typically call PublishAsync with a message that round-trips
+        // through the in-memory transport without real serialization; per-type mappings configured
+        // via configure (MapSerializer<,>()) still take precedence over this default.
+        services.TryAddSingleton<IMessageSerializer>(new NoOpMessageSerializer());
+        services.TryAddSingleton<IMessageDeserializer>(new NoOpMessageDeserializer());
 
-        FlowController flowController = new(loggerFactory.CreateLogger<FlowController>());
-        MiddlewareChain middlewareChain = new([]);
+        services.AddBareWireWithInMemory(
+            t =>
+            {
+                // Compatibility mode: default exchange "" plus auto-declared endpoint queues, so a
+                // plain PublishAsync/SendAsync behaves the same way it did against the previous stub.
+                t.DefaultExchange(string.Empty);
+                t.AutoDeclareEndpointQueues();
+                transport?.Invoke(t);
+            },
+            configure);
 
-        MessagePipeline pipeline = new(
-            middlewareChain: middlewareChain,
-            deserializerResolver: deserializerResolver,
-            logger: loggerFactory.CreateLogger<MessagePipeline>(),
-            instrumentation: new NullInstrumentation());
+        // AddBareWireWithInMemory replaces IRoutingKeyResolver/IExchangeResolver from configure's own
+        // mappings — an override supplied to this method must therefore be applied AFTER the bundle
+        // call, or the bundle's own Replace would win instead.
+        if (routingKeyResolver is not null)
+            services.Replace(ServiceDescriptor.Singleton<IRoutingKeyResolver>(routingKeyResolver));
 
-        PublishFlowControlOptions publishFlowControl = new();
-        IRoutingKeyResolver resolver = routingKeyResolver ?? new RoutingKeyResolver();
-        IExchangeResolver exchResolver = exchangeResolver ?? new ExchangeResolver();
+        if (exchangeResolver is not null)
+            services.Replace(ServiceDescriptor.Singleton<IExchangeResolver>(exchangeResolver));
 
-        ISerializerResolver serializerResolver = new DefaultSerializerResolver(serializer);
-        BareWireBus bus = new(
-            adapter: adapter,
-            serializerResolver: serializerResolver,
-            pipeline: pipeline,
-            flowController: flowController,
-            publishFlowControl: publishFlowControl,
-            logger: loggerFactory.CreateLogger<BareWireBus>(),
-            instrumentation: new NullInstrumentation(),
-            routingKeyResolver: resolver,
-            exchangeResolver: exchResolver);
+        DecorateTransportAdapter(services);
 
-        BusConfigurator configurator = new() { HasInMemoryTransport = true };
-        configure?.Invoke(configurator);
+        ServiceProvider provider = services.BuildServiceProvider();
+        bool started = false;
+        try
+        {
+            IBusControl busControl = provider.GetRequiredService<IBusControl>();
+            var adapter = (ObservingTransportAdapter)provider.GetRequiredService<ITransportAdapter>();
+            IRoutingKeyResolver resolver = provider.GetRequiredService<IRoutingKeyResolver>();
 
-        BareWireBusControl busControl = new(
-            bus: bus,
-            adapter: adapter,
-            flowController: flowController,
-            configurator: configurator,
-            logger: loggerFactory.CreateLogger<BareWireBusControl>(),
-            topology: null,
-            endpointBindings: [],
-            deserializerResolver: deserializerResolver,
-            scopeFactory: new ServiceCollection().BuildServiceProvider().GetRequiredService<IServiceScopeFactory>(),
-            instrumentation: new NullInstrumentation(),
-            loggerFactory: loggerFactory,
-            sagaDispatchers: []);
+            await busControl.StartAsync(cancellationToken).ConfigureAwait(false);
+            started = true;
 
-        await busControl.StartAsync(cancellationToken).ConfigureAwait(false);
-
-        return new BareWireTestHarness(adapter, busControl, resolver);
+            return new BareWireTestHarness(provider, adapter, busControl, resolver);
+        }
+        finally
+        {
+            if (!started)
+                await provider.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -163,7 +181,7 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await _busControl.StopAsync().ConfigureAwait(false);
-        await _adapter.DisposeAsync().ConfigureAwait(false);
+        await _provider.DisposeAsync().ConfigureAwait(false);
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -208,6 +226,54 @@ public sealed class BareWireTestHarness : IAsyncDisposable
         return tcs.Task;
     }
 
+    /// <summary>
+    /// Replaces the <see cref="ITransportAdapter"/> descriptor registered by
+    /// <c>AddBareWireWithInMemory</c> with one that wraps the same transport in an
+    /// <see cref="ObservingTransportAdapter"/>.
+    /// </summary>
+    private static void DecorateTransportAdapter(ServiceCollection services)
+    {
+        ServiceDescriptor? original = null;
+        for (int i = services.Count - 1; i >= 0; i--)
+        {
+            ServiceDescriptor candidate = services[i];
+            if (candidate.ServiceType == typeof(ITransportAdapter) && !candidate.IsKeyedService)
+            {
+                original = candidate;
+                services.RemoveAt(i);
+                break;
+            }
+        }
+
+        if (original is null)
+        {
+            throw new InvalidOperationException(
+                "No ITransportAdapter descriptor was found to decorate — AddBareWireWithInMemory is " +
+                "expected to have registered one before this method runs.");
+        }
+
+        services.AddSingleton<ITransportAdapter>(sp => new ObservingTransportAdapter(CreateInner(original, sp)));
+    }
+
+    /// <summary>
+    /// Builds the inner transport instance described by <paramref name="descriptor"/>. Only a
+    /// factory or an implementation-type descriptor is supported — the bundle registers the
+    /// in-memory transport via a factory, and an already-constructed instance descriptor cannot be
+    /// safely decorated: this decorator would then own and dispose an instance it did not create.
+    /// </summary>
+    private static ITransportAdapter CreateInner(ServiceDescriptor descriptor, IServiceProvider provider)
+    {
+        if (descriptor.ImplementationFactory is not null)
+            return (ITransportAdapter)descriptor.ImplementationFactory(provider);
+
+        if (descriptor.ImplementationType is not null)
+            return (ITransportAdapter)ActivatorUtilities.CreateInstance(provider, descriptor.ImplementationType);
+
+        throw new InvalidOperationException(
+            "The registered ITransportAdapter descriptor must supply a factory or an implementation " +
+            "type. An instance descriptor is not supported here.");
+    }
+
     // ── No-op serializer / deserializer ───────────────────────────────────────
 
     private sealed class NoOpMessageSerializer : IMessageSerializer
@@ -225,6 +291,13 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     {
         public string ContentType => "application/octet-stream";
 
-        public T? Deserialize<T>(ReadOnlySequence<byte> data) where T : class => null;
+        // Fails loudly instead of returning null: the harness observes outbound messages only, and a
+        // consumer silently handed a null message would pass or fail for the wrong reason.
+        public T? Deserialize<T>(ReadOnlySequence<byte> data) where T : class =>
+            throw new NotSupportedException(
+                $"BareWireTestHarness does not deserialize inbound messages (requested type: {typeof(T).FullName}). " +
+                "The harness observes outbound publishes and sends only. To consume messages in a test, host a " +
+                "real bus with AddBareWireWithInMemory and a real serializer, or configure a deserializer for " +
+                "the receive endpoint with UseDeserializer<T>().");
     }
 }

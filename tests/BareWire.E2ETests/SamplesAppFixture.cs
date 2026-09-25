@@ -59,6 +59,9 @@ public sealed class SamplesAppFixture : IAsyncLifetime
             // Consumer definition showcase: ConsumerDefinition<TConsumer> discovered via DI,
             // colocating routing keys + retry policy, plus the opt-in DeclareTopology helper.
             "consumer-definition-showcase",
+            // Modular monolith sample on RabbitMQ (in-memory variant is proven separately, as a
+            // subprocess, by InMemoryModularMonolithInMemorySmokeTests — no broker needed there).
+            "inmemory-modular-monolith",
         ];
 
         foreach (string resource in sampleResources)

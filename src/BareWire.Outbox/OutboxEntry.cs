@@ -26,4 +26,17 @@ internal sealed class OutboxEntry
     // guarantee. The dispatcher uses this field to enforce head-of-line ordering per key;
     // it never re-parses Headers to determine the key.
     internal string? OrderingKey { get; init; }
+
+    // Earliest instant the entry may be claimed again after a transport nack; null means the
+    // entry has never been nacked, or was most recently released by an ordering barrier
+    // (claimable immediately, the "new" class). Used only by InMemoryOutboxStore — the EF store
+    // tracks the equivalent deferral through its own row columns and leaves this at its default.
+    internal DateTimeOffset? NotBefore { get; set; }
+
+    // Number of transport nacks accumulated so far; drives the escalation bucket of the next
+    // deferral. InMemoryOutboxStore both reads and updates this field. The EF store never updates
+    // it (its own row columns are authoritative for the deferral schedule), but GetPendingAsync
+    // populates it from the row's RetryCount so the dispatcher's retry-observability logging can
+    // read a row's accumulated nack count from either store uniformly.
+    internal int NackCount { get; set; }
 }

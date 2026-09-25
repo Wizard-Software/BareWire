@@ -14,12 +14,18 @@ Each transport ships a thin **bundle** package — `BareWire.RabbitMQ`, `BareWir
 the core and the matching transport and exposes a single `AddBareWireWith{Transport}` method:
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireWithRabbitMq(
-    transport => transport.Host("amqp://guest:guest@localhost:5672/"),
+    transport =>
+    {
+        transport.Host("amqp://guest:guest@localhost:5672/");
+        transport.ReceiveEndpoint("my-queue", e => e.Consumer<MyConsumer, MyMessage>());
+    },
     bus =>
     {
-        bus.AddConsumer<MyConsumer>();
-        // serializers, middleware, endpoints...
+        // middleware, serializer mappings...
     });
 ```
 
@@ -28,6 +34,9 @@ The `bus` delegate is optional — omit it when transport defaults are enough:
 ```csharp
 builder.Services.AddBareWireWithRabbitMq(transport => transport.Host("amqp://localhost"));
 ```
+
+Every registration path also needs a serializer: register one with `AddBareWireJsonSerializer()`
+(or another serializer package). Neither the core nor a bundle registers a serializer for you.
 
 This is the most ergonomic path for the common case of a single transport. Install one package
 (`BareWire.RabbitMQ`) instead of two, and register in one statement.
@@ -38,16 +47,16 @@ Register the transport adapter and the core explicitly. Use this when you refere
 transport packages separately, or you want maximum control over package versions:
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireRabbitMq(transport =>
 {
     transport.Host("amqp://guest:guest@localhost:5672/");
-    transport.ReceiveEndpoint("my-queue", e => { /* ... */ });
+    transport.ReceiveEndpoint("my-queue", e => e.Consumer<MyConsumer, MyMessage>());
 });
 
-builder.Services.AddBareWire(bus =>
-{
-    bus.AddConsumer<MyConsumer>();
-});
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings, ... */ });
 ```
 
 `AddBareWireWith{Transport}` is exactly this pair behind one method, so the two paths are
@@ -62,19 +71,36 @@ core twice).
 > the bundle). Calls still compile (with a warning) for one release; migrate to one of the forms
 > above.
 
-### 3. In-memory — tests
+### 3. In-memory — single process and tests
 
-For unit and integration tests, `BareWire.Testing` provides an in-memory harness that needs no
-broker:
+The in-memory transport runs the bus inside one process with no broker — for a modular monolith,
+local development, and tests. It is registered with the same single-call pattern:
 
 ```csharp
-builder.Services.AddBareWireTestHarness(bus =>
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
+
+builder.Services.AddBareWireWithInMemory(transport =>
 {
-    bus.AddConsumer<MyConsumer>();
+    transport.AutoDeclareEndpointQueues();
+    transport.DefaultExchange("");                  // route by queue name
+    transport.MapRoutingKey<OrderCreated>("orders");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
 });
 ```
 
-See [Custom Serializers](custom-serializers.md) and the testing guide for the harness API.
+For tests that only need to assert what a piece of code publishes or sends, `BareWire.Testing`
+provides `BareWireTestHarness`, which observes outbound messages on the same in-memory engine:
+
+```csharp
+await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync();
+Task<OutboundMessage> published = harness.WaitForPublishAsync<OrderCreated>(TimeSpan.FromSeconds(5));
+await harness.Bus.PublishAsync(new OrderCreated(orderId));
+await published;
+```
+
+The harness does not host consumers or sagas; to test those, build a bus with
+`AddBareWireWithInMemory` in the test. See [In-Memory Transport](transport-inmemory.md).
 
 ### Why it is layered this way
 

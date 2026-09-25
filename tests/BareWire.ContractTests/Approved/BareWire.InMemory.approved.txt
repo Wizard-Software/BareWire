@@ -1,0 +1,7 @@
+namespace BareWire.InMemory
+{
+    public static class ServiceCollectionExtensions
+    {
+        public static Microsoft.Extensions.DependencyInjection.IServiceCollection AddBareWireWithInMemory(this Microsoft.Extensions.DependencyInjection.IServiceCollection services, System.Action<BareWire.Abstractions.Configuration.IInMemoryConfigurator> transport, System.Action<BareWire.Abstractions.Configuration.IBusConfigurator>? bus = null) { }
+    }
+}

@@ -190,6 +190,10 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 
 The result: ordered hand-off to the broker **and** ordered processing at the consumer — full end-to-end per-key ordering. See [Transactional Outbox](outbox.md) for the producer side.
 
+**When the transport rejects the head of a key.** A rejected outbox row is deferred with an escalating delay (see [Retries after a transport rejection](outbox.md#retries-after-a-transport-rejection)). In `OrderingMode.PerKey` a deferred head **holds back its own key**: later rows with the same key are not sent until the head is confirmed. Other keys, and rows without a key, keep flowing. The built-in head-of-line claim never puts two rows of one key into the same batch, so under normal operation the broker never receives a later row of a key ahead of its head.
+
+Duplicates of such "sibling" rows are possible only when a batch does carry several rows of one key — a custom SQL dialect without a correct head-of-line predicate, or `AllowDegradedOrdering` (where per-key order is not guaranteed anyway). In that case a sibling the broker already accepted behind a rejected head is released without being marked delivered and is sent again later. Independently of that, outbox delivery is at-least-once, so pair ordered consumers with [inbox deduplication](inbox.md), and keep `InboxRetention` (7 days by default) longer than the longest time a row can stay undelivered in the outbox.
+
 ## Running the sample
 
 A working end-to-end demo (multiple competing instances via Aspire `WithReplicas(2)`, outbox `OrderingMode.PerKey`, poison-head parking via DLX, both strategy variants) lives in the sample directory:

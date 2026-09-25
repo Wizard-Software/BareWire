@@ -68,14 +68,32 @@ public interface IOutboxSqlDialect
     /// <paramref name="instanceId"/>. Claimed rows are identified by <c>LockedBy = instanceId</c>
     /// and <c>DeliveredAt IS NULL</c> in the subsequent SELECT.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Predicate contract.</b> A row is eligible exactly when
+    /// <c>DeliveredAt IS NULL AND (LockedAt IS NULL OR LockedAt &lt; staleCutoff)</c>; eligible rows are
+    /// claimed in ascending <c>Id</c> order, skipping rows locked by a concurrent claim. The statement sets
+    /// <c>LockedAt = now</c> and <c>LockedBy = instanceId</c> on every row it claims.
+    /// </para>
+    /// <para>
+    /// <b>Affected-row count.</b> The statement must be a single data-modifying statement whose
+    /// affected-row count, as returned by <c>ExecuteSqlAsync</c>, is the number of rows it claimed. The
+    /// outbox store uses that count to size the remaining claim steps of the same cycle. A negative count
+    /// (for example when the provider runs with <c>SET NOCOUNT ON</c>) is treated as a full batch, which only
+    /// shrinks the remaining steps; an under-reported count lets the cycle claim more rows than intended.
+    /// </para>
+    /// </remarks>
     /// <param name="instanceId">
     /// The unique identifier of the calling dispatcher instance.
     /// Used as the <c>LockedBy</c> value on claimed rows.
     /// </param>
     /// <param name="now">The current UTC time used as the <c>LockedAt</c> value.</param>
     /// <param name="staleCutoff">
-    /// Rows with <c>LockedAt &lt; staleCutoff</c> are treated as stale and eligible for
-    /// re-claim. Computed as <c>now - OutboxLockTimeout</c>.
+    /// Rows with <c>LockedAt &lt; staleCutoff</c> are treated as stale and eligible for re-claim. This is
+    /// usually <c>now - OutboxLockTimeout</c>, but not always: to claim only rows that were never claimed,
+    /// the store passes a sentinel older than any lock (for example <see cref="DateTimeOffset.UnixEpoch"/>),
+    /// with which the predicate admits only <c>LockedAt IS NULL</c>. Implementations must apply the value
+    /// as given.
     /// </param>
     /// <param name="batchSize">Maximum number of rows to claim in a single call.</param>
     /// <returns>
@@ -97,7 +115,9 @@ public interface IOutboxSqlDialect
     /// </param>
     /// <param name="now">The current UTC time used as the <c>LockedAt</c> value.</param>
     /// <param name="staleCutoff">
-    /// Rows with <c>LockedAt &lt; staleCutoff</c> are treated as stale and eligible for re-claim.
+    /// Rows with <c>LockedAt &lt; staleCutoff</c> are treated as stale and eligible for re-claim. Not always
+    /// <c>now - OutboxLockTimeout</c>: a sentinel older than any lock (for example
+    /// <see cref="DateTimeOffset.UnixEpoch"/>) restricts the claim to rows whose <c>LockedAt</c> is null.
     /// </param>
     /// <param name="batchSize">Maximum number of rows to claim in a single call.</param>
     /// <param name="orderingMode">
@@ -115,6 +135,24 @@ public interface IOutboxSqlDialect
     /// The default implementation always delegates to
     /// <see cref="GetClaimSql(string, DateTimeOffset, DateTimeOffset, int)"/>, preserving
     /// backward compatibility for dialects that do not yet support ordering.
+    /// </remarks>
+    /// <remarks>
+    /// <para>
+    /// The predicate and affected-row-count contract of
+    /// <see cref="GetClaimSql(string, DateTimeOffset, DateTimeOffset, int)"/> applies unchanged, with the
+    /// head-of-line predicate added under <see cref="OrderingMode.PerKey"/>.
+    /// </para>
+    /// <para>
+    /// <b>Fair claim.</b> For a custom dialect the outbox store calls this overload two or three times per
+    /// dispatch cycle: first
+    /// for new rows only (sentinel <paramref name="staleCutoff"/>, limited to a reservation of the batch),
+    /// then with the real stale-lock cutoff for the remaining capacity, and optionally once more to top up
+    /// unused capacity. New rows are therefore never starved by rows the broker keeps rejecting. With a
+    /// custom dialect, however, stale rows are claimed in <c>Id</c> order: under a large cohort of
+    /// permanently rejected rows with low ids, younger retries and claims abandoned by a crashed instance
+    /// can wait until that cohort shrinks. Ordering retries by due time is available only with the
+    /// dialects built into the framework.
+    /// </para>
     /// </remarks>
     /// <returns>
     /// A <see cref="FormattableString"/> suitable for use with

@@ -47,6 +47,8 @@
       href: transport-aws-sqs.md
     - name: Google Pub/Sub
       href: transport-google-pubsub.md
+    - name: In-Memory
+      href: transport-inmemory.md
 - name: MassTransit Interop
   href: masstransit-interop.md
 - name: Advanced Patterns

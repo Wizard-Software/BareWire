@@ -37,7 +37,7 @@ namespace BareWire.Benchmarks;
 /// </para>
 /// <para>
 /// The global <c>&lt; 512 B/op</c> consume budget remains guarded by
-/// <see cref="ConsumeBenchmarks.ConsumeAndAck_InMemory"/> (transport floor, unchanged by ADR-030 —
+/// <see cref="ConsumeBenchmarks.ConsumeAndAck_CoreOnly"/> (Core-only consume floor, unchanged by this path —
 /// the enhancement adds only this 0-B/op selection arithmetic, so the global budget is preserved).
 /// </para>
 /// <para>

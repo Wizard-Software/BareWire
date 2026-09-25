@@ -39,9 +39,13 @@ public sealed class OutboxDispatcherTests
             .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(Array.Empty<SendResult>()));
 
         // Default: ReleaseLockAsync retains no buffers (mirrors EF Core, which rents fresh per-cycle
-        // buffers). Tests that assert on nacked behaviour override the capture but keep this shape.
+        // buffers). The dispatcher always calls the two-list overload (transport nacks + ordering-
+        // barrier siblings); tests that assert on released ids override the capture but keep this shape.
         _store
-            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
+            .ReleaseLockAsync(
+                Arg.Any<IReadOnlyList<long>>(),
+                Arg.Any<IReadOnlyList<long>>(),
+                Arg.Any<CancellationToken>())
             .Returns(_ => ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty));
     }
 
@@ -317,15 +321,6 @@ public sealed class OutboxDispatcherTests
                 return ValueTask.CompletedTask;
             });
 
-        IReadOnlyList<long>? releasedIds = null;
-        _store
-            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
-            .Returns(ci =>
-            {
-                releasedIds = ci.Arg<IReadOnlyList<long>>();
-                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
-            });
-
         await using var sut = CreateSut();
 
         // Act
@@ -337,12 +332,12 @@ public sealed class OutboxDispatcherTests
         capturedIds.Should().NotBeNull();
         capturedIds!.Should().BeEquivalentTo([1L, 3L]);
 
-        // The nacked id (2) must be explicitly released for immediate retry on the next poll cycle.
-        await _store.Received().ReleaseLockAsync(
-            Arg.Any<IReadOnlyList<long>>(),
+        // The nacked id (2) must be explicitly released as a transport nack (deferred retry), with no
+        // ordering-barrier siblings.
+        await _store.Received(1).ReleaseLockAsync(
+            Arg.Is<IReadOnlyList<long>>(nacked => nacked.Count == 1 && nacked[0] == 2L),
+            Arg.Is<IReadOnlyList<long>>(barrier => barrier.Count == 0),
             Arg.Any<CancellationToken>());
-        releasedIds.Should().NotBeNull();
-        releasedIds!.Should().BeEquivalentTo([2L]);
     }
 
     [Fact]
@@ -392,15 +387,6 @@ public sealed class OutboxDispatcherTests
                 new(IsConfirmed: false, DeliveryTag: 2),
             }));
 
-        IReadOnlyList<long>? releasedIds = null;
-        _store
-            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
-            .Returns(ci =>
-            {
-                releasedIds = ci.Arg<IReadOnlyList<long>>();
-                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
-            });
-
         await using var sut = CreateSut();
 
         // Act
@@ -413,13 +399,13 @@ public sealed class OutboxDispatcherTests
             Arg.Any<IReadOnlyList<long>>(),
             Arg.Any<CancellationToken>());
 
-        // All nacked ids must be explicitly released so they retry on the next poll cycle
-        // (~PollingInterval) instead of waiting for OutboxLockTimeout.
+        // All nacked ids must be explicitly released as transport nacks (deferred retry instead of
+        // waiting for OutboxLockTimeout), with no ordering-barrier siblings.
         await _store.Received().ReleaseLockAsync(
-            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Is<IReadOnlyList<long>>(nacked =>
+                nacked.Count == 3 && nacked.Contains(1L) && nacked.Contains(2L) && nacked.Contains(3L)),
+            Arg.Is<IReadOnlyList<long>>(barrier => barrier.Count == 0),
             Arg.Any<CancellationToken>());
-        releasedIds.Should().NotBeNull();
-        releasedIds!.Should().BeEquivalentTo([1L, 2L, 3L]);
 
         // Adapter was called (messages were sent), but store was polled again (retry).
         await _adapter.Received().SendBatchAsync(
@@ -470,7 +456,7 @@ public sealed class OutboxDispatcherTests
             "the dispatcher must continue polling after a transient send error");
     }
 
-    // U8 — R7.7.6: PerKey barrier blocks confirmed siblings behind a nacked head.
+    // PerKey barrier blocks confirmed siblings behind a nacked head.
     [Fact]
     public async Task DispatchBatchAsync_PerKey_NackedHead_BlocksSiblings_OtherKeysDelivered()
     {
@@ -482,7 +468,7 @@ public sealed class OutboxDispatcherTests
         //
         // Expected:
         //   MarkDeliveredAsync([3, 4])
-        //   ReleaseLockAsync([1, 2])
+        //   ReleaseLockAsync(nacked: [1], barrier: [2]) — one combined call
         var entries = new List<OutboxEntry>
         {
             CreateKeyedEntry(1, "K1"),
@@ -525,15 +511,6 @@ public sealed class OutboxDispatcherTests
                 return ValueTask.CompletedTask;
             });
 
-        IReadOnlyList<long>? releasedIds = null;
-        _store
-            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
-            .Returns(ci =>
-            {
-                releasedIds = ci.Arg<IReadOnlyList<long>>();
-                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
-            });
-
         var options = new OutboxOptions
         {
             PollingInterval = TimeSpan.FromMilliseconds(10),
@@ -553,19 +530,90 @@ public sealed class OutboxDispatcherTests
         markedIds!.Should().BeEquivalentTo([3L, 4L],
             "K2 and keyless entries are unaffected by the K1 barrier");
 
-        releasedIds.Should().NotBeNull();
-        releasedIds!.Should().BeEquivalentTo([1L, 2L],
-            "nacked K1 head (Id=1) and blocked K1 sibling (Id=2) are released for retry");
+        // The nacked head is released as a transport nack (deferred, RetryCount + 1); the blocked sibling
+        // was accepted by the transport, so it is released as a barrier sibling (no deferral, no increment).
+        await _store.Received(1).ReleaseLockAsync(
+            Arg.Is<IReadOnlyList<long>>(nacked => nacked.Count == 1 && nacked[0] == 1L),
+            Arg.Is<IReadOnlyList<long>>(barrier => barrier.Count == 1 && barrier[0] == 2L),
+            Arg.Any<CancellationToken>());
     }
 
-    // U9 — R7.7.6: None mode path is bit-identical to pre-R7.7.6 — no grouping, no extra calls.
+    // The nack list and the ordering-barrier list are released by ONE combined store call (the store
+    // applies both atomically); the dispatcher never falls back to the nack-only shorthand, which would
+    // defer and count the barrier siblings as if the transport had rejected them.
+    [Fact]
+    public async Task DispatchBatchAsync_PerKey_NackAndBarrier_ReleasedInSingleCombinedCall()
+    {
+        // Arrange:
+        // K1: Id=1 nacked head, Id=2 and Id=3 confirmed siblings held back by the barrier.
+        // K2: Id=4 nacked head (no siblings).
+        var entries = new List<OutboxEntry>
+        {
+            CreateKeyedEntry(1, "K1"),
+            CreateKeyedEntry(2, "K1"),
+            CreateKeyedEntry(3, "K1"),
+            CreateKeyedEntry(4, "K2"),
+        };
+
+        bool firstGetPending = true;
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                if (firstGetPending)
+                {
+                    firstGetPending = false;
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(entries);
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
+            {
+                new(IsConfirmed: false, DeliveryTag: 0), // Id=1 nacked head of K1
+                new(IsConfirmed: true,  DeliveryTag: 1), // Id=2 confirmed, blocked by K1 barrier
+                new(IsConfirmed: true,  DeliveryTag: 2), // Id=3 confirmed, blocked by K1 barrier
+                new(IsConfirmed: false, DeliveryTag: 3), // Id=4 nacked head of K2
+            }));
+
+        var options = new OutboxOptions
+        {
+            PollingInterval = TimeSpan.FromMilliseconds(10),
+            DispatchBatchSize = 100,
+            OrderingMode = BareWire.Abstractions.Outbox.OrderingMode.PerKey,
+            OrderingKeyHeaderName = "x-order-key"
+        };
+        await using var sut = CreateSutWithOptions(options);
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await Task.Delay(50);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert — exactly one combined release, nacks and barrier siblings kept apart.
+        await _store.Received(1).ReleaseLockAsync(
+            Arg.Is<IReadOnlyList<long>>(nacked => nacked.Count == 2 && nacked.Contains(1L) && nacked.Contains(4L)),
+            Arg.Is<IReadOnlyList<long>>(barrier => barrier.Count == 2 && barrier.Contains(2L) && barrier.Contains(3L)),
+            Arg.Any<CancellationToken>());
+        await _store.DidNotReceive().ReleaseLockAsync(
+            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Any<CancellationToken>());
+        await _store.DidNotReceive().MarkDeliveredAsync(
+            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Any<CancellationToken>());
+    }
+
+    // None mode path: no per-key grouping, no extra calls.
     [Fact]
     public async Task DispatchBatchAsync_None_NackedEntries_PathIdenticalToPreR776_NoGrouping()
     {
         // Arrange — 3 entries with default None ordering: Id=1 confirmed, Id=2 nacked, Id=3 confirmed.
         // The test verifies that:
         //   - MarkDeliveredAsync is called exactly once with [1, 3]
-        //   - ReleaseLockAsync is called exactly once with [2]
+        //   - ReleaseLockAsync is called exactly once with nacked [2] and an empty barrier list
         //   - No extra calls occur (no grouping artefacts)
         var entries = new List<OutboxEntry>
         {
@@ -608,17 +656,6 @@ public sealed class OutboxDispatcherTests
                 return ValueTask.CompletedTask;
             });
 
-        IReadOnlyList<long>? releasedIds = null;
-        int releaseLockCallCount = 0;
-        _store
-            .ReleaseLockAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
-            .Returns(ci =>
-            {
-                releasedIds = ci.Arg<IReadOnlyList<long>>();
-                releaseLockCallCount++;
-                return ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty);
-            });
-
         await using var sut = CreateSut(); // default OutboxOptions: OrderingMode = None
 
         // Act
@@ -631,10 +668,14 @@ public sealed class OutboxDispatcherTests
         markedIds.Should().NotBeNull();
         markedIds!.Should().BeEquivalentTo([1L, 3L]);
 
-        // Exactly one ReleaseLockAsync call with nacked id [2].
-        releaseLockCallCount.Should().Be(1, "None path must issue a single ReleaseLockAsync call");
-        releasedIds.Should().NotBeNull();
-        releasedIds!.Should().BeEquivalentTo([2L]);
+        // Exactly one ReleaseLockAsync call: nacked id [2], no barrier siblings (no grouping without PerKey).
+        await _store.Received(1).ReleaseLockAsync(
+            Arg.Is<IReadOnlyList<long>>(nacked => nacked.Count == 1 && nacked[0] == 2L),
+            Arg.Is<IReadOnlyList<long>>(barrier => barrier.Count == 0),
+            Arg.Any<CancellationToken>());
+        await _store.DidNotReceive().ReleaseLockAsync(
+            Arg.Any<IReadOnlyList<long>>(),
+            Arg.Any<CancellationToken>());
     }
 
     // Drain-loop: within a SINGLE poll tick the dispatcher keeps claiming while each batch comes
@@ -782,17 +823,142 @@ public sealed class OutboxDispatcherTests
             $"gap={gapMs}ms pollingInterval={pollingInterval.TotalMilliseconds}ms");
     }
 
-    // Drain-loop failure guard: a FULL batch that is only PARTIALLY confirmed (at least one nack) must
-    // NOT drain within the tick. The nacked rows are released for retry; re-claiming them immediately
-    // within the same tick would hot-retry the failing subset against a struggling broker. The
-    // dispatcher must wait for the next tick, where the released rows retry ~PollingInterval later
-    // (the ADR-024 release-on-nack pacing). So the second claim lands on the next tick, not this one.
+    // Drain rule: a FULL batch in which only a MINORITY was nacked still drains within the same tick.
+    // Nacked rows are deferred per row by the store (not claimable again before at least one
+    // PollingInterval), so draining cannot hot-retry them — it only picks up fresh backlog.
     [Fact]
-    public async Task RunPollingLoop_FullBatchPartiallyNacked_DoesNotDrain_WaitsForNextTick()
+    public async Task RunPollingLoop_FullBatchWithMinorityNacks_Drains()
     {
-        const int batchSize = 2;
         TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
 
+        // Batch 4: one nack, three confirmed (2 x 3 >= 4).
+        long gapMs = await MeasureGapBetweenFirstTwoClaimsAsync(
+            new OutboxOptions { PollingInterval = pollingInterval, DispatchBatchSize = 4 },
+            firstBatch: () => [CreateEntry(1), CreateEntry(2), CreateEntry(3), CreateEntry(4)],
+            secondBatch: () => [CreateEntry(5), CreateEntry(6), CreateEntry(7), CreateEntry(8)],
+            resultsFor: msgs => Results(msgs, i => i != 0));
+
+        gapMs.Should().BeLessThan(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"a full batch with a minority of nacks must drain within the same tick; gap={gapMs}ms");
+    }
+
+    // Drain rule boundary: exactly half confirmed (2 x Confirmed == Claimed) drains. This replaces the
+    // earlier expectation that any nack in a full batch stops the drain.
+    [Fact]
+    public async Task RunPollingLoop_FullBatchHalfNacked_Drains()
+    {
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        // Batch 2: first confirmed, second nacked.
+        long gapMs = await MeasureGapBetweenFirstTwoClaimsAsync(
+            new OutboxOptions { PollingInterval = pollingInterval, DispatchBatchSize = 2 },
+            firstBatch: () => [CreateEntry(1), CreateEntry(2)],
+            secondBatch: () => [CreateEntry(3), CreateEntry(4)],
+            resultsFor: msgs => Results(msgs, i => i == 0));
+
+        gapMs.Should().BeLessThan(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"a full batch that is exactly half confirmed must drain within the same tick; gap={gapMs}ms");
+    }
+
+    // Drain rule: a FULL batch in which the MAJORITY was nacked pauses one PollingInterval (relative to
+    // the end of the batch) before the next claim.
+    [Fact]
+    public async Task RunPollingLoop_FullBatchMajorityNacked_Pauses()
+    {
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        // Batch 3: two nacks, one confirmed (2 x 1 < 3).
+        long gapMs = await MeasureGapBetweenFirstTwoClaimsAsync(
+            new OutboxOptions { PollingInterval = pollingInterval, DispatchBatchSize = 3 },
+            firstBatch: () => [CreateEntry(1), CreateEntry(2), CreateEntry(3)],
+            secondBatch: () => [CreateEntry(4), CreateEntry(5), CreateEntry(6)],
+            resultsFor: msgs => Results(msgs, i => i == 2));
+
+        gapMs.Should().BeGreaterThanOrEqualTo(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"a full batch whose majority was nacked must pause for the next tick; gap={gapMs}ms");
+    }
+
+    // Drain rule: confirmed siblings held back by the per-key ordering barrier are NOT progress — they
+    // are released, not delivered — so they do not count as confirmed. K1 = nacked head + 2 confirmed
+    // siblings, K2 = 1 confirmed: Confirmed = 1 of 4 claimed, so the loop pauses. Counting the siblings
+    // as confirmed (3 of 4) would wrongly drain.
+    [Fact]
+    public async Task RunPollingLoop_PerKeyBarrierSiblingsNotCountedAsConfirmed_Pauses()
+    {
+        TimeSpan pollingInterval = TimeSpan.FromMilliseconds(250);
+
+        long gapMs = await MeasureGapBetweenFirstTwoClaimsAsync(
+            new OutboxOptions
+            {
+                PollingInterval = pollingInterval,
+                DispatchBatchSize = 4,
+                OrderingMode = BareWire.Abstractions.Outbox.OrderingMode.PerKey,
+                OrderingKeyHeaderName = "x-order-key"
+            },
+            firstBatch: () =>
+            [
+                CreateKeyedEntry(1, "K1"),
+                CreateKeyedEntry(2, "K1"),
+                CreateKeyedEntry(3, "K1"),
+                CreateKeyedEntry(4, "K2"),
+            ],
+            secondBatch: () =>
+            [
+                CreateKeyedEntry(5, "K3"),
+                CreateKeyedEntry(6, "K3"),
+                CreateKeyedEntry(7, "K4"),
+                CreateKeyedEntry(8, "K4"),
+            ],
+            resultsFor: msgs => Results(msgs, i => i != 0));
+
+        gapMs.Should().BeGreaterThanOrEqualTo(
+            (long)(pollingInterval.TotalMilliseconds / 2),
+            $"barrier-held siblings are not confirmed progress, so 1 of 4 confirmed must pause; gap={gapMs}ms");
+    }
+
+    // Deliberate backpressure trade-off: a drain streak that has seen a nack is capped at HALF the burst
+    // of a clean streak. Sustained backlog where every batch is half nacked: 1 initial claim plus
+    // MaxConsecutiveDrainsWithNacks immediate drains, then a PollingInterval pause.
+    [Fact]
+    public async Task RunPollingLoop_SustainedHalfNackedBacklog_DrainStreakCappedAtHalf()
+    {
+        int claims = await CountClaimsInFirstStreakAsync(
+            expectedClaims: 1 + OutboxDispatcher.MaxConsecutiveDrainsWithNacks,
+            resultsFor: msgs => Results(msgs, i => i == 0));
+
+        claims.Should().Be(
+            1 + OutboxDispatcher.MaxConsecutiveDrainsWithNacks,
+            "a drain streak containing nacks stops at the halved cap before pausing");
+    }
+
+    // Control for the halved cap: the same sustained backlog without any nack drains the full burst.
+    [Fact]
+    public async Task RunPollingLoop_SustainedConfirmedBacklog_DrainStreakUsesFullCap()
+    {
+        int claims = await CountClaimsInFirstStreakAsync(
+            expectedClaims: 1 + OutboxDispatcher.MaxConsecutiveDrains,
+            resultsFor: msgs => Results(msgs, _ => true));
+
+        claims.Should().Be(
+            1 + OutboxDispatcher.MaxConsecutiveDrains,
+            "a clean drain streak runs the full burst before pausing");
+    }
+
+    // Builds one send result per message, confirmed where isConfirmed(index) is true.
+    private static SendResult[] Results(IReadOnlyList<OutboundMessage> msgs, Func<int, bool> isConfirmed)
+        => msgs.Select((_, i) => new SendResult(IsConfirmed: isConfirmed(i), DeliveryTag: (ulong)i)).ToArray();
+
+    // Runs the dispatcher against a store that returns firstBatch, then secondBatch, then nothing, and a
+    // broker answering every send with resultsFor(messages). Returns the gap between the first two claims.
+    private async Task<long> MeasureGapBetweenFirstTwoClaimsAsync(
+        OutboxOptions options,
+        Func<OutboxEntry[]> firstBatch,
+        Func<OutboxEntry[]> secondBatch,
+        Func<IReadOnlyList<OutboundMessage>, SendResult[]> resultsFor)
+    {
         var secondClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         long firstClaimMs = -1;
@@ -807,45 +973,74 @@ public sealed class OutboxDispatcherTests
                 if (call == 1)
                 {
                     firstClaimMs = stopwatch.ElapsedMilliseconds;
-                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
-                        new[] { CreateEntry(1), CreateEntry(2) });
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(firstBatch());
                 }
 
                 if (call == 2)
                 {
                     secondClaimMs = stopwatch.ElapsedMilliseconds;
                     secondClaim.TrySetResult();
-                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
-                        new[] { CreateEntry(3), CreateEntry(4) });
+                    return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(secondBatch());
                 }
 
                 return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
             });
 
-        // Broker confirms the first message, nacks the second — a partially failing full batch.
         _adapter
             .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
-            .Returns(_ => Task.FromResult<IReadOnlyList<SendResult>>(new SendResult[]
-            {
-                new(IsConfirmed: true,  DeliveryTag: 0),
-                new(IsConfirmed: false, DeliveryTag: 1),
-            }));
+            .Returns(ci => Task.FromResult<IReadOnlyList<SendResult>>(
+                resultsFor(ci.Arg<IReadOnlyList<OutboundMessage>>())));
 
-        await using var sut = CreateSut(pollingInterval: pollingInterval, batchSize: batchSize);
+        await using var sut = CreateSutWithOptions(options);
 
-        // Act
         await sut.StartAsync(CancellationToken.None);
         await secondClaim.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await sut.StopAsync(CancellationToken.None);
 
-        // Assert — a partially-nacked batch must not hot-retry the released rows within the tick; the
-        // second claim waits ~one full PollingInterval for the next tick.
-        long gapMs = secondClaimMs - firstClaimMs;
-        gapMs.Should().BeGreaterThanOrEqualTo(
-            (long)(pollingInterval.TotalMilliseconds / 2),
-            $"a partially-nacked full batch must not drain within the tick (the released nacked rows " +
-            $"would be hot-retried); it waits for the next tick. firstClaim@{firstClaimMs}ms " +
-            $"secondClaim@{secondClaimMs}ms gap={gapMs}ms pollingInterval={pollingInterval.TotalMilliseconds}ms");
+        return secondClaimMs - firstClaimMs;
+    }
+
+    // Sustained full backlog (batch size 2, unique ids per claim) with a long PollingInterval: waits
+    // until the expected number of claims has happened, lets the loop settle well inside the pause, and
+    // returns how many claims the first drain streak issued.
+    private async Task<int> CountClaimsInFirstStreakAsync(
+        int expectedClaims,
+        Func<IReadOnlyList<OutboundMessage>, SendResult[]> resultsFor)
+    {
+        var reachedExpected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int getPendingCalls = 0;
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                int n = Interlocked.Increment(ref getPendingCalls);
+                if (n == expectedClaims)
+                {
+                    reachedExpected.TrySetResult();
+                }
+
+                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(
+                    new[] { CreateEntry(2L * n), CreateEntry(2L * n + 1) });
+            });
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci => Task.FromResult<IReadOnlyList<SendResult>>(
+                resultsFor(ci.Arg<IReadOnlyList<OutboundMessage>>())));
+
+        await using var sut = CreateSut(pollingInterval: TimeSpan.FromSeconds(5), batchSize: 2);
+
+        await sut.StartAsync(CancellationToken.None);
+        await reachedExpected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Settle: any extra (over-cap) claim would land immediately; the next legitimate claim is a full
+        // PollingInterval (5 s) away, far beyond this window.
+        await Task.Delay(300);
+        int claims = Volatile.Read(ref getPendingCalls);
+
+        await sut.StopAsync(CancellationToken.None);
+        return claims;
     }
 
     // Regression (Codex adversarial review): nack→retry pacing must be measured from the NACKED

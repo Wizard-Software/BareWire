@@ -195,6 +195,81 @@ Demonstrates three behaviors:
 POST /run   — publish 1 delivery, wait for the consumer to succeed after retrying, return the observation
 ```
 
+### InMemoryModularMonolith
+
+A modular monolith: three modules — Ordering, Billing, Shipping — in one process, sharing one
+topology and one set of consumers. A single configuration key, `Transport` (`InMemory` by default,
+or `RabbitMQ`), switches the transport; the topology, the modules, and the consumers are identical
+either way. `Messaging/TransportRegistration.cs` is the only place the two transports diverge:
+
+```csharp
+switch (transport)
+{
+    case TransportKind.InMemory:
+        services.AddBareWireWithInMemory(t =>
+        {
+            t.DrainTimeout(TimeSpan.FromSeconds(10));
+            ModulithMessaging.Configure(t.ConfigureTopology, t.DefaultExchange, t.ReceiveEndpoint);
+        });
+        break;
+
+    case TransportKind.RabbitMQ:
+        services.AddBareWireWithRabbitMq(r =>
+        {
+            r.Host(rabbitMqConnectionString);
+            ModulithMessaging.Configure(r.ConfigureTopology, r.DefaultExchange, r.ReceiveEndpoint);
+        });
+        break;
+}
+```
+
+**Event flow** — a fanout exchange broadcasts `OrderPlaced` to both modules; Billing's
+`PaymentCaptured` reaches Shipping through a topic exchange and a binding pattern:
+
+```
+POST /orders ─→ OrderingModule.PlaceOrderAsync ─→ PublishAsync(OrderPlaced)
+     exchange "modulith.ordering" (Fanout)
+        ├─→ queue "billing.order-placed"  ─→ OrderPlacedBillingConsumer
+        │        └─ PaymentLedger.TryRecord + PublishAsync(PaymentCaptured)
+        │              exchange "modulith.billing" (Topic), routing key "billing.payment.captured"
+        │                 └─→ queue "shipping.payment-captured" ─→ PaymentCapturedShippingConsumer
+        └─→ queue "shipping.order-placed" ─→ OrderPlacedShippingConsumer
+ShipmentBoard: OrderReceived + PaymentConfirmed ⇒ ReadyToShip
+```
+
+**Delivery guarantee.** The outbox (EF Core + SQLite) is registered, and registering it also
+registers the inbox: redeliveries into the fan-out/topic consumers above are deduplicated by
+message id. A publish made from *inside* a consumer — Billing's `PaymentCaptured` — is **not**
+buffered by this outbox; it goes directly to the transport, the same way the HTTP endpoint's
+`OrderPlaced` publish does. With the in-memory transport, delivery is therefore at-most-once
+end-to-end (see the startup log line below); with RabbitMQ, the inbox still protects the
+fan-out/topic consumers against broker redelivery.
+
+**Graceful shutdown.** `ApplicationStopping` / `ApplicationStopped` are logged, and the in-memory
+transport's `DrainTimeout` (10 s) is kept below `HostOptions.ShutdownTimeout` (15 s), so in-flight
+messages get a chance to drain before consumer loops are cancelled.
+
+**Run it:**
+
+```bash
+# In-memory transport (default) — no broker, no Docker required
+dotnet run --project BareWire.Samples.InMemoryModularMonolith/
+
+# Bounded smoke run — places 5 orders, waits for ReadyToShip, then exits with code 0 or 1
+dotnet run --project BareWire.Samples.InMemoryModularMonolith/ -- --Smoke:Enabled=true
+
+# RabbitMQ transport
+dotnet run --project BareWire.Samples.InMemoryModularMonolith/ -- --Transport=RabbitMQ
+
+# Or via the Aspire AppHost (runs the RabbitMQ variant alongside every other sample)
+dotnet run --project BareWire.Samples.AppHost/
+```
+
+```
+POST /orders            — place an order (validates CustomerId and Amount)
+GET  /orders/{orderId}  — { orderId, billingCaptured, shippingStatus, transport }
+```
+
 ## Shared Projects
 
 - **BareWire.Samples.AppHost** — Aspire orchestrator for all samples (RabbitMQ + PostgreSQL + Dashboard)

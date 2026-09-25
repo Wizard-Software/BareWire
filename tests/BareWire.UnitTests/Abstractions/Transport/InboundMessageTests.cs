@@ -74,4 +74,100 @@ public sealed class InboundMessageTests
         // the Return path was executed and the reference was cleared.)
         message.PooledBuffer.Should().BeNull();
     }
+
+    [Fact]
+    public void TryPinPooledBuffer_NotDisposed_ReturnsTrueAndKeepsBuffer()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+
+        bool pinned = message.TryPinPooledBuffer();
+
+        pinned.Should().BeTrue();
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
+        message.UnpinPooledBuffer();
+        message.Dispose();
+    }
+
+    [Fact]
+    public void TryPinPooledBuffer_AfterDispose_ReturnsFalse()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.Dispose();
+
+        message.TryPinPooledBuffer().Should().BeFalse();
+    }
+
+    [Fact]
+    public void TryPinPooledBuffer_AlreadyPinned_ReturnsFalse()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.TryPinPooledBuffer().Should().BeTrue();
+
+        message.TryPinPooledBuffer().Should().BeFalse();
+
+        message.UnpinPooledBuffer();
+        message.Dispose();
+    }
+
+    [Fact]
+    public void Dispose_WhilePinned_KeepsBufferUntilUnpin()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        rentedBuffer.AsSpan(0, 4).Fill(0x5A);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 4);
+        message.TryPinPooledBuffer().Should().BeTrue();
+
+        message.Dispose();
+
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
+        message.Body.ToArray().Should().Equal(0x5A, 0x5A, 0x5A, 0x5A);
+        message.UnpinPooledBuffer();
+        message.PooledBuffer.Should().BeNull();
+    }
+
+    [Fact]
+    public void UnpinPooledBuffer_WithoutDispose_LeavesMessageLiveForNormalDispose()
+    {
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(64);
+        InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 64);
+        message.TryPinPooledBuffer().Should().BeTrue();
+
+        message.UnpinPooledBuffer();
+
+        message.PooledBuffer.Should().BeSameAs(rentedBuffer);
+        message.Dispose();
+        message.PooledBuffer.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task TryPinPooledBuffer_RacingDispose_ReturnsBufferExactlyOnceAfterBoth()
+    {
+        for (int i = 0; i < 1_000; i++)
+        {
+            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(16);
+            InboundMessage message = CreateMessage(rentedBuffer, bodyLength: 16);
+            using var start = new ManualResetEventSlim();
+
+            Task pinAndUnpin = Task.Run(() =>
+            {
+                start.Wait(TestContext.Current.CancellationToken);
+                if (message.TryPinPooledBuffer())
+                {
+                    message.UnpinPooledBuffer();
+                }
+            }, TestContext.Current.CancellationToken);
+            Task dispose = Task.Run(() =>
+            {
+                start.Wait(TestContext.Current.CancellationToken);
+                message.Dispose();
+            }, TestContext.Current.CancellationToken);
+            start.Set();
+            await Task.WhenAll(pinAndUnpin, dispose);
+
+            message.PooledBuffer.Should().BeNull();
+        }
+    }
 }

@@ -42,6 +42,18 @@ internal sealed partial class BareWireBus : IBus
     private Task _publisherTask = Task.CompletedTask;
     private bool _disposed;
 
+    // Set to 1 from just before the first TryRead of a batch until that batch has been sent (or
+    // dropped) — see RunPublisherLoopAsync. Combined with the outgoing channel's own Count, this
+    // lets BareWireBusControl's graceful-drain quiescence check (StopAsync) observe whether the
+    // publish loop is idle without a dedicated signalling primitive on the hot path.
+    private int _batchInFlight;
+
+    // Incremented once per batch taken by the publisher loop (not once per message). Lets the
+    // graceful-drain quiescence check detect that a batch passed through the loop between two
+    // "idle" observations, even if the channel and the in-flight flag were both momentarily clear
+    // in between (see IsPublishIdle remarks).
+    private long _publishBatchEpoch;
+
     // Upper bound for the publisher-loop send retry backoff. The initial delay doubles per
     // consecutive failure up to this cap so a sustained broker outage retries at a steady,
     // non-hammering cadence rather than busy-looping.
@@ -117,6 +129,34 @@ internal sealed partial class BareWireBus : IBus
     {
         _publisherTask = RunPublisherLoopAsync(_publishCts.Token);
     }
+
+    /// <summary>
+    /// Gets a value indicating whether the publish loop currently has no work: the outgoing
+    /// channel is empty AND no batch is in flight (being handed to the transport adapter).
+    /// </summary>
+    /// <remarks>
+    /// The channel's <c>Count</c> is read FIRST, then <see cref="_batchInFlight"/> — in that
+    /// order. The publish loop sets <see cref="_batchInFlight"/> to 1 BEFORE the first
+    /// <c>TryRead</c> of a batch, so there is no instant where a message has left the channel
+    /// (decrementing <c>Count</c>) without <see cref="_batchInFlight"/> already reflecting that a
+    /// batch is being processed. Reading in the reverse order could observe the flag as 0 (not
+    /// yet set) and the channel as already empty (message just read by a batch that is about to
+    /// set the flag), which would falsely report idle. Used only during shutdown (the graceful
+    /// drain quiescence check in <see cref="BareWireBusControl.StopAsync"/>) — never on the
+    /// per-message publish hot path.
+    /// </remarks>
+    internal bool IsPublishIdle => _outgoingChannel.Reader.Count == 0 && Volatile.Read(ref _batchInFlight) == 0;
+
+    /// <summary>
+    /// Gets the number of batches the publish loop has taken from the outgoing channel so far.
+    /// </summary>
+    /// <remarks>
+    /// Used by the graceful-drain quiescence check to detect that a batch passed through the loop
+    /// between two <see cref="IsPublishIdle"/> observations, even when both observations
+    /// individually reported idle — closing the race where a message is published and fully sent
+    /// in the gap between two checks.
+    /// </remarks>
+    internal long PublishBatchEpoch => Interlocked.Read(ref _publishBatchEpoch);
 
     // ── IPublishEndpoint ─────────────────────────────────────────────────────
 
@@ -298,19 +338,31 @@ internal sealed partial class BareWireBus : IBus
 
         try
         {
-            await foreach (OutboundMessage msg in _outgoingChannel.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+            while (await _outgoingChannel.Reader.WaitToReadAsync(ct).ConfigureAwait(false))
             {
-                batch.Add(msg);
+                // Set BEFORE the first TryRead of this batch — see IsPublishIdle remarks. Cleared
+                // in the finally block below once the batch has been sent (or dropped).
+                Interlocked.Exchange(ref _batchInFlight, 1);
+                Interlocked.Increment(ref _publishBatchEpoch);
 
-                // Drain as many additional items as are available without waiting.
-                while (batch.Count < maxBatchSize && _outgoingChannel.Reader.TryRead(out OutboundMessage? additional))
-                    batch.Add(additional);
+                try
+                {
+                    while (batch.Count < maxBatchSize && _outgoingChannel.Reader.TryRead(out OutboundMessage? msg))
+                        batch.Add(msg);
 
-                // Pass a snapshot so the adapter sees a stable collection even after the batch is cleared.
-                OutboundMessage[] snapshot = batch.ToArray();
-                await SendBatchWithRetryAsync(adapter, snapshot, ct).ConfigureAwait(false);
-                DecrementPendingBytes(snapshot);
-                batch.Clear();
+                    if (batch.Count == 0)
+                        continue;
+
+                    // Pass a snapshot so the adapter sees a stable collection even after the batch is cleared.
+                    OutboundMessage[] snapshot = batch.ToArray();
+                    await SendBatchWithRetryAsync(adapter, snapshot, ct).ConfigureAwait(false);
+                    DecrementPendingBytes(snapshot);
+                    batch.Clear();
+                }
+                finally
+                {
+                    Volatile.Write(ref _batchInFlight, 0);
+                }
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

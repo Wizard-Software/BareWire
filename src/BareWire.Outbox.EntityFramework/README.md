@@ -88,6 +88,11 @@ A row is claimable when:
 - `DeliveredAt IS NULL` — the row has not yet been delivered, AND
 - `LockedAt IS NULL` (unclaimed) OR `LockedAt < NOW() - OutboxLockTimeout` (lock expired)
 
+`NOW()` here is read on the application side from the `TimeProvider` registered in the DI container
+(`TimeProvider.System` unless you register your own before calling `AddBareWireOutbox`). That clock must
+track real UTC time with a zero offset, clock skew between instances must stay well below
+`OutboxLockTimeout`, and a test clock must never be registered in a production host.
+
 ### Crash Recovery
 
 If a dispatcher instance crashes between claiming rows and publishing them to the broker,
@@ -109,9 +114,12 @@ any outbox side effect.
 ### Polling Cost and Backlog Drain
 
 When the outbox is idle — or the pending backlog is smaller than `DispatchBatchSize` — each polling
-cycle issues one claim `UPDATE` per instance (affecting `0..DispatchBatchSize` rows) and then waits
-`PollingInterval` before the next cycle. At the default `PollingInterval` of `1s` that is roughly one
-write statement per second per instance at steady state. For low-throughput deployments — or when
+cycle issues a short, fixed sequence of statements per instance and then waits `PollingInterval` before
+the next cycle: one indexed read of the rows the instance still owns, two claim `UPDATE`s (new rows,
+then due retries — see [Fair Claim](#fair-claim-new-rows-and-retries)), a third claim `UPDATE` only when
+new rows are backlogged and fewer retries are due than reserved, and the `SELECT` of the claimed batch.
+An `UPDATE` that matches no rows writes nothing. At the default `PollingInterval` of `1s` that is a few
+cheap statements per second per instance at steady state. For low-throughput deployments — or when
 running many instances — raise `PollingInterval` to reduce steady-state idle write/WAL load on the
 shared `OutboxMessages` table.
 
@@ -132,17 +140,59 @@ recovery burst.
 
 ### Nacked Rows (Partial Send Failures)
 
-Rows the broker does not confirm (nacks) are **explicitly released**: the dispatcher clears their
-per-instance lock as soon as the batch completes, so they are re-claimed on the **next poll cycle**
-(about one `PollingInterval` later) — **not** after `OutboxLockTimeout`. `OutboxLockTimeout` is only the
-fallback for a dispatcher that *crashes* mid-send (see [Crash Recovery](#crash-recovery)); a normal nack
-never waits for it.
+Rows the broker does not confirm (nacks) are **explicitly released** as soon as the batch completes —
+they never wait for `OutboxLockTimeout`, which is only the fallback for a dispatcher that *crashes*
+mid-send (see [Crash Recovery](#crash-recovery)). A released row is not re-claimed immediately, though:
+it is **deferred**, and no instance claims it again before its deferral has elapsed.
 
-Because a nack retries within ~`PollingInterval`, a persistently failing ("poison") row is re-sent
-roughly once per `PollingInterval` per instance, and during a broker outage every pending row nacks and
-is released each cycle — so retry load scales with the backlog at the poll cadence. Size
-`PollingInterval` for that worst case (and add poison-message handling upstream if a row can fail
-indefinitely) rather than assuming a slower `OutboxLockTimeout`-spaced retry.
+- The first deferral is one `PollingInterval`; each further rejection of the same row doubles it, up to
+  `OutboxLockTimeout`.
+- Each row gets up to +20% jitter on top of its deferral, so rows nacked together (e.g. during a broker
+  outage) do not all return in a single wave.
+- `RetryCount` counts how many times the broker rejected the row.
+- A permanently failing ("poison") row is therefore retried at most about once per `OutboxLockTimeout`
+  per row, instead of every poll cycle. Bounded retry / dead-lettering is not built in — add poison-message
+  handling upstream if a row can fail indefinitely.
+
+With `OrderingMode.PerKey`, rows the broker did not reject but that are held back only because an
+earlier row of the same key was nacked are released **immediately**, without a deferral and without
+incrementing `RetryCount`; the per-key ordering still keeps them behind that earlier row.
+
+### Fair Claim (New Rows and Retries)
+
+Each claim cycle splits its batch between two classes of rows, so neither can starve the other:
+
+- **New rows** — never claimed (`LockedAt IS NULL`), claimed oldest first (by `Id`). They get
+  `N − R` reserved slots, where `N` is the batch capacity and `R = max(1, ⌊N / 4⌋)` (25 of 100 at the
+  default `DispatchBatchSize`). Any number of permanently rejected rows therefore cannot stop fresh
+  messages: every cycle with new rows waiting moves at least `N − R` of them.
+- **Due retries** — nacked rows whose deferral has elapsed and claims abandoned by a crashed instance
+  (`LockedAt < now − OutboxLockTimeout`), claimed in **due-time order** (earliest `LockedAt` first).
+  They get the remaining capacity — at least `R` slots whenever any retry is due. A permanently rejected
+  row is re-stamped on every attempt and moves to the back of the retry queue, so it cannot keep a row
+  rejected only once, or an abandoned claim, waiting behind it.
+- Capacity one class leaves unused goes to the other (new rows top up an under-used retry share, retries
+  fill the batch when few new rows are waiting).
+- With a batch capacity of **1** the batch cannot be split: when both classes are waiting, each cycle
+  gives the slot to one of them, and successive contested cycles alternate between the two classes
+  (the first contested cycle of a process serves the new-rows class), so both keep making progress.
+  On a provider without a matching atomic dialect (the client-side fallback claim — SQLite, or any
+  provider used with `AllowNonAtomicProvider = true`), the alternation only advances when both classes
+  actually have candidates, so contested cycles alternate strictly. On the atomic dialect path
+  (PostgreSQL and custom dialects), the store cannot tell before claiming whether both classes are
+  waiting, so the alternation advances on every single-slot cycle regardless — a waiting class is
+  therefore served within at most two consecutive single-slot cycles. Either way the alternation is
+  per dispatcher process (one shared turn per service provider), not shared across processes.
+- **Carry-forward limit:** rows the instance still owns from an earlier cycle — for example a batch whose
+  send threw and was never released — count against `N` while their lock is valid. An instance never
+  holds more than `N` rows with a valid lock, so a failing instance does not claim a fresh batch on every
+  cycle. Once an owned row's lock expires it counts as a due retry again: any instance may claim it, and
+  its former owner sends it only after re-claiming it.
+
+The built-in PostgreSQL dialect serves both classes from the existing `IX_OutboxMessages_Claim` index as
+ordered range scans (no sort, no additional index, no migration). A custom dialect gets the same
+fairness for new rows, but its retries are claimed through its `GetClaimSql` in `Id` order — see
+[Custom SQL Dialect](#custom-sql-dialect).
 
 ## Configuration Options
 
@@ -373,6 +423,20 @@ public sealed class SqlServerOutboxSqlDialect : IOutboxSqlDialect
 services.AddSingleton<IOutboxSqlDialect, SqlServerOutboxSqlDialect>(); // wins over the default (TryAdd)
 services.AddBareWireOutbox(options => options.UseSqlServer(connectionString));
 ```
+
+Contract of `GetClaimSql` that a custom dialect must honor:
+
+- The eligibility predicate is exactly `DeliveredAt IS NULL AND (LockedAt IS NULL OR LockedAt < staleCutoff)`,
+  claimed in ascending `Id` order. `staleCutoff` is **not** always `now − OutboxLockTimeout`: to claim only
+  new rows the store passes a cutoff older than any lock (`DateTimeOffset.UnixEpoch`).
+- The statement must report the number of rows it claimed as its affected-row count. A negative count
+  (for example with `SET NOCOUNT ON`) is treated as a full batch, which only shrinks the remaining steps
+  of that cycle; an under-reported count lets that cycle claim more than intended.
+- The store calls it two to three times per cycle (new rows, then retries, then an optional top-up).
+- Limitation: a custom dialect keeps claims correct and new rows fair, but retries are claimed in `Id`
+  order. Under a large cohort of permanently rejected rows with low ids, younger retries and abandoned
+  claims can wait until that cohort shrinks. The due-time ordering of retries is available only with the
+  built-in dialect.
 
 ## Startup Fail-Fast Guard (Atomic-Provider Requirement)
 

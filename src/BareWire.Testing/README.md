@@ -1,6 +1,8 @@
 # BareWire.Testing
 
-In-memory test harness for BareWire with deterministic message delivery and assertion helpers.
+An in-process test harness that wires up a fully working BareWire bus backed by the real in-memory
+transport, so tests can publish and send messages and observe what reaches the transport without an
+external broker.
 
 ## Installation
 
@@ -12,24 +14,60 @@ dotnet add package BareWire.Testing
 
 ```csharp
 [Fact]
-public async Task OrderCreated_StartsOrderSaga()
+public async Task PublishAsync_OrderCreated_ReachesTransport()
 {
-    await using var harness = new BareWireTestHarness();
-    harness.AddConsumer<OrderCreatedConsumer>();
+    await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync();
 
-    await harness.Start();
-    await harness.Bus.Publish(new OrderCreated(Guid.NewGuid()));
+    Task<OutboundMessage> waitTask = harness.WaitForPublishAsync<OrderCreated>(TimeSpan.FromSeconds(5));
 
-    (await harness.Consumed<OrderCreated>()).Should().HaveCount(1);
+    await harness.Bus.PublishAsync(new OrderCreated(Guid.NewGuid()));
+
+    OutboundMessage message = await waitTask;
+    message.RoutingKey.Should().Be(typeof(OrderCreated).FullName);
 }
 ```
 
-## Features
+`CreateAsync` starts the bus; disposing the harness (`await using`, or an explicit `DisposeAsync()`
+call) stops it. `WaitForPublishAsync<T>` and `WaitForSendAsync<T>` resolve as soon as a message whose
+routing key matches `T` is observed on the transport — no polling required — or throw
+`TimeoutException` once the given timeout elapses.
 
-- In-memory transport for fast, isolated tests
-- Deterministic message delivery (no timing issues)
-- Built-in assertion helpers with AwesomeAssertions
-- Consumer and saga test support
+An optional `configure` callback exposes the same `IBusConfigurator` used in production (middleware,
+per-type outbound serializer mappings via `MapSerializer<,>()`).
+
+The harness observes **outbound** messages only — it does not host consumers or sagas. To test a
+consumer or a saga end to end, build a real bus in the test with `AddBareWireWithInMemory(...)` and a
+real serializer (for example `AddBareWireJsonSerializer()`); it runs on the same in-memory transport
+engine the harness uses.
+
+## How it works
+
+Each harness builds its own private dependency-injection container and registers the real in-memory
+transport into it — no two harness instances share a broker, a queue, or any other state, so tests can
+run in parallel without interfering with each other.
+
+The harness registers the in-memory transport in a compatibility mode: a default exchange of `""`
+plus automatic declaration of receive-endpoint queues, matching how a plain `PublishAsync`/`SendAsync`
+call behaved before the harness used the real transport. A message published with no matching queue is
+accepted and then dropped with a warning in the transport's own logs (the harness itself produces no
+log output by default) — it is still observable through `WaitForPublishAsync`/`WaitForSendAsync`,
+which watch every outbound send regardless of whether it was ultimately delivered anywhere.
+
+A message scheduled for native delivery (for example a saga timeout) is delivered directly by the
+transport's own scheduler once it fires, bypassing the harness's send observation entirely — such a
+message is never seen by `WaitForPublishAsync`/`WaitForSendAsync`, only by a real consumer or a direct
+read of the transport's queue.
+
+The harness's default serializer does not actually serialize message content — tests that publish a
+message typically only need it to reach the transport by type name, not by byte-for-byte payload. Map a
+real serializer for specific message types via `configure`'s `MapSerializer<,>()` when a test needs to
+inspect the outbound body. The harness's default deserializer throws `NotSupportedException` instead of
+returning `null`, so an inbound message can never reach a consumer as a silent `null`.
+
+Disposing the harness stops the bus the same way a production shutdown does: it waits for in-flight
+work to settle before consumer loops are cancelled, bounded by the configured drain timeout (10 seconds
+by default). A test that leaves an active consumer with a non-empty queue at the point of disposal can
+therefore stretch `DisposeAsync` out to that timeout instead of returning immediately.
 
 ## Documentation
 

@@ -71,3 +71,8 @@ appsettings.*.json
 
 # Legacy solution file (using .slnx)
 BareWire.sln
+
+# Local SQLite databases created by samples
+*.db
+*.db-shm
+*.db-wal

@@ -15,8 +15,15 @@ namespace BareWire.Abstractions.Transport;
 /// </remarks>
 public sealed class InboundMessage : IDisposable
 {
+    private const int StateLive = 0;
+    private const int StateDisposed = 1;
+    private const int StatePinned = 2;
+
     private byte[]? _pooledBuffer;
-    private int _disposed; // 0 = not disposed, 1 = disposed (Interlocked)
+
+    // Lifetime of the pooled buffer, changed only with Interlocked: live, disposed (buffer returned or
+    // about to be), or pinned by a transport that is copying the body while the consumer may dispose.
+    private int _state;
 
     /// <summary>
     /// Gets the unique identifier of the message assigned by the transport or originating publisher.
@@ -77,6 +84,37 @@ public sealed class InboundMessage : IDisposable
     }
 
     /// <summary>
+    /// Pins the body so it stays readable until <see cref="UnpinPooledBuffer"/> is called, even if the
+    /// consumer disposes the message in the meantime.
+    /// </summary>
+    /// <remarks>
+    /// Decided by the same state as <see cref="Dispose"/>: pinning fails once the message has been
+    /// disposed. A <see cref="Dispose"/> that arrives while the body is pinned does not return the buffer;
+    /// <see cref="UnpinPooledBuffer"/> does, so the buffer goes back to the pool exactly once and never
+    /// while it is being read. At most one caller may hold a pin.
+    /// </remarks>
+    /// <returns>
+    /// <see langword="true"/> when the body is pinned and may be read; <see langword="false"/> when the
+    /// message was already disposed or pinned.
+    /// </returns>
+    internal bool TryPinPooledBuffer() =>
+        Interlocked.CompareExchange(ref _state, StatePinned, StateLive) == StateLive;
+
+    /// <summary>
+    /// Releases a pin taken with <see cref="TryPinPooledBuffer"/>. When the message was disposed while
+    /// pinned, the pooled buffer is returned to the pool here instead.
+    /// </summary>
+    internal void UnpinPooledBuffer()
+    {
+        if (Interlocked.CompareExchange(ref _state, StateLive, StatePinned) == StatePinned)
+        {
+            return;
+        }
+
+        ReturnPooledBuffer();
+    }
+
+    /// <summary>
     /// Returns the <see cref="ArrayPool{T}"/>-rented buffer (if any) back to
     /// <see cref="ArrayPool{T}.Shared"/>. Safe to call multiple times — subsequent calls are no-ops.
     /// </summary>
@@ -87,9 +125,15 @@ public sealed class InboundMessage : IDisposable
     /// </remarks>
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        // A pinned buffer is returned by UnpinPooledBuffer once the pin holder has finished reading it.
+        if (Interlocked.Exchange(ref _state, StateDisposed) != StateLive)
             return;
 
+        ReturnPooledBuffer();
+    }
+
+    private void ReturnPooledBuffer()
+    {
         if (_pooledBuffer is not null)
         {
             ArrayPool<byte>.Shared.Return(_pooledBuffer);

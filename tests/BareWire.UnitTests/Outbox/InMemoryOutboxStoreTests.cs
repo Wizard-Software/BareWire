@@ -1,13 +1,17 @@
+using System.Buffers;
 using AwesomeAssertions;
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
+using Microsoft.Extensions.Time.Testing;
 using Xunit;
 
 namespace BareWire.UnitTests.Outbox;
 
 public sealed class InMemoryOutboxStoreTests
 {
+    private static readonly DateTimeOffset T0 = new(2026, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
     private static OutboundMessage CreateMessage(string routingKey = "test.routing.key")
         => new(
             routingKey: routingKey,
@@ -26,24 +30,27 @@ public sealed class InMemoryOutboxStoreTests
         new OutboxOptions { OrderingMode = OrderingMode.PerKey, OrderingKeyHeaderName = headerName };
 
     [Fact]
-    public async Task ReleaseLockAsync_AfterGetPending_ReEnqueuesEntryAndRetainsBuffer()
+    public async Task ReleaseLockAsync_AfterGetPending_ReEnqueuesEntryWithoutRetainingCallerBuffer()
     {
         // Arrange — save one message and claim it (GetPendingAsync removes it from the pending queue).
-        await using var store = new InMemoryOutboxStore();
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
         await store.SaveMessagesAsync([CreateMessage()]);
 
         IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
         firstBatch.Should().HaveCount(1);
         long id = firstBatch[0].Id;
 
-        // Act — a nack releases the lock, which for the in-memory store means re-enqueue.
+        // Act — a nack releases the lock, which for the in-memory store means re-enqueue, deferred
+        // until the nack-deferral schedule says the entry is claimable again.
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id]);
 
-        // Assert — the re-enqueued entry still references its pooled buffer, so the store reports it
-        // as retained (the dispatcher must NOT return that buffer to the ArrayPool — R-5/GAP-1).
-        retained.Should().BeEquivalentTo([id]);
+        // Assert — the caller only ever held a copy with its own buffer, so nothing is retained and
+        // the caller returns its buffer to the ArrayPool on every path.
+        retained.Should().BeEmpty();
 
-        // The released entry must be available again on the next poll.
+        // The released entry must be available again once the deferral has elapsed.
+        clock.Advance(TimeSpan.FromSeconds(40));
         IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
         secondBatch.Should().ContainSingle().Which.Id.Should().Be(id);
     }
@@ -59,6 +66,54 @@ public sealed class InMemoryOutboxStoreTests
     }
 
     [Fact]
+    public async Task ReleaseLockAsync_NackedAndBarrierLists_ReEnqueuesBothWithoutRetainingCallerBuffers()
+    {
+        // Arrange — save two messages and claim both (GetPendingAsync removes them from the queue).
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
+        await store.SaveMessagesAsync([CreateMessage(), CreateMessage()]);
+        IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
+        firstBatch.Should().HaveCount(2);
+        long nacked = firstBatch[0].Id;
+        long barrierReleased = firstBatch[1].Id;
+
+        // Act — one row rejected by the transport, one held back only by the ordering barrier.
+        IReadOnlySet<long> retained = await store.ReleaseLockAsync([nacked], [barrierReleased]);
+
+        // Assert — no caller buffer is retained, and only the barrier-released row is claimable
+        // immediately: the nacked row is deferred by the nack-deferral schedule.
+        retained.Should().BeEmpty();
+        IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
+        secondBatch.Should().ContainSingle("the nacked row is still deferred").Which.Id.Should().Be(barrierReleased);
+
+        // Once the deferral elapses, the nacked row is claimable too.
+        clock.Advance(TimeSpan.FromSeconds(40));
+        IReadOnlyList<OutboxEntry> thirdBatch = await store.GetPendingAsync(10);
+        thirdBatch.Should().ContainSingle().Which.Id.Should().Be(nacked);
+    }
+
+    [Fact]
+    public async Task ReleaseLockAsync_IdInBothLists_ReEnqueuesOnce()
+    {
+        // Arrange
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
+        await store.SaveMessagesAsync([CreateMessage()]);
+        IReadOnlyList<OutboxEntry> firstBatch = await store.GetPendingAsync(10);
+        long id = firstBatch.Should().ContainSingle().Which.Id;
+
+        // Act — the same id passed in both lists must not be enqueued twice (it would be sent twice).
+        // The nacked list is processed first, so the id is treated as a nack, not a barrier release.
+        IReadOnlySet<long> retained = await store.ReleaseLockAsync([id], [id]);
+
+        // Assert
+        retained.Should().BeEmpty();
+        clock.Advance(TimeSpan.FromSeconds(40));
+        IReadOnlyList<OutboxEntry> secondBatch = await store.GetPendingAsync(10);
+        secondBatch.Should().ContainSingle().Which.Id.Should().Be(id);
+    }
+
+    [Fact]
     public async Task ReleaseLockAsync_DeliveredEntry_IsNotReEnqueued()
     {
         // Arrange — save, claim, and mark the entry delivered.
@@ -71,7 +126,7 @@ public sealed class InMemoryOutboxStoreTests
         // Act — releasing a delivered id must be an idempotent no-op.
         IReadOnlySet<long> retained = await store.ReleaseLockAsync([id]);
 
-        // Assert — nothing retained, nothing re-enqueued.
+        // Assert — nothing re-enqueued.
         retained.Should().BeEmpty("a delivered entry must not be re-enqueued");
         IReadOnlyList<OutboxEntry> afterRelease = await store.GetPendingAsync(10);
         afterRelease.Should().BeEmpty();
@@ -88,7 +143,7 @@ public sealed class InMemoryOutboxStoreTests
     }
 
     // -------------------------------------------------------------------------
-    // U7 — head-of-line per key + keyless passthrough (R7.7.5)
+    // Head-of-line per key + keyless passthrough
     // -------------------------------------------------------------------------
 
     [Fact]
@@ -174,7 +229,7 @@ public sealed class InMemoryOutboxStoreTests
     [Fact]
     public async Task GetPendingAsync_None_ReturnsAllPendingWithoutGrouping()
     {
-        // Default-OFF guard (§2.1): None mode must not apply any head-of-line filtering.
+        // Default-off guard: None mode must not apply any head-of-line filtering.
         await using var store = new InMemoryOutboxStore(); // default options = None
 
         await store.SaveMessagesAsync([
@@ -189,5 +244,49 @@ public sealed class InMemoryOutboxStoreTests
         // Assert — all three rows returned without any head-of-line filtering.
         batch.Should().HaveCount(3,
             "None mode must return all pending rows without per-key grouping");
+    }
+
+    [Fact]
+    public async Task GetPendingAsync_ClaimedEntry_CarriesItsOwnBufferCopy()
+    {
+        // Arrange
+        await using var store = new InMemoryOutboxStore();
+        await store.SaveMessagesAsync([CreateMessage()]);
+
+        // Act
+        OutboxEntry claimed = (await store.GetPendingAsync(10)).Should().ContainSingle().Which;
+        OutboxEntry stored = store.FindEntry(claimed.Id)!;
+
+        // Assert — same payload, different arrays: the caller owns and returns the copy, the store
+        // keeps and returns its own buffer, so no array is ever returned to the pool twice.
+        claimed.PooledBody.Should().NotBeSameAs(stored.PooledBody);
+        claimed.PooledBody.AsSpan(0, claimed.BodyLength).ToArray()
+            .Should().Equal(stored.PooledBody.AsSpan(0, stored.BodyLength).ToArray());
+    }
+
+    [Fact]
+    public async Task ReleaseLockAsync_CallerReturnsClaimedBuffer_RedispatchStillCarriesOriginalPayload()
+    {
+        // Arrange — claim, then do what the dispatcher does on every path: return the claimed buffer.
+        var clock = new FakeTimeProvider(T0);
+        await using var store = new InMemoryOutboxStore(timeProvider: clock);
+        await store.SaveMessagesAsync([CreateMessage()]);
+        OutboxEntry first = (await store.GetPendingAsync(10)).Should().ContainSingle().Which;
+        byte[] original = first.PooledBody.AsSpan(0, first.BodyLength).ToArray();
+        await store.ReleaseLockAsync([first.Id]);
+        ArrayPool<byte>.Shared.Return(first.PooledBody);
+
+        // Scribble over a same-sized rental, which the pool may hand back as that very array.
+        byte[] scribble = ArrayPool<byte>.Shared.Rent(first.BodyLength);
+        scribble.AsSpan().Fill(0xFF);
+
+        // Act
+        clock.Advance(TimeSpan.FromSeconds(40));
+        OutboxEntry second = (await store.GetPendingAsync(10)).Should().ContainSingle().Which;
+
+        // Assert — the re-dispatched entry is served from the store-owned buffer, untouched.
+        second.PooledBody.AsSpan(0, second.BodyLength).ToArray().Should().Equal(original);
+        ArrayPool<byte>.Shared.Return(scribble);
+        ArrayPool<byte>.Shared.Return(second.PooledBody);
     }
 }

@@ -131,4 +131,13 @@ builder.AddProject<Projects.BareWire_Samples_ConsumerDefinitionShowcase>("consum
     .WithReference(rabbitmq)
     .WaitFor(rabbitmq);
 
+// Modular monolith sample: three modules (Ordering, Billing, Shipping) sharing one topology and one
+// set of consumers, switchable between the in-memory transport and RabbitMQ by changing exactly one
+// registration call (Messaging/TransportRegistration.cs). Here it runs on RabbitMQ; the outbox/inbox
+// use a local SQLite file (per-process, self-cleaning), so no Postgres reference is needed.
+builder.AddProject<Projects.BareWire_Samples_InMemoryModularMonolith>("inmemory-modular-monolith")
+    .WithEnvironment("Transport", "RabbitMQ")
+    .WithReference(rabbitmq)
+    .WaitFor(rabbitmq);
+
 builder.Build().Run();

@@ -43,7 +43,7 @@ namespace BareWire.Benchmarks;
 /// </para>
 /// <para>
 /// The global <c>&lt; 512 B/op</c> consume budget remains guarded by
-/// <see cref="ConsumeBenchmarks.ConsumeAndAck_InMemory"/> (transport floor). The consumer-definition
+/// <see cref="ConsumeBenchmarks.ConsumeAndAck_CoreOnly"/> (transport floor). The consumer-definition
 /// enhancement (19.x) adds only start-up discovery + this 0-B/op per-delivery read, so the global consume
 /// budget is unchanged.
 /// </para>

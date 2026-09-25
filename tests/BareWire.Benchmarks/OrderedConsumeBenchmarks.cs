@@ -49,6 +49,7 @@ namespace BareWire.Benchmarks;
 /// This benchmark class measures local ordered-dispatch allocation overhead only (no broker, in-memory).
 /// </para>
 /// </summary>
+[SimpleJob(launchCount: 1, warmupCount: 3, iterationCount: 15)]
 [MemoryDiagnoser(displayGenColumns: true)]
 #pragma warning disable CA1001 // BenchmarkDotNet lifecycle: disposal is handled by [GlobalCleanup].
 public class OrderedConsumeBenchmarks
@@ -114,7 +115,35 @@ public class OrderedConsumeBenchmarks
     private async Task RunAsync(EndpointBinding binding)
     {
         int messageCount = _messages.Count;
-        var adapter = new BenchmarkFakeAdapter(_messages);
+        var adapter = new CoreOnlyTransportAdapter(consumeCapacity: messageCount);
+
+        // Every message is enqueued BEFORE the runner starts — CoreOnlyTransportAdapter drains a
+        // pre-filled channel rather than yielding lazily during consumption, unlike the previous private
+        // fake. Header/InboundMessage construction stays in this measured method, same as before, so
+        // that part of the cost is still captured by the benchmark.
+        for (int i = 0; i < messageCount; i++)
+        {
+            (string key, int perKeySeq) = _messages[i];
+            var headers = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["seq"] = perKeySeq.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                [KeyHeader] = key,
+            };
+
+            var message = new InboundMessage(
+                messageId: Guid.NewGuid().ToString(),
+                headers: headers,
+                body: ReadOnlySequence<byte>.Empty,
+                deliveryTag: (ulong)i);
+
+            if (!adapter.TryEnqueue(message))
+            {
+                throw new InvalidOperationException(
+                    $"CoreOnlyTransportAdapter rejected enqueue of message {i} — the consume channel " +
+                    "capacity must be at least the message count.");
+            }
+        }
+
         var completions = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var services = new ServiceCollection();
@@ -138,7 +167,7 @@ public class OrderedConsumeBenchmarks
 
         // Wait for all messages to complete, then cancel the runner.
         await completions.Task.WaitAsync(cts.Token).ConfigureAwait(false);
-        await adapter.SettledAsync(messageCount, cts.Token).ConfigureAwait(false);
+        await adapter.WaitForSettledAsync(messageCount, cts.Token).ConfigureAwait(false);
         await cts.CancelAsync().ConfigureAwait(false);
 
         try
@@ -214,90 +243,6 @@ public class OrderedConsumeBenchmarks
             tracker.Record();
             return Task.CompletedTask;
         }
-    }
-
-    // ── Fake transport adapter (mirrors FakeAdapter in ordering unit tests) ───
-
-    /// <summary>
-    /// Lightweight fake transport adapter that yields pre-built key-stamped messages.
-    /// No NSubstitute — real implementation (PERF-2 requirement). Tracks settlement count
-    /// so the benchmark can drain the runner before cancellation.
-    /// </summary>
-    private sealed class BenchmarkFakeAdapter(IReadOnlyList<(string Key, int PerKeySeq)> messages)
-        : ITransportAdapter
-    {
-        private int _settled;
-        private readonly TaskCompletionSource _allSettled = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        private int _settleTarget = int.MaxValue;
-
-        public string TransportName => "BenchmarkFake";
-        public TransportCapabilities Capabilities => TransportCapabilities.None;
-
-        public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
-            string endpointName,
-            FlowControlOptions flowControl,
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            for (int i = 0; i < messages.Count; i++)
-            {
-                (string key, int perKeySeq) = messages[i];
-                var headers = new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    ["seq"] = perKeySeq.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    [KeyHeader] = key,
-                };
-
-                yield return new InboundMessage(
-                    messageId: Guid.NewGuid().ToString(),
-                    headers: headers,
-                    body: ReadOnlySequence<byte>.Empty,
-                    deliveryTag: (ulong)i);
-            }
-
-            // Block until cancelled so RunAsync stays alive through settlement.
-            var tcs = new TaskCompletionSource();
-            using (cancellationToken.Register(() => tcs.TrySetResult()))
-            {
-                await tcs.Task.ConfigureAwait(false);
-            }
-
-            yield break;
-        }
-
-        public Task SettleAsync(
-            SettlementAction action,
-            InboundMessage message,
-            CancellationToken cancellationToken = default)
-        {
-            int now = Interlocked.Increment(ref _settled);
-            if (now >= Volatile.Read(ref _settleTarget))
-            {
-                _allSettled.TrySetResult();
-            }
-
-            return Task.CompletedTask;
-        }
-
-        internal async Task SettledAsync(int count, CancellationToken ct)
-        {
-            Volatile.Write(ref _settleTarget, count);
-            if (Volatile.Read(ref _settled) >= count)
-            {
-                _allSettled.TrySetResult();
-            }
-
-            await _allSettled.Task.WaitAsync(ct).ConfigureAwait(false);
-        }
-
-        public Task<IReadOnlyList<SendResult>> SendBatchAsync(
-            IReadOnlyList<OutboundMessage> messages,
-            CancellationToken cancellationToken = default)
-            => throw new NotSupportedException();
-
-        public Task DeployTopologyAsync(
-            BareWire.Abstractions.Topology.TopologyDeclaration topology,
-            CancellationToken cancellationToken = default)
-            => throw new NotSupportedException();
     }
 
     // ── Stub collaborators (no NSubstitute — PERF-2 requirement) ─────────────

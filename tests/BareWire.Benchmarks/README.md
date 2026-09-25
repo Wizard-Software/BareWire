@@ -6,10 +6,10 @@ Performance benchmarks for BareWire messaging pipeline using [BenchmarkDotNet](h
 
 | Operation | Throughput | Allocation | Tolerance |
 |-----------|-----------|------------|-----------|
-| Publish typed (in-memory) | > 500K msgs/s | < 768 B/msg | ±10% |
-| Publish raw (in-memory) | > 1M msgs/s | < 512 B/msg | ±10% |
-| Consume + ack (in-memory) | > 300K msgs/s | < 512 B/op | ±10% |
-| SAGA transition (in-memory) | > 100K msgs/s | < 768 B/transition | ±15% |
+| Publish typed (Core-only) | > 500K msgs/s | < 768 B/msg | ±10% |
+| Publish raw (Core-only) | > 1M msgs/s | < 512 B/msg | ±10% |
+| Consume + ack (Core-only) | > 300K msgs/s | < 512 B/op | ±10% |
+| SAGA transition (in-memory saga repository, no transport) | > 100K msgs/s | < 768 B/transition | ±15% |
 | JSON serialize raw (1 KB) | < 2 μs | < 384 B | ±10% |
 | JSON serialize envelope (1 KB) | < 2 μs | < 512 B | ±10% |
 | JSON deserialize raw (1 KB) | < 5 μs | < 5 KB | ±10% |
@@ -29,6 +29,9 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Publish
 dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Consume*'
 dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*Saga*'
 
+# In-memory transport engine (single binding + fan-out); also matches SagaBenchmarks.StateTransition_InMemory
+dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*InMemory*'
+
 # JSON vs MessagePack comparative benchmark (R3.3)
 dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*JsonVsMessagePack*'
 
@@ -43,14 +46,51 @@ dotnet run --project tests/BareWire.Benchmarks/ -c Release -- --filter '*' --exp
 
 | Class | Description | Targets |
 |-------|-------------|---------|
-| `PublishBenchmarks` | Typed and raw publish through in-memory transport | 500K–1M msgs/s |
-| `ConsumeBenchmarks` | Consume + ack loop via InMemoryTransportAdapter | > 300K msgs/s |
+| `PublishBenchmarks` | Typed and raw publish through the Core pipeline on the local Core-only fake adapter (`CoreOnlyBus`) | 500K–1M msgs/s |
+| `PublishPayloadScalingBenchmarks` | Raw publish allocation scaling by payload size, Core-only | allocation trend |
+| `ConsumeBenchmarks` | Consume + ack loop (`ConsumeAndAck_CoreOnly`) against the local Core-only fake adapter | > 300K msgs/s |
 | `OrderedConsumeBenchmarks` | Ordered consume path (`OrderedBy` ON vs OFF) — N×L params sweep; per-lane overhead constant (ADR-026 R8.15) | < 512 B/op |
-| `SagaBenchmarks` | State machine transitions with InMemorySagaRepository | > 100K msgs/s |
+| `SagaBenchmarks` | State machine transitions with InMemorySagaRepository (no transport involved) | > 100K msgs/s |
+| `InMemoryTransportBenchmarks` | In-memory transport engine, single binding: `Publish_SingleBinding` (bus publish until the queue holds every message), `Consume_SingleBinding` (consume + ack + buffer return) | same targets as Core publish/consume, used as a gate |
+| `InMemoryFanOutBenchmarks` | In-memory transport fan-out to 1/4/16 queues × 128/4096 B payload, `FanOut_DeliverAndAck` (send, deliver, ack every copy) | budget per delivered copy |
 | `SerializationBenchmarks` | JSON serialize/deserialize with System.Text.Json | < 1 μs |
 | `JsonVsMessagePackBenchmarks` | JSON vs MessagePack serialize/deserialize/on-wire size, same object graph, 100 B – 100 KB | MessagePack ~2-5x fewer allocations |
 | `ConsumerEnvelopeDispatchBenchmarks` | Per-consumer MassTransit-envelope deserializer selection (`ReceiveEndpointRunner.ResolverFor`); no-opt-in degradation to the pre-18.5 dispatch path (18.5, ADR-031 D4) | 0 B/op (no-opt-in) |
 | `ConsumerDefinitionDispatchAllocationBenchmarks` | Consumer-definition dispatch WITHOUT any definition opt-in — discovery + `TMessage` inference baked ONCE at start-up (19.6 seam), per-delivery read of baked delegate + precompiled `ConsumerRegistration` fields (19.12) | 0 B/op (no-opt-in) |
+
+## Baseline change: Core-only vs in-memory transport
+
+The in-memory transport stub that used to live in `BareWire.Testing` is gone: the test harness now runs
+on the real in-memory transport engine. Measuring the Core targets above through the harness would have
+silently redefined them as "Core + transport engine". To keep them honest, the Core benchmarks now run on a
+minimal fake adapter that is local to this project (`CoreOnlyTransportAdapter`, `internal`, never packed):
+
+- **Core-only** (`PublishBenchmarks`, `PublishPayloadScalingBenchmarks`, `ConsumeBenchmarks`,
+  `OrderedConsumeBenchmarks`): the fake's send is a sink that confirms every message without storing or
+  copying it; its consume side is a bounded channel pre-filled outside the measured region. The project
+  targets (> 500K msgs/s publish, > 300K msgs/s consume, < 768 B/msg publish, < 512 B/op consume) keep
+  measuring Core only. `SagaBenchmarks` never touched a transport.
+- **In-memory transport** (`InMemoryTransportBenchmarks`, `InMemoryFanOutBenchmarks`): measure the transport
+  engine itself. The single-binding pair uses the same targets as a gate; fan-out reports its budget
+  **per delivered copy** (the per-message value divided by the fan-out factor).
+
+What changed compared with older results:
+
+- `ConsumeBenchmarks.ConsumeAndAck_InMemory` is now `ConsumeBenchmarks.ConsumeAndAck_CoreOnly` and reports
+  **per message** (`OperationsPerInvoke`), not per batch of 1,000 messages.
+- The Core publish path now serializes a fixed ~56 B JSON payload instead of an empty body, and the fake
+  adapter no longer pays the old stub's per-message costs (message id, inbound message, result array).
+  Absolute numbers are therefore not comparable with reports produced before this change.
+- `ConsumeAndAck_CoreOnly` does not run the receive pipeline (no dispatch, no DI scope); it is the
+  consume + ack floor of the fake adapter. The per-message cost of the Core receive/dispatch path is
+  visible in `OrderedConsumeBenchmarks.Baseline_Off`.
+- `Publish_SingleBinding` and the Core-only `PublishTyped` have different shapes (a barrier batch of 256
+  vs one call in steady state); compare each with the targets, not with each other.
+- Every class touched by this change declares `[SimpleJob(launchCount: 1, warmupCount: 3, iterationCount: 15)]`;
+  run them without `--job short` for recorded numbers. `Program.cs` exits non-zero when a benchmark fails
+  or a filter matches nothing.
+
+Latest recorded results: [`docs/articles/benchmark-report.md`](../../docs/articles/benchmark-report.md).
 
 ## OrderedConsume Benchmark (R8.15)
 
@@ -334,8 +374,8 @@ unchanged by the consumer-definition enhancement (19.x).
   `ConsumerRegistration` fields read directly.
 - The actual invocation of the baked delegate is OUT of the measured path (invoking a consumer allocates a
   DI scope + deserialization) — same boundary as `DispatchBenchmarks` and `ConsumerEnvelopeDispatchBenchmarks`.
-- The global `< 512 B/op` consume budget stays guarded by `ConsumeBenchmarks.ConsumeAndAck_InMemory`
-  (transport floor, unchanged by the enhancement).
+- The global `< 512 B/op` consume budget stays guarded by `ConsumeBenchmarks.ConsumeAndAck_CoreOnly`
+  (Core-only consume floor, unchanged by the enhancement).
 
 ### Running
 

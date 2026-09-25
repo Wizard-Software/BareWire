@@ -51,6 +51,21 @@ public sealed class PackageReadmeTests
             + "missing in: {0}", string.Join(", ", offenders));
     }
 
+    [Theory]
+    [InlineData("BareWire.InMemory")]
+    [InlineData("BareWire.Transport.InMemory")]
+    public void NewInMemoryPackage_ShouldBePackable_AndHaveAReadme(string projectName)
+    {
+        var projectDir = Path.Combine(FindRepositoryRoot().FullName, "src", projectName);
+        var csproj = Path.Combine(projectDir, $"{projectName}.csproj");
+
+        File.Exists(csproj).Should().BeTrue("the package project {0} should exist", projectName);
+        File.ReadAllText(csproj).Should().NotContainEquivalentOf("<IsPackable>false</IsPackable>",
+            "{0} ships as a NuGet package", projectName);
+        File.Exists(Path.Combine(projectDir, "README.md")).Should().BeTrue(
+            "{0} must ship a README.md or dotnet pack fails with NU5019", projectName);
+    }
+
     /// <summary>
     /// Walks up from the test output directory until the directory containing
     /// <c>BareWire.slnx</c> (the repository root) is found.

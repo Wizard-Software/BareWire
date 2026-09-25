@@ -1,23 +1,33 @@
 using System.Buffers;
 using System.Collections.Frozen;
+using System.Linq.Expressions;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using BareWire.Abstractions.Transport;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
 
 namespace BareWire.Outbox.EntityFramework;
 
-internal sealed class EfCoreOutboxStore : IOutboxStore
+internal sealed class EfCoreOutboxStore : IOutboxStore, IOutboxRetryBacklogProbe
 {
     private readonly OutboxDbContext _dbContext;
     private readonly string _instanceId;
     private readonly IOutboxSqlDialect _dialect;
     private readonly OutboxOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly IOutboxJitterSource _jitterSource;
+    private readonly OutboxSingleSlotTurn _singleSlotTurn;
+    private OutboxNackDeferralSchedule? _nackSchedule;
 
     internal EfCoreOutboxStore(
         OutboxDbContext dbContext,
         OutboxInstanceId instanceId,
         IOutboxSqlDialect dialect,
-        OutboxOptions options)
+        OutboxOptions options,
+        TimeProvider? timeProvider = null,
+        IOutboxJitterSource? jitterSource = null,
+        OutboxSingleSlotTurn? singleSlotTurn = null)
     {
         ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(instanceId);
@@ -28,7 +38,25 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         _instanceId = instanceId.Value;
         _dialect = dialect;
         _options = options;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _jitterSource = jitterSource ?? SharedRandomOutboxJitterSource.Instance;
+        // Falls back to a private instance per store when no singleton is supplied (e.g. a directly
+        // constructed store in tests): the first single-slot cycle of that store instance always
+        // serves the new-rows class first. Production always resolves the DI singleton (see
+        // ServiceCollectionExtensions.AddBareWireOutbox), so every EfCoreOutboxStore of one process
+        // alternates through the same turn across dispatch cycles.
+        _singleSlotTurn = singleSlotTurn ?? new OutboxSingleSlotTurn();
     }
+
+    // The clock every time-dependent operation of this store reads — exactly once per operation, so
+    // the claim timestamp and the stale-lock cutoff always derive from the same instant.
+    internal TimeProvider TimeProvider => _timeProvider;
+
+    // Randomness source for retry jitter.
+    internal IOutboxJitterSource JitterSource => _jitterSource;
+
+    // Turn of a contested single-slot claim (see OutboxSingleSlotTurn).
+    internal OutboxSingleSlotTurn SingleSlotTurn => _singleSlotTurn;
 
     public ValueTask SaveMessagesAsync(
         IReadOnlyList<OutboundMessage> messages,
@@ -41,7 +69,7 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             return ValueTask.CompletedTask;
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        DateTimeOffset now = _timeProvider.GetUtcNow();
 
         foreach (OutboundMessage message in messages)
         {
@@ -75,110 +103,36 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         int batchSize,
         CancellationToken cancellationToken = default)
     {
-        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (batchSize <= 0)
+        {
+            return Array.Empty<OutboxEntry>();
+        }
+
+        DateTimeOffset now = _timeProvider.GetUtcNow();
         DateTimeOffset staleCutoff = now - _options.OutboxLockTimeout;
 
         // Use the configured dialect's atomic claim only when it targets the active EF Core
         // provider — matched via the base DatabaseFacade.ProviderName API (keeps this package
         // provider-agnostic: no hard dependency on any provider package). Providers without a
-        // matching dialect fall back to the non-atomic client-side claim below.
+        // matching dialect fall back to the non-atomic client-side claim.
+        int staleOwnedCount;
         if (string.Equals(_dbContext.Database.ProviderName, _dialect.ProviderName, StringComparison.Ordinal))
         {
-            // Atomic disjoint claim via the provider dialect (PostgreSQL: FOR UPDATE SKIP LOCKED).
-            // Deliberately two statements (claim UPDATE here, then the shared SELECT below) rather
-            // than a single UPDATE ... RETURNING: EF Core's ExecuteSqlAsync returns only an
-            // affected-row count, and FromSql/SqlQuery wrap the statement in a subquery — a
-            // data-modifying statement cannot sit at non-top-level (e.g. on PostgreSQL) — so
-            // RETURNING cannot be materialized through EF Core here. The follow-up SELECT
-            // (LockedBy == this instance) reads back exactly the rows this instance just claimed.
-            await _dbContext.Database.ExecuteSqlAsync(
-                _dialect.GetClaimSql(_instanceId, now, staleCutoff, batchSize, _options.OrderingMode),
-                cancellationToken).ConfigureAwait(false);
+            staleOwnedCount = await ClaimWithDialectAsync(batchSize, now, staleCutoff, cancellationToken)
+                .ConfigureAwait(false);
         }
         else
         {
-            // SQLite / other providers: two-step non-concurrent claim.
-            // Step 1: identify claimable ids — Take() in ExecuteUpdateAsync is not supported.
-            // SQLite EF does not support nullable DateTimeOffset OR comparisons in a single Where.
-            // Fetch pending (undelivered) ids, LockedAt, LockedBy, and OrderingKey client-side,
-            // then filter in-memory. Rows already owned by this instance are always included
-            // (refresh their lock timestamp).
-            var pendingRows = await _dbContext.Set<OutboxMessage>()
-                .Where(m => m.DeliveredAt == null)
-                .Select(m => new { m.Id, m.LockedAt, m.LockedBy, m.OrderingKey })
-                .ToListAsync(cancellationToken)
-                .ConfigureAwait(false);
-
-            // Head-of-line filter for PerKey mode — applied BEFORE Take(batchSize) so the batch
-            // limit is not consumed by blocked rows (O(n)/cycle over undelivered rows, where n is
-            // the number of undelivered messages). This path is for SQLite / test/dev only —
-            // NOT production. For production multi-instance deployments use PostgreSQL with the
-            // atomic FOR UPDATE SKIP LOCKED claim path above.
-            IEnumerable<long> claimableCandidates = pendingRows
-                .Where(x => x.LockedBy == _instanceId
-                    || x.LockedAt is null
-                    || x.LockedAt.Value < staleCutoff)
-                .OrderBy(x => x.Id)
-                .Select(x => x.Id);
-
-            if (_options.OrderingMode == BareWire.Abstractions.Outbox.OrderingMode.PerKey)
-            {
-                // Build a set of the minimum Id per key among all undelivered rows (not just
-                // claimable ones) — these are the heads. A keyed row is claimable only when its
-                // Id is the head Id for that key. Keyless rows (OrderingKey == null) always pass.
-                Dictionary<string, long> headIdPerKey = pendingRows
-                    .Where(x => x.OrderingKey is not null)
-                    .GroupBy(x => x.OrderingKey!)
-                    .ToDictionary(g => g.Key, g => g.Min(x => x.Id));
-
-                claimableCandidates = claimableCandidates
-                    .Where(id =>
-                    {
-                        var row = pendingRows.First(x => x.Id == id);
-                        // Keyless rows are never blocked.
-                        if (row.OrderingKey is null)
-                        {
-                            return true;
-                        }
-
-                        // A keyed row is claimable only if it is the head of its key group.
-                        return headIdPerKey.TryGetValue(row.OrderingKey, out long headId)
-                            && id == headId;
-                    });
-            }
-
-            List<long> claimableIds = claimableCandidates
-                .Take(batchSize)
-                .ToList();
-
-            if (claimableIds.Count == 0)
+            if (!await ClaimClientSideAsync(batchSize, now, staleCutoff, cancellationToken).ConfigureAwait(false))
             {
                 return Array.Empty<OutboxEntry>();
             }
 
-            // Step 2: mark those specific ids as claimed.
-            await _dbContext.Set<OutboxMessage>()
-                .Where(m => claimableIds.Contains(m.Id))
-                .ExecuteUpdateAsync(
-                    s => s
-                        .SetProperty(m => m.LockedAt, now)
-                        .SetProperty(m => m.LockedBy, _instanceId),
-                    cancellationToken)
-                .ConfigureAwait(false);
+            // The client-side claim re-stamps every row this instance owns, so none of them is stale.
+            staleOwnedCount = 0;
         }
 
-        // Select claimed rows: LockedBy == this instance AND not yet delivered.
-        // Do NOT compare LockedAt == now — timestamptz precision truncation causes equality to fail.
-        // Take(batchSize) bounds the returned batch: this instance may still own carry-forward rows
-        // from a prior cycle (e.g. nacked rows whose lock has not yet expired), so without the cap a
-        // cycle could return more than batchSize rows (and rent that many pooled buffers). Oldest-first
-        // (OrderBy Id) ensures carry-forward rows drain before newer claims.
-        List<OutboxMessage> rows = await _dbContext.Set<OutboxMessage>()
-            .AsNoTracking()
-            .Where(m => m.LockedBy == _instanceId && m.DeliveredAt == null)
-            .OrderBy(m => m.Id)
-            .Take(batchSize)
-            .ToListAsync(cancellationToken)
+        List<OutboxMessage> rows = await ReadOwnedBatchAsync(batchSize, staleCutoff, staleOwnedCount, cancellationToken)
             .ConfigureAwait(false);
 
         var entries = new List<OutboxEntry>(rows.Count);
@@ -204,11 +158,277 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
                 ContentType = row.ContentType,
                 CreatedAt = row.CreatedAt,
                 Status = OutboxEntryStatus.Pending,
-                OrderingKey = row.OrderingKey
+                OrderingKey = row.OrderingKey,
+                NackCount = row.RetryCount
             });
         }
 
         return entries;
+    }
+
+    // Atomic fair claim through the provider dialect (PostgreSQL: FOR UPDATE SKIP LOCKED). Each claim
+    // statement is an UPDATE whose affected-row count is the number of rows it claimed; the rows
+    // themselves are read back by the shared SELECT (LockedBy == this instance). Deliberately separate
+    // statements rather than UPDATE ... RETURNING: EF Core's ExecuteSqlAsync returns only an
+    // affected-row count, and FromSql/SqlQuery wrap the statement in a subquery, where a
+    // data-modifying statement cannot sit on PostgreSQL.
+    //
+    // A cycle runs up to three claim statements against its effective capacity (batch size minus the
+    // rows this instance still validly owns):
+    //   1. new rows, in id order, up to the new-row reservation;
+    //   2. due retries (deferred nacks, abandoned claims) in the remaining capacity — in due-time order
+    //      for a built-in dialect, through the public claim statement (id order) for a custom one;
+    //   3. a top-up with new rows when step 1 filled its reservation and step 2 left capacity unused.
+    // Returns the number of stale rows this instance owned before the claim; ReadOwnedBatchAsync
+    // must not hand those back unless one of the steps re-claimed them.
+    private async ValueTask<int> ClaimWithDialectAsync(
+        int batchSize,
+        DateTimeOffset now,
+        DateTimeOffset staleCutoff,
+        CancellationToken cancellationToken)
+    {
+        // Rows this instance still owns (carry-forward, e.g. a batch whose send threw and was never
+        // released). Only rows with a valid lock count against the batch: a stale own row is claimable
+        // by any instance in step 2, so it must be re-claimed before it may be sent again. LockedAt is
+        // compared client-side because not every EF Core provider translates DateTimeOffset
+        // comparisons; the list is bounded by what this instance owns.
+        List<DateTimeOffset?> ownedLocks = await _dbContext.Set<OutboxMessage>()
+            .Where(m => m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .Select(m => m.LockedAt)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        int validOwnedCount = 0;
+        foreach (DateTimeOffset? lockedAt in ownedLocks)
+        {
+            if (lockedAt is { } value && value >= staleCutoff)
+            {
+                validOwnedCount++;
+            }
+        }
+
+        int staleOwnedCount = ownedLocks.Count - validOwnedCount;
+        int effective = OutboxFairClaimPlan.GetEffectiveBatchSize(batchSize, validOwnedCount);
+        if (effective == 0)
+        {
+            return staleOwnedCount;
+        }
+
+        // A single-slot cycle cannot tell before claiming whether both classes are waiting; an empty
+        // step simply hands its capacity to the next one, so the alternating turn only decides who goes
+        // first.
+        bool retryTurn = effective == 1 && _singleSlotTurn.NextIsRetryTurn();
+        int retryReserve = OutboxFairClaimPlan.GetRetryReserve(effective, retryTurn);
+        BareWire.Abstractions.Outbox.OrderingMode mode = _options.OrderingMode;
+
+        int newLimit = effective - retryReserve;
+        int newClaimed = newLimit > 0
+            ? await ExecuteClaimAsync(GetNewRowsClaimSql(now, newLimit, mode), newLimit, cancellationToken)
+                .ConfigureAwait(false)
+            : 0;
+
+        int retryLimit = effective - newClaimed;
+        int retryClaimed = 0;
+        if (retryLimit > 0)
+        {
+            FormattableString retrySql = _dialect is IDueOrderedRetryClaimSql dueOrdered
+                ? dueOrdered.GetDueOrderedRetryClaimSql(_instanceId, now, staleCutoff, retryLimit, mode)
+                : _dialect.GetClaimSql(_instanceId, now, staleCutoff, retryLimit, mode);
+            retryClaimed = await ExecuteClaimAsync(retrySql, retryLimit, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (OutboxFairClaimPlan.ShouldTopUp(effective, retryReserve, newClaimed, retryClaimed))
+        {
+            int topUpLimit = effective - newClaimed - retryClaimed;
+            FormattableString topUpSql = _dialect is INewRowsClaimSql newRows
+                ? newRows.GetNewRowsClaimSql(_instanceId, now, topUpLimit, mode)
+                : _dialect.GetClaimSql(_instanceId, now, staleCutoff, topUpLimit, mode);
+            await ExecuteClaimAsync(topUpSql, topUpLimit, cancellationToken).ConfigureAwait(false);
+        }
+
+        return staleOwnedCount;
+    }
+
+    // New rows only: the built-in dialect's index-ordered shape, or the public claim statement with a
+    // cutoff older than any lock, which admits only rows whose LockedAt is NULL.
+    private FormattableString GetNewRowsClaimSql(
+        DateTimeOffset now,
+        int limit,
+        BareWire.Abstractions.Outbox.OrderingMode mode)
+        => _dialect is INewRowsClaimSql newRows
+            ? newRows.GetNewRowsClaimSql(_instanceId, now, limit, mode)
+            : _dialect.GetClaimSql(_instanceId, now, OutboxFairClaimPlan.NewRowsOnlyCutoff, limit, mode);
+
+    private async ValueTask<int> ExecuteClaimAsync(
+        FormattableString sql,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        int reported = await _dbContext.Database.ExecuteSqlAsync(sql, cancellationToken).ConfigureAwait(false);
+        return OutboxFairClaimPlan.ClampClaimed(reported, limit);
+    }
+
+    // SQLite / other providers without a matching dialect: two-step, non-concurrent claim — safe for a
+    // single dispatcher instance (tests, development), not for multi-instance production. Candidate ids
+    // are selected in memory (Take() in ExecuteUpdateAsync is not supported, and SQLite EF does not
+    // translate nullable DateTimeOffset comparisons), split into the same classes as the dialect path,
+    // then marked as claimed with one UPDATE. Returns false when there was nothing to claim.
+    private async ValueTask<bool> ClaimClientSideAsync(
+        int batchSize,
+        DateTimeOffset now,
+        DateTimeOffset staleCutoff,
+        CancellationToken cancellationToken)
+    {
+        var pendingRows = await _dbContext.Set<OutboxMessage>()
+            .Where(m => m.DeliveredAt == null)
+            .Select(m => new { m.Id, m.LockedAt, m.LockedBy, m.OrderingKey })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // Rows already owned by this instance are always claimable (their lock is refreshed); others
+        // only when never claimed or when their lock is stale.
+        var candidates = pendingRows
+            .Where(x => x.LockedBy == _instanceId
+                || x.LockedAt is null
+                || x.LockedAt.Value < staleCutoff);
+
+        if (_options.OrderingMode == BareWire.Abstractions.Outbox.OrderingMode.PerKey)
+        {
+            // Head-of-line filter, applied before the batch split so blocked rows consume no slots. The
+            // heads are the minimum Id per key among ALL undelivered rows (not only claimable ones); a
+            // keyed row is claimable only when it is the head of its key. Keyless rows always pass.
+            Dictionary<string, long> headIdPerKey = pendingRows
+                .Where(x => x.OrderingKey is not null)
+                .GroupBy(x => x.OrderingKey!)
+                .ToDictionary(g => g.Key, g => g.Min(x => x.Id));
+
+            candidates = candidates.Where(x =>
+                x.OrderingKey is null
+                || (headIdPerKey.TryGetValue(x.OrderingKey, out long headId) && x.Id == headId));
+        }
+
+        var carried = new List<long>();
+        var fresh = new List<long>();
+        var retries = new List<(DateTimeOffset LockedAt, long Id)>();
+
+        foreach (var row in candidates)
+        {
+            if (row.LockedBy == _instanceId)
+            {
+                carried.Add(row.Id);
+            }
+            else if (row.LockedAt is { } lockedAt)
+            {
+                retries.Add((lockedAt, row.Id));
+            }
+            else
+            {
+                fresh.Add(row.Id);
+            }
+        }
+
+        carried.Sort();
+        if (carried.Count > batchSize)
+        {
+            carried.RemoveRange(batchSize, carried.Count - batchSize);
+        }
+
+        int effective = OutboxFairClaimPlan.GetEffectiveBatchSize(batchSize, carried.Count);
+        bool retryTurn = effective == 1
+            && fresh.Count > 0
+            && retries.Count > 0
+            && _singleSlotTurn.NextIsRetryTurn();
+        int retryReserve = OutboxFairClaimPlan.GetRetryReserve(effective, retryTurn);
+        (int newTake, int retryTake) = OutboxFairClaimPlan.SplitCandidates(
+            effective,
+            retryReserve,
+            fresh.Count,
+            retries.Count);
+
+        // New rows in id order; due retries in due-time order (earliest LockedAt first, then id).
+        fresh.Sort();
+        retries.Sort((a, b) =>
+        {
+            int byDueTime = a.LockedAt.CompareTo(b.LockedAt);
+            return byDueTime != 0 ? byDueTime : a.Id.CompareTo(b.Id);
+        });
+
+        var claimableIds = new List<long>(carried.Count + newTake + retryTake);
+        claimableIds.AddRange(carried);
+        claimableIds.AddRange(fresh.Take(newTake));
+        claimableIds.AddRange(retries.Take(retryTake).Select(r => r.Id));
+
+        if (claimableIds.Count == 0)
+        {
+            return false;
+        }
+
+        await _dbContext.Set<OutboxMessage>()
+            .Where(m => claimableIds.Contains(m.Id))
+            .ExecuteUpdateAsync(
+                s => s
+                    .SetProperty(m => m.LockedAt, now)
+                    .SetProperty(m => m.LockedBy, _instanceId),
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return true;
+    }
+
+    // Reads the claimed batch: LockedBy == this instance AND not yet delivered, oldest first.
+    // Do NOT compare LockedAt == now — timestamptz precision truncation causes equality to fail.
+    // Take(batchSize) bounds the returned batch (and the pooled buffers rented for it). When this
+    // instance owned stale rows before the claim, those rows are claimable by any instance, so they are
+    // returned only if a claim step of this cycle re-stamped them. Their number is not bounded by the
+    // batch size (a batch whose send keeps throwing is never released), so the lock check runs on a
+    // lightweight (Id, LockedAt) projection and only the kept ids — at most batchSize — load their
+    // payloads. LockedAt is compared client-side because not every EF Core provider translates
+    // DateTimeOffset comparisons.
+    private async ValueTask<List<OutboxMessage>> ReadOwnedBatchAsync(
+        int batchSize,
+        DateTimeOffset staleCutoff,
+        int staleOwnedCount,
+        CancellationToken cancellationToken)
+    {
+        IQueryable<OutboxMessage> owned = _dbContext.Set<OutboxMessage>()
+            .AsNoTracking()
+            .Where(m => m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .OrderBy(m => m.Id);
+
+        if (staleOwnedCount == 0)
+        {
+            return await owned.Take(batchSize).ToListAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var ownedLocks = await owned
+            .Select(m => new { m.Id, m.LockedAt })
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var validIds = new List<long>(Math.Min(batchSize, ownedLocks.Count));
+        foreach (var row in ownedLocks)
+        {
+            if (row.LockedAt is { } lockedAt && lockedAt >= staleCutoff)
+            {
+                validIds.Add(row.Id);
+                if (validIds.Count == batchSize)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (validIds.Count == 0)
+        {
+            return [];
+        }
+
+        return await _dbContext.Set<OutboxMessage>()
+            .AsNoTracking()
+            .Where(m => validIds.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .OrderBy(m => m.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask MarkDeliveredAsync(
@@ -222,35 +442,80 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
             return;
         }
 
+        DateTimeOffset deliveredAt = _timeProvider.GetUtcNow();
+
         await _dbContext.Set<OutboxMessage>()
             .Where(m => ids.Contains(m.Id))
             .ExecuteUpdateAsync(
-                s => s.SetProperty(m => m.DeliveredAt, DateTimeOffset.UtcNow),
+                s => s.SetProperty(m => m.DeliveredAt, deliveredAt),
                 cancellationToken)
             .ConfigureAwait(false);
     }
 
-    public async ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+    public ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
         IReadOnlyList<long> ids,
         CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(ids);
+        => ReleaseLockAsync(ids, [], cancellationToken);
 
-        if (ids.Count == 0)
+    public async ValueTask<IReadOnlySet<long>> ReleaseLockAsync(
+        IReadOnlyList<long> nackedIds,
+        IReadOnlyList<long> barrierReleasedIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(nackedIds);
+        ArgumentNullException.ThrowIfNull(barrierReleasedIds);
+
+        if (nackedIds.Count == 0 && barrierReleasedIds.Count == 0)
         {
             return FrozenSet<long>.Empty;
         }
 
-        // Zero the lock on rows this instance still owns and has not yet delivered, so the next
-        // poll cycle re-claims them immediately. The LockedBy == _instanceId filter ensures an
-        // instance never releases another instance's claim (preserves the B4 no-double-delivery
-        // guarantee); DeliveredAt == null guards against a race with MarkDeliveredAsync.
+        IReadOnlyList<long> releasedIds = ResolveReleasedIds(nackedIds, barrierReleasedIds);
+
+        Expression<Func<OutboxMessage, DateTimeOffset?>>? deferredLockedAt = null;
+        Expression<Func<OutboxMessage, int>>? incrementedRetryCount = null;
+
+        if (nackedIds.Count > 0)
+        {
+            // Created lazily: this store is scoped per consume scope, and most scopes never nack.
+            _nackSchedule ??= OutboxNackDeferralSchedule.FromOptions(_options, _jitterSource);
+
+            // With both kinds in one call, only the nacked ids are deferred and counted; an id in both
+            // lists evaluates as nacked, so a rejected row is never released without its deferral.
+            Expression<Func<OutboxMessage, bool>>? isNacked = barrierReleasedIds.Count > 0
+                ? m => nackedIds.Contains(m.Id)
+                : null;
+
+            (deferredLockedAt, incrementedRetryCount) = BuildNackSetters(
+                _nackSchedule.CreatePlan(),
+                _timeProvider.GetUtcNow(),
+                isNacked);
+        }
+
+        // Both kinds are released by ONE statement, so there is no window in which the nacked head of an
+        // ordering key is already released while its barrier-held siblings are still owned by this
+        // instance (and would be re-sent ahead of it on the next cycle). The LockedBy == _instanceId
+        // filter ensures an instance never releases another instance's claim, which preserves the
+        // no-double-delivery guarantee across instances; DeliveredAt == null guards against a race with
+        // MarkDeliveredAsync. A nacked row gets LockedAt = now - OutboxLockTimeout + deferral, so the
+        // claim predicate LockedAt < now' - OutboxLockTimeout keeps it unclaimable until the deferral
+        // has elapsed; a barrier-released row gets LockedAt = null and is claimable on the next cycle.
         await _dbContext.Set<OutboxMessage>()
-            .Where(m => ids.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
+            .Where(m => releasedIds.Contains(m.Id) && m.LockedBy == _instanceId && m.DeliveredAt == null)
             .ExecuteUpdateAsync(
-                s => s
-                    .SetProperty(m => m.LockedAt, (DateTimeOffset?)null)
-                    .SetProperty(m => m.LockedBy, (string?)null),
+                setters =>
+                {
+                    setters.SetProperty(m => m.LockedBy, (string?)null);
+
+                    if (deferredLockedAt is null || incrementedRetryCount is null)
+                    {
+                        setters.SetProperty(m => m.LockedAt, (DateTimeOffset?)null);
+                        return;
+                    }
+
+                    setters.SetProperty(m => m.LockedAt, deferredLockedAt);
+                    setters.SetProperty(m => m.RetryCount, incrementedRetryCount);
+                },
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -259,11 +524,156 @@ internal sealed class EfCoreOutboxStore : IOutboxStore
         return FrozenSet<long>.Empty;
     }
 
+    private static IReadOnlyList<long> ResolveReleasedIds(
+        IReadOnlyList<long> nackedIds,
+        IReadOnlyList<long> barrierReleasedIds)
+    {
+        if (barrierReleasedIds.Count == 0)
+        {
+            return nackedIds;
+        }
+
+        if (nackedIds.Count == 0)
+        {
+            return barrierReleasedIds;
+        }
+
+        var union = new HashSet<long>(nackedIds);
+        union.UnionWith(barrierReleasedIds);
+        return [.. union];
+    }
+
+    // Builds the LockedAt and RetryCount setter values for nacked rows. When isNacked is given (a call
+    // that also carries barrier-released ids), rows it does not match keep LockedAt = null and their
+    // RetryCount unchanged.
+    //
+    // LockedAt is one flat conditional over the row's retry bucket (RetryCount == 0, == 1, ..., otherwise
+    // the escalation cap) and jitter bucket (Id % JitterBucketCount), which EF Core translates into a
+    // single CASE expression. Identity ids are positive, so SQL's Id % 4 equals the schedule's
+    // normalized jitter bucket. Every cell value is read through a StrongBox field — the shape the C#
+    // compiler emits for a captured variable — so EF Core sends it as a query parameter rather than
+    // inlining a literal: the SQL text and the EF Core query-cache key stay stable across releases (no
+    // re-translation per release, and prepared statements can be reused where the provider enables them).
+    //
+    // RetryCount saturates at int.MaxValue instead of overflowing: an overflowed value would make the
+    // row unreadable (or fail the whole statement) and stall this instance's dispatch.
+    private static (Expression<Func<OutboxMessage, DateTimeOffset?>> LockedAt,
+        Expression<Func<OutboxMessage, int>> RetryCount) BuildNackSetters(
+        OutboxNackDeferralPlan plan,
+        DateTimeOffset now,
+        Expression<Func<OutboxMessage, bool>>? isNacked)
+    {
+        ParameterExpression row = isNacked?.Parameters[0] ?? Expression.Parameter(typeof(OutboxMessage), "m");
+        MemberExpression retryCount = Expression.Property(row, nameof(OutboxMessage.RetryCount));
+        Expression jitterBucket = Expression.Modulo(
+            Expression.Property(row, nameof(OutboxMessage.Id)),
+            Expression.Constant((long)plan.JitterBucketCount));
+
+        int capRetryBucket = plan.RetryBucketCount - 1;
+        int lastJitterBucket = plan.JitterBucketCount - 1;
+
+        // Built from the innermost ELSE outwards, so the outermost test is (retry 0, jitter 0).
+        Expression lockedAt = Cell(plan, now, capRetryBucket, lastJitterBucket);
+        for (int retryBucket = capRetryBucket; retryBucket >= 0; retryBucket--)
+        {
+            int topJitterBucket = retryBucket == capRetryBucket ? lastJitterBucket - 1 : lastJitterBucket;
+            for (int bucket = topJitterBucket; bucket >= 0; bucket--)
+            {
+                Expression test = Expression.Equal(jitterBucket, Expression.Constant((long)bucket));
+                if (retryBucket < capRetryBucket)
+                {
+                    test = Expression.AndAlso(
+                        Expression.Equal(retryCount, Expression.Constant(retryBucket)),
+                        test);
+                }
+
+                lockedAt = Expression.Condition(test, Cell(plan, now, retryBucket, bucket), lockedAt);
+            }
+        }
+
+        Expression incremented = Expression.Condition(
+            Expression.LessThan(retryCount, Expression.Constant(int.MaxValue)),
+            Expression.Add(retryCount, Expression.Constant(1)),
+            retryCount);
+
+        if (isNacked is not null)
+        {
+            lockedAt = Expression.Condition(isNacked.Body, lockedAt, Expression.Constant(null, typeof(DateTimeOffset?)));
+            incremented = Expression.Condition(isNacked.Body, incremented, retryCount);
+        }
+
+        return (
+            Expression.Lambda<Func<OutboxMessage, DateTimeOffset?>>(lockedAt, row),
+            Expression.Lambda<Func<OutboxMessage, int>>(incremented, row));
+    }
+
+    private static MemberExpression Cell(OutboxNackDeferralPlan plan, DateTimeOffset now, int retryBucket, int jitterBucket)
+        => Expression.Field(
+            Expression.Constant(
+                new StrongBox<DateTimeOffset?>(plan.GetDeferredLockedAt(now, retryBucket, jitterBucket))),
+            nameof(StrongBox<DateTimeOffset?>.Value));
+
+    // Reports the due instant of the oldest row in the retry-backlog class: still locked (LockedAt !=
+    // null), not delivered, and whose deferral (or, for an abandoned claim, the stale-lock timeout) has
+    // elapsed. Deliberately includes rows abandoned by a crashed instance (LockedBy no longer meaningful
+    // once staleCutoff has passed) — the gauge measures delay for the whole retry class, not only
+    // deferred nacks. A barrier-released row (LockedAt == null) is excluded by the filter itself. The
+    // minimum LockedAt among ALL still-locked rows is correct: a fresh claim always has a LockedAt at or
+    // after `now`, strictly later than any row whose deferral has already elapsed, so it can never be
+    // the minimum while a genuinely due row exists.
+    public async ValueTask<DateTimeOffset?> GetOldestDueRetryAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        DateTimeOffset staleCutoff = now - _options.OutboxLockTimeout;
+        DateTimeOffset? oldestLockedAt;
+
+        if (string.Equals(_dbContext.Database.ProviderName, _dialect.ProviderName, StringComparison.Ordinal))
+        {
+            // ORDER BY DeliveredAt, LockedAt mirrors the leading columns of IX_OutboxMessages_Claim
+            // (DeliveredAt, LockedAt, Id): DeliveredAt is constant within the filtered predicate, so this
+            // lets the provider read the filtered rows in index order instead of adding a Sort node for
+            // a plain ORDER BY LockedAt.
+            oldestLockedAt = await _dbContext.Set<OutboxMessage>()
+                .Where(m => m.DeliveredAt == null && m.LockedAt != null)
+                .OrderBy(m => m.DeliveredAt)
+                .ThenBy(m => m.LockedAt)
+                .Select(m => m.LockedAt)
+                .FirstOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            // No matching dialect (e.g. SQLite in tests/dev): load the filtered LockedAt values and take
+            // the minimum client-side, the same cost class as ClaimClientSideAsync — paid only when a
+            // collector actually reads the gauge. LockedAt is compared client-side because not every EF
+            // Core provider translates nullable DateTimeOffset comparisons.
+            List<DateTimeOffset?> lockedAts = await _dbContext.Set<OutboxMessage>()
+                .Where(m => m.DeliveredAt == null && m.LockedAt != null)
+                .Select(m => m.LockedAt)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            oldestLockedAt = null;
+            foreach (DateTimeOffset? lockedAt in lockedAts)
+            {
+                if (oldestLockedAt is null || lockedAt < oldestLockedAt)
+                {
+                    oldestLockedAt = lockedAt;
+                }
+            }
+        }
+
+        return oldestLockedAt is { } value && value < staleCutoff
+            ? value + _options.OutboxLockTimeout
+            : null;
+    }
+
     public async ValueTask CleanupAsync(
         TimeSpan retention,
         CancellationToken cancellationToken = default)
     {
-        DateTimeOffset cutoff = DateTimeOffset.UtcNow - retention;
+        DateTimeOffset cutoff = _timeProvider.GetUtcNow() - retention;
 
         await _dbContext.Set<OutboxMessage>()
             .Where(m => m.DeliveredAt != null && m.DeliveredAt < cutoff)

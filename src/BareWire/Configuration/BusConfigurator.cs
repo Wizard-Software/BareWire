@@ -42,11 +42,21 @@ internal sealed class BusConfigurator : IBusConfigurator
     internal Action<object>? ObservabilityConfigurator { get; private set; }
 
     /// <summary>
-    /// Gets a value indicating whether an InMemory transport has been registered via DI
-    /// (used by tests and by <see cref="ConfigurationValidator"/> to determine whether
-    /// a transport is available without requiring a full transport package reference).
+    /// Deprecated no-op kept for source compatibility of existing callers. Transport presence is
+    /// now detected from the actual <c>ITransportAdapter</c> registration in the dependency
+    /// injection container, not from this marker — the getter always returns
+    /// <see langword="false"/> and the setter silently ignores the value it is given.
     /// </summary>
-    internal bool HasInMemoryTransport { get; set; }
+    // CA1822 (member could be static) is intentionally suppressed: this must stay an instance
+    // member so existing callers can keep assigning it on a BusConfigurator instance (including
+    // via object-initializer syntax) without a source change.
+#pragma warning disable CA1822
+    internal bool HasInMemoryTransport
+    {
+        get => false;
+        set { }
+    }
+#pragma warning restore CA1822
 
     // ── IBusConfigurator ───────────────────────────────────────────────────────
 
@@ -114,8 +124,10 @@ internal sealed class BusConfigurator : IBusConfigurator
     // ── Transport detection ────────────────────────────────────────────────────
 
     /// <summary>
-    /// Returns <see langword="true"/> when at least one transport has been configured —
-    /// either RabbitMQ (Phase 3) or InMemory (set externally before validation).
+    /// Returns <see langword="true"/> when the deprecated <see cref="RabbitMqConfigurator"/> marker
+    /// was set. Always <see langword="false"/> for every other transport, including the in-memory
+    /// one — actual transport presence is detected elsewhere from the <c>ITransportAdapter</c>
+    /// registration in the dependency injection container, not from this marker.
     /// </summary>
     internal bool HasTransport => RabbitMqConfigurator is not null || HasInMemoryTransport;
 }
