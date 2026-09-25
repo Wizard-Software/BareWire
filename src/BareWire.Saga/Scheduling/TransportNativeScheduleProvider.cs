@@ -89,12 +89,12 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
 
     // UTC ticks of the next time the time-based eviction scan is allowed to run. A scan sets
     // this to (now + EvictionGrace) after it runs; EvictStaleEntries skips the O(n) scan
-    // entirely until this checkpoint elapses. The size cap (EnforceMaxSize) does NOT feed into
+    // entirely until this checkpoint elapses. The size cap (EvictToCapacityNoLock) does NOT feed into
     // this checkpoint — it evicts via the O(log n) heap below instead of ever triggering a scan.
     private long _nextEvictionAtTicks;
 
     // Min-heap of (TokenKey, EvictAfter ticks) candidates, giving O(log n) access to the
-    // oldest live entry for EnforceMaxSize instead of an O(n) scan over the whole map. Every
+    // oldest live entry for EvictToCapacityNoLock instead of an O(n) scan over the whole map. Every
     // successful insert in ScheduleAsync pushes one candidate; overwriting, cancelling, or
     // time-evicting a key leaves its old candidate in the heap as a stale entry, which is
     // discarded lazily (by comparing against the map's CURRENT entry) the next time it is
@@ -103,7 +103,7 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
     private readonly Lock _heapLock = new();
 
     // Aggregation state for the "live token evicted under the cap" warning — all touched only
-    // while holding _heapLock (from EnforceMaxSize), so plain fields suffice.
+    // while holding _heapLock (from EvictToCapacityNoLock), so plain fields suffice.
     private int _evictedSinceLastWarning;
     private long _lastLiveEvictionWarningAtTicks;
     private Guid _sampleEvictedCorrelationId;
@@ -141,10 +141,9 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
         var enqueueAt = now + delay;
 
         // Time-based sweep of entries past EnqueueAt + grace. Amortized — see EvictStaleEntries.
+        // The size cap is enforced at insert time (StoreToken), not here: a check made before the
+        // broker round-trip below would be stale by the time the entry is stored.
         EvictStaleEntries(now);
-
-        // Size-cap enforcement — evict the oldest entry (via the heap) on overflow.
-        EnforceMaxSize(now);
 
         // Serialize message. Not a hot path — ArrayBufferWriter allocation is acceptable here
         // (same pattern as DelayRequeueScheduleProvider, explicitly noted in plan §13).
@@ -170,7 +169,7 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
         // look up. Scheduling the same (correlationId, T) pair again overwrites the prior entry.
         var key = new TokenKey(correlationId, typeof(T));
         var entry = new TokenEntry(token, enqueueAt + EvictionGrace);
-        StoreToken(key, entry);
+        StoreToken(key, entry, _timeProvider.GetUtcNow());
 
         LogScheduled(correlationId, typeof(T).Name, enqueueAt);
     }
@@ -213,38 +212,56 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
     // ── Private helpers ───────────────────────────────────────────────────────
 
     // Stores (key, entry) in the map, incrementing _count if and only if the key did not
-    // already exist. TryAdd and "overwrite an existing key" are two different outcomes that
-    // must be told apart atomically: naively falling back to `_tokens[key] = entry` after a
-    // failed TryAdd can re-insert a key that a concurrent CancelAsync/eviction removed between
-    // the TryAdd and the fallback write, silently underreporting _count relative to the map's
-    // real contents (PERF-3/SEC-2). The loop retries instead, so _count only ever changes on an
-    // insert/removal that actually happened.
-    private void StoreToken(TokenKey key, TokenEntry entry)
+    // already exist, and enforces the size cap as a hard limit.
+    //
+    // Every insert of a NEW key happens under _heapLock, right after EvictToCapacityNoLock has
+    // brought _count below the cap. Removals (cancel, time sweep) only ever decrease the count
+    // and run without the lock, so no concurrent caller can push the map past _maxTokens: a
+    // pre-insert check made outside the lock (e.g. before the broker round-trip) would let N
+    // concurrent callers each see "one slot free" and overshoot the cap by N - 1.
+    //
+    // Overwriting an existing key does not change the count. The two outcomes are told apart
+    // atomically via TryGetValue + TryUpdate / TryAdd in a retry loop: naively falling back to
+    // `_tokens[key] = entry` could re-insert a key that a concurrent CancelAsync/eviction just
+    // removed, silently underreporting _count relative to the map's real contents.
+    private void StoreToken(TokenKey key, TokenEntry entry, DateTimeOffset now)
     {
-        while (true)
+        lock (_heapLock)
         {
-            if (_tokens.TryAdd(key, entry))
+            while (true)
             {
-                Interlocked.Increment(ref _count);
-                break;
+                if (_tokens.TryGetValue(key, out TokenEntry existing))
+                {
+                    if (_tokens.TryUpdate(key, entry, existing))
+                    {
+                        break;
+                    }
+
+                    // The value changed or the key was removed between TryGetValue and TryUpdate
+                    // (a concurrent cancel or time sweep) — retry from the top.
+                    continue;
+                }
+
+                // New key: make room first so the insert below never exceeds the cap.
+                EvictToCapacityNoLock(now);
+
+                if (_tokens.TryAdd(key, entry))
+                {
+                    Interlocked.Increment(ref _count);
+                    break;
+                }
+
+                // Not reachable through ScheduleAsync (every add of a key goes through this
+                // lock), but retry defensively rather than assume.
             }
 
-            if (_tokens.TryGetValue(key, out TokenEntry existing) && _tokens.TryUpdate(key, entry, existing))
-            {
-                break;
-            }
-
-            // Either the key was removed concurrently after the TryAdd above failed (so
-            // TryGetValue found nothing), or TryUpdate lost a race against another writer
-            // (the value changed between TryGetValue and TryUpdate) — retry from the top.
+            EnqueueEvictionCandidateNoLock(key, entry);
         }
-
-        EnqueueEvictionCandidate(key, entry);
     }
 
     // Time-based sweep: scans the whole map only once the eviction checkpoint has elapsed (now
     // is at or past _nextEvictionAtTicks) — never on every ScheduleAsync call, and never merely
-    // because the map is near capacity (PERF-2; the size cap is handled by EnforceMaxSize's
+    // because the map is near capacity (PERF-2; the size cap is handled by EvictToCapacityNoLock's
     // heap instead, so a map saturated with live entries does not force a rescan here). A scan
     // that finds nothing to remove still advances the checkpoint, so an idle provider does not
     // re-scan on every subsequent call either. Concurrent scans are harmless: TryRemove is
@@ -267,85 +284,76 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
         Interlocked.Exchange(ref _nextEvictionAtTicks, (now + EvictionGrace).UtcTicks);
     }
 
-    // Size-cap enforcement. Cheap on the common path (a single Volatile.Read) and only touches
-    // the heap while the map is actually at or over the cap. Finds the oldest live entry via
-    // the min-heap in O(log n) instead of scanning the whole map (PERF-1): heap candidates are
-    // popped in EvictAfter order and checked against the map's CURRENT entry for that key,
-    // discarding stale candidates (left behind by overwrite/cancel/time-eviction) until a live
-    // match is found and atomically removed.
-    private void EnforceMaxSize(DateTimeOffset now)
+    // Size-cap enforcement, called by StoreToken under _heapLock before a new key is added.
+    // Cheap on the common path (a single Volatile.Read) and only touches the heap while the map
+    // is actually at the cap. Finds the oldest live entry via the min-heap in O(log n) instead
+    // of scanning the whole map: heap candidates are popped in EvictAfter order and checked
+    // against the map's CURRENT entry for that key, discarding stale candidates (left behind by
+    // overwrite/cancel/time-eviction) until a live match is found and atomically removed.
+    // Must be called while holding _heapLock.
+    private void EvictToCapacityNoLock(DateTimeOffset now)
     {
-        if (Volatile.Read(ref _count) < _maxTokens)
+        while (Volatile.Read(ref _count) >= _maxTokens)
         {
-            return;
-        }
-
-        lock (_heapLock)
-        {
-            while (Volatile.Read(ref _count) >= _maxTokens)
+            if (!_evictionHeap.TryDequeue(out TokenKey key, out long evictAfterTicks))
             {
-                if (!_evictionHeap.TryDequeue(out TokenKey key, out long evictAfterTicks))
+                // The heap ran dry (e.g. every remaining candidate was already popped as
+                // stale) while the map still reports entries at/over the cap. Rebuild the
+                // heap from the live map and retry once before giving up.
+                CompactEvictionHeapNoLock();
+                if (!_evictionHeap.TryDequeue(out key, out evictAfterTicks))
                 {
-                    // The heap ran dry (e.g. every remaining candidate was already popped as
-                    // stale) while the map still reports entries at/over the cap. Rebuild the
-                    // heap from the live map and retry once before giving up.
-                    CompactEvictionHeapNoLock();
-                    if (!_evictionHeap.TryDequeue(out key, out evictAfterTicks))
-                    {
-                        break; // Map is empty (concurrent removal race) — nothing left to evict.
-                    }
+                    break; // Map is empty (concurrent removal race) — nothing left to evict.
                 }
+            }
 
-                if (!_tokens.TryGetValue(key, out TokenEntry current) || current.EvictAfter.UtcTicks != evictAfterTicks)
-                {
-                    // Stale heap candidate: this key was overwritten, cancelled, or time-evicted
-                    // since this candidate was pushed. Lazy deletion — discard and pop the next.
-                    continue;
-                }
+            if (!_tokens.TryGetValue(key, out TokenEntry current) || current.EvictAfter.UtcTicks != evictAfterTicks)
+            {
+                // Stale heap candidate: this key was overwritten, cancelled, or time-evicted
+                // since this candidate was pushed. Lazy deletion — discard and pop the next.
+                continue;
+            }
 
-                if (!_tokens.TryRemove(new KeyValuePair<TokenKey, TokenEntry>(key, current)))
-                {
-                    // Lost a race with a concurrent cancel/re-schedule between the read above
-                    // and this compare-and-remove. Discard and pop the next candidate.
-                    continue;
-                }
+            if (!_tokens.TryRemove(new KeyValuePair<TokenKey, TokenEntry>(key, current)))
+            {
+                // Lost a race with a concurrent cancel/re-schedule between the read above
+                // and this compare-and-remove. Discard and pop the next candidate.
+                continue;
+            }
 
-                Interlocked.Decrement(ref _count);
+            Interlocked.Decrement(ref _count);
 
-                // The entry's own timeout has not fired yet (its enqueueAt is still in the
-                // future) — evicting it under the size cap means it can no longer be cancelled.
-                if (current.EvictAfter - EvictionGrace > now)
-                {
-                    RecordLiveTokenEvictionNoLock(key.CorrelationId, key.MessageType.Name, now);
-                }
+            // The entry's own timeout has not fired yet (its enqueueAt is still in the
+            // future) — evicting it under the size cap means it can no longer be cancelled.
+            if (current.EvictAfter - EvictionGrace > now)
+            {
+                RecordLiveTokenEvictionNoLock(key.CorrelationId, key.MessageType.Name, now);
             }
         }
     }
 
     // Pushes one eviction candidate for the entry just stored. Must be called with the same
     // (key, entry) that StoreToken just wrote to _tokens — the heap's priority is EvictAfter's
-    // UtcTicks, so EnforceMaxSize can tell a live heap candidate from a stale one just by
-    // comparing against the map's current entry (see EnforceMaxSize).
-    private void EnqueueEvictionCandidate(TokenKey key, TokenEntry entry)
+    // UtcTicks, so EvictToCapacityNoLock can tell a live heap candidate from a stale one just by
+    // comparing against the map's current entry. Must be called while holding _heapLock.
+    private void EnqueueEvictionCandidateNoLock(TokenKey key, TokenEntry entry)
     {
-        lock (_heapLock)
-        {
-            _evictionHeap.Enqueue(key, entry.EvictAfter.UtcTicks);
+        _evictionHeap.Enqueue(key, entry.EvictAfter.UtcTicks);
 
-            // Overwritten, cancelled, and time-evicted keys leave their old candidate behind as
-            // heap garbage that is never proactively removed (only lazily discarded on pop).
-            // Rebuilding from the live map bounds that garbage instead of letting the heap grow
-            // without limit under sustained overwrite/cancel churn.
-            if (_evictionHeap.Count > _maxTokens * HeapCompactionMultiplier)
-            {
-                CompactEvictionHeapNoLock();
-            }
+        // Overwritten, cancelled, and time-evicted keys leave their old candidate behind as
+        // heap garbage that is never proactively removed (only lazily discarded on pop).
+        // Rebuilding from the live map bounds that garbage instead of letting the heap grow
+        // without limit under sustained overwrite/cancel churn.
+        if (_evictionHeap.Count > _maxTokens * HeapCompactionMultiplier)
+        {
+            CompactEvictionHeapNoLock();
         }
     }
 
     // Rebuilds the heap from the live map's current entries. Must be called while holding
     // _heapLock. Runs only when the heap has grown past HeapCompactionMultiplier × the cap, so
-    // it is rare — the map itself never holds more than _maxTokens live entries at a time.
+    // it is rare. The map itself never holds more than _maxTokens entries: StoreToken makes room
+    // and adds a new key under _heapLock, so the cap is a hard limit even under concurrency.
     private void CompactEvictionHeapNoLock()
     {
         _evictionHeap.Clear();

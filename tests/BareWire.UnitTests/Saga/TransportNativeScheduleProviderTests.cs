@@ -414,6 +414,56 @@ public sealed class TransportNativeScheduleProviderTests
     }
 
     /// <summary>
+    /// The size cap must hold under concurrency: calls that all pass the cap check while the
+    /// map is full and then insert after their broker round-trip completes must not push the map
+    /// past the cap. The broker call is held open until every caller has reached it, so every
+    /// insert happens after every pre-await check.
+    /// </summary>
+    [Fact]
+    public async Task ScheduleAsync_ConcurrentCallsAtCap_NeverExceedCap()
+    {
+        const int max = 4;
+        const int concurrentCalls = 16;
+        var (provider, scheduler, _, _) = CreateProvider(maxTokens: max);
+
+        long seq = 0;
+        scheduler.ScheduleAsync(Arg.Any<OutboundMessage>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(_ => Task.FromResult(AToken(seq: Interlocked.Increment(ref seq))));
+
+        for (int i = 0; i < max; i++)
+        {
+            var id = Guid.NewGuid();
+            await provider.ScheduleAsync(new OrderTimeout(id), TimeSpan.FromMinutes(30), "q", id);
+        }
+
+        var allCallersReachedBroker = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int callersAtBroker = 0;
+        scheduler.ScheduleAsync(Arg.Any<OutboundMessage>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(async _ =>
+            {
+                if (Interlocked.Increment(ref callersAtBroker) == concurrentCalls)
+                {
+                    allCallersReachedBroker.SetResult();
+                }
+
+                await allCallersReachedBroker.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                return AToken(seq: Interlocked.Increment(ref seq));
+            });
+
+        Task[] calls = Enumerable.Range(0, concurrentCalls)
+            .Select(_ => Task.Run(async () =>
+            {
+                var id = Guid.NewGuid();
+                await provider.ScheduleAsync(new OrderTimeout(id), TimeSpan.FromMinutes(30), "q", id);
+            }))
+            .ToArray();
+        await Task.WhenAll(calls);
+
+        provider.DictionaryEntryCount.Should().Be(max);
+        provider.TokenCount.Should().Be(max);
+    }
+
+    /// <summary>
     /// PERF-1: repeated overflow within one <c>LiveEvictionWarningInterval</c> must fold into a
     /// single aggregated warning instead of logging one line per eviction. Once the interval
     /// elapses, the next overflow flushes everything accumulated since the last warning.
