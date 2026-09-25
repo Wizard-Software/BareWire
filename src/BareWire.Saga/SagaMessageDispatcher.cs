@@ -21,11 +21,12 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
     where TStateMachine : BareWireStateMachine<TSaga>
     where TSaga : class, ISagaState, new()
 {
-    // Type-erased delegate: (scopeFactory, definition, loggerFactory, body, headers, msgId, endpointName, pub, send, deserResolver, ct) -> Task<bool>
+    // Type-erased delegate: (scopeFactory, definition, loggerFactory, scheduleProviderCache, body, headers, msgId, endpointName, pub, send, deserResolver, ct) -> Task<bool>
     private delegate Task<bool> TryDispatchEventDelegate(
         IServiceScopeFactory scopeFactory,
         StateMachineDefinition<TSaga> definition,
         ILoggerFactory loggerFactory,
+        SagaScheduleProviderCache scheduleProviderCache,
         ReadOnlySequence<byte> body,
         IReadOnlyDictionary<string, string> headers,
         string messageId,
@@ -45,6 +46,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<SagaMessageDispatcher<TStateMachine, TSaga>> _logger;
+    private readonly SagaScheduleProviderCache _scheduleProviderCache = new();
 
     /// <inheritdoc />
     public Type StateMachineType => typeof(TStateMachine);
@@ -104,7 +106,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
                 if (string.Equals(_eventTypeNames[i], messageType, StringComparison.Ordinal))
                 {
                     return await _eventDispatchers[i](
-                        _scopeFactory, _definition, _loggerFactory,
+                        _scopeFactory, _definition, _loggerFactory, _scheduleProviderCache,
                         body, headers, messageId, endpointName,
                         publishEndpoint, sendEndpointProvider,
                         deserializerResolver, cancellationToken).ConfigureAwait(false);
@@ -119,7 +121,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
         foreach (TryDispatchEventDelegate dispatch in _eventDispatchers)
         {
             bool handled = await dispatch(
-                _scopeFactory, _definition, _loggerFactory,
+                _scopeFactory, _definition, _loggerFactory, _scheduleProviderCache,
                 body, headers, messageId, endpointName,
                 publishEndpoint, sendEndpointProvider,
                 deserializerResolver, cancellationToken).ConfigureAwait(false);
@@ -135,7 +137,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
     private static TryDispatchEventDelegate BuildEventDelegate<TEvent>()
         where TEvent : class
     {
-        return async (scopeFactory, definition, loggerFactory, body, headers, messageId, endpointName, pub, send, deserResolver, ct) =>
+        return async (scopeFactory, definition, loggerFactory, scheduleProviderCache, body, headers, messageId, endpointName, pub, send, deserResolver, ct) =>
         {
             headers.TryGetValue("content-type", out string? contentType);
             IMessageDeserializer deser = deserResolver.Resolve(contentType);
@@ -160,8 +162,7 @@ internal sealed partial class SagaMessageDispatcher<TStateMachine, TSaga> : ISag
             ISagaRepository<TSaga> repository = scope.ServiceProvider.GetRequiredService<ISagaRepository<TSaga>>();
             ITransportAdapter transport = scope.ServiceProvider.GetRequiredService<ITransportAdapter>();
             IMessageSerializer serializer = scope.ServiceProvider.GetRequiredService<IMessageSerializer>();
-            IScheduleProvider scheduleProvider = ScheduleProviderFactory.Create(
-                SchedulingStrategy.Auto, transport, loggerFactory, serializer);
+            IScheduleProvider scheduleProvider = scheduleProviderCache.GetOrCreate(transport, serializer, loggerFactory);
             var executor = new StateMachineExecutor<TSaga>(
                 definition, repository, loggerFactory.CreateLogger<StateMachineExecutor<TSaga>>(),
                 scheduleProvider, endpointName);

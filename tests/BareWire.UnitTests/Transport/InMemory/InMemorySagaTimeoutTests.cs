@@ -23,13 +23,14 @@ namespace BareWire.UnitTests.Transport.InMemory;
 /// <see cref="InMemoryMessageScheduler"/> without ever deploying topology.
 /// </summary>
 /// <remarks>
-/// Timeout CANCELLATION through the saga ENGINE is a separate, unresolved limitation, out of this
-/// subtask's write scope: <c>SagaMessageDispatcher</c> builds a fresh <c>IScheduleProvider</c> per
-/// dispatched event, so the <c>correlationId → token</c> map a single <c>TransportNativeScheduleProvider</c>
-/// instance keeps is empty by the time a later event tries to cancel — the cancel call is then a no-op and
-/// a timeout the saga engine believes it cancelled is still delivered. <see cref="NativeProvider_CancelBeforeDue_IsNotDelivered"/>
-/// below exercises cancellation at the PROVIDER level only (one provider instance handling both calls) and
-/// is named accordingly — it is not evidence that saga-engine cancellation works end to end.
+/// Timeout CANCELLATION through the saga ENGINE — a later event's <c>CancelTimeout&lt;T&gt;()</c> actually
+/// removing a timeout scheduled by an earlier event of the same saga — is covered separately by
+/// <c>SagaTimeoutCancelAcrossEventsTests</c> (<c>BareWire.UnitTests.Saga</c>), which dispatches two
+/// separate events through one <c>SagaMessageDispatcher</c>. This class checks cancellation at the
+/// PROVIDER level only: <see cref="NativeProvider_CancelBeforeDue_IsNotDelivered"/> below drives both the
+/// schedule and the cancel call through one <see cref="TransportNativeScheduleProvider"/> instance, so its
+/// token map is already populated when <c>CancelAsync</c> runs — it is not evidence, on its own, that
+/// saga-engine cancellation works end to end.
 /// </remarks>
 public sealed class InMemorySagaTimeoutTests
 {
@@ -102,7 +103,8 @@ public sealed class InMemorySagaTimeoutTests
     /// <summary>
     /// PROVIDER-level cancellation test — see this class's own remarks. One
     /// <see cref="TransportNativeScheduleProvider"/> instance drives both calls, so its token map is
-    /// populated when <c>CancelAsync</c> runs; the saga engine itself does not guarantee this.
+    /// populated when <c>CancelAsync</c> runs. Cancellation through the saga engine, across two separate
+    /// dispatched events, is covered by <c>SagaTimeoutCancelAcrossEventsTests</c>.
     /// </summary>
     [Fact]
     public async Task NativeProvider_CancelBeforeDue_IsNotDelivered()
