@@ -14,6 +14,7 @@ Each transport ships a thin **bundle** package — `BareWire.RabbitMQ`, `BareWir
 the core and the matching transport and exposes a single `AddBareWireWith{Transport}` method:
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
 builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
 
 builder.Services.AddBareWireWithRabbitMq(
@@ -34,6 +35,9 @@ The `bus` delegate is optional — omit it when transport defaults are enough:
 builder.Services.AddBareWireWithRabbitMq(transport => transport.Host("amqp://localhost"));
 ```
 
+Every registration path also needs a serializer: register one with `AddBareWireJsonSerializer()`
+(or another serializer package). Neither the core nor a bundle registers a serializer for you.
+
 This is the most ergonomic path for the common case of a single transport. Install one package
 (`BareWire.RabbitMQ`) instead of two, and register in one statement.
 
@@ -43,6 +47,7 @@ Register the transport adapter and the core explicitly. Use this when you refere
 transport packages separately, or you want maximum control over package versions:
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
 builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
 
 builder.Services.AddBareWireRabbitMq(transport =>
