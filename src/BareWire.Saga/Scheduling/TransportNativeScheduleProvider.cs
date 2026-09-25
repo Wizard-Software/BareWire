@@ -79,12 +79,12 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
     // types scheduled for the same saga instance never collide.
     private readonly ConcurrentDictionary<TokenKey, TokenEntry> _tokens = new();
 
-    // Live entry count, maintained by Interlocked increment/decrement — but ONLY on an insert
-    // that actually adds a new key and a removal that actually takes an entry out. The
-    // insert loop in ScheduleAsync distinguishes "added a new key" from "overwrote an existing
-    // key" so a key re-inserted after a concurrent removal (TryAdd racing TryRemove) can never
-    // drift the counter. Read instead of _tokens.Count (which takes every internal bucket lock)
-    // by TokenCount and the size-cap check below.
+    // Live entry count, changed ONLY on an insert that actually adds a new key and a removal
+    // that actually takes an entry out. Every map/counter mutation (StoreToken, CancelAsync,
+    // EvictStaleEntries, EvictToCapacityNoLock) runs under _heapLock, so the count equals the
+    // map's real size whenever the lock is free and the cap check cannot be defeated by a
+    // concurrent writer. Interlocked/Volatile keep lock-free reads (TokenCount) accurate.
+    // Read instead of _tokens.Count (which takes every internal bucket lock).
     private int _count;
 
     // UTC ticks of the next time the time-based eviction scan is allowed to run. A scan sets
@@ -179,9 +179,21 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
         Guid correlationId,
         CancellationToken cancellationToken = default) where T : class
     {
-        if (_tokens.TryRemove(new TokenKey(correlationId, typeof(T)), out TokenEntry entry))
+        bool removed;
+        TokenEntry entry;
+        lock (_heapLock)
         {
-            Interlocked.Decrement(ref _count);
+            // Every map/counter mutation runs under _heapLock, so _count always equals the map's
+            // real size at lock boundaries. The broker call below stays outside the lock.
+            removed = _tokens.TryRemove(new TokenKey(correlationId, typeof(T)), out entry);
+            if (removed)
+            {
+                Interlocked.Decrement(ref _count);
+            }
+        }
+
+        if (removed)
+        {
             await _scheduler.CancelScheduledAsync(entry.Token, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -215,15 +227,13 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
     // already exist, and enforces the size cap as a hard limit.
     //
     // Every insert of a NEW key happens under _heapLock, right after EvictToCapacityNoLock has
-    // brought _count below the cap. Removals (cancel, time sweep) only ever decrease the count
-    // and run without the lock, so no concurrent caller can push the map past _maxTokens: a
-    // pre-insert check made outside the lock (e.g. before the broker round-trip) would let N
-    // concurrent callers each see "one slot free" and overshoot the cap by N - 1.
+    // brought _count below the cap. Removals (cancel, time sweep, cap eviction) take the same
+    // lock, so _count equals the map's size here and no concurrent caller can push the map past
+    // _maxTokens. A pre-insert check made outside the lock (e.g. before the broker round-trip)
+    // would let N concurrent callers each see "one slot free" and overshoot the cap by N - 1.
     //
-    // Overwriting an existing key does not change the count. The two outcomes are told apart
-    // atomically via TryGetValue + TryUpdate / TryAdd in a retry loop: naively falling back to
-    // `_tokens[key] = entry` could re-insert a key that a concurrent CancelAsync/eviction just
-    // removed, silently underreporting _count relative to the map's real contents.
+    // Overwriting an existing key does not change the count; TryGetValue decides between the
+    // overwrite and the add, and the loop retries if the key changed in between.
     private void StoreToken(TokenKey key, TokenEntry entry, DateTimeOffset now)
     {
         lock (_heapLock)
@@ -264,8 +274,9 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
     // because the map is near capacity (PERF-2; the size cap is handled by EvictToCapacityNoLock's
     // heap instead, so a map saturated with live entries does not force a rescan here). A scan
     // that finds nothing to remove still advances the checkpoint, so an idle provider does not
-    // re-scan on every subsequent call either. Concurrent scans are harmless: TryRemove is
-    // idempotent, so a losing thread's removal attempt is simply a no-op.
+    // re-scan on every subsequent call either. The scan runs under _heapLock like every other
+    // map/counter mutation, and removes an entry only if it is still the stale value it read, so
+    // a key re-scheduled with a fresh token is never swept away.
     private void EvictStaleEntries(DateTimeOffset now)
     {
         if (now.UtcTicks < Interlocked.Read(ref _nextEvictionAtTicks))
@@ -273,15 +284,24 @@ internal sealed partial class TransportNativeScheduleProvider : IScheduleProvide
             return;
         }
 
-        foreach (var (key, entry) in _tokens)
+        lock (_heapLock)
         {
-            if (entry.EvictAfter <= now && _tokens.TryRemove(key, out _))
+            if (now.UtcTicks < Interlocked.Read(ref _nextEvictionAtTicks))
             {
-                Interlocked.Decrement(ref _count);
+                return; // Another caller swept while this one waited for the lock.
             }
-        }
 
-        Interlocked.Exchange(ref _nextEvictionAtTicks, (now + EvictionGrace).UtcTicks);
+            foreach (var (key, entry) in _tokens)
+            {
+                if (entry.EvictAfter <= now
+                    && _tokens.TryRemove(new KeyValuePair<TokenKey, TokenEntry>(key, entry)))
+                {
+                    Interlocked.Decrement(ref _count);
+                }
+            }
+
+            Interlocked.Exchange(ref _nextEvictionAtTicks, (now + EvictionGrace).UtcTicks);
+        }
     }
 
     // Size-cap enforcement, called by StoreToken under _heapLock before a new key is added.

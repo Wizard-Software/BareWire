@@ -464,6 +464,72 @@ public sealed class TransportNativeScheduleProviderTests
     }
 
     /// <summary>
+    /// Mixed concurrent schedule / overwrite / cancel / time-sweep traffic on a small cap must
+    /// keep the counter equal to the map's real contents and never let the map exceed the cap.
+    /// The broker call yields so schedule and cancel interleave across threads.
+    /// </summary>
+    [Fact]
+    public async Task ScheduleAndCancel_ConcurrentMixedTraffic_CounterMatchesMapAndCapHolds()
+    {
+        const int max = 8;
+        var (provider, scheduler, _, timeProvider) = CreateProvider(maxTokens: max);
+
+        long seq = 0;
+        int maxObserved = 0;
+        scheduler.ScheduleAsync(Arg.Any<OutboundMessage>(), Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>())
+            .Returns(async _ =>
+            {
+                await Task.Yield();
+                int size = provider.DictionaryEntryCount;
+                int observed;
+                while (size > (observed = Volatile.Read(ref maxObserved))
+                    && Interlocked.CompareExchange(ref maxObserved, size, observed) != observed)
+                {
+                }
+
+                return AToken(seq: Interlocked.Increment(ref seq));
+            });
+
+        // A small pool of correlation ids so schedules overwrite and cancels hit live keys.
+        Guid[] ids = Enumerable.Range(0, 24).Select(_ => Guid.NewGuid()).ToArray();
+
+        Task[] workers = Enumerable.Range(0, 8)
+            .Select(worker => Task.Run(async () =>
+            {
+                var random = new Random(worker);
+                for (int i = 0; i < 400; i++)
+                {
+                    Guid id = ids[random.Next(ids.Length)];
+                    switch (random.Next(4))
+                    {
+                        case 0:
+                            await provider.CancelAsync<OrderTimeout>(id);
+                            break;
+                        case 1:
+                            await provider.ScheduleAsync(new PaymentTimeout(id), TimeSpan.FromMinutes(1), "q", id);
+                            break;
+                        default:
+                            await provider.ScheduleAsync(
+                                new OrderTimeout(id), TimeSpan.FromMinutes(random.Next(1, 30)), "q", id);
+                            break;
+                    }
+
+                    if (worker == 0 && i % 50 == 0)
+                    {
+                        // Push some entries past EvictAfter so the time sweep runs concurrently.
+                        timeProvider.Advance(TimeSpan.FromMinutes(10));
+                    }
+                }
+            }))
+            .ToArray();
+        await Task.WhenAll(workers);
+
+        provider.TokenCount.Should().Be(provider.DictionaryEntryCount);
+        provider.DictionaryEntryCount.Should().BeLessThanOrEqualTo(max);
+        maxObserved.Should().BeLessThanOrEqualTo(max);
+    }
+
+    /// <summary>
     /// PERF-1: repeated overflow within one <c>LiveEvictionWarningInterval</c> must fold into a
     /// single aggregated warning instead of logging one line per eviction. Once the interval
     /// elapses, the next overflow flushes everything accumulated since the last warning.
