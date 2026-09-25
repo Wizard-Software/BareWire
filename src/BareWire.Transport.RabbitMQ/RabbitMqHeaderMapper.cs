@@ -8,8 +8,37 @@ namespace BareWire.Transport.RabbitMQ;
 /// Default AMQP ↔ BareWire mappings are always applied; a <see cref="RabbitMqHeaderMappingConfigurator"/>
 /// can override or extend them.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Headers with the reserved <c>BW-</c> prefix are transport-authoritative: they must originate either
+/// from this transport itself or from an AMQP property this mapper maps by default, never from an
+/// arbitrary raw header a publisher put on the wire.
+/// </para>
+/// <para>
+/// On outbound, an unmapped <c>BW-</c>-prefixed header is never sent on the wire — the prefix is
+/// compared case-insensitively (<see cref="StringComparison.OrdinalIgnoreCase"/>), so <c>bw-forged</c>
+/// and <c>Bw-Forged</c> are stripped just like <c>BW-Forged</c>.
+/// </para>
+/// <para>
+/// On inbound, an unmapped raw <c>BW-</c>-prefixed header is dropped (case-insensitive) without being
+/// logged, with two exceptions compared using an exact, case-sensitive match: the mapping-epoch header
+/// this transport itself stamps directly onto the AMQP headers dictionary, and <c>BW-MessageType</c>
+/// when the result does not already carry a message type — that is, when the AMQP <c>Type</c> property
+/// (or a configured <c>MapMessageType</c> source) left it empty. The <c>Type</c> property always wins
+/// over the raw header when both are present.
+/// </para>
+/// <para>
+/// An explicit header mapping configured via <see cref="RabbitMqHeaderMappingConfigurator.MapHeader"/> —
+/// including an identity mapping such as mapping <c>BW-TenantId</c> to itself — takes precedence over
+/// this filter in both directions, and is the supported way to carry a custom <c>BW-</c>-prefixed header
+/// through the broker.
+/// </para>
+/// </remarks>
 internal sealed class RabbitMqHeaderMapper
 {
+    // Reserved BareWire header prefix — see the trust-boundary remarks on the type above.
+    private const string ReservedHeaderPrefix = "BW-";
+
     // Default AMQP property names used as source/destination keys in the custom-mapping lookup.
     private const string BwMessageId = "message-id";
     private const string BwCorrelationId = "correlation-id";
@@ -109,12 +138,11 @@ internal sealed class RabbitMqHeaderMapper
                 }
 
                 string rawKey = entry.Key;
-                string rawValue = ConvertHeaderValue(entry.Value);
 
                 // traceparent is always mapped 1:1 by default
                 if (rawKey.Equals(BwTraceparent, StringComparison.OrdinalIgnoreCase))
                 {
-                    result[BwTraceparent] = rawValue;
+                    result[BwTraceparent] = ConvertHeaderValue(entry.Value);
                     continue;
                 }
 
@@ -124,12 +152,19 @@ internal sealed class RabbitMqHeaderMapper
 
                 if (bareWireKey is not null)
                 {
-                    result[bareWireKey] = rawValue;
+                    result[bareWireKey] = ConvertHeaderValue(entry.Value);
+                }
+                else if (IsReservedHeader(rawKey) && !IsAcceptedReservedWireHeader(rawKey, result))
+                {
+                    // Unmapped reserved BareWire header supplied by the publisher, not stamped by this
+                    // transport — drop it so it cannot masquerade as transport-authoritative metadata.
+                    // The value is intentionally never decoded here: dropped headers must not pay the
+                    // conversion cost.
                 }
                 else if (!ignoreUnmapped)
                 {
                     // Passthrough: no mapping defined but we are not filtering
-                    result[rawKey] = rawValue;
+                    result[rawKey] = ConvertHeaderValue(entry.Value);
                 }
                 // else: ignoreUnmapped=true and no mapping found → drop header
             }
@@ -225,8 +260,9 @@ internal sealed class RabbitMqHeaderMapper
                 continue;
             }
 
-            // Skip remaining internal BareWire routing headers — they must not be sent on the wire.
-            if (bwKey.StartsWith("BW-", StringComparison.Ordinal))
+            // Skip remaining reserved BareWire headers (case-insensitive) — only the transport stamps
+            // them on the wire.
+            if (IsReservedHeader(bwKey))
             {
                 continue;
             }
@@ -242,6 +278,19 @@ internal sealed class RabbitMqHeaderMapper
 
         return (props, amqpHeaders);
     }
+
+    // Returns whether the key carries the reserved BareWire prefix, compared case-insensitively.
+    private static bool IsReservedHeader(string key) =>
+        key.StartsWith(ReservedHeaderPrefix, StringComparison.OrdinalIgnoreCase);
+
+    // Returns whether an unmapped reserved header is nonetheless accepted from the raw AMQP headers
+    // dictionary: either the mapping-epoch header this transport stamps itself (bypassing MapOutbound),
+    // or BW-MessageType when the result does not already carry a message type (the AMQP Type property,
+    // mapped earlier, always wins). Both comparisons are exact-case — a letter-case variant is not
+    // accepted and falls through to the drop branch.
+    private static bool IsAcceptedReservedWireHeader(string key, Dictionary<string, string> result) =>
+        key.Equals(RabbitMqTransportAdapter.MappingEpochHeaderName, StringComparison.Ordinal) ||
+        (key.Equals(BwMessageType, StringComparison.Ordinal) && !result.ContainsKey(BwMessageType));
 
     private static string? ReadStringHeader(IDictionary<string, object?>? headers, string key)
     {

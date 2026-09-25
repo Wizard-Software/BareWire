@@ -145,6 +145,124 @@ public sealed class RabbitMqHeaderMapperTests
         result["traceparent"].Should().Be("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
     }
 
+    // ── Reserved BW-* header trust boundary ─────────────────────────────────────
+
+    [Theory]
+    [InlineData("bw-forged")]
+    [InlineData("Bw-Forged")]
+    [InlineData("BW-FORGED")]
+    public void MapOutbound_BwPrefixedHeaderInAnyCaseWithoutMapping_IsNotSentOnTheWire(string forgedKey)
+    {
+        // Arrange
+        var sut = CreateDefaultMapper();
+        var headers = new Dictionary<string, string>
+        {
+            [forgedKey] = "forged-value",
+            ["x-tenant-id"] = "tenant-42",
+        };
+
+        // Act
+        (_, Dictionary<string, object?> amqpHeaders) = sut.MapOutbound(headers);
+
+        // Assert
+        amqpHeaders.Should().NotContainKey(forgedKey);
+        amqpHeaders.Should().ContainKey("x-tenant-id", "non-reserved headers must still pass through");
+    }
+
+    [Theory]
+    [InlineData("BW-Exchange")]
+    [InlineData("bw-exchange")]
+    [InlineData("BW-RoutingKey")]
+    [InlineData("Bw-ConsumerChannelId")]
+    [InlineData("BW-Forged")]
+    [InlineData("bw-messagetype")]
+    [InlineData("BW-Endpoint")]
+    [InlineData("bw-mappingepoch")]
+    public void MapInbound_UnmappedRawBwHeaderInAnyCase_IsDropped(string forgedKey)
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?>
+        {
+            [forgedKey] = "forged-value",
+            ["x-tenant-id"] = "tenant-42",
+        };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateDefaultMapper();
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result.Should().NotContainKey(forgedKey);
+        result["x-tenant-id"].Should().Be("tenant-42", "non-reserved headers must still pass through");
+    }
+
+    [Fact]
+    public void MapInbound_RawBwMessageTypeHeader_DoesNotOverrideAmqpTypeProperty()
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?> { ["BW-MessageType"] = "ForgedType" };
+        IReadOnlyBasicProperties properties = CreateProperties(type: "OrderCreated", headers: amqpHeaders);
+        var sut = CreateDefaultMapper();
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result["BW-MessageType"].Should().Be("OrderCreated");
+    }
+
+    [Fact]
+    public void MapInbound_RawBwMessageTypeHeaderWhenAmqpTypeIsEmpty_IsAccepted()
+    {
+        // Arrange — no AMQP Type property set, so the raw BW-MessageType header is the only source.
+        var amqpHeaders = new Dictionary<string, object?> { ["BW-MessageType"] = "OrderCreated" };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateDefaultMapper();
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result["BW-MessageType"].Should().Be("OrderCreated");
+    }
+
+    [Fact]
+    public void MapInbound_TransportStampedMappingEpochHeader_IsPreserved()
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?>
+        {
+            [RabbitMqTransportAdapter.MappingEpochHeaderName] = 42L,
+        };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateDefaultMapper();
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result[RabbitMqTransportAdapter.MappingEpochHeaderName].Should().Be("42");
+    }
+
+    [Fact]
+    public void MapInbound_ExplicitIdentityMappedBwHeader_IsPreservedInBothDirections()
+    {
+        // Arrange
+        var sut = CreateMapperWith(cfg => cfg.MapHeader("BW-TenantId", "BW-TenantId"));
+        IReadOnlyBasicProperties properties = CreateProperties(
+            headers: new Dictionary<string, object?> { ["BW-TenantId"] = "tenant-7" });
+
+        // Act
+        (_, Dictionary<string, object?> outbound) =
+            sut.MapOutbound(new Dictionary<string, string> { ["BW-TenantId"] = "tenant-7" });
+        Dictionary<string, string> inbound = sut.MapInbound(properties);
+
+        // Assert
+        outbound["BW-TenantId"].Should().Be("tenant-7");
+        inbound["BW-TenantId"].Should().Be("tenant-7");
+    }
+
     // ── MapOutbound — default mappings ────────────────────────────────────────
 
     [Fact]

@@ -334,7 +334,7 @@ Routing, settlement and dead-lettering mirror the RabbitMQ transport: the same e
 | Full dead-letter queue | The dead-letter queue's own overflow policy applies | The new dead-letter is dropped with a `Warning` and a metric; settlement never waits |
 | `Requeue` limit | Classic queues: unlimited; quorum queues: `delivery-limit` | Always limited by `MaxRedeliveries` (20), then dead-lettered or dropped |
 | Dead-letter headers | `x-death` header chain | No `x-death`; the original `BW-Exchange` and `BW-RoutingKey` are kept and the redelivery count resets |
-| `BW-*` headers | Carried as set by the publisher, subject to header mapping | Stripped and stamped authoritatively (`BW-RoutingKey`, `BW-Exchange`); `BW-MessageType` is the exception and passes through |
+| `BW-*` headers | Unmapped `BW-*` headers are not sent and are dropped on receive (any letter case); `BW-MessageType` is accepted only when the AMQP `type` property is empty; an explicit header mapping carries a `BW-*` header in both directions | Stripped and stamped authoritatively (`BW-RoutingKey`, `BW-Exchange`); `BW-MessageType` is the exception and passes through |
 | Header mapping and allow-listing | Available | Not available; application headers pass through unfiltered |
 | Topology at runtime | Can be declared at any time | Sealed when the bus starts; declaring a different topology later fails. Saga timeouts use the transport's native scheduler instead of runtime delay queues |
 | Unsupported features | — | `Headers` and `ConsistentHash` exchanges, queue arguments such as TTL, `x-max-length`, `x-max-length-bytes` and `x-expires`, and `TransportAffinity.ConsistentHash` fail at startup with a configuration error |

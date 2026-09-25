@@ -49,9 +49,9 @@ public abstract class TransportSemanticParityTests
     /// The default implementation goes through <see cref="ITransportAdapter.SendBatchAsync"/> like every
     /// other scenario. A transport whose header mapper strips or renames <c>BW-*</c> headers at publish
     /// time (RabbitMQ's does) overrides this hook to make the forged header actually reach the broker —
-    /// for example by configuring the adapter with a header mapper that maps <c>BW-Forged</c> to a
-    /// broker-native name, or by publishing with the raw client and letting the adapter consume it — so
-    /// the difference test proves the real trust gap instead of a testing artifact.
+    /// by configuring the adapter with a header mapper that maps <c>BW-Forged</c> to a broker-native
+    /// name, the only way a <c>BW-*</c> header survives the outbound strip — so the difference test
+    /// proves the real (opt-in) behavior instead of a testing artifact.
     /// </remarks>
     protected virtual Task<IReadOnlyList<SendResult>> SendD4MessageAsync(
         ITransportAdapter adapter, string exchange, string routingKey, string payload, CancellationToken cancellationToken)
@@ -835,9 +835,9 @@ public abstract class TransportSemanticParityTests
     }
 
     /// <summary>
-    /// D4 — a publisher-supplied <c>BW-*</c> header reaching the consumer unchanged is a known trust gap
-    /// on RabbitMQ, not a guaranteed feature: it documents that a subscriber must never trust a
-    /// publisher-supplied <c>BW-*</c> header as if the transport had stamped it.
+    /// D4 — a publisher-supplied <c>BW-*</c> header reaches the consumer only through an explicit header
+    /// mapping on RabbitMQ; unmapped raw <c>BW-*</c> headers are dropped on both the send and the
+    /// receive side.
     /// </summary>
     [Fact]
     public async Task ConsumeAsync_PublisherSuppliedBwHeader_IsPreservedByTransport()
@@ -858,8 +858,8 @@ public abstract class TransportSemanticParityTests
         Payload(received).Should().Be("forged-header-payload");
         received.Headers.Should().ContainKey("BW-Forged").WhoseValue.Should().Be(
             "forged-value",
-            "a publisher-supplied BW-* header reaching the consumer is a known RabbitMQ trust gap, not a " +
-            "guaranteed feature — see the skip reason on the in-memory transport for the opposite, safer default");
+            "on RabbitMQ a BW-* header survives only through the explicit header mapping this setup " +
+            "configures — see the skip reason on the in-memory transport, which has no mapping and always strips");
         await adapter.SettleAsync(SettlementAction.Ack, received, cts.Token);
     }
 

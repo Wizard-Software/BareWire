@@ -45,9 +45,9 @@ public sealed class RabbitMqTransportSemanticParityTests(AspireFixture fixture)
         string connectionString = fixture.GetRabbitMqConnectionString();
 
         var headerMappingConfigurator = new RabbitMqHeaderMappingConfigurator();
-        // D4's forged canonical header would otherwise be stripped as an internal "BW-" header by
-        // RabbitMqHeaderMapper.MapOutbound — mapping it to a broker-native name is what lets the
-        // known trust gap the D4 test documents actually reach the consumer on this transport.
+        // The forged canonical header is stripped as a reserved "BW-" header on send and dropped on
+        // receive unless mapped — mapping it to a broker-native name is what lets it round-trip in
+        // both directions.
         headerMappingConfigurator.MapHeader(ForgedHeaderName, ForgedHeaderTransportName);
         var headerMapper = new RabbitMqHeaderMapper(headerMappingConfigurator);
 

@@ -179,6 +179,47 @@ negative confirm. On that path guaranteed routing turns a *silent* drop into an 
 warning log) but does not by itself make direct publishing at-least-once. For at-least-once delivery
 against topology drift, publish through the outbox with this option enabled.
 
+## Header trust boundary
+
+Headers prefixed `BW-` are reserved for BareWire and the transport itself.
+
+- **Send side** — an unmapped `BW-*` header in any letter case (`BW-Forged`, `bw-forged`, `Bw-Forged`)
+  is not published; it never reaches the broker.
+- **Receive side** — an unmapped raw AMQP header whose name starts with `BW-` in any letter case is
+  dropped before the consumer sees it, with two exceptions the transport itself stamps or reads:
+  - `BW-MappingEpoch` — the diagnostic mapping-epoch marker the transport stamps on the wire itself. A
+    forged value only affects diagnostics — it can trigger a spurious warning and overwrite the
+    remembered lane epoch, masking or faking a real re-map — never routing, dispatch, or settlement.
+  - `BW-MessageType` — accepted only while the AMQP `type` property is empty; the `type` property
+    always wins.
+- **Routing metadata is always transport-authoritative** — `BW-Exchange`, `BW-RoutingKey`, and
+  `BW-ConsumerChannelId` are stamped by the transport from the delivery itself, never from a raw
+  header the publisher supplied.
+- **What the publisher still controls** — the message type (via the AMQP `type` property, or a raw
+  `BW-MessageType` header while `type` is empty), `message-id`, `correlation-id`, `reply-to`,
+  `content-type`, `traceparent`, and the routing key value used at publish time. For untrusted
+  publishers, restrict access with broker permissions or an authorization middleware rather than
+  relying on the header filter alone.
+- **The in-memory transport applies the same reserved-prefix rule, with the same nuance** — both
+  transports strip an unmapped `BW-*` header the publisher sets, and both let `BW-MessageType` through.
+  RabbitMQ narrows that to the case where the AMQP `type` property is empty, and additionally lets you
+  carry any other `BW-*` header through the broker with an explicit mapping — the in-memory transport
+  has no mapping mechanism, so it never round-trips one.
+
+Carry your own `BW-*` header through the broker in both directions with an explicit mapping:
+
+```csharp
+transport.ConfigureHeaderMapping(headers =>
+{
+    headers.MapHeader("BW-TenantId", "BW-TenantId");
+});
+```
+
+> **Behavior change:** an unmapped raw `BW-*` header a publisher sets no longer reaches consumers. To
+> keep one, map it explicitly as shown above. For the message type, set the AMQP `type` property or
+> configure `MapMessageType(...)` — a raw `BW-MessageType` header keeps working only while the `type`
+> property is empty.
+
 ## Feature map
 
 RabbitMQ-specific behaviour is documented across these guides:

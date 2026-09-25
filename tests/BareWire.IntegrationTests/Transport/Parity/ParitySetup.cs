@@ -54,7 +54,7 @@ public enum ParityDifference
     /// <summary><c>Requeue</c> past a redelivery limit on a queue type that enforces one.</summary>
     BoundedRequeue,
 
-    /// <summary>Whether a publisher-supplied <c>BW-*</c> header reaches the consumer.</summary>
+    /// <summary>Whether a publisher-supplied <c>BW-*</c> header can reach the consumer through an explicit transport header mapping.</summary>
     BwHeaderStrip,
 
     /// <summary>Whether topology can be declared after the adapter has already started.</summary>
