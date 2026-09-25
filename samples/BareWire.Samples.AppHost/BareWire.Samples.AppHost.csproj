@@ -28,5 +28,6 @@
     <ProjectReference Include="..\BareWire.Samples.CompetingResponders\BareWire.Samples.CompetingResponders.csproj" />
     <ProjectReference Include="..\BareWire.Samples.ConsumerRoutingKeys\BareWire.Samples.ConsumerRoutingKeys.csproj" />
     <ProjectReference Include="..\BareWire.Samples.ConsumerDefinitionShowcase\BareWire.Samples.ConsumerDefinitionShowcase.csproj" />
+    <ProjectReference Include="..\BareWire.Samples.InMemoryModularMonolith\BareWire.Samples.InMemoryModularMonolith.csproj" />
   </ItemGroup>
 </Project>

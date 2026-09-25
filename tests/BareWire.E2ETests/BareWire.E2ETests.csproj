@@ -22,6 +22,10 @@
          point; the test asserts against the raw JSON body, so the message types are not needed. -->
     <ProjectReference Include="..\..\samples\BareWire.Samples.MassTransitToBareWire\BareWire.Samples.MassTransitToBareWire.csproj"
                       ReferenceOutputAssembly="false" />
+    <!-- Built (but not referenced) so InMemoryModularMonolithInMemorySmokeTests can launch the sample
+         as a subprocess in smoke mode, without needing a broker or Aspire. -->
+    <ProjectReference Include="..\..\samples\BareWire.Samples.InMemoryModularMonolith\BareWire.Samples.InMemoryModularMonolith.csproj"
+                      ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\BareWire.OutboxE2EAppHost\BareWire.OutboxE2EAppHost.csproj" />
     <ProjectReference Include="..\..\src\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\BareWire\BareWire.csproj" />
