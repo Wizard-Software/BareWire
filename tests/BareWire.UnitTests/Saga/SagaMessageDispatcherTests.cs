@@ -105,7 +105,9 @@ public sealed class SagaMessageDispatcherTests
 
         // Build a minimal IServiceScopeFactory that returns the mocked repository,
         // ITransportAdapter, and IMessageSerializer when requested from the scope.
-        // SagaMessageDispatcher resolves all three per-message to build the schedule provider.
+        // SagaMessageDispatcher resolves the transport and serializer from the per-message scope,
+        // but the schedule provider itself is created lazily once and shared across events via the
+        // dispatcher's SagaScheduleProviderCache.
         var transport = Substitute.For<ITransportAdapter>();
         transport.TransportName.Returns("test");
         var messageSerializer = Substitute.For<IMessageSerializer>();

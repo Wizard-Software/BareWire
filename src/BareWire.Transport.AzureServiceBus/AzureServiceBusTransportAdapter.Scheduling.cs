@@ -51,7 +51,34 @@ internal sealed partial class AzureServiceBusTransportAdapter : INativeMessageSc
         // state needed; the token is self-sufficient for cancel (D-GAP-1b).
         ServiceBusSender sender = GetOrCreateSender(token.Destination);
 
-        await sender.CancelScheduledMessageAsync(token.SequenceNumber, cancellationToken)
-            .ConfigureAwait(false);
+        if (!await TryCancelScheduledMessageAsync(sender, token.SequenceNumber, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            LogScheduledMessageAlreadyGone(token.SequenceNumber);
+        }
+    }
+
+    /// <summary>
+    /// Cancels a scheduled message, tolerating the case where the broker reports it can no longer
+    /// be found — already delivered by the native scheduler, or already cancelled by a previous
+    /// call. Any other <see cref="ServiceBusException"/> or failure propagates.
+    /// </summary>
+    /// <returns><see langword="true"/> when the cancel succeeded; <see langword="false"/> when the
+    /// broker reported <see cref="ServiceBusFailureReason.MessageNotFound"/>.</returns>
+    internal static async Task<bool> TryCancelScheduledMessageAsync(
+        ServiceBusSender sender,
+        long sequenceNumber,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await sender.CancelScheduledMessageAsync(sequenceNumber, cancellationToken)
+                .ConfigureAwait(false);
+            return true;
+        }
+        catch (ServiceBusException ex) when (ex.Reason == ServiceBusFailureReason.MessageNotFound)
+        {
+            return false;
+        }
     }
 }

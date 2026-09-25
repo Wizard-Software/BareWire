@@ -234,13 +234,26 @@ delivery guarantee as the rest of this transport (see "Delivery guarantee" above
 further into the future. A schedule token returned by this transport is an opaque handle used to
 identify and cancel the pending entry — **not** a permission or a security credential.
 
-Cancellation is **best-effort**: a schedule token that names an already-delivered, already-cancelled, or
-unknown entry is silently ignored rather than raising an error. Combined with the fact that this
-transport has no persistence, a consumer of scheduled messages (a saga's timeout handler, in
-particular) must treat every delivery as something that might arrive **even though it was meant to have
-been cancelled** — a state machine that reacts to a timeout must first check whether it is still in a
-state that actually expects one, and ignore it otherwise, rather than assuming cancellation is a
-guarantee.
+Cancellation is **best-effort**. `CancelTimeout<T>()` issued by a later event of the same saga cancels a
+timeout scheduled by an earlier event of that saga within the same process — every event of a saga run
+shares the same schedule provider, and each timeout type is tracked and cancelled independently, so
+cancelling one type leaves any other pending timeout for that saga untouched. A schedule token that names
+an already-delivered, already-cancelled, or unknown entry is silently ignored rather than raising an
+error. Combined with the fact that this transport has no persistence, a consumer of scheduled messages (a
+saga's timeout handler, in particular) must still treat every delivery as something that might arrive
+**even though it was meant to have been cancelled** — a state machine that reacts to a timeout must first
+check whether it is still in a state that actually expects one, and ignore it otherwise, rather than
+assuming cancellation is a guarantee. Cancellation stays best-effort in the following cases:
+
+- the process restarted between scheduling and cancelling the timeout;
+- the saga runs across multiple instances and the cancel call lands on a different instance than the one
+  that scheduled the timeout;
+- the token was evicted from the schedule provider's map because it reached its size limit — logged as a
+  warning when it happens;
+- the timeout had already fired and been handed off for delivery by the time the cancel call ran — a
+  race against the timer;
+- the same timeout type was scheduled again before the previous one was cancelled, so the newer token
+  replaced the older one in the map.
 
 A destination or pending-limit rejection at scheduling time surfaces as a thrown exception from the call
 that tried to schedule the message — for a saga, that is ordinarily the same call that is processing the

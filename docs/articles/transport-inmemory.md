@@ -462,11 +462,16 @@ What to expect:
   and **never retried** — scheduled delivery is at-most-once, like everything else on this transport. A
   pending timeout is also lost on restart.
 
-> [!WARNING]
-> **Known limitation: cancelling a scheduled timeout does not cancel it.** `CancelTimeout<T>()` is
-> currently a no-op on native schedulers, including this one, so the timeout is still delivered. Make
-> every timeout handler check that the saga is still in a state that expects the timeout, and ignore it
-> otherwise.
+> [!IMPORTANT]
+> **Cancellation is best-effort.** `CancelTimeout<T>()` issued by a later event of the same saga cancels
+> a timeout scheduled by an earlier event of that saga within the same process, and each timeout type is
+> cancelled independently. Even so, a timeout handler must still check that the saga is in a state that
+> expects the timeout and ignore it otherwise, because cancellation stays best-effort in these cases:
+> the process restarted between scheduling and cancelling; the saga runs across multiple instances and
+> the cancel call lands on a different instance than the one that scheduled the timeout; the token was
+> evicted from the schedule provider's map at its size limit (logged as a warning); the timeout had
+> already fired by the time the cancel call ran, a race against the timer; or the same timeout type was
+> scheduled again before the previous one was cancelled, so the newer token replaced the older one.
 
 ## Metrics, logging and health
 

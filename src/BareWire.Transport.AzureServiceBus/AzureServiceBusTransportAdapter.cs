@@ -411,4 +411,9 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
     [LoggerMessage(Level = LogLevel.Debug,
         Message = "Azure Service Bus produce: resolved SessionId='{SessionId}' for queue/topic '{RoutingKey}'.")]
     private partial void LogSessionIdResolved(string sessionId, string routingKey);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Azure Service Bus cancel scheduled message: sequence number {SequenceNumber} was already " +
+                  "gone (delivered or already cancelled) — nothing to cancel.")]
+    private partial void LogScheduledMessageAlreadyGone(long sequenceNumber);
 }
