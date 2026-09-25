@@ -33,8 +33,12 @@ routing key matches `T` is observed on the transport — no polling required —
 `TimeoutException` once the given timeout elapses.
 
 An optional `configure` callback exposes the same `IBusConfigurator` used in production (middleware,
-receive endpoints, per-type serializer mappings via `MapSerializer<,>()`), so a harness can exercise
-consumers and sagas the same way a hosted bus would.
+per-type outbound serializer mappings via `MapSerializer<,>()`).
+
+The harness observes **outbound** messages only — it does not host consumers or sagas. To test a
+consumer or a saga end to end, build a real bus in the test with `AddBareWireWithInMemory(...)` and a
+real serializer (for example `AddBareWireJsonSerializer()`); it runs on the same in-memory transport
+engine the harness uses.
 
 ## How it works
 
@@ -55,9 +59,10 @@ message is never seen by `WaitForPublishAsync`/`WaitForSendAsync`, only by a rea
 read of the transport's queue.
 
 The harness's default serializer does not actually serialize message content — tests that publish a
-message typically only need it to round-trip through the transport by type name, not by byte-for-byte
-payload. Map a real serializer for specific message types via `configure`'s `MapSerializer<,>()` when a
-test needs one.
+message typically only need it to reach the transport by type name, not by byte-for-byte payload. Map a
+real serializer for specific message types via `configure`'s `MapSerializer<,>()` when a test needs to
+inspect the outbound body. The harness's default deserializer throws `NotSupportedException` instead of
+returning `null`, so an inbound message can never reach a consumer as a silent `null`.
 
 Disposing the harness stops the bus the same way a production shutdown does: it waits for in-flight
 work to settle before consumer loops are cancelled, bounded by the configured drain timeout (10 seconds

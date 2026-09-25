@@ -51,6 +51,9 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     /// </summary>
     internal ObservingTransportAdapter Adapter => _adapter;
 
+    /// <summary>Gets the harness's private service provider (test-only access to its registrations).</summary>
+    internal IServiceProvider Services => _provider;
+
     /// <summary>
     /// Gets the running <see cref="IBus"/> backed by the in-memory transport.
     /// </summary>
@@ -61,8 +64,8 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     /// </summary>
     /// <param name="configure">
     /// An optional callback that receives an <see cref="IBusConfigurator"/> to apply custom bus
-    /// configuration (middleware, receive endpoints, serializer mappings) in the harness's private
-    /// container.
+    /// configuration (middleware, outbound serializer mappings) in the harness's private container.
+    /// The harness observes outbound messages only — it does not host consumers or sagas.
     /// </param>
     /// <param name="routingKeyResolver">
     /// An optional <see cref="IRoutingKeyResolver"/> to override the default fallback resolver.
@@ -288,6 +291,13 @@ public sealed class BareWireTestHarness : IAsyncDisposable
     {
         public string ContentType => "application/octet-stream";
 
-        public T? Deserialize<T>(ReadOnlySequence<byte> data) where T : class => null;
+        // Fails loudly instead of returning null: the harness observes outbound messages only, and a
+        // consumer silently handed a null message would pass or fail for the wrong reason.
+        public T? Deserialize<T>(ReadOnlySequence<byte> data) where T : class =>
+            throw new NotSupportedException(
+                $"BareWireTestHarness does not deserialize inbound messages (requested type: {typeof(T).FullName}). " +
+                "The harness observes outbound publishes and sends only. To consume messages in a test, host a " +
+                "real bus with AddBareWireWithInMemory and a real serializer, or configure a deserializer for " +
+                "the receive endpoint with UseDeserializer<T>().");
     }
 }

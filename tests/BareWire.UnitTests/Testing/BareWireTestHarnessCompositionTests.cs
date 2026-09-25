@@ -1,9 +1,12 @@
+using System.Buffers;
 using System.Reflection;
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Testing;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 
 namespace BareWire.UnitTests.Testing;
@@ -11,6 +14,19 @@ namespace BareWire.UnitTests.Testing;
 public sealed class BareWireTestHarnessCompositionTests
 {
     private sealed record Unmapped(string Id);
+
+    [Fact]
+    public async Task Deserialize_DefaultHarnessDeserializer_ThrowsNotSupportedException()
+    {
+        await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync(
+            cancellationToken: TestContext.Current.CancellationToken);
+        IMessageDeserializer deserializer = harness.Services.GetRequiredService<IMessageDeserializer>();
+
+        Action act = () => deserializer.Deserialize<Unmapped>(new ReadOnlySequence<byte>("{}"u8.ToArray()));
+
+        act.Should().Throw<NotSupportedException>()
+            .WithMessage("*observes outbound publishes and sends only*");
+    }
 
     [Fact]
     public async Task DisposeAsync_DrainsTransportThroughDecorator()
