@@ -69,6 +69,29 @@ public sealed class PublicApiTests
                      $"if intentional, update Approved/{assemblyName}.approved.txt by running RegenerateAllBaselines");
     }
 
+    // -------------------------------------------------------------------------
+    // Transport.InMemory is snapshotted on its own (separately from the six
+    // bundle packages above): its public surface is a single entry point —
+    // AddBareWireInMemory — so locking it down is cheap, and the snapshot
+    // guards against an internal seam (health, drain, broker) accidentally
+    // becoming public.
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void TransportInMemory_PublicApi_ShouldMatchApproved()
+    {
+        var assembly = typeof(BareWire.Transport.InMemory.ServiceCollectionExtensions).Assembly;
+        var options = new ApiGeneratorOptions { IncludeAssemblyAttributes = false };
+        var publicApi = assembly.GeneratePublicApi(options);
+
+        var approved = File.ReadAllText(GetApprovedFilePath("BareWire.Transport.InMemory"));
+
+        publicApi.Should().Be(
+            approved,
+            because: "a breaking public API change was detected in BareWire.Transport.InMemory — " +
+                     "if intentional, update Approved/BareWire.Transport.InMemory.approved.txt by running RegenerateAllBaselines");
+    }
+
     [Fact(Skip = "Manual — run to regenerate baselines")]
     public void RegenerateAllBaselines()
     {
@@ -93,6 +116,9 @@ public sealed class PublicApiTests
             var bundleApi = BundleAssembly(bundle).GeneratePublicApi(options);
             File.WriteAllText(GetApprovedFilePath(bundle), bundleApi);
         }
+
+        var transportInMemoryApi = typeof(BareWire.Transport.InMemory.ServiceCollectionExtensions).Assembly.GeneratePublicApi(options);
+        File.WriteAllText(GetApprovedFilePath("BareWire.Transport.InMemory"), transportInMemoryApi);
     }
 
     private static System.Reflection.Assembly BundleAssembly(string assemblyName) => assemblyName switch

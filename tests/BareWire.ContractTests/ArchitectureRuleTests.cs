@@ -28,6 +28,17 @@ public sealed class ArchitectureRuleTests
         "BareWire.Buffers",
     ];
 
+    /// <summary>All six Transport packages — shared by every rule that must enumerate them.</summary>
+    private static readonly string[] AllTransports =
+    [
+        "BareWire.Transport.RabbitMQ",
+        "BareWire.Transport.Kafka",
+        "BareWire.Transport.AzureServiceBus",
+        "BareWire.Transport.AWS.SQS",
+        "BareWire.Transport.Google.PubSub",
+        "BareWire.Transport.InMemory",
+    ];
+
     // -------------------------------------------------------------------------
     // Rule 1: Abstractions must NOT depend on any other BareWire package
     // -------------------------------------------------------------------------
@@ -45,6 +56,7 @@ public sealed class ArchitectureRuleTests
             "BareWire.Transport.RabbitMQ",
             "BareWire.Transport.Kafka",
             "BareWire.Transport.AzureServiceBus",
+            "BareWire.Transport.InMemory",
             "BareWire.Observability",
             "BareWire.Saga",
             "BareWire.Outbox",
@@ -75,13 +87,20 @@ public sealed class ArchitectureRuleTests
     {
         var assembly = typeof(BareWire.ServiceCollectionExtensions).Assembly;
 
-        var result = Types.InAssembly(assembly)
-            .ShouldNot()
-            .HaveDependencyOn("BareWire.Transport.RabbitMQ")
-            .GetResult();
+        foreach (var transportName in AllTransports)
+        {
+            var result = Types.InAssembly(assembly)
+                .ShouldNot()
+                .HaveDependencyOn(transportName)
+                .GetResult();
 
-        result.IsSuccessful.Should().BeTrue(
-            result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+            result.IsSuccessful.Should().BeTrue(
+                result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+            assembly.GetReferencedAssemblies().Select(a => a.Name)
+                .Should().NotContain(transportName,
+                    "Core must never take a binary reference on a Transport package ({0})", transportName);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -297,6 +316,32 @@ public sealed class ArchitectureRuleTests
             result.IsSuccessful.Should().BeTrue(
                 result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 4f: Transport.InMemory must depend only on Abstractions (external Microsoft.Extensions.* allowed)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void InMemoryTransport_ShouldDependOnlyOn_Abstractions()
+    {
+        var assembly = GetAssembly("BareWire.Transport.InMemory");
+
+        AssertNoDependencyOnCore(assembly);
+
+        var result = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Observability")
+            .GetResult();
+
+        result.IsSuccessful.Should().BeTrue(result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+        assembly.GetReferencedAssemblies()
+            .Select(a => a.Name)
+            .Where(n => n is not null && n.StartsWith("BareWire", StringComparison.Ordinal))
+            .Should().BeEquivalentTo(["BareWire.Abstractions"],
+                "the in-memory transport may reference only BareWire.Abstractions among BareWire packages; "
+                + "external Microsoft.Extensions.* abstractions are allowed");
     }
 
     // -------------------------------------------------------------------------
@@ -534,21 +579,66 @@ public sealed class ArchitectureRuleTests
     }
 
     // -------------------------------------------------------------------------
-    // Rule 10: Testing must NOT depend on production Transport
+    // Rule 10: Testing must NOT depend on any broker Transport — not directly and
+    // not transitively — while the in-memory transport remains reachable only
+    // through the BareWire.InMemory bundle (never as a direct reference).
     // -------------------------------------------------------------------------
 
-    [Fact]
-    public void Testing_ShouldNotDependOn_ProductionTransport()
+    /// <summary>Broker transports that BareWire.Testing must never reach, directly or transitively.</summary>
+    public static TheoryData<string> BrokerTransports => new()
     {
-        var assembly = typeof(BareWire.Testing.BareWireTestHarness).Assembly;
+        "BareWire.Transport.RabbitMQ",
+        "BareWire.Transport.Kafka",
+        "BareWire.Transport.AzureServiceBus",
+        "BareWire.Transport.AWS.SQS",
+        "BareWire.Transport.Google.PubSub",
+    };
 
-        var result = Types.InAssembly(assembly)
+    [Theory]
+    [MemberData(nameof(BrokerTransports))]
+    public void Testing_ShouldNotDependOn_BrokerTransport(string transportName)
+    {
+        var testing = typeof(BareWire.Testing.BareWireTestHarness).Assembly;
+
+        var result = Types.InAssembly(testing)
             .ShouldNot()
-            .HaveDependencyOn("BareWire.Transport.RabbitMQ")
+            .HaveDependencyOn(transportName)
             .GetResult();
 
         result.IsSuccessful.Should().BeTrue(
             result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+        TransitiveBareWireReferences(testing).Should().NotContain(transportName,
+            "BareWire.Testing must stay broker-free even transitively; only the in-memory transport is allowed");
+    }
+
+    [Fact]
+    public void Testing_TransitiveClosure_ReachesInMemoryTransport()
+    {
+        var testing = typeof(BareWire.Testing.BareWireTestHarness).Assembly;
+
+        TransitiveBareWireReferences(testing).Should().Contain("BareWire.Transport.InMemory",
+            "the harness is built on the in-memory bundle; if this path disappears the broker-free rule above "
+            + "may be passing vacuously and must be revisited");
+    }
+
+    [Fact]
+    public void Testing_ShouldNotDependDirectlyOn_InMemoryTransport()
+    {
+        var testing = typeof(BareWire.Testing.BareWireTestHarness).Assembly;
+
+        var result = Types.InAssembly(testing)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Transport.InMemory")
+            .GetResult();
+
+        result.IsSuccessful.Should().BeTrue(
+            result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+        testing.GetReferencedAssemblies().Select(a => a.Name)
+            .Should().NotContain("BareWire.Transport.InMemory",
+                "BareWire.Testing may reach the in-memory transport only transitively, through the "
+                + "BareWire.InMemory bundle — never as a direct reference");
     }
 
     // -------------------------------------------------------------------------
@@ -717,17 +807,7 @@ public sealed class ArchitectureRuleTests
     [Fact]
     public void Transports_ShouldNotDependOn_AnyBundle()
     {
-        string[] transports =
-        [
-            "BareWire.Transport.RabbitMQ",
-            "BareWire.Transport.Kafka",
-            "BareWire.Transport.AzureServiceBus",
-            "BareWire.Transport.AWS.SQS",
-            "BareWire.Transport.Google.PubSub",
-            "BareWire.Transport.InMemory",
-        ];
-
-        foreach (var transportName in transports)
+        foreach (var transportName in AllTransports)
         {
             var transport = GetAssembly(transportName);
             var referenced = transport.GetReferencedAssemblies().Select(a => a.Name).ToArray();
@@ -739,6 +819,49 @@ public sealed class ArchitectureRuleTests
                     transportName, bundleName);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Rule 14d: neither Core, nor any transport, nor any bundle may depend on BareWire.Testing
+    // -------------------------------------------------------------------------
+
+    /// <summary>Core, every transport and every bundle — none may depend on BareWire.Testing.</summary>
+    public static TheoryData<string> ProductionCompositionAssemblies
+    {
+        get
+        {
+            var data = new TheoryData<string> { "BareWire" };
+
+            foreach (var transportName in AllTransports)
+            {
+                data.Add(transportName);
+            }
+
+            foreach (var bundleName in BundleNames)
+            {
+                data.Add(bundleName);
+            }
+
+            return data;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(ProductionCompositionAssemblies))]
+    public void ProductionAssembly_ShouldNotDependOn_Testing(string assemblyName)
+    {
+        var assembly = GetAssembly(assemblyName);
+
+        var result = Types.InAssembly(assembly)
+            .ShouldNot()
+            .HaveDependencyOn("BareWire.Testing")
+            .GetResult();
+
+        result.IsSuccessful.Should().BeTrue(
+            result.FailingTypeNames is { Count: > 0 } names ? names[0] : null);
+
+        assembly.GetReferencedAssemblies().Select(a => a.Name).Should().NotContain("BareWire.Testing",
+            "{0} is production composition code and must never reference the test harness", assemblyName);
     }
 
     // -------------------------------------------------------------------------
@@ -760,4 +883,35 @@ public sealed class ArchitectureRuleTests
     }
 
     private static Assembly GetAssembly(string name) => Assembly.Load(name);
+
+    /// <summary>
+    /// Breadth-first walk over referenced assemblies whose simple name starts with "BareWire",
+    /// returning every BareWire.* assembly name reachable from <paramref name="root"/> (root excluded).
+    /// External assemblies are not traversed.
+    /// </summary>
+    private static HashSet<string> TransitiveBareWireReferences(Assembly root)
+    {
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<Assembly>();
+        queue.Enqueue(root);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+
+            foreach (var referencedName in current.GetReferencedAssemblies())
+            {
+                if (referencedName.Name is not { } name
+                    || !name.StartsWith("BareWire", StringComparison.Ordinal)
+                    || !visited.Add(name))
+                {
+                    continue;
+                }
+
+                queue.Enqueue(Assembly.Load(referencedName));
+            }
+        }
+
+        return visited;
+    }
 }

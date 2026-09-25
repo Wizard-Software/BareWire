@@ -280,6 +280,26 @@ namespace BareWire.Abstractions.Configuration
         void UseTls(System.Action<BareWire.Abstractions.Configuration.ITlsConfigurator> configure);
         void Username(string username);
     }
+    public interface IInMemoryConfigurator
+    {
+        void AutoDeclareEndpointQueues();
+        void ConfigureTopology(System.Action<BareWire.Abstractions.Topology.ITopologyConfigurator> configure);
+        void DefaultExchange(string exchangeName);
+        void DrainTimeout(System.TimeSpan timeout);
+        void EnableDefer(System.TimeSpan? delay = default);
+        void GuaranteedRouting();
+        void MapExchange<T>(string exchangeName)
+            where T :  class;
+        void MapRoutingKey<T>(string routingKey)
+            where T :  class;
+        void MaxMessageSize(int bytes);
+        void MaxRedeliveries(int maxRedeliveries);
+        void Publish<T>(System.Action<BareWire.Abstractions.Configuration.IPublishConfigurator<T>> configure)
+            where T :  class;
+        void QueueCapacity(int capacity);
+        void ReceiveEndpoint(string queueName, System.Action<BareWire.Abstractions.Configuration.IReceiveEndpointConfigurator> configure);
+        void SendTimeout(System.TimeSpan timeout);
+    }
     public interface IPublishConfigurator<T>
         where T :  class
     {
