@@ -12,6 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="..\BareWire.Abstractions\BareWire.Abstractions.csproj" />
     <ProjectReference Include="..\BareWire\BareWire.csproj" />
+    <ProjectReference Include="..\BareWire.InMemory\BareWire.InMemory.csproj" />
   </ItemGroup>
 
   <ItemGroup>

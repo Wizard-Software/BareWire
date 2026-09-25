@@ -9,14 +9,23 @@ namespace BareWire.Benchmarks;
 /// <summary>
 /// Benchmarks for consume-side throughput through the in-memory transport.
 /// Measures the inbound pipeline performance: channel dequeue + settlement acknowledgement.
-/// Uses <see cref="InMemoryTransportAdapter"/> directly for precise measurement of the
-/// consume + ack path without bus dispatch overhead.
+/// Uses a <see cref="BareWireTestHarness"/>'s underlying in-memory transport adapter directly for
+/// measurement of the consume + ack path without bus dispatch overhead.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Performance targets:
 /// <list type="bullet">
 /// <item><description>ConsumeAndAck_InMemory: &gt; 300K msgs/s, &lt; 512 B/op</description></item>
 /// </list>
+/// </para>
+/// <para>
+/// This benchmark now measures the real in-memory transport adapter obtained from a
+/// <see cref="BareWireTestHarness"/> — the consumer runner, its delivery map, and its pooled
+/// buffers — rather than a simplified test-only stub. The &lt; 512 B/op target above is not
+/// re-baselined against this real transport here; a dedicated Core-only baseline is left to a
+/// later benchmark task.
+/// </para>
 /// NOTE: [EventPipeProfiler] is intentionally omitted — BenchmarkDotNet has a known bug with
 /// .NET 10 where runtime detection treats it as v1 (https://github.com/dotnet/BenchmarkDotNet/issues/2699).
 /// Add [EventPipeProfiler] after BenchmarkDotNet ships a fix.
@@ -29,7 +38,8 @@ public class ConsumeBenchmarks
     private const int MessageCount = 1_000;
     private const string EndpointName = "bench-consume";
 
-    private InMemoryTransportAdapter _adapter = null!;
+    private BareWireTestHarness _harness = null!;
+    private ObservingTransportAdapter _adapter = null!;
     private FlowControlOptions _flowControl = null!;
 
     // Pre-built batch of outbound messages reused across iterations to avoid allocation noise
@@ -69,14 +79,14 @@ public class ConsumeBenchmarks
     [IterationSetup]
     public void IterationSetup()
     {
-        // Dispose previous adapter (channel must be drained to empty before each iteration).
-        _adapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        // Dispose the previous harness (channel must be drained to empty before each iteration).
+        _harness.DisposeAsync().AsTask().GetAwaiter().GetResult();
         CreateAndFillAdapterAsync().GetAwaiter().GetResult();
     }
 
     [GlobalCleanup]
     public async Task CleanupAsync()
-        => await _adapter.DisposeAsync().ConfigureAwait(false);
+        => await _harness.DisposeAsync().ConfigureAwait(false);
 
     /// <summary>
     /// Consumes all pre-published messages from the in-memory transport and acknowledges each one.
@@ -107,7 +117,10 @@ public class ConsumeBenchmarks
 
     private async Task CreateAndFillAdapterAsync()
     {
-        _adapter = new InMemoryTransportAdapter();
+        _harness = await BareWireTestHarness.CreateAsync(
+            null, null, null, t => t.ConfigureTopology(topo => topo.DeclareQueue(EndpointName)), CancellationToken.None)
+            .ConfigureAwait(false);
+        _adapter = _harness.Adapter;
         await _adapter.SendBatchAsync(_batch).ConfigureAwait(false);
     }
 }
