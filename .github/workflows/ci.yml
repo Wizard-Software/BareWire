@@ -52,6 +52,14 @@ jobs:
       - name: Analyzer Tests
         run: dotnet test tests/BareWire.Analyzers.Tests/ --no-build -c Release --logger "trx;LogFileName=analyzer-tests.trx" --results-directory ./test-results
 
+      # Broker-free sample smoke: runs the modular-monolith sample on the in-memory transport as a
+      # subprocess (no Docker, no RabbitMQ). The rest of the E2E suite needs containers and stays local.
+      - name: In-memory sample smoke test
+        run: >
+          dotnet test tests/BareWire.E2ETests/ --no-build -c Release
+          --filter "FullyQualifiedName~InMemoryModularMonolithInMemorySmokeTests"
+          --logger "trx;LogFileName=inmemory-sample-smoke.trx" --results-directory ./test-results
+
       - name: Run benchmarks (in-memory)
         run: >
           dotnet run --project tests/BareWire.Benchmarks/ -c Release --
