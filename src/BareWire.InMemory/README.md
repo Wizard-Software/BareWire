@@ -97,8 +97,14 @@ host in production, so traffic to the broker is encrypted in transit.
 referenced separately):
 
 ```csharp
-builder.Services.AddBareWireInMemory(transport => transport.DefaultExchange(""));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWireInMemory(transport =>
+{
+    transport.AutoDeclareEndpointQueues();
+    transport.DefaultExchange("");                  // route by queue name
+    transport.MapRoutingKey<OrderCreated>("orders");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
+});
+builder.Services.AddBareWire(bus => { });
 ```
 
 ## One bus per container

@@ -62,19 +62,33 @@ core twice).
 > the bundle). Calls still compile (with a warning) for one release; migrate to one of the forms
 > above.
 
-### 3. In-memory — tests
+### 3. In-memory — single process and tests
 
-For unit and integration tests, `BareWire.Testing` provides an in-memory harness that needs no
-broker:
+The in-memory transport runs the bus inside one process with no broker — for a modular monolith,
+local development, and tests. It is registered with the same single-call pattern:
 
 ```csharp
-builder.Services.AddBareWireTestHarness(bus =>
+builder.Services.AddBareWireWithInMemory(transport =>
 {
-    bus.AddConsumer<MyConsumer>();
+    transport.AutoDeclareEndpointQueues();
+    transport.DefaultExchange("");                  // route by queue name
+    transport.MapRoutingKey<OrderCreated>("orders");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
 });
 ```
 
-See [Custom Serializers](custom-serializers.md) and the testing guide for the harness API.
+For tests that only need to assert what a piece of code publishes or sends, `BareWire.Testing`
+provides `BareWireTestHarness`, which observes outbound messages on the same in-memory engine:
+
+```csharp
+await using BareWireTestHarness harness = await BareWireTestHarness.CreateAsync();
+Task<OutboundMessage> published = harness.WaitForPublishAsync<OrderCreated>(TimeSpan.FromSeconds(5));
+await harness.Bus.PublishAsync(new OrderCreated(orderId));
+await published;
+```
+
+The harness does not host consumers or sagas; to test those, build a bus with
+`AddBareWireWithInMemory` in the test. See [In-Memory Transport](transport-inmemory.md).
 
 ### Why it is layered this way
 
