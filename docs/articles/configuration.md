@@ -14,12 +14,17 @@ Each transport ships a thin **bundle** package — `BareWire.RabbitMQ`, `BareWir
 the core and the matching transport and exposes a single `AddBareWireWith{Transport}` method:
 
 ```csharp
+builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireWithRabbitMq(
-    transport => transport.Host("amqp://guest:guest@localhost:5672/"),
+    transport =>
+    {
+        transport.Host("amqp://guest:guest@localhost:5672/");
+        transport.ReceiveEndpoint("my-queue", e => e.Consumer<MyConsumer, MyMessage>());
+    },
     bus =>
     {
-        bus.AddConsumer<MyConsumer>();
-        // serializers, middleware, endpoints...
+        // middleware, serializer mappings...
     });
 ```
 
@@ -38,16 +43,15 @@ Register the transport adapter and the core explicitly. Use this when you refere
 transport packages separately, or you want maximum control over package versions:
 
 ```csharp
+builder.Services.AddTransient<MyConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireRabbitMq(transport =>
 {
     transport.Host("amqp://guest:guest@localhost:5672/");
-    transport.ReceiveEndpoint("my-queue", e => { /* ... */ });
+    transport.ReceiveEndpoint("my-queue", e => e.Consumer<MyConsumer, MyMessage>());
 });
 
-builder.Services.AddBareWire(bus =>
-{
-    bus.AddConsumer<MyConsumer>();
-});
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings, ... */ });
 ```
 
 `AddBareWireWith{Transport}` is exactly this pair behind one method, so the two paths are
@@ -68,6 +72,9 @@ The in-memory transport runs the bus inside one process with no broker — for a
 local development, and tests. It is registered with the same single-call pattern:
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireWithInMemory(transport =>
 {
     transport.AutoDeclareEndpointQueues();

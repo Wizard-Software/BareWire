@@ -17,11 +17,13 @@ dotnet add package BareWire.InMemory
 
 ```csharp
 builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
 builder.Services.AddBareWireWithInMemory(
     transport =>
     {
-        transport.DefaultExchange("");
+        transport.DefaultExchange("");                  // route by queue name
         transport.AutoDeclareEndpointQueues();
+        transport.MapRoutingKey<OrderCreated>("orders");
         transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
     });
 ```
@@ -97,6 +99,9 @@ host in production, so traffic to the broker is encrypted in transit.
 referenced separately):
 
 ```csharp
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireInMemory(transport =>
 {
     transport.AutoDeclareEndpointQueues();
