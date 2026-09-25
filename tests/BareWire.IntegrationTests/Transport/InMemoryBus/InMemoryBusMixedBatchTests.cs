@@ -7,7 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 3 (task 20.28): a bus-loop batch that mixes an oversized message with healthy ones —
+/// Scenario 3: a bus-loop batch that mixes an oversized message with healthy ones —
 /// the oversized message must be rejected on its own without losing or blocking the rest of the batch.
 /// </summary>
 [Collection(InMemoryBusIsolation.Name)]
@@ -20,7 +20,7 @@ public sealed class InMemoryBusMixedBatchTests
     // Large enough that the "mixed" queue never comes close to being full while holding all 31
     // messages of the real batch, but small enough that filling "gate-mixed" to capacity (see the
     // gate technique below) with plain integer-payload messages is cheap. QueueCapacity is a
-    // transport-WIDE option (BareWire.CLAUDE.md / GAP-5 mitigation) — it applies to both queues.
+    // transport-WIDE option — it applies to both queues.
     private const int QueueCapacity = 40;
 
     [Fact]
@@ -65,7 +65,7 @@ public sealed class InMemoryBusMixedBatchTests
             // above. Give the loop time to read this message ALONE (the channel is otherwise empty at
             // this point) and enter that wait before publishing anything else below — this is what
             // guarantees the 31 "mixed" messages cannot be split across more than one SendBatchAsync
-            // call (GAP-5 mitigation): they accumulate in the bus's outgoing channel while the loop is
+            // call: they accumulate in the bus's outgoing channel while the loop is
             // busy stalled on this send, and are all drained together once it returns.
             await host.Bus.PublishAsync(new GateMessage(QueueCapacity), TestContext.Current.CancellationToken);
             await Task.Delay(TimeSpan.FromMilliseconds(300), TestContext.Current.CancellationToken);
@@ -100,7 +100,7 @@ public sealed class InMemoryBusMixedBatchTests
                 .CounterTotal(InMemoryTransportMetrics.RejectedCounterName, (InMemoryTransportMetrics.ReasonTag, "oversized"))
                 .Should().Be(1);
 
-            // SEC-1 hardening: the rejection log/metric path never includes message bodies — assert it
+            // Hardening: the rejection log/metric path never includes message bodies — assert it
             // directly by checking the unique marker placed inside the oversized payload never leaks
             // into any captured log (formatted message or exception text).
             host.Telemetry.Logs.Should().NotContain(l => l.Message.Contains(uniqueMarker, StringComparison.Ordinal));

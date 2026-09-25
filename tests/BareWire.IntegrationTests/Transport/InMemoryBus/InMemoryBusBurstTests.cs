@@ -7,7 +7,7 @@ using Microsoft.Extensions.Logging;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 5 (task 20.28): a burst of twice a queue's capacity. With a fast, always-active consumer
+/// Scenario 5: a burst of twice a queue's capacity. With a fast, always-active consumer
 /// the queue must never latch and loss must be bounded by the excess over capacity. The negative
 /// control (a permanently stalled consumer) proves the "no latch" assertion above is actually
 /// sensitive — it fails, with a latch and rejections, under the same burst.
@@ -38,7 +38,7 @@ public sealed class InMemoryBusBurstTests
             minimumLogLevel: LogLevel.Information,
             cancellationToken: TestContext.Current.CancellationToken);
 
-        // Warm-up (PERF-5 mitigation): IBusControl.StartAsync can return before the "burst" consume
+        // Warm-up: IBusControl.StartAsync can return before the "burst" consume
         // loop has actually begun reading (BareWireBusControl races the loop's first iteration). A
         // single message, waited for delivery, proves the consumer is active before the real burst —
         // otherwise the burst's first wave could find the queue full with NO active consumer yet and

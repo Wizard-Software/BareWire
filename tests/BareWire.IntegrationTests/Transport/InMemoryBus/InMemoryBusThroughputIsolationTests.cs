@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 1 (task 20.28): a consumer of one queue ("iso-a") is stalled and 5% of the scenario's
+/// Scenario 1: a consumer of one queue ("iso-a") is stalled and 5% of the scenario's
 /// traffic still targets it. Publish throughput to every other queue ("iso-b".."iso-z") must stay at
 /// least half of the throughput measured for the same load shape with no traffic to "iso-a" at all,
 /// no healthy queue may ever be found full at reservation time, and no publish-channel back-pressure
@@ -20,8 +20,8 @@ namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 /// <remarks>
 /// <strong>Why 26 distinct closed generic message types.</strong> <c>BareWireBus.PublishAsync&lt;T&gt;</c>
 /// resolves exactly one routing key per message TYPE (not per call), so round-robining a single shared
-/// message type across 26 queues via typed <c>PublishAsync</c> is not possible — see the task's
-/// verification section 10 (GAP-3/PERF-4). <see cref="IsoMessage{TMarker}"/> is a generic marker record;
+/// message type across 26 queues via typed <c>PublishAsync</c> is not possible.
+/// <see cref="IsoMessage{TMarker}"/> is a generic marker record;
 /// each of the 26 marker types below (<see cref="QA"/>..<see cref="QZ"/>) closes it into its own type,
 /// each mapped via <c>MapRoutingKey&lt;IsoMessage&lt;TMarker&gt;&gt;</c> to its own queue. This is also
 /// what makes the scenario exercise the alert-checked path at all: the health-check
@@ -34,7 +34,7 @@ public sealed class InMemoryBusThroughputIsolationTests
     private const string StalledQueue = "iso-a";
     private const int QueueCapacity = 100;
 
-    // Upper bound allowed by the spec is half of QueueCapacity (PERF-2 mitigation) — the maximum a
+    // Upper bound allowed by the spec is half of QueueCapacity — the maximum a
     // healthy queue's published-but-not-yet-delivered backlog may reach before the producer waits for it
     // to catch up. A much smaller value is used here on purpose: this backlog is measured end-to-end
     // (published vs. fully delivered), so it also bounds how many messages can be sitting in the bus's
@@ -48,16 +48,16 @@ public sealed class InMemoryBusThroughputIsolationTests
     // outgoing channel per wave stays a small fraction of MaxPendingPublishes below.
     private const int BurstRounds = 2;
 
-    // D2/GAP-3 mitigation: low enough that the 90% alert threshold (900) is a small, meaningful number —
+    // Low enough that the 90% alert threshold (900) is a small, meaningful number —
     // sensitizes the "no back-pressure alert" assertion instead of it being vacuously true against the
     // library default of 10,000.
     private const int MaxPendingPublishes = 1_000;
 
-    // PERF-3 mitigation: large N so JIT/GC/thread-pool jitter is a small fraction of the measured
+    // Large N so JIT/GC/thread-pool jitter is a small fraction of the measured
     // duration. One measured run publishes this many messages to the healthy queues (b..z combined).
     private const int MessageCount = 20_000;
 
-    // PERF-3 mitigation: best-of-5 across interleaved baseline/scenario runs on the SAME host.
+    // Best-of-5 across interleaved baseline/scenario runs on the SAME host.
     private const int Repeats = 5;
 
     // 5% of scenario traffic additionally targets the stalled queue (every 20th healthy message also
@@ -109,15 +109,15 @@ public sealed class InMemoryBusThroughputIsolationTests
 
         try
         {
-            // Warm-up (PERF-5 mitigation): IBusControl.StartAsync returns before the consume loops are
+            // Warm-up: IBusControl.StartAsync returns before the consume loops are
             // actually reading, so an un-warmed queue could latch on its very first burst regardless of
             // a slow consumer. One confirmed delivery per healthy queue, plus confirmation that the
             // stalled consumer has actually started processing its own first (warm-up) message.
             await WarmUpAsync(host, probe, ct);
 
             // Drive "iso-a" into an actual LATCH (not merely "full with an active-but-blocked
-            // consumer") BEFORE any timing starts, and prove it with a negative control (PERF-3
-            // mitigation) — bounded wait, not a fixed sleep. Once latched, further sends to "iso-a" are
+            // consumer") BEFORE any timing starts, and prove it with a negative control —
+            // bounded wait, not a fixed sleep. Once latched, further sends to "iso-a" are
             // rejected immediately (no per-SendBatchAsync-call wait budget spent on it), which is what
             // keeps mixing 5% traffic into "iso-a" from stalling the publisher loop's shared batches
             // during the scenario runs below.
@@ -130,7 +130,7 @@ public sealed class InMemoryBusThroughputIsolationTests
                 .CounterTotal(InMemoryTransportMetrics.RejectedCounterName, (InMemoryTransportMetrics.QueueTag, StalledQueue))
                 .Should().BeGreaterThan(0, "same as above");
 
-            // One host for warm-up, the latch drive, and every measured run below (PERF-3 mitigation) —
+            // One host for warm-up, the latch drive, and every measured run below —
             // a fresh host per repetition would let JIT/GC/thread-pool jitter of whichever run happens
             // first alone decide the ratio. Interleaved runs (baseline, scenario, baseline, ...),
             // best-of-5 (minimum duration) on each side.
@@ -169,7 +169,7 @@ public sealed class InMemoryBusThroughputIsolationTests
             }
 
             // No publish-channel back-pressure alert in EITHER shape of load.
-            // NOTE (GAP-3 mitigation, documented honestly per the task's verification section 10): with
+            // NOTE: with
             // the healthy-queue pacing above — and "iso-a" being LATCHED rather than merely full, so its
             // rejections never spend the publisher loop's per-SendBatchAsync-call wait budget — the
             // absence of this log is a CONSEQUENCE of the pacing keeping the outgoing channel's occupancy
@@ -233,7 +233,7 @@ public sealed class InMemoryBusThroughputIsolationTests
 
                 // Registered AFTER AddBareWire's own default (inside InMemoryBusHost.StartAsync) wins
                 // resolution — Microsoft.Extensions.DependencyInjection resolves the LAST registration
-                // of a given service type. Low on purpose (D2/GAP-3 mitigation): sensitizes the 90%
+                // of a given service type. Low on purpose: sensitizes the 90%
                 // back-pressure alert threshold against the library's 10,000 default.
                 s.AddSingleton(new PublishFlowControlOptions { MaxPendingPublishes = MaxPendingPublishes });
 
@@ -264,7 +264,7 @@ public sealed class InMemoryBusThroughputIsolationTests
                 RegisterHealthyConsumer<QY>(s);
                 RegisterHealthyConsumer<QZ>(s);
             },
-            // D4/section-10 mitigation: Information, not the host default of Trace — no per-message log
+            // Information, not the host default of Trace — no per-message log
             // exists on this hot path today, but capturing at Trace would still allocate a CapturedLog
             // per entry for no reason while a throughput measurement is running.
             minimumLogLevel: LogLevel.Information,
@@ -332,8 +332,8 @@ public sealed class InMemoryBusThroughputIsolationTests
         var stopwatch = Stopwatch.StartNew();
         await PublishHealthyTrafficAsync(host.Bus, run, includeStalledTraffic, cancellationToken).ConfigureAwait(false);
 
-        // Completion signalled via a TCS set by the consumer that observes the target count (PERF-3
-        // mitigation) rather than polled — avoids adding a fixed polling-interval tail to the very
+        // Completion signalled via a TCS set by the consumer that observes the target count
+        // rather than polled — avoids adding a fixed polling-interval tail to the very
         // duration being measured.
         await run.Completion.Task.WaitAsync(TimeSpan.FromSeconds(20), cancellationToken).ConfigureAwait(false);
         stopwatch.Stop();

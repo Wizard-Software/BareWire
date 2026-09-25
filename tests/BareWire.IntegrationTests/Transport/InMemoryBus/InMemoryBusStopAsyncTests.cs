@@ -13,7 +13,7 @@ using Microsoft.Extensions.Logging;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 6 (task 20.28): <c>StopAsync</c>/<c>DisposeAsync</c> ordering and timing on the in-memory
+/// Scenario 6: <c>StopAsync</c>/<c>DisposeAsync</c> ordering and timing on the in-memory
 /// bus. <see cref="BareWire.Bus.BareWireBusControl.StopAsync"/> drains in-flight work (bounded by
 /// <c>DrainTimeout</c>) BEFORE cancelling consume loops, so genuinely in-flight messages — including a
 /// follow-up published from inside a handler — get a chance to complete; a queue with no active
@@ -144,10 +144,23 @@ public sealed class InMemoryBusStopAsyncTests
             minimumLogLevel: LogLevel.Information,
             cancellationToken: TestContext.Current.CancellationToken);
 
-        // Arrange: both queues' consumers block forever on the first message they are ever handed (D5),
+        // Arrange: both queues' consumers block forever on the first message they are ever handed,
         // so both queues fill to capacity and stay full. Far more than fits (100 vs. a capacity of 5) is
         // published to each, so most of the 200 messages never even leave the bus's OWN outgoing channel
         // before the publisher loop's single-wait-per-batch budget (InMemorySender.cs) is spent.
+        // Deterministically reproduce the exact scenario — the publisher loop actually PARKED
+        // inside a SendTimeout wait against a full, still-active-consumer (non-latched) queue — instead
+        // of hoping to land inside that up-to-1s window by timing alone. HasPendingSpaceWaiter is a
+        // dedicated test hook on InMemoryQueue for exactly this. Polling starts BEFORE publishing so a
+        // slow runner cannot miss the short window in which the loop is parked.
+        InMemoryQueue internalQueueA = GetQueueOrThrow(host, queueA);
+        InMemoryQueue internalQueueB = GetQueueOrThrow(host, queueB);
+
+        Task<bool> waiterObservation = WaitUntilAsync(
+            () => internalQueueA.HasPendingSpaceWaiter || internalQueueB.HasPendingSpaceWaiter,
+            TimeSpan.FromSeconds(20),
+            TestContext.Current.CancellationToken);
+
         var publishes = new List<Task>(perQueueMessageCount * 2);
         for (int i = 0; i < perQueueMessageCount; i++)
         {
@@ -157,17 +170,7 @@ public sealed class InMemoryBusStopAsyncTests
 
         await Task.WhenAll(publishes).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
-        // Deterministically reproduce PERF-1's exact scenario — the publisher loop actually PARKED
-        // inside a SendTimeout wait against a full, still-active-consumer (non-latched) queue — instead
-        // of hoping to land inside that up-to-1s window by timing alone. HasPendingSpaceWaiter is a
-        // dedicated test hook on InMemoryQueue for exactly this.
-        InMemoryQueue internalQueueA = GetQueueOrThrow(host, queueA);
-        InMemoryQueue internalQueueB = GetQueueOrThrow(host, queueB);
-
-        bool waiterObserved = await WaitUntilAsync(
-            () => internalQueueA.HasPendingSpaceWaiter || internalQueueB.HasPendingSpaceWaiter,
-            TimeSpan.FromSeconds(10),
-            TestContext.Current.CancellationToken);
+        bool waiterObserved = await waiterObservation;
 
         waiterObserved.Should().BeTrue(
             "the publisher loop must be observed mid-SendTimeout-wait against a full, non-latched queue " +

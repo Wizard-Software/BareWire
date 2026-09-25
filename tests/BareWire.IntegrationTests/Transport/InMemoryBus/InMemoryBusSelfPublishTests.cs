@@ -7,7 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 2 (task 20.28): a consumer that publishes back into its own, already-full queue must not
+/// Scenario 2: a consumer that publishes back into its own, already-full queue must not
 /// hang the bus's publish loop — an unrelated healthy queue published to concurrently must still receive
 /// every one of its own messages, and the transport must record rejections for the full "self" queue.
 /// </summary>
@@ -20,7 +20,7 @@ public sealed class InMemoryBusSelfPublishTests
     private const int SelfFloodCount = 50;
     private const int OtherCount = 20;
 
-    // Kept at or below half of QueueCapacity (PERF-2 mitigation): a full "self" spends the bus's single
+    // Kept at or below half of QueueCapacity: a full "self" spends the bus's single
     // one-wait-per-SendBatchAsync-call budget, and any OTHER full queue reached later in that same call
     // would be rejected outright (no wait left) rather than waited on. Keeping "other" always below
     // capacity avoids that entirely, regardless of how badly "self" is overflowing.
@@ -72,10 +72,18 @@ public sealed class InMemoryBusSelfPublishTests
                 await Task.WhenAll(batch).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
                 published += batchSize;
 
-                await WaitUntilAsync(
+                bool paced = await WaitUntilAsync(
                     () => probe.OtherReceived.Count >= published - OtherWindow,
                     TimeSpan.FromSeconds(10),
                     TestContext.Current.CancellationToken);
+
+                if (!paced)
+                {
+                    // Fail fast instead of publishing the remaining batches against a stalled consumer.
+                    throw new TimeoutException(
+                        $"Pacing wait timed out after 10s at published={published}: "
+                        + $"received={probe.OtherReceived.Count}, required>={published - OtherWindow}.");
+                }
             }
 
             await WaitUntilAsync(
@@ -95,7 +103,7 @@ public sealed class InMemoryBusSelfPublishTests
                 .CounterTotal(InMemoryTransportMetrics.RejectedCounterName, (InMemoryTransportMetrics.QueueTag, OtherQueue))
                 .Should().Be(0);
 
-            // Sanity check only (PERF-8 mitigation) — PublishAsync merely writes to the bus's own
+            // Sanity check only — PublishAsync merely writes to the bus's own
             // outgoing channel, so this proves the consumer's 50 calls returned, nothing about whether
             // the transport actually accepted any of them. The real proof of "self" overflowing is the
             // rejected-counter assertion above.
@@ -109,7 +117,7 @@ public sealed class InMemoryBusSelfPublishTests
         }
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken cancellationToken)
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken cancellationToken)
     {
         using var timeoutCts = new CancellationTokenSource(timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
@@ -120,10 +128,13 @@ public sealed class InMemoryBusSelfPublishTests
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(25), linkedCts.Token).ConfigureAwait(false);
             }
+
+            return true;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             // Timed out — the caller's own assertion reports the unmet condition.
+            return false;
         }
     }
 

@@ -10,7 +10,7 @@ using Microsoft.Extensions.DependencyInjection;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 4 (task 20.28): a fanout exchange bound to three healthy queues and one permanently stalled
+/// Scenario 4: a fanout exchange bound to three healthy queues and one permanently stalled
 /// queue. Every healthy subscriber must receive every message regardless of the stalled subscriber's
 /// latch state, and a direct <c>SendBatchAsync</c> call issued while the stalled queue is latched must
 /// report the whole fan-out as unconfirmed while still delivering to the healthy subscribers.
@@ -32,7 +32,7 @@ public sealed class InMemoryBusFanOutLatchTests
     {
         const int total = 200;
 
-        // Half of QueueCapacity (PERF-2 mitigation): keeps every healthy queue's published-but-not-yet-
+        // Half of QueueCapacity: keeps every healthy queue's published-but-not-yet-
         // delivered backlog bounded, so none of them is ever found full at reservation time — a full
         // "fan-stuck" already spends the bus's single one-wait-per-SendBatchAsync-call budget on itself
         // (it is last in the transport's fixed, name-ordered per-message target sequence), so any
@@ -58,10 +58,18 @@ public sealed class InMemoryBusFanOutLatchTests
                 published += batchSize;
 
                 int publishedSoFar = published;
-                await WaitUntilAsync(
+                bool paced = await WaitUntilAsync(
                     () => HealthyQueues.All(q => probe.Received[q].Count >= publishedSoFar - window),
                     TimeSpan.FromSeconds(10),
                     TestContext.Current.CancellationToken);
+
+                if (!paced)
+                {
+                    // Fail fast instead of publishing the remaining batches against a stalled consumer.
+                    throw new TimeoutException(
+                        $"Pacing wait timed out after 10s at published={publishedSoFar}: "
+                        + string.Join(", ", HealthyQueues.Select(q => $"{q}: received={probe.Received[q].Count}")));
+                }
             }
 
             await WaitUntilAsync(
@@ -136,7 +144,7 @@ public sealed class InMemoryBusFanOutLatchTests
             };
 
             // Built the same way the bus itself builds an outbound message (BareWireBus.PublishAsync) —
-            // see deviation D3 in the task plan: this scenario needs the SendResult that IBus.PublishAsync
+            // this scenario needs the SendResult that IBus.PublishAsync
             // never exposes to its caller, so it calls the same adapter the bus's own container resolved,
             // through the same internal serialization path, rather than a hand-rolled one.
             OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
@@ -196,7 +204,7 @@ public sealed class InMemoryBusFanOutLatchTests
                 .AddTransient<StuckConsumer>(),
             cancellationToken: cancellationToken);
 
-    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken cancellationToken)
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout, CancellationToken cancellationToken)
     {
         using var timeoutCts = new CancellationTokenSource(timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
@@ -207,10 +215,13 @@ public sealed class InMemoryBusFanOutLatchTests
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(25), linkedCts.Token).ConfigureAwait(false);
             }
+
+            return true;
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
         {
             // Timed out — the caller's own assertion reports the unmet condition.
+            return false;
         }
     }
 

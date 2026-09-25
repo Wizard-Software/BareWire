@@ -1,19 +1,17 @@
 using System.Diagnostics.Metrics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
-using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
-using BareWire.Bus;
+using BareWire.InMemory;
 using BareWire.Serialization.Json;
 using BareWire.Transport.InMemory;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Groups every InMemoryBus-level P0 test class (task 20.28) into one xUnit collection with
+/// Groups every InMemoryBus-level P0 test class into one xUnit collection with
 /// parallelization disabled — several scenarios measure elapsed time, rejection counts, or latch
 /// state, which would be skewed by another test in the same collection running concurrently.
 /// </summary>
@@ -30,24 +28,10 @@ public sealed class InMemoryBusIsolation
 /// <see cref="StartAsync"/> and dispose via <c>await using</c>.
 /// </summary>
 /// <remarks>
-/// <para>
-/// <strong>Composition, not the bundle (deviation D1, task 20.28).</strong> The ergonomic single-call
-/// bundle <c>BareWire.InMemory.ServiceCollectionExtensions.AddBareWireWithInMemory</c> would require
-/// this test project to reference the <c>BareWire.InMemory</c> project, which is outside this task's
-/// write scope. This type instead reproduces the bundle's registration body exactly: register the
-/// serializer, then <c>AddBareWireInMemory(transport)</c> — capturing
-/// <see cref="IInMemoryConfigurator.DrainTimeout"/> via a local decorator that mirrors
-/// <c>DrainTimeoutCapturingConfigurator</c> in that project — then
-/// <c>TryAddSingleton(new BusShutdownOptions { DrainTimeout = captured })</c>, then
-/// <c>AddBareWire(bus)</c>. Once this test project references the bundle (directly, or transitively
-/// once a sibling task rewires <c>BareWire.Testing</c>), this composition collapses to a single
-/// <c>services.AddBareWireWithInMemory(transport, bus)</c> call.
-/// </para>
-/// <para>
-/// Also registers <see cref="Abstractions.Serialization.IMessageSerializer"/> via
-/// <c>AddBareWireJsonSerializer()</c> — neither the bundle nor <c>AddBareWire</c> registers a
-/// serializer on its own, and <c>AddBareWire</c> requires one to resolve <see cref="IBusControl"/>.
-/// </para>
+/// Registers the bus with the single-call <c>AddBareWireWithInMemory</c> bundle — the same entry point
+/// applications use — plus <see cref="Abstractions.Serialization.IMessageSerializer"/> via
+/// <c>AddBareWireJsonSerializer()</c>, because neither the bundle nor <c>AddBareWire</c> registers a
+/// serializer on its own.
 /// </remarks>
 internal sealed class InMemoryBusHost : IAsyncDisposable
 {
@@ -117,12 +101,7 @@ internal sealed class InMemoryBusHost : IAsyncDisposable
         serviceCollection.AddMetrics();
         serviceCollection.AddBareWireJsonSerializer();
 
-        var capture = new DrainTimeoutCapture();
-        serviceCollection.AddBareWireInMemory(inner => transport(new DrainTimeoutCapturingConfigurator(inner, capture)));
-        serviceCollection.TryAddSingleton(capture.DrainTimeout is { } drainTimeout
-            ? new BusShutdownOptions { DrainTimeout = drainTimeout }
-            : new BusShutdownOptions());
-        serviceCollection.AddBareWire(bus ?? (_ => { }));
+        serviceCollection.AddBareWireWithInMemory(transport, bus);
 
         services?.Invoke(serviceCollection);
 
@@ -196,54 +175,5 @@ internal sealed class InMemoryBusHost : IAsyncDisposable
 
         await _provider.DisposeAsync().ConfigureAwait(false);
         Telemetry.Dispose();
-    }
-
-    /// <summary>Holds the last <see cref="IInMemoryConfigurator.DrainTimeout"/> value seen, if any.</summary>
-    private sealed class DrainTimeoutCapture
-    {
-        public TimeSpan? DrainTimeout { get; set; }
-    }
-
-    /// <summary>
-    /// Forwards every <see cref="IInMemoryConfigurator"/> call to the transport's own configurator
-    /// unchanged, while separately recording the last <see cref="DrainTimeout"/> value passed by the
-    /// caller — mirrors <c>BareWire.InMemory.Internal.DrainTimeoutCapturingConfigurator</c> (see the
-    /// deviation D1 remarks on <see cref="InMemoryBusHost"/>).
-    /// </summary>
-    private sealed class DrainTimeoutCapturingConfigurator(IInMemoryConfigurator inner, DrainTimeoutCapture capture)
-        : IInMemoryConfigurator
-    {
-        public void ConfigureTopology(Action<ITopologyConfigurator> configure) => inner.ConfigureTopology(configure);
-
-        public void ReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure) =>
-            inner.ReceiveEndpoint(queueName, configure);
-
-        public void DefaultExchange(string exchangeName) => inner.DefaultExchange(exchangeName);
-
-        public void GuaranteedRouting() => inner.GuaranteedRouting();
-
-        public void AutoDeclareEndpointQueues() => inner.AutoDeclareEndpointQueues();
-
-        public void QueueCapacity(int capacity) => inner.QueueCapacity(capacity);
-
-        public void SendTimeout(TimeSpan timeout) => inner.SendTimeout(timeout);
-
-        public void MaxMessageSize(int bytes) => inner.MaxMessageSize(bytes);
-
-        public void MaxRedeliveries(int maxRedeliveries) => inner.MaxRedeliveries(maxRedeliveries);
-
-        public void DrainTimeout(TimeSpan timeout)
-        {
-            capture.DrainTimeout = timeout;
-            inner.DrainTimeout(timeout);
-        }
-
-        public void EnableDefer(TimeSpan? delay = null) => inner.EnableDefer(delay);
-
-        public void MapRoutingKey<T>(string routingKey) where T : class => inner.MapRoutingKey<T>(routingKey);
-
-        public void MapExchange<T>(string exchangeName) where T : class => inner.MapExchange<T>(exchangeName);
-
-        public void Publish<T>(Action<IPublishConfigurator<T>> configure) where T : class => inner.Publish(configure);
     }
 }

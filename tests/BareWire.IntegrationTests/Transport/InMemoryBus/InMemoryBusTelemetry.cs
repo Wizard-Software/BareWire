@@ -14,7 +14,7 @@ internal sealed record CapturedLog(string Category, LogLevel Level, EventId Even
 /// <remarks>
 /// <para>
 /// <strong>Meter scoping.</strong> The <c>"BareWire"</c> meter is created fresh by every host's
-/// <c>IMeterFactory</c> (task 20.28 hosts are one-per-test, private containers), so a process-wide
+/// <c>IMeterFactory</c> (hosts are one-per-test, private containers), so a process-wide
 /// <see cref="MeterListener"/> would also observe another host's instruments if one happened to be
 /// running concurrently. <see cref="StartListening"/> filters strictly to instruments whose
 /// <c>Meter.Scope</c> is reference-equal to the supplied <see cref="IMeterFactory"/>, so only this

@@ -7,12 +7,12 @@ using Microsoft.Extensions.Logging;
 namespace BareWire.IntegrationTests.Transport.InMemoryBus;
 
 /// <summary>
-/// Scenario 7 (task 20.28): a SAGA timeout scheduled on the in-memory transport's native message
-/// scheduler (task 20.25) is delivered back to the SAGA's own queue and drives a state transition,
+/// Scenario 7: a SAGA timeout scheduled on the in-memory transport's native message
+/// scheduler is delivered back to the SAGA's own queue and drives a state transition,
 /// with no runtime topology deployment (the in-memory topology is sealed at bus startup).
 /// </summary>
 /// <remarks>
-/// Timeout CANCELLATION through the SAGA engine is a known, separate limitation (task 20.25) — this
+/// Timeout CANCELLATION through the SAGA engine is a known, separate limitation — this
 /// test asserts only that a scheduled timeout is DELIVERED and drives a transition, never that
 /// cancellation works end to end.
 /// </remarks>
@@ -25,7 +25,7 @@ public sealed class InMemoryBusSagaTimeoutTests
     [Fact]
     public async Task SagaTimeout_ScheduledOnInMemoryBus_IsDeliveredAndTransitionsSagaWithoutRuntimeTopologyDeploy()
     {
-        // GAP-6 mitigation: InMemorySagaRepository<TSaga> is internal and not registered by default —
+        // InMemorySagaRepository<TSaga> is internal and not registered by default —
         // register it explicitly, and hold the exact same instance so the test polls the state the
         // dispatcher actually wrote, not a second, unrelated repository.
         var repository = new InMemorySagaRepository<TimeoutSagaState>();
