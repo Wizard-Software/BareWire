@@ -13,6 +13,10 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
     // Header key written by RabbitMqHeaderMapper for the message type discriminator.
     private const string MessageTypeHeader = "BW-MessageType";
 
+    // Metric tag used when the context carries no endpoint name — the dedup key may then fall back to
+    // the producer-controlled message-type header, which must never become a metric tag value.
+    private const string UnknownEndpointMetricTag = "unknown";
+
     private static readonly AsyncLocal<OutboxBuffer?> _current = new();
 
     // The physical connection pinned for the in-flight consume operation, flowed across the
@@ -80,7 +84,13 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
             //    lock row is committed immediately and visible to other workers even if the
             //    business transaction later rolls back.
             bool lockAcquired = await _inboxFilter
-                .TryLockAsync(context.MessageId, consumerType, ct)
+                .TryLockAsync(
+                    context.MessageId,
+                    consumerType,
+                    metricConsumerTag: !string.IsNullOrEmpty(context.EndpointName)
+                        ? context.EndpointName
+                        : UnknownEndpointMetricTag,
+                    ct)
                 .ConfigureAwait(false);
 
             if (!lockAcquired)

@@ -36,6 +36,10 @@ BareWire emits the following metrics via OpenTelemetry:
 | `barewire.messages.consumed` | Counter of consumed messages |
 | `barewire.message.duration` | Histogram of message processing duration |
 
+Feature packages add their own instruments on the same `BareWire` meter — for example
+`barewire.outbox.rows.retried` and `barewire.outbox.retry.oldest_due_age` (see [Outbox](outbox.md)) and
+`barewire.inbox.duplicates` (see [Inbox](inbox.md)).
+
 ## Health Checks
 
 BareWire registers health checks that report transport and flow control status:

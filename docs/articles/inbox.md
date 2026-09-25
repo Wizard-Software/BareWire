@@ -79,6 +79,24 @@ rmq.ReceiveEndpoint("audit-log", e =>
 
 If the broker redelivers a message, each consumer's inbox entry is checked independently. `EmailNotificationConsumer` might have already processed it while `AuditLogConsumer` has not — the inbox handles both correctly.
 
+## Duplicate Metric
+
+Every message the inbox skips as a duplicate — because the same `(MessageId, ConsumerType)` pair is
+already locked or already processed — increments one counter on the `BareWire` meter:
+
+| Instrument | Type | Unit | Tags | Meaning |
+|------------|------|------|------|---------|
+| `barewire.inbox.duplicates` | counter | `{message}` | `consumer_type` | Messages skipped by the inbox as duplicates. |
+
+- `consumer_type` is the receive endpoint name. When a message carries no endpoint name the tag is
+  `unknown` — a value taken from message headers is never used as a tag, so a producer cannot inflate
+  the metric's cardinality. The message id is never recorded.
+- The counter is created when an `IMeterFactory` is registered in DI — the .NET generic host registers
+  one by default. Without it, deduplication works exactly the same and only the metric is skipped.
+- A steady non-zero rate is expected wherever duplicates are part of the delivery model (for example
+  outbox retries after a transport rejection, or a fan-out where one subscriber rejected the message);
+  compare it with `barewire.outbox.rows.retried` to see how many retries turned into duplicates.
+
 ## Inspecting the Inbox
 
 The InboxDeduplication sample exposes an endpoint to inspect inbox state:

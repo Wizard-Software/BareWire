@@ -1,3 +1,4 @@
+using System.Diagnostics.Metrics;
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Outbox;
@@ -112,11 +113,16 @@ public static class ServiceCollectionExtensions
                 sp.GetRequiredService<OutboxDbContext>(),
                 sp.GetRequiredService<IInboxSqlDialect>()));
 
+        // One InboxDiagnostics per container: the duplicates counter lives on the shared "BareWire"
+        // meter; metrics are skipped when no IMeterFactory is registered.
+        services.TryAddSingleton(sp => new InboxDiagnostics(sp.GetService<IMeterFactory>()));
+
         // Register InboxFilter as scoped — it depends on the scoped IInboxStore.
         services.AddScoped(sp => new InboxFilter(
             sp.GetRequiredService<IInboxStore>(),
             sp.GetRequiredService<OutboxOptions>(),
-            sp.GetRequiredService<ILogger<InboxFilter>>()));
+            sp.GetRequiredService<ILogger<InboxFilter>>(),
+            sp.GetRequiredService<InboxDiagnostics>()));
 
         // Register the transactional middleware as scoped (depends on OutboxDbContext + EfCoreInboxStore).
         services.AddScoped<IMessageMiddleware>(sp => new TransactionalOutboxMiddleware(
