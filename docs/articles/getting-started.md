@@ -99,6 +99,41 @@ registration paths and why the engine and transport are layered the way they are
 
 > See: `samples/BareWire.Samples.BasicPublishConsume/Program.cs`
 
+### Run without a broker
+
+To try BareWire with no RabbitMQ at all — or to run a modular monolith in one process — register the
+in-memory transport from the `BareWire.InMemory` package instead. The topology and the consumer stay
+the same; only the registration call changes:
+
+```csharp
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddTransient<MessageConsumer>();   // consumers are resolved from DI
+
+builder.Services.AddBareWireWithInMemory(transport =>
+{
+    transport.ConfigureTopology(topology =>
+    {
+        topology.DeclareExchange("messages", ExchangeType.Fanout, durable: true);
+        topology.DeclareQueue("messages", durable: true);
+        topology.BindExchangeToQueue("messages", "messages", routingKey: "");
+    });
+
+    // PublishAsync<MessageSent> resolves this exchange.
+    transport.DefaultExchange("messages");
+
+    transport.ReceiveEndpoint("messages", e =>
+    {
+        e.Consumer<MessageConsumer, MessageSent>();
+    });
+});
+```
+
+The in-memory transport delivers **at-most-once**: queued messages live in process memory and are
+lost on restart. Use it for development, tests and single-process applications; switch back to a
+broker when you need at-least-once delivery. See [In-Memory Transport](transport-inmemory.md).
+
+> See: `samples/BareWire.Samples.InMemoryModularMonolith/Program.cs`
+
 ## Publish a Message
 
 Inject `IPublishEndpoint` (or `IBus`) and call `PublishAsync`:
@@ -130,3 +165,4 @@ dotnet run --project samples/BareWire.Samples.AppHost/
 - [Configuration](configuration.md) — detailed bus and transport options
 - [Publishing and Consuming](publishing-and-consuming.md) — patterns for pub/sub, request-response, and raw messages
 - [Topology](topology.md) — exchange types, routing keys, and binding strategies
+- [In-Memory Transport](transport-inmemory.md) — run without a broker, sizing, and differences vs RabbitMQ

@@ -5,7 +5,9 @@ BareWire separates its **core engine** — pipeline, flow control, dispatch, sag
 configuration work across every transport: you swap the adapter, not your application code.
 
 RabbitMQ is the reference transport and the focus of most guides on this site. BareWire also ships
-first-class adapters for Kafka, Azure Service Bus, AWS SQS, and Google Pub/Sub.
+first-class adapters for Kafka, Azure Service Bus, AWS SQS, and Google Pub/Sub, plus an in-memory
+transport that runs without a broker inside a single process — for modular monoliths, local
+development and tests, with at-most-once delivery.
 
 ## Available transports
 
@@ -16,6 +18,7 @@ first-class adapters for Kafka, Azure Service Bus, AWS SQS, and Google Pub/Sub.
 | Azure Service Bus | `BareWire.AzureServiceBus` | `AddBareWireWithAzureServiceBus` | Sessions (per-session FIFO), scheduled messages, Entra ID + SAS — [Azure Service Bus Transport](transport-azure-service-bus.md) |
 | AWS SQS | `BareWire.AWS.SQS` | `AddBareWireWithSqs` | Batch producer, long-polling, FIFO, IAM auth, SSE, redrive DLQ — [AWS SQS Transport](transport-aws-sqs.md) |
 | Google Pub/Sub | `BareWire.Google.PubSub` | `AddBareWireWithPubSub` | Ordering keys, dead-letter topics — [Google Pub/Sub Transport](transport-google-pubsub.md) |
+| In-Memory | `BareWire.InMemory` | `AddBareWireWithInMemory` | Single process, no broker, at-most-once; bounded queues, same topology model as RabbitMQ — [In-Memory Transport](transport-inmemory.md) |
 
 > **Kafka maturity caveat.** The Kafka adapter currently defaults to `SecurityProtocol=Plaintext`
 > and SASL/SSL is not yet wired up — do not point it at a production broker until the secure-config
@@ -31,14 +34,24 @@ Every transport offers the same two registration shapes described in [Configurat
 
 ```csharp
 // Bundle — the common single-transport case
-builder.Services.AddBareWireWithKafka(
-    transport =>
+builder.Services.AddTransient<OrderConsumer>();   // consumers are resolved from DI
+
+builder.Services.AddBareWireWithRabbitMq(transport =>
+{
+    transport.Host(builder.Configuration.GetConnectionString("rabbitmq")!);
+    transport.ConfigureTopology(topology =>
     {
-        transport.BootstrapServers("localhost:9092");
-        transport.ConsumerGroup("orders");
-    },
-    bus => bus.AddConsumer<OrderConsumer>());
+        topology.DeclareExchange("orders", ExchangeType.Fanout);
+        topology.DeclareQueue("order-processing");
+        topology.BindExchangeToQueue("orders", "order-processing", routingKey: "#");
+    });
+    transport.DefaultExchange("orders");
+    transport.ReceiveEndpoint("order-processing", e => e.Consumer<OrderConsumer, OrderCreated>());
+});
 ```
+
+Swapping the bundle call — for example `AddBareWireWithRabbitMq` for `AddBareWireWithInMemory` — is the
+only change needed to move the same topology and consumers to another transport that supports them.
 
 ## Serialization and persistence are pluggable too
 
