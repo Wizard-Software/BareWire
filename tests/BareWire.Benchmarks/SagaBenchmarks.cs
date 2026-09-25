@@ -23,7 +23,15 @@ namespace BareWire.Benchmarks;
 /// The <see cref="Instances"/> parameter controls how many pre-created saga instances are
 /// transitioned per benchmark invocation, modelling load from multiple concurrent correlations.
 /// </para>
+/// <para>
+/// This benchmark does not touch any transport — <see cref="InMemorySagaRepository{TSaga}"/> persists
+/// saga state directly in process memory, with no <c>ITransportAdapter</c> or broker involved at any
+/// point. "InMemory" in the benchmark method name refers to the saga repository, not to the in-memory
+/// transport measured by <c>InMemoryTransportBenchmarks</c>/<c>InMemoryFanOutBenchmarks</c>. It measures
+/// Core + Saga only.
+/// </para>
 /// </remarks>
+[SimpleJob(launchCount: 1, warmupCount: 3, iterationCount: 15)]
 [MemoryDiagnoser(displayGenColumns: true)]
 public class SagaBenchmarks
 {
