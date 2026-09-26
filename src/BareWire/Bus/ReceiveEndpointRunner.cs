@@ -363,6 +363,16 @@ internal sealed partial class ReceiveEndpointRunner
                     {
                         LogSettlementError(_binding.EndpointName, message.MessageId, outcome.Action, ex);
                     }
+
+                    // A cancellation-induced requeue puts the delivery back at the head of the queue —
+                    // the loop must stop instead of reading it again, rather than fetching the same
+                    // delivery over and over while shutting down. The catch (OperationCanceledException)
+                    // filter below logs the exit; the finally block still runs to release credit, dispose
+                    // the message, and check health.
+                    if (outcome.Action == SettlementAction.Requeue)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
                 }
                 finally
                 {

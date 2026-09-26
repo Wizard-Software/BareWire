@@ -97,7 +97,13 @@ internal sealed class InMemoryQueueRunner
                 gateAcquired = true;
             }
 
-            await foreach (InMemoryDelivery delivery in Queue.ReadAllAsync(linked.Token).ConfigureAwait(false))
+            // stopToken = the caller's own, un-linked token: closes the CancelAsync LIFO-callback race
+            // documented on InMemoryQueue.ReadAllAsync — a consumer registered on this same original
+            // token can requeue its in-flight delivery and wake this reader before linked's own callback
+            // has propagated the cancellation to it.
+            await foreach (InMemoryDelivery delivery in Queue
+                .ReadAllAsync(linked.Token, cancellationToken)
+                .ConfigureAwait(false))
             {
                 ulong deliveryTag = _map.NextTag();
                 var message = new InboundMessage(

@@ -99,6 +99,62 @@ public sealed class InMemoryQueueConsumerTests
     }
 
     [Fact]
+    public async Task ReadAllAsync_ConsumerRequeuesInlineFromCancelledOriginalToken_DoesNotRereadBeforeLinkedTokenCatchesUp()
+    {
+        // Reproduces the production race (InMemoryQueueRunner): the reader waits on a token LINKED from
+        // the consumer's own (original) token, but a stalled consumer that reacts to its own token's
+        // cancellation by requeuing its in-flight delivery — inline, from a cancellation continuation,
+        // exactly like ReceiveEndpointRunner's cancellation-induced Requeue settlement — can wake this
+        // reader before the linked token's own cascade callback has propagated the cancellation to it.
+        // This test drives that ordering directly with two independent tokens instead of racing a real
+        // CancellationTokenSource.CancelAsync callback cascade, so the gap reproduces deterministically
+        // rather than only intermittently.
+        var q = new InMemoryQueue("orders", capacity: 2);
+        Enqueue(q);
+
+        using var originalCts = new CancellationTokenSource(); // the consumer's own token
+        using var linkedCts = new CancellationTokenSource(); // stands in for InMemoryQueueRunner's `linked`
+
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        IAsyncEnumerator<InMemoryDelivery> reader =
+            q.ReadAllAsync(linkedCts.Token, originalCts.Token).GetAsyncEnumerator(linkedCts.Token);
+
+        (await reader.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5), ct)).Should().BeTrue();
+        InMemoryDelivery delivered = reader.Current;
+
+        // Park the reader in WaitToReadAsync on the still-uncancelled linked token — the exact position
+        // InMemoryQueueRunner's reader is in when a stalled consumer's own shutdown handling wakes it.
+        ValueTask<bool> pendingRead = reader.MoveNextAsync();
+
+        // Registered after the read is already parked, so the requeue below wakes a genuinely waiting
+        // reader rather than one that is still catching up.
+        originalCts.Token.Register(() =>
+            q.RequeueAtHead(delivered.CreateRedelivery(delivered.Buffer, delivered.Length)));
+
+        await originalCts.CancelAsync();
+
+        // linkedCts is deliberately never cancelled here: it stands in for the window where the linked
+        // token's own cascade callback has not yet propagated the original token's cancellation to it.
+        Func<Task> awaitPendingRead = async () =>
+            await pendingRead.AsTask().WaitAsync(TimeSpan.FromSeconds(5), ct);
+        await awaitPendingRead.Should().ThrowAsync<OperationCanceledException>(
+            "the original consumer token was already cancelled when the inline requeue woke this reader, " +
+            "and it must refuse the just-requeued delivery instead of reading it back out just because the " +
+            "linked token it waits on has not caught up yet");
+
+        q.Occupancy.Should().Be(1, "the requeue reuses the delivery's already-reserved slot; nothing was lost or leaked");
+
+        await reader.DisposeAsync();
+
+        using var drainCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using IAsyncEnumerator<InMemoryDelivery> drain =
+            q.ReadAllAsync(drainCts.Token).GetAsyncEnumerator(drainCts.Token);
+        (await drain.MoveNextAsync()).Should().BeTrue();
+        drain.Current.RedeliveryCount.Should().Be(1,
+            "requeued exactly once by the inline callback — never read and requeued a second time by this reader");
+    }
+
+    [Fact]
     public async Task TryReserve_FullQueueAfterConsumerFaulted_LatchesInsteadOfOfferingWait()
     {
         var q = new InMemoryQueue("orders", capacity: 1);

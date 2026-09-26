@@ -848,8 +848,30 @@ internal sealed class InMemoryQueue
     /// next <c>MoveNextAsync</c> — any delivery still pending in the channel at that point is left
     /// untouched.
     /// </summary>
+    /// <param name="cancellationToken">
+    /// Cancels the wait for the next delivery and deactivates this reader's active-consumer registration.
+    /// Typically a token linking the caller's own token with a transport-wide shutdown token.
+    /// </param>
+    /// <param name="stopToken">
+    /// An additional guard checked, via <see cref="CancellationToken.ThrowIfCancellationRequested"/>,
+    /// immediately before every <c>TryRead</c> attempt (including the one right after
+    /// <c>WaitToReadAsync</c> returns) — alongside, not instead of, <paramref name="cancellationToken"/>.
+    /// It exists to close a narrow race: <see cref="CancellationTokenSource.CancelAsync"/> marks its token
+    /// cancelled and only then runs its registered callbacks, in LIFO order. When a consumer registered on
+    /// the SAME original token this reader's <paramref name="cancellationToken"/> is linked from reacts to
+    /// that cancellation inline — for example by requeuing its own in-flight delivery — and thereby wakes
+    /// this reader, the linked token's own callback (which would propagate the cancellation to
+    /// <paramref name="cancellationToken"/>) may not have run yet, even though the original token already
+    /// reports <see cref="CancellationToken.IsCancellationRequested"/> as <see langword="true"/>. Passing
+    /// that original token here lets this reader observe the cancellation immediately — a plain flag read,
+    /// independent of callback ordering — and refuse to read the just-requeued delivery back out, instead
+    /// of taking it and only bumping its redelivery count for no reason. Defaults to
+    /// <see langword="default"/> (never cancelled) for callers with no such original token to guard
+    /// against.
+    /// </param>
     internal async IAsyncEnumerable<InMemoryDelivery> ReadAllAsync(
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken cancellationToken = default,
+        CancellationToken stopToken = default)
     {
         Interlocked.Increment(ref _activeConsumers);
         var registration = new ConsumerRegistration(this);
@@ -863,6 +885,7 @@ internal sealed class InMemoryQueue
                 while (true)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    stopToken.ThrowIfCancellationRequested();
                     if (!reader.TryRead(out InMemoryDelivery? delivery))
                     {
                         break;
