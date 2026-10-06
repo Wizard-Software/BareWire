@@ -13,6 +13,7 @@ internal sealed class BareWireMetrics : IDisposable
     private readonly Counter<long> _retried;
     private readonly Counter<long> _deadLettered;
     private readonly Counter<long> _publishRejected;
+    private readonly Counter<long> _publishIntercepted;
 
     private readonly Histogram<double> _duration;
     private readonly Histogram<long> _size;
@@ -54,6 +55,11 @@ internal sealed class BareWireMetrics : IDisposable
             "barewire.publish.rejected",
             unit: null,
             description: "Number of publish operations rejected due to full outgoing channel");
+
+        _publishIntercepted = _meter.CreateCounter<long>(
+            "barewire.publish.intercepted",
+            unit: null,
+            description: "Number of outbound messages captured by an outbound message interceptor (e.g. the transactional outbox)");
 
         _duration = _meter.CreateHistogram<double>(
             "barewire.message.duration",
@@ -177,6 +183,17 @@ internal sealed class BareWireMetrics : IDisposable
         };
 
         _publishRejected.Add(1, tags);
+    }
+
+    internal void RecordPublishIntercepted(string endpoint, string messageType)
+    {
+        var tags = new TagList
+        {
+            { "endpoint", endpoint },
+            { "message_type", messageType }
+        };
+
+        _publishIntercepted.Add(1, tags);
     }
 
     public void Dispose() => _meter.Dispose();

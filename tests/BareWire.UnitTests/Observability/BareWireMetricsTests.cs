@@ -99,6 +99,19 @@ public sealed class BareWireMetricsTests : IDisposable
             .Should().Be(512);
     }
 
+    // ── RecordPublishIntercepted ──────────────────────────────────────────────
+
+    [Fact]
+    public void RecordPublishIntercepted_IncrementsInterceptedCounterOnly()
+    {
+        // Act
+        _metrics.RecordPublishIntercepted("orders-queue", "OrderCreated");
+
+        // Assert — separate counter; the regular published counter is untouched
+        SumLong("barewire.publish.intercepted").Should().Be(1);
+        SumLong("barewire.messages.published").Should().Be(0);
+    }
+
     // ── RecordConsume ─────────────────────────────────────────────────────────
 
     [Fact]

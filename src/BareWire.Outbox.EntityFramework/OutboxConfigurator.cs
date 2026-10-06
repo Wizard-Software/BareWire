@@ -19,6 +19,8 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     private bool _allowNonAtomicProvider = OutboxOptions.Default.AllowNonAtomicProvider;
     private bool _allowDegradedOrdering = OutboxOptions.Default.AllowDegradedOrdering;
     private bool _autoCreateSchema = OutboxOptions.Default.AutoCreateSchema;
+    private int _maxBufferedMessagesPerConsume = OutboxOptions.Default.MaxBufferedMessagesPerConsume;
+    private long _maxBufferedBytesPerConsume = OutboxOptions.Default.MaxBufferedBytesPerConsume;
     private OrderingMode _orderingMode = OutboxOptions.Default.OrderingMode;
     private string _orderingKeyHeaderName = OutboxOptions.Default.OrderingKeyHeaderName ?? string.Empty;
 
@@ -93,6 +95,20 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
     }
 
     /// <inheritdoc />
+    public int MaxBufferedMessagesPerConsume
+    {
+        get => _maxBufferedMessagesPerConsume;
+        set => _maxBufferedMessagesPerConsume = value;
+    }
+
+    /// <inheritdoc />
+    public long MaxBufferedBytesPerConsume
+    {
+        get => _maxBufferedBytesPerConsume;
+        set => _maxBufferedBytesPerConsume = value;
+    }
+
+    /// <inheritdoc />
     public OrderingMode OrderingMode
     {
         get => _orderingMode;
@@ -126,6 +142,8 @@ internal sealed class OutboxConfigurator : IOutboxConfigurator
             OutboxLockTimeout = _outboxLockTimeout,
             CleanupInterval = _cleanupInterval,
             AutoCreateSchema = _autoCreateSchema,
+            MaxBufferedMessagesPerConsume = _maxBufferedMessagesPerConsume,
+            MaxBufferedBytesPerConsume = _maxBufferedBytesPerConsume,
             OrderingMode = _orderingMode,
             OrderingKeyHeaderName = string.IsNullOrEmpty(_orderingKeyHeaderName) ? null : _orderingKeyHeaderName,
         };

@@ -29,6 +29,8 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
     private readonly IOutboxStore _outboxStore;
     private readonly InboxFilter _inboxFilter;
     private readonly ILogger<TransactionalOutboxMiddleware> _logger;
+    private readonly int _maxBufferedMessages;
+    private readonly long _maxBufferedBytes;
 
     internal static OutboxBuffer? Current => _current.Value;
 
@@ -38,7 +40,8 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
         OutboxDbContext dbContext,
         IOutboxStore outboxStore,
         InboxFilter inboxFilter,
-        ILogger<TransactionalOutboxMiddleware> logger)
+        ILogger<TransactionalOutboxMiddleware> logger,
+        OutboxOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(dbContext);
         ArgumentNullException.ThrowIfNull(outboxStore);
@@ -49,6 +52,9 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
         _outboxStore = outboxStore;
         _inboxFilter = inboxFilter;
         _logger = logger;
+        OutboxOptions effective = options ?? OutboxOptions.Default;
+        _maxBufferedMessages = effective.MaxBufferedMessagesPerConsume;
+        _maxBufferedBytes = effective.MaxBufferedBytesPerConsume;
     }
 
     public async Task InvokeAsync(MessageContext context, NextMiddleware nextMiddleware)
@@ -100,8 +106,14 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
                 return;
             }
 
-            var buffer = new OutboxBuffer();
+            var buffer = new OutboxBuffer(_maxBufferedMessages, _maxBufferedBytes);
             _current.Value = buffer;
+
+            // In-process retries (RetryMiddleware sits inside this middleware) re-run the handler on the
+            // same buffer; discard what the failed attempt published so only the successful attempt's
+            // messages reach the outbox.
+            Action retryCallback = buffer.Clear;
+            context.Items[RetryAttemptStarting] = retryCallback;
 
             // 2. Begin ambient transaction. The connection is already open and will be enlisted
             //    once in this scope. Both SaveChangesAsync and MarkProcessedAsync use the same
@@ -117,6 +129,9 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
                 await nextMiddleware(context).ConfigureAwait(false);
 
                 // 4. Flush outbox buffer — add OutboxMessage entities to DbContext (no SaveChanges yet).
+                //    Seal first: work that outlives the handler (e.g. Task.Run) captured the AsyncLocal
+                //    buffer, and must not append after the snapshot below has been taken.
+                buffer.Seal();
                 if (!buffer.IsEmpty)
                 {
                     var messages = buffer.GetMessages();
@@ -143,14 +158,25 @@ internal sealed partial class TransactionalOutboxMiddleware : IMessageMiddleware
             {
                 // Buffer is discarded; DbContext changes are not saved; TransactionScope
                 // disposes without Complete() — automatic rollback of all three writes.
-                int discardCount = buffer.GetMessages().Count;
+                int discardCount = buffer.Count;
                 TransactionalOutboxLogMessages.DiscardingBuffer(_logger, context.MessageId, discardCount);
                 buffer.Clear();
                 throw;
             }
             finally
             {
+                buffer.Seal();
                 _current.Value = null;
+
+                // The retry slot is owned by this middleware; if inner middleware replaced or removed it,
+                // retried attempts may have leaked duplicate messages into the buffer.
+                if (!context.Items.TryGetValue(RetryAttemptStarting, out object? slot)
+                    || !ReferenceEquals(slot, retryCallback))
+                {
+                    TransactionalOutboxLogMessages.RetryCallbackOverwritten(_logger, context.MessageId);
+                }
+
+                context.Items.Remove(RetryAttemptStarting);
             }
         }
         finally
@@ -191,6 +217,14 @@ internal static partial class TransactionalOutboxLogMessages
         ILogger logger,
         Guid messageId,
         int messageCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "The retry-attempt callback registered by the transactional outbox for message {MessageId} was " +
+                  "overwritten or removed by other middleware; messages from failed retry attempts may be duplicated")]
+    internal static partial void RetryCallbackOverwritten(
+        ILogger logger,
+        Guid messageId);
 
     [LoggerMessage(
         Level = LogLevel.Information,

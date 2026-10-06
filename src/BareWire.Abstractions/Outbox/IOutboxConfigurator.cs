@@ -99,6 +99,25 @@ public interface IOutboxConfigurator
     bool AutoCreateSchema { get; set; }
 
     /// <summary>
+    /// Gets or sets the maximum number of outbound messages a single consume operation may buffer
+    /// for the transactional outbox (messages published from a consumer, an injected bus or a saga).
+    /// Exceeding the limit throws a <see cref="BareWire.Abstractions.Exceptions.BareWireException"/> from the
+    /// publish call, which fails the consume operation and rolls its transaction back.
+    /// Must be greater than zero. Defaults to <c>10000</c>.
+    /// </summary>
+    int MaxBufferedMessagesPerConsume { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum total body size, in bytes, that a single consume operation may buffer
+    /// for the transactional outbox. Exceeding the limit throws a
+    /// <see cref="BareWire.Abstractions.Exceptions.BareWireException"/> from the publish call, which fails
+    /// the consume operation and rolls its transaction back. Captured messages are not counted against the
+    /// publish byte budget; this limit is their only size bound.
+    /// Must be greater than zero. Defaults to <c>67108864</c> (64 MiB).
+    /// </summary>
+    long MaxBufferedBytesPerConsume { get; set; }
+
+    /// <summary>
     /// Gets or sets the local dispatch ordering mode for outbox messages.
     /// Defaults to <see cref="OrderingMode.None"/>, which preserves pre-R7.7 behavior exactly.
     /// Set to <see cref="OrderingMode.PerKey"/> to enable head-of-line ordering per key group.

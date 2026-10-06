@@ -28,6 +28,7 @@ internal sealed partial class BareWireBus : IBus
     private readonly PublishFlowControlOptions _publishFlowControl;
     private readonly ILogger<BareWireBus> _logger;
     private readonly IBareWireInstrumentation _instrumentation;
+    private readonly IOutboundMessageInterceptor? _outboundInterceptor;
     private readonly IRoutingKeyResolver _routingKeyResolver;
     private readonly IExchangeResolver _exchangeResolver;
     private readonly IRequestClientFactory? _requestClientFactory;
@@ -75,7 +76,8 @@ internal sealed partial class BareWireBus : IBus
         IRequestClientFactory? requestClientFactory = null,
         IExchangeResolver? exchangeResolver = null,
         TimeSpan? publisherRetryInitialDelay = null,
-        int? publisherMaxSendAttempts = null)
+        int? publisherMaxSendAttempts = null,
+        IOutboundMessageInterceptor? outboundInterceptor = null)
     {
         // The adapter is intentionally nullable here (15.3 / C1): when no transport is registered,
         // construction must still succeed so that BareWireBusControl.StartAsync can raise the friendly
@@ -91,6 +93,7 @@ internal sealed partial class BareWireBus : IBus
         _routingKeyResolver = routingKeyResolver ?? new RoutingKeyResolver();
         _exchangeResolver = exchangeResolver ?? new ExchangeResolver();
         _requestClientFactory = requestClientFactory;
+        _outboundInterceptor = outboundInterceptor;
 
         // Default to a 1s initial backoff in production; tests inject a tiny value for fast,
         // deterministic retry assertions. A non-positive value is coerced to the default.
@@ -208,12 +211,17 @@ internal sealed partial class BareWireBus : IBus
             }
 
             IMessageSerializer serializer = _serializerResolver.Resolve<T>();
-        OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
+            OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
                 message,
                 serializer,
                 routingKey,
                 mergedHeaders,
                 cancellationToken);
+
+            // Captured messages (e.g. buffered by the transactional outbox) skip the byte budget and the
+            // publish metrics; the interceptor owns their delivery. One null check when none is registered.
+            if (_outboundInterceptor is { IsCapturing: true } && TryIntercept(outbound, messageType))
+                return;
 
             await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
             Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
@@ -247,6 +255,11 @@ internal sealed partial class BareWireBus : IBus
             body: payload,
             contentType: contentType);
 
+        // The raw path hands the caller's buffer to the transport zero-copy. An interceptor may retain the
+        // message beyond this call, so it receives an owned copy; the copy exists only when one is registered.
+        if (_outboundInterceptor is { IsCapturing: true } && TryInterceptRaw(outbound, rawMessageType))
+            return;
+
         await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
         Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
 
@@ -264,10 +277,44 @@ internal sealed partial class BareWireBus : IBus
 
         ISendEndpoint endpoint = _sendEndpoints.GetOrAdd(
             address,
-            static (uri, state) => new BareWireSendEndpoint(uri, state._serializerResolver, state._outgoingChannel.Writer),
-            (_serializerResolver, _outgoingChannel));
+            static (uri, state) => new BareWireSendEndpoint(
+                uri, state._serializerResolver, state._outgoingChannel.Writer, state.Bus),
+            (_serializerResolver, _outgoingChannel, Bus: this));
 
         return Task.FromResult(endpoint);
+    }
+
+    // ── Outbound interception ────────────────────────────────────────────────
+
+    // Offers the message to the registered interceptor. Callers must check _outboundInterceptor?.IsCapturing first.
+    private bool TryIntercept(OutboundMessage outbound, string messageType)
+    {
+        if (!_outboundInterceptor!.TryIntercept(outbound))
+            return false;
+
+        _instrumentation.RecordPublishIntercepted(outbound.RoutingKey, messageType);
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+            outbound.Headers.TryGetValue("message-id", out string? messageId);
+            LogMessageIntercepted(_logger, messageId ?? string.Empty, messageType);
+        }
+
+        return true;
+    }
+
+    // Raw variant: the interceptor is offered an owned copy of the payload (callers have already confirmed
+    // IsCapturing). When it declines anyway (race), the original zero-copy message continues down the normal
+    // path, so the copy is simply discarded.
+    private bool TryInterceptRaw(OutboundMessage outbound, string messageType)
+    {
+        OutboundMessage owned = new(
+            outbound.RoutingKey,
+            outbound.Headers,
+            outbound.Body.ToArray(),
+            outbound.ContentType);
+
+        return TryIntercept(owned, messageType);
     }
 
     // ── IBus ─────────────────────────────────────────────────────────────────
@@ -554,6 +601,11 @@ internal sealed partial class BareWireBus : IBus
 
     // ── Logger messages ───────────────────────────────────────────────────────
 
+    // Deliberately limited to the message id and type name: never the body, the headers or any lock owner.
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Outbound message {MessageId} of type {MessageType} was captured by the outbound message interceptor.")]
+    private static partial void LogMessageIntercepted(ILogger logger, string messageId, string messageType);
+
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Publish channel back-pressure alert: {Utilization:F1}% capacity used ({Pending}/{Capacity} pending).")]
     private static partial void LogPublishBackpressureAlert(
@@ -589,12 +641,15 @@ internal sealed partial class BareWireBus : IBus
     {
         private readonly ISerializerResolver _serializerResolver;
         private readonly ChannelWriter<OutboundMessage> _channelWriter;
+        private readonly BareWireBus _bus;
 
         internal BareWireSendEndpoint(
             Uri address,
             ISerializerResolver serializerResolver,
-            ChannelWriter<OutboundMessage> channelWriter)
+            ChannelWriter<OutboundMessage> channelWriter,
+            BareWireBus bus)
         {
+            _bus = bus ?? throw new ArgumentNullException(nameof(bus));
             Address = address ?? throw new ArgumentNullException(nameof(address));
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _channelWriter = channelWriter ?? throw new ArgumentNullException(nameof(channelWriter));
@@ -652,6 +707,9 @@ internal sealed partial class BareWireBus : IBus
                 headers: headers,
                 cancellationToken);
 
+            if (_bus._outboundInterceptor is not null && _bus.TryIntercept(outbound, typeof(T).Name))
+                return;
+
             await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
         }
 
@@ -684,6 +742,9 @@ internal sealed partial class BareWireBus : IBus
                 headers: headers,
                 body: payload,
                 contentType: contentType);
+
+            if (_bus._outboundInterceptor is { IsCapturing: true } && _bus.TryInterceptRaw(outbound, "raw"))
+                return;
 
             await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
         }

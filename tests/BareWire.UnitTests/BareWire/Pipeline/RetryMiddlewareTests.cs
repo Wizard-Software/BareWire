@@ -60,6 +60,86 @@ public sealed class RetryMiddlewareTests
     }
 
     [Fact]
+    public async Task InvokeAsync_FirstAttemptSucceeds_DoesNotInvokeRetryAttemptStartingCallback()
+    {
+        // Arrange
+        int resetCount = 0;
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(),
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+        var context = CreateContext();
+        context.Items[WellKnownItemKeys.RetryAttemptStarting] = (Action)(() => resetCount++);
+
+        // Act
+        await sut.InvokeAsync(context, _ => Task.CompletedTask);
+
+        // Assert
+        resetCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_TransientFailures_InvokesRetryAttemptStartingCallbackOncePerRetry()
+    {
+        // Arrange
+        int callCount = 0;
+        int resetCount = 0;
+        int callsAtLastReset = 0;
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(retryCount: 3),
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+        var context = CreateContext();
+        context.Items[WellKnownItemKeys.RetryAttemptStarting] = (Action)(() =>
+        {
+            resetCount++;
+            callsAtLastReset = callCount;
+        });
+
+        // Act — two failures followed by a success = 2 retries
+        await sut.InvokeAsync(context, _ =>
+        {
+            callCount++;
+            if (callCount < 3)
+                throw new InvalidOperationException("transient");
+            return Task.CompletedTask;
+        });
+
+        // Assert — invoked exactly once per retry, before the retried attempt runs
+        callCount.Should().Be(3);
+        resetCount.Should().Be(2);
+        callsAtLastReset.Should().Be(2);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_RetryWithNonActionItemValue_IgnoresItAndRetries()
+    {
+        // Arrange
+        int callCount = 0;
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(retryCount: 3),
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+        var context = CreateContext();
+        context.Items[WellKnownItemKeys.RetryAttemptStarting] = "not a callback";
+
+        // Act
+        await sut.InvokeAsync(context, _ =>
+        {
+            callCount++;
+            if (callCount < 2)
+                throw new InvalidOperationException("transient");
+            return Task.CompletedTask;
+        });
+
+        // Assert
+        callCount.Should().Be(2);
+    }
+
+    [Fact]
     public async Task InvokeAsync_TransientFailure_RetriesUpToMaxCount()
     {
         // Arrange

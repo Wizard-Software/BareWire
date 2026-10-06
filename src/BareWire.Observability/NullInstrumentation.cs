@@ -38,6 +38,8 @@ internal sealed class NullInstrumentation : IBareWireInstrumentation
 
     public void RecordPublishRejected(string endpoint, string messageType) { }
 
+    public void RecordPublishIntercepted(string endpoint, string messageType) { }
+
     public void InjectTraceContext(Activity? activity, IDictionary<string, string> headers) { }
 
     public Activity? ExtractTraceContext(IReadOnlyDictionary<string, string> headers, string operationName)

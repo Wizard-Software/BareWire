@@ -70,6 +70,9 @@ internal sealed class BareWireInstrumentation(BareWireMetrics metrics)
     public void RecordPublishRejected(string endpoint, string messageType)
         => metrics.RecordPublishRejected(endpoint, messageType);
 
+    public void RecordPublishIntercepted(string endpoint, string messageType)
+        => metrics.RecordPublishIntercepted(endpoint, messageType);
+
     public void InjectTraceContext(Activity? activity, IDictionary<string, string> headers)
         => TraceContextPropagator.InjectTraceContext(activity, headers);
 
