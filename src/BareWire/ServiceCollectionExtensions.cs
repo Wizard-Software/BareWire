@@ -170,17 +170,25 @@ public static class ServiceCollectionExtensions
         // that a missing transport does NOT throw a raw InvalidOperationException during graph
         // construction — the friendly BareWireConfigurationException must surface from StartAsync first
         // (15.3 / C1 / ADR-028 E6).
-        services.AddSingleton(sp => new BareWireBus(
-            sp.GetService<ITransportAdapter>(),
-            sp.GetRequiredService<ISerializerResolver>(),
-            sp.GetRequiredService<MessagePipeline>(),
-            sp.GetRequiredService<FlowController>(),
-            sp.GetRequiredService<PublishFlowControlOptions>(),
-            sp.GetRequiredService<ILogger<BareWireBus>>(),
-            sp.GetRequiredService<IBareWireInstrumentation>(),
-            sp.GetRequiredService<IRoutingKeyResolver>(),
-            sp.GetService<IRequestClientFactory>(),
-            sp.GetRequiredService<IExchangeResolver>()));
+        //
+        // The optional outbound interceptor (e.g. the transactional outbox) is resolved once here; a
+        // duplicate registration logs a warning and the last one wins.
+        services.AddSingleton(sp =>
+        {
+            ILogger<BareWireBus> busLogger = sp.GetRequiredService<ILogger<BareWireBus>>();
+            return new BareWireBus(
+                sp.GetService<ITransportAdapter>(),
+                sp.GetRequiredService<ISerializerResolver>(),
+                sp.GetRequiredService<MessagePipeline>(),
+                sp.GetRequiredService<FlowController>(),
+                sp.GetRequiredService<PublishFlowControlOptions>(),
+                busLogger,
+                sp.GetRequiredService<IBareWireInstrumentation>(),
+                sp.GetRequiredService<IRoutingKeyResolver>(),
+                sp.GetService<IRequestClientFactory>(),
+                sp.GetRequiredService<IExchangeResolver>(),
+                outboundInterceptor: OutboundInterceptorResolver.Resolve(sp, busLogger));
+        });
 
         // BareWireBusControl — wraps BareWireBus and implements IBusControl / IBus.
         // Uses a factory because the constructor is internal.

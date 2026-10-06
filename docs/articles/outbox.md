@@ -93,6 +93,59 @@ services.AddDbContext<TransferDbContext>((sp, options) =>
 
 > See: `samples/BareWire.Samples.TransactionalOutbox/`, `samples/BareWire.Samples.OrderedConsumers/`, and `samples/BareWire.Samples.InboxDeduplication/` — every sample whose consumer persists business state uses this single-commit pattern, so none requires 2PC.
 
+## Publishing from a consumer
+
+When the `TransactionalOutboxMiddleware` is active, every message a consumer publishes or sends is buffered and written to the outbox table **in the same transaction** as the consumer's business changes and the inbox marker. This covers `context.PublishAsync`, `context.GetSendEndpoint(...)`, `context.RespondAsync`, an `IBus` injected into the consumer, and messages published by sagas. Nothing leaves for the broker until the transaction commits; the `OutboxDispatcher` then delivers the buffered messages like any other outbox row.
+
+```csharp
+public sealed class TransferConsumer(TransferDbContext db) : IConsumer<TransferRequested>
+{
+    public async Task ConsumeAsync(ConsumeContext<TransferRequested> context)
+    {
+        db.Transfers.Add(new Transfer(context.Message.Id));
+
+        // Buffered, not sent: written to the outbox atomically with the Transfer row.
+        await context.PublishAsync(new TransferAccepted(context.Message.Id), context.CancellationToken);
+    }
+}
+```
+
+What this means in practice:
+
+- **Handler fails, nothing is published.** If the consumer throws, the transaction rolls back and the buffered messages are discarded together with the business changes.
+- **In-process retries start from a clean buffer.** When a retry policy re-runs the handler, messages published by the failed attempt are discarded; only the successful attempt's messages are stored, so a retried message does not publish duplicates.
+- **Delivery is delayed until commit plus polling.** Messages become visible to the broker after the commit and the next dispatcher poll, i.e. up to `PollingInterval` (default 1 second) later. Tune `PollingInterval` and `DispatchBatchSize` if this latency matters.
+- **Responses are transactional too.** `RespondAsync` is buffered like any other message and keeps its correlation id, so a request/response caller sees the response after the commit plus up to `PollingInterval`. Size the caller's request timeout accordingly.
+- **The buffer is bounded.** A single consume operation may buffer at most `MaxBufferedMessagesPerConsume` messages (default 10000, must be greater than zero). Publishing one more throws a `BareWireException` from the publish call, which fails the consume operation and rolls the transaction back. A second limit, `MaxBufferedBytesPerConsume` (default 64 MiB, must be greater than zero), caps the total body size buffered by one consume operation and fails it the same way. Captured messages bypass the bus's publish byte budget, so these two limits are the only bounds on what a consume operation can buffer.
+- **Buffered data is stored in plaintext.** Buffered payloads and headers are written to the outbox table unencrypted until they are dispatched, and are then retained according to `OutboxRetention` (default 7 days). Encrypt sensitive payloads (for example in a serializer or a middleware) if that matters for your data.
+
+```csharp
+builder.Services.AddBareWireOutbox(
+    configureDbContext: options => options.UseNpgsql(connectionString),
+    configureOutbox: outbox =>
+    {
+        outbox.MaxBufferedMessagesPerConsume = 1_000;
+        outbox.MaxBufferedBytesPerConsume = 16 * 1024 * 1024;
+    });
+```
+
+### Work that outlives the handler
+
+The buffer is closed as soon as the consume operation persists it. A message published afterwards from work that outlives the handler (for example a fire-and-forget `Task.Run` started by the consumer) cannot join the transaction: it is sent **directly to the transport, non-transactionally**, and a warning is logged with the message id and type. Await such work inside the handler if you need its messages to be transactional.
+
+### What is not intercepted
+
+The following paths do not go through the outbox buffer and are sent as before:
+
+- **Request-client requests.** The RabbitMQ request client publishes on its own channel, immediately and outside the transaction, even if the consume transaction later rolls back.
+- **Scheduled and timeout messages** (delayed delivery, saga timeouts).
+- **Kafka retry and dead-letter producer** messages.
+
+### Assumptions
+
+- **One bus per process.** The active outbox buffer is tracked per process, so the interception assumes a single BareWire bus in the process.
+- **Single interceptor slot.** The outbox registers its interceptor with `AddBareWireOutbox`, replacing any `IOutboundMessageInterceptor` registered earlier. A custom `IOutboundMessageInterceptor` registered **after** `AddBareWireOutbox` replaces the outbox one, which turns this behavior off; a warning is logged at startup when more than one is registered.
+
 ## Horizontal Scaling
 
 When you run more than one instance of the dispatcher (multiple pods/processes), each `GetPendingAsync` poll **atomically claims** its batch so two instances never pick the same rows. On PostgreSQL the claim uses `FOR UPDATE SKIP LOCKED`; a claimed row carries a `LockedAt`/`LockedBy` marker and is invisible to other instances until the claim expires.

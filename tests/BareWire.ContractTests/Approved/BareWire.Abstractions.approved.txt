@@ -466,6 +466,7 @@ namespace BareWire.Abstractions.Observability
         void RecordFailure(string endpoint, string messageType, string errorType);
         void RecordInflight(string endpoint, string messageType, int delta, int bytesDelta);
         void RecordPublish(string endpoint, string messageType, int messageSize);
+        void RecordPublishIntercepted(string endpoint, string messageType);
         void RecordPublishPending(string endpoint, int delta);
         void RecordPublishRejected(string endpoint, string messageType);
         void RecordRetryAttempt(string endpoint, string messageType, string errorType);
@@ -485,6 +486,8 @@ namespace BareWire.Abstractions.Outbox
         int DispatchBatchSize { get; set; }
         System.TimeSpan InboxLockTimeout { get; set; }
         System.TimeSpan InboxRetention { get; set; }
+        long MaxBufferedBytesPerConsume { get; set; }
+        int MaxBufferedMessagesPerConsume { get; set; }
         string OrderingKeyHeaderName { get; set; }
         BareWire.Abstractions.Outbox.OrderingMode OrderingMode { get; set; }
         System.TimeSpan OutboxLockTimeout { get; set; }
@@ -519,6 +522,7 @@ namespace BareWire.Abstractions.Pipeline
     public static class WellKnownItemKeys
     {
         public const string InboxFiltered = "inbox:filtered";
+        public const string RetryAttemptStarting = "retry:attempt-starting";
     }
 }
 namespace BareWire.Abstractions.Routing
@@ -770,6 +774,11 @@ namespace BareWire.Abstractions.Transport
     {
         System.Threading.Tasks.Task CancelScheduledAsync(BareWire.Abstractions.Transport.ScheduledMessageToken token, System.Threading.CancellationToken cancellationToken = default);
         System.Threading.Tasks.Task<BareWire.Abstractions.Transport.ScheduledMessageToken> ScheduleAsync(BareWire.Abstractions.Transport.OutboundMessage message, System.DateTimeOffset scheduledEnqueueTime, System.Threading.CancellationToken cancellationToken = default);
+    }
+    public interface IOutboundMessageInterceptor
+    {
+        bool IsCapturing { get; }
+        bool TryIntercept(BareWire.Abstractions.Transport.OutboundMessage message);
     }
     public interface ITransportAdapter
     {

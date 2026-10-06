@@ -34,6 +34,7 @@ BareWire emits the following metrics via OpenTelemetry:
 |---|---|
 | `barewire.messages.published` | Counter of published messages |
 | `barewire.messages.consumed` | Counter of consumed messages |
+| `barewire.publish.intercepted` | Counter of outbound messages captured by an outbound message interceptor (for example the transactional outbox buffering a message published from a consumer). Captured messages are not counted in `barewire.messages.published` |
 | `barewire.message.duration` | Histogram of message processing duration |
 
 Feature packages add their own instruments on the same `BareWire` meter — for example

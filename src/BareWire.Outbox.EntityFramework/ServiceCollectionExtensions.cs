@@ -1,6 +1,7 @@
 using System.Diagnostics.Metrics;
 using BareWire.Abstractions.Outbox;
 using BareWire.Abstractions.Pipeline;
+using BareWire.Abstractions.Transport;
 using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
@@ -129,7 +130,13 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<OutboxDbContext>(),
             sp.GetRequiredService<IOutboxStore>(),
             sp.GetRequiredService<InboxFilter>(),
-            sp.GetRequiredService<ILogger<TransactionalOutboxMiddleware>>()));
+            sp.GetRequiredService<ILogger<TransactionalOutboxMiddleware>>(),
+            sp.GetRequiredService<OutboxOptions>()));
+
+        // Route messages published from a consumer (ConsumeContext, injected IBus, sagas) into the active
+        // transactional outbox buffer. Replace (not TryAdd) so an interceptor the user registered earlier
+        // cannot silently disable the outbox; a custom one registered AFTER this call replaces it instead.
+        services.Replace(ServiceDescriptor.Singleton<IOutboundMessageInterceptor, TransactionalOutboxInterceptor>());
 
         // Build and register OutboxOptions as a singleton BEFORE the hosted services, so their
         // registration can branch on it (AutoCreateSchema, OrderingMode) and the start order below is

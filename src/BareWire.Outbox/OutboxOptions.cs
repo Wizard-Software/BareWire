@@ -20,6 +20,18 @@ internal sealed record OutboxOptions
     public OrderingMode OrderingMode { get; init; } = OrderingMode.None;
     public string? OrderingKeyHeaderName { get; init; }
 
+    /// <summary>
+    /// Maximum number of outbound messages a single consume operation may buffer for the transactional
+    /// outbox. Exceeding it fails the consume operation (the transaction rolls back). Default: 10000.
+    /// </summary>
+    public int MaxBufferedMessagesPerConsume { get; init; } = 10_000;
+
+    /// <summary>
+    /// Maximum total body size, in bytes, that a single consume operation may buffer for the transactional
+    /// outbox. Exceeding it fails the consume operation (the transaction rolls back). Default: 64 MiB.
+    /// </summary>
+    public long MaxBufferedBytesPerConsume { get; init; } = 67_108_864;
+
     internal void Validate()
     {
         if (PollingInterval <= TimeSpan.Zero)
@@ -32,6 +44,18 @@ internal sealed record OutboxOptions
         {
             throw new BareWireConfigurationException(
                 $"{nameof(DispatchBatchSize)} must be between 1 and 10,000. Got: {DispatchBatchSize}");
+        }
+
+        if (MaxBufferedMessagesPerConsume <= 0)
+        {
+            throw new BareWireConfigurationException(
+                $"{nameof(MaxBufferedMessagesPerConsume)} must be greater than zero. Got: {MaxBufferedMessagesPerConsume}");
+        }
+
+        if (MaxBufferedBytesPerConsume <= 0)
+        {
+            throw new BareWireConfigurationException(
+                $"{nameof(MaxBufferedBytesPerConsume)} must be greater than zero. Got: {MaxBufferedBytesPerConsume}");
         }
 
         if (InboxRetention <= TimeSpan.Zero)

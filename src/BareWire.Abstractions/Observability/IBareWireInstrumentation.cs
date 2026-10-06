@@ -139,6 +139,18 @@ public interface IBareWireInstrumentation
     void RecordPublishRejected(string endpoint, string messageType);
 
     /// <summary>
+    /// Records an outbound message captured by an <c>IOutboundMessageInterceptor</c>: increments the
+    /// <c>barewire.publish.intercepted</c> counter. Captured messages are not counted as regular publishes.
+    /// </summary>
+    /// <param name="endpoint">The routing key or target of the captured message.</param>
+    /// <param name="messageType">The fully-qualified or short message type name.</param>
+    /// <remarks>
+    /// Default interface member (a no-op) so that adding this member is not a breaking change for
+    /// external implementations of <see cref="IBareWireInstrumentation"/>.
+    /// </remarks>
+    void RecordPublishIntercepted(string endpoint, string messageType) { }
+
+    /// <summary>
     /// Injects the W3C trace context (<c>traceparent</c>, <c>tracestate</c>) from the given
     /// <see cref="Activity"/> into the provided outbound message headers dictionary.
     /// Safe to call with a <see langword="null"/> activity — writes nothing in that case.

@@ -54,6 +54,15 @@ internal sealed class RetryMiddleware : IMessageMiddleware
 
                 await _policy.DelayAsync(attempt, context.CancellationToken).ConfigureAwait(false);
 
+                // Let outer middleware (e.g. the transactional outbox) discard side effects buffered by the
+                // failed attempt. HasItems keeps this allocation-free when nothing registered a callback.
+                if (context.HasItems
+                    && context.Items.TryGetValue(WellKnownItemKeys.RetryAttemptStarting, out object? callback)
+                    && callback is Action reset)
+                {
+                    reset();
+                }
+
                 attempt++;
             }
             catch (Exception ex)
