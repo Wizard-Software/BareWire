@@ -8,6 +8,8 @@ encryption at rest are all supported.
 
 ## Registration
 
+> **Consumer registration:** the Amazon SQS transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
+
 The ergonomic path is the bundle package `BareWire.AWS.SQS`, which registers the core engine and
 the SQS transport in one call via `AddBareWireWithSqs`. The `bus` delegate is optional — omit it
 when transport defaults are enough:
@@ -17,8 +19,7 @@ builder.Services.AddBareWireWithSqs(
     transport => transport.Region("eu-central-1"),
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // endpoints, middleware, serializers...
+        // middleware, serializers...
     });
 ```
 
@@ -28,7 +29,7 @@ separately):
 
 ```csharp
 builder.Services.AddBareWireSqs(transport => transport.Region("eu-central-1"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 ## Authentication

@@ -16,12 +16,16 @@ dotnet add package BareWire.RabbitMQ
 ## Usage — single call
 
 ```csharp
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
 builder.Services.AddBareWireWithRabbitMq(
-    transport => transport.Host("localhost"),
+    transport =>
+    {
+        transport.Host("localhost");
+        transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
+    },
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // endpoints, middleware, serializers...
+        // middleware, serializers...
     });
 ```
 
@@ -38,8 +42,12 @@ supported (use it when you need to register multiple transports, or want the cor
 transport packages referenced separately):
 
 ```csharp
-builder.Services.AddBareWireRabbitMq(transport => transport.Host("localhost"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWireRabbitMq(transport =>
+{
+    transport.Host("localhost");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
+});
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 ## Layering

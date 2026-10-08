@@ -12,6 +12,8 @@ layer is in place.
 
 ## Registration
 
+> **Consumer registration:** the Kafka transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
+
 As with every BareWire transport, you register the **core engine** and the **Kafka transport**
 together. There are two ways to do it (see [Configuration](configuration.md) for the full
 rationale).
@@ -22,6 +24,7 @@ The `BareWire.Kafka` bundle depends on both the core and the transport and expos
 `AddBareWireWithKafka`:
 
 ```csharp
+using BareWire.Kafka;
 using BareWire.Transport.Kafka;
 using Confluent.Kafka;
 using Microsoft.Extensions.DependencyInjection;
@@ -36,8 +39,7 @@ builder.Services.AddBareWireWithKafka(
     },
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // serializers, middleware, endpoints...
+        // middleware, serializers...
     });
 ```
 
@@ -54,7 +56,7 @@ the core and transport packages separately, or when an application needs more th
 
 ```csharp
 builder.Services.AddBareWireKafka(kafka => kafka.BootstrapServers("localhost:9092"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 `AddBareWireKafka` registers the Kafka `ITransportAdapter` and `AddBareWire` the core engine. At

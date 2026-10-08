@@ -8,6 +8,8 @@ form.
 
 ## Registration
 
+> **Consumer registration:** the Google Cloud Pub/Sub transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
+
 ### Single call — bundle package (recommended)
 
 The `BareWire.Google.PubSub` bundle depends on both the core and the Pub/Sub transport and exposes
@@ -19,8 +21,7 @@ builder.Services.AddBareWireWithPubSub(
     transport => transport.ProjectId("my-gcp-project"),
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // serializers, middleware, endpoints...
+        // middleware, serializers...
     });
 ```
 
@@ -38,7 +39,7 @@ transport:
 
 ```csharp
 builder.Services.AddBareWirePubSub(transport => transport.ProjectId("my-gcp-project"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 Both paths configure the transport through the same `IPubSubConfigurator` fluent API described

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - SQLite: the transactional outbox/inbox middleware no longer relies on a `TransactionScope` that Microsoft.Data.Sqlite cannot enlist in. On SQLite each consume now runs in an explicit local transaction (deferred `BEGIN`), so the outbox messages and the inbox processed marker commit or roll back atomically and the `AmbientTransactionWarning` suppression is no longer needed. PostgreSQL and SQL Server keep using a `TransactionScope`
+- Documentation: the getting-started guide, the transport articles and the package READMEs no longer show APIs that do not exist (`bus.AddConsumer`, `wire.AddConsumer`, `UseJsonSerializer`, `builder.AddBareWire(wire => ...)`). RabbitMQ examples register consumers via `ReceiveEndpoint(...).Consumer<TConsumer, TMessage>()` and declare a default exchange, the getting-started guide notes `amqps://` for production, and the Kafka, Amazon SQS, Azure Service Bus and Google Cloud Pub/Sub docs state that declarative consumer registration is not available yet on those transports
 
 ### Changed
 

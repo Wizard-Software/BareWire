@@ -10,15 +10,15 @@ dotnet add package BareWire.Outbox
 
 ## Usage
 
+Register the outbox through the Entity Framework Core provider package (`BareWire.Outbox.EntityFramework`):
+
 ```csharp
-builder.AddBareWire(wire =>
-{
-    wire.UseOutbox(outbox =>
+builder.Services.AddBareWireOutbox(
+    options => options.UseNpgsql(connectionString),
+    outbox =>
     {
-        outbox.UseEntityFramework<AppDbContext>();
-        outbox.DeliveryInterval = TimeSpan.FromSeconds(5);
+        outbox.PollingInterval = TimeSpan.FromSeconds(5);
     });
-});
 ```
 
 ## Features

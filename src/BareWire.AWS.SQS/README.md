@@ -15,13 +15,14 @@ dotnet add package BareWire.AWS.SQS
 
 ## Usage — single call
 
+> **Consumer registration:** this transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on it. To consume messages today, use the RabbitMQ or in-memory transport — see the [BareWire documentation](https://barewire.wizardsoftware.pl).
+
 ```csharp
 builder.Services.AddBareWireWithSqs(
     transport => transport.Region("eu-central-1"),
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // endpoints, middleware, serializers...
+        // middleware, serializers...
     });
 ```
 
@@ -39,7 +40,7 @@ referenced separately):
 
 ```csharp
 builder.Services.AddBareWireSqs(transport => transport.Region("eu-central-1"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 ## Layering

@@ -11,19 +11,18 @@ dotnet add package BareWire.Transport.RabbitMQ
 ## Usage
 
 ```csharp
-builder.AddBareWire(wire =>
+builder.Services.AddBareWireJsonSerializer();
+builder.Services.AddBareWireRabbitMq(rmq =>
 {
-    wire.UseRabbitMq(rmq =>
+    rmq.Host("amqp://guest:guest@localhost:5672/");
+    rmq.ConfigureTopology(t =>
     {
-        rmq.Host("localhost");
-        rmq.ConfigureTopology(t =>
-        {
-            t.DeclareExchange("orders", ExchangeType.Topic);
-            t.DeclareQueue("order-processing");
-            t.Bind("orders", "order-processing", "order.created");
-        });
+        t.DeclareExchange("orders", ExchangeType.Topic);
+        t.DeclareQueue("order-processing");
+        t.BindExchangeToQueue("orders", "order-processing", "order.created");
     });
 });
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 ## Features

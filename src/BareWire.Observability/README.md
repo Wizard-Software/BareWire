@@ -11,14 +11,9 @@ dotnet add package BareWire.Observability
 ## Usage
 
 ```csharp
-builder.AddBareWire(wire =>
+builder.Services.AddBareWireObservability(otel =>
 {
-    wire.UseOpenTelemetry(otel =>
-    {
-        otel.EnableTracing();
-        otel.EnableMetrics();
-        otel.EnableHealthChecks(threshold: 0.9);
-    });
+    otel.UseOtlpExporter(); // endpoint from OTEL_EXPORTER_OTLP_ENDPOINT when omitted
 });
 ```
 
