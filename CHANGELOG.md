@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- SQLite: the transactional outbox/inbox middleware no longer relies on a `TransactionScope` that Microsoft.Data.Sqlite cannot enlist in. On SQLite each consume now runs in an explicit local transaction (deferred `BEGIN`), so the outbox messages and the inbox processed marker commit or roll back atomically and the `AmbientTransactionWarning` suppression is no longer needed. PostgreSQL and SQL Server keep using a `TransactionScope`
+
+### Changed
+
+- **Breaking for SQLite users:** a consumer `DbContext` that shares `IOutboxConnectionAccessor.Current` must call `Database.UseTransaction(accessor.CurrentTransaction)`. `IOutboxConnectionAccessor.CurrentTransaction` is new (default `null` on providers that use a `TransactionScope`). The transaction is owned by the middleware: consumers must not commit, roll back or dispose it, otherwise the middleware throws `InvalidOperationException`
+- SQLite limitations documented: WAL read-then-write transactions can fail with `SQLITE_BUSY_SNAPSHOT` (start with a write), shared-cache SQLite is not supported for consume transactions, and suppressing `AmbientTransactionWarning` on a non-SQLite provider silently disables atomicity and is unsupported
+
 ## [2.0.4] - 2026-06-29
 
 ### Changed

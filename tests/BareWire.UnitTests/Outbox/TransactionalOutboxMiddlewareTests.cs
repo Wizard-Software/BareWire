@@ -5,6 +5,7 @@
 using System.Buffers;
 using System.Data;
 using System.Data.Common;
+using System.Transactions;
 using AwesomeAssertions;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Outbox;
@@ -38,7 +39,7 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// <paramref name="lockAcquired"/>.
     /// </summary>
     private static (TransactionalOutboxMiddleware Middleware, IInboxStore InboxStore)
-        CreateMiddleware(bool lockAcquired)
+        CreateMiddleware(bool useAmbientTransaction, bool lockAcquired)
     {
         IInboxStore inboxStore = Substitute.For<IInboxStore>();
         inboxStore
@@ -74,7 +75,8 @@ public sealed class TransactionalOutboxMiddlewareTests
             dbContext,
             outboxStore,
             inboxFilter,
-            NullLogger<TransactionalOutboxMiddleware>.Instance);
+            NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new OutboxTransactionMode(useAmbientTransaction));
 
         return (middleware, inboxStore);
     }
@@ -84,7 +86,7 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// test can assert the connection the middleware pins for sharing is that context's own connection.
     /// </summary>
     private static (TransactionalOutboxMiddleware Middleware, OutboxDbContext DbContext)
-        CreateMiddlewareWithDbContext()
+        CreateMiddlewareWithDbContext(bool useAmbientTransaction)
     {
         IInboxStore inboxStore = Substitute.For<IInboxStore>();
         inboxStore
@@ -107,7 +109,8 @@ public sealed class TransactionalOutboxMiddlewareTests
             dbContext,
             outboxStore,
             inboxFilter,
-            NullLogger<TransactionalOutboxMiddleware>.Instance);
+            NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new OutboxTransactionMode(useAmbientTransaction));
 
         return (middleware, dbContext);
     }
@@ -120,11 +123,13 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// — and it must be the <see cref="OutboxDbContext"/>'s own connection, so a consumer DbContext can
     /// share that exact connection and commit single-phase (no escalation to a two-phase commit).
     /// </summary>
-    [Fact]
-    public async Task InvokeAsync_WhileHandlerRuns_ExposesPinnedOpenConnectionViaAccessor()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhileHandlerRuns_ExposesPinnedOpenConnectionViaAccessor(bool useAmbientTransaction)
     {
         // Arrange
-        var (middleware, dbContext) = CreateMiddlewareWithDbContext();
+        var (middleware, dbContext) = CreateMiddlewareWithDbContext(useAmbientTransaction);
         MessageContext context = CreateContext();
 
         OutboxConnectionAccessor accessor = new();
@@ -157,11 +162,13 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// The pinned connection must not leak past the consume flow: once <see cref="TransactionalOutboxMiddleware.InvokeAsync"/>
     /// returns, the accessor reports <see langword="null"/> on this asynchronous flow.
     /// </summary>
-    [Fact]
-    public async Task InvokeAsync_AfterCompletion_ClearsExposedConnection()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_AfterCompletion_ClearsExposedConnection(bool useAmbientTransaction)
     {
         // Arrange
-        var (middleware, _) = CreateMiddlewareWithDbContext();
+        var (middleware, _) = CreateMiddlewareWithDbContext(useAmbientTransaction);
         MessageContext context = CreateContext();
         OutboxConnectionAccessor accessor = new();
         NextMiddleware next = _ => Task.CompletedTask;
@@ -174,11 +181,43 @@ public sealed class TransactionalOutboxMiddlewareTests
             "the pinned connection must be cleared after the consume operation completes");
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenDuplicateDetected_SetsInboxFilteredFlag()
+    /// <summary>
+    /// In ambient mode the handler runs inside a <see cref="Transaction"/> and no local transaction is
+    /// exposed; in local mode it is the other way around.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhileHandlerRuns_UsesTransactionKindMatchingTheMode(bool useAmbientTransaction)
+    {
+        // Arrange
+        var (middleware, _) = CreateMiddlewareWithDbContext(useAmbientTransaction);
+        OutboxConnectionAccessor accessor = new();
+        Transaction? ambient = null;
+        DbTransaction? local = null;
+        NextMiddleware next = _ =>
+        {
+            ambient = Transaction.Current;
+            local = accessor.CurrentTransaction;
+            return Task.CompletedTask;
+        };
+
+        // Act
+        await middleware.InvokeAsync(CreateContext(), next);
+
+        // Assert
+        (ambient is not null).Should().Be(useAmbientTransaction);
+        (local is not null).Should().Be(!useAmbientTransaction);
+        accessor.CurrentTransaction.Should().BeNull();
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenDuplicateDetected_SetsInboxFilteredFlag(bool useAmbientTransaction)
     {
         // Arrange — inbox store signals duplicate (TryLockAsync returns false).
-        var (middleware, _) = CreateMiddleware(lockAcquired: false);
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction, lockAcquired: false);
         MessageContext context = CreateContext();
         bool nextCalled = false;
         NextMiddleware next = _ =>
@@ -201,11 +240,13 @@ public sealed class TransactionalOutboxMiddlewareTests
         _ = nextCalled; // suppress unused-variable warning
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenDuplicateDetected_DoesNotCallNext()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenDuplicateDetected_DoesNotCallNext(bool useAmbientTransaction)
     {
         // Arrange — inbox store signals duplicate (TryLockAsync returns false).
-        var (middleware, _) = CreateMiddleware(lockAcquired: false);
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction, lockAcquired: false);
         MessageContext context = CreateContext();
         bool nextCalled = false;
         NextMiddleware next = _ =>
@@ -222,11 +263,13 @@ public sealed class TransactionalOutboxMiddlewareTests
             "the downstream pipeline must not be invoked for duplicate messages");
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenLockAcquired_DoesNotSetInboxFilteredFlag()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenLockAcquired_DoesNotSetInboxFilteredFlag(bool useAmbientTransaction)
     {
         // Arrange — inbox store grants the lock (TryLockAsync returns true).
-        var (middleware, _) = CreateMiddleware(lockAcquired: true);
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction, lockAcquired: true);
         MessageContext context = CreateContext();
 
         bool nextCalled = false;
@@ -258,11 +301,13 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// Atomicity of the write (marker + business state) is proven by the E2E test against a
     /// real PostgreSQL instance, where <c>TransactionScope</c> is enforced.
     /// </summary>
-    [Fact]
-    public async Task InvokeAsync_WhenLockAcquiredAndHandlerSucceeds_CallsMarkProcessedAsync()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenLockAcquiredAndHandlerSucceeds_CallsMarkProcessedAsync(bool useAmbientTransaction)
     {
         // Arrange — inbox store grants the lock; handler is a no-op.
-        var (middleware, inboxStore) = CreateMiddleware(lockAcquired: true);
+        var (middleware, inboxStore) = CreateMiddleware(useAmbientTransaction, lockAcquired: true);
         MessageContext context = CreateContext();
         NextMiddleware next = _ => Task.CompletedTask;
 
@@ -284,11 +329,13 @@ public sealed class TransactionalOutboxMiddlewareTests
     /// <c>Complete()</c> — all three writes (business state + outbox + processed marker) roll back.
     /// This test guards the rollback path: the marker must never be persisted on a failed handler.
     /// </summary>
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerThrows_DoesNotCallMarkProcessedAsync()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerThrows_DoesNotCallMarkProcessedAsync(bool useAmbientTransaction)
     {
         // Arrange — inbox store grants the lock; handler faults.
-        var (middleware, inboxStore) = CreateMiddleware(lockAcquired: true);
+        var (middleware, inboxStore) = CreateMiddleware(useAmbientTransaction, lockAcquired: true);
         MessageContext context = CreateContext();
         NextMiddleware next = _ => Task.FromException(new InvalidOperationException("handler fault"));
 

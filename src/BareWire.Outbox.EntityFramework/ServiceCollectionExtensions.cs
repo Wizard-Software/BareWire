@@ -72,6 +72,14 @@ public static class ServiceCollectionExtensions
         // singleton over an async-flow-local — see IOutboxConnectionAccessor for the consumer wiring.
         services.TryAddSingleton<IOutboxConnectionAccessor, OutboxConnectionAccessor>();
 
+        // Decides once per application whether consume transactions use an ambient TransactionScope or an
+        // explicit local transaction. The provider name is read lazily from a short-lived scope, at most once.
+        services.TryAddSingleton(sp => new OutboxTransactionMode(() =>
+        {
+            using IServiceScope scope = sp.CreateScope();
+            return scope.ServiceProvider.GetRequiredService<OutboxDbContext>().Database.ProviderName;
+        }));
+
         // Default outbox claim dialect: PostgreSQL (FOR UPDATE SKIP LOCKED). The store invokes a
         // dialect only when its IOutboxSqlDialect.ProviderName matches the active EF Core provider,
         // so this default is used on PostgreSQL and is inert elsewhere. To get an atomic claim on
@@ -131,6 +139,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IOutboxStore>(),
             sp.GetRequiredService<InboxFilter>(),
             sp.GetRequiredService<ILogger<TransactionalOutboxMiddleware>>(),
+            sp.GetRequiredService<OutboxTransactionMode>(),
             sp.GetRequiredService<OutboxOptions>()));
 
         // Route messages published from a consumer (ConsumeContext, injected IBus, sagas) into the active
