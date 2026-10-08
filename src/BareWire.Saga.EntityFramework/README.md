@@ -11,13 +11,8 @@ dotnet add package BareWire.Saga.EntityFramework
 ## Usage
 
 ```csharp
-builder.AddBareWire(wire =>
-{
-    wire.UseSaga(saga =>
-    {
-        saga.UseEntityFramework<AppDbContext>();
-    });
-});
+builder.Services.AddBareWireSaga<OrderSagaState>(
+    options => options.UseNpgsql(connectionString));
 ```
 
 Requires EF Core migrations for saga state tables. See the documentation for migration setup.

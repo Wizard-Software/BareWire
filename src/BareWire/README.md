@@ -15,12 +15,23 @@ dotnet add package BareWire
 ```csharp
 var builder = Host.CreateApplicationBuilder(args);
 
-builder.AddBareWire(wire =>
+builder.Services.AddBareWireJsonSerializer();          // BareWire.Serialization.Json
+builder.Services.AddTransient<OrderCreatedConsumer>(); // consumers are resolved from DI
+
+builder.Services.AddBareWireRabbitMq(transport =>      // BareWire.Transport.RabbitMQ
 {
-    wire.AddConsumer<OrderCreatedConsumer>();
-    wire.UseJsonSerializer();
-    wire.UseRabbitMq(rmq => rmq.Host("localhost"));
+    transport.Host("amqp://guest:guest@localhost:5672/");
+    transport.ConfigureTopology(topology =>
+    {
+        topology.DeclareExchange("orders", ExchangeType.Fanout, durable: true);
+        topology.DeclareQueue("orders", durable: true);
+        topology.BindExchangeToQueue("orders", "orders", routingKey: "");
+    });
+    transport.DefaultExchange("orders");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderCreatedConsumer, OrderCreated>());
 });
+
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 
 await builder.Build().RunAsync();
 ```

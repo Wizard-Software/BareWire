@@ -15,13 +15,14 @@ dotnet add package BareWire.Google.PubSub
 
 ## Usage — single call
 
+> **Consumer registration:** this transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on it. To consume messages today, use the RabbitMQ or in-memory transport — see the [BareWire documentation](https://barewire.wizardsoftware.pl).
+
 ```csharp
 builder.Services.AddBareWireWithPubSub(
     transport => transport.ProjectId("my-gcp-project"),
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // endpoints, middleware, serializers...
+        // middleware, serializers...
     });
 ```
 
@@ -39,7 +40,7 @@ referenced separately):
 
 ```csharp
 builder.Services.AddBareWirePubSub(transport => transport.ProjectId("my-gcp-project"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 ## Layering

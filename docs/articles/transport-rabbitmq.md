@@ -23,6 +23,8 @@ The `BareWire.RabbitMQ` bundle depends on both the core and the transport and ex
 in the second:
 
 ```csharp
+builder.Services.AddTransient<OrderConsumer>(); // consumers are resolved from DI
+
 builder.Services.AddBareWireWithRabbitMq(
     transport =>
     {
@@ -32,7 +34,6 @@ builder.Services.AddBareWireWithRabbitMq(
     },
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
         // serializers, middleware...
     });
 ```
@@ -51,8 +52,13 @@ transport (a bundle call registers the core internally, so two bundle calls woul
 twice):
 
 ```csharp
-builder.Services.AddBareWireRabbitMq(transport => transport.Host("amqp://guest:guest@localhost:5672/"));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddTransient<OrderConsumer>();
+builder.Services.AddBareWireRabbitMq(transport =>
+{
+    transport.Host("amqp://guest:guest@localhost:5672/");
+    transport.ReceiveEndpoint("orders", e => e.Consumer<OrderConsumer, OrderCreated>());
+});
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 > **Deprecated:** configuring the transport with `cfg.UseRabbitMQ(...)` *inside* the `AddBareWire`

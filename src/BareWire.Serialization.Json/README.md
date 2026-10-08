@@ -11,10 +11,7 @@ dotnet add package BareWire.Serialization.Json
 ## Usage
 
 ```csharp
-builder.AddBareWire(wire =>
-{
-    wire.UseJsonSerializer(); // System.Text.Json, raw output
-});
+builder.Services.AddBareWireJsonSerializer(); // System.Text.Json, raw output
 ```
 
 ## Features

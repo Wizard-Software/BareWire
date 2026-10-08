@@ -16,19 +16,20 @@ dotnet add package BareWire.Transport.AzureServiceBus  # or the transport alone
 
 ## Registration
 
+> **Consumer registration:** the Azure Service Bus transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
+
 ### Single call — bundle (recommended)
 
 `AddBareWireWithAzureServiceBus` registers the transport adapter and the core engine together.
 The `transport` delegate configures the Azure Service Bus connection and options; the optional
-`bus` delegate configures consumers, middleware, and serializers.
+`bus` delegate configures middleware and serializers.
 
 ```csharp
 builder.Services.AddBareWireWithAzureServiceBus(
     transport => transport.ConnectionString(connectionString),
     bus =>
     {
-        bus.AddConsumer<OrderConsumer>();
-        // endpoints, middleware, serializers...
+        // middleware, serializers...
     });
 ```
 
@@ -47,7 +48,7 @@ application registers more than one transport:
 
 ```csharp
 builder.Services.AddBareWireAzureServiceBus(transport => transport.ConnectionString(connectionString));
-builder.Services.AddBareWire(bus => bus.AddConsumer<OrderConsumer>());
+builder.Services.AddBareWire(bus => { /* middleware, serializer mappings... */ });
 ```
 
 The bundle is a thin composition layer over the core (`BareWire`) and the transport — the core
