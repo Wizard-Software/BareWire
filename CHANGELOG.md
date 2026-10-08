@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Consumer-level retry: a retry policy set on a consumer with `consumer.Retry(...)` (inline or in a `ConsumerDefinition<TConsumer>`) was stored but never applied at runtime, so the first exception dead-lettered the message. The policy is now built when the endpoint starts and wraps that consumer's invocation; deserialization failures are not retried by it
 - SQLite: the transactional outbox/inbox middleware no longer relies on a `TransactionScope` that Microsoft.Data.Sqlite cannot enlist in. On SQLite each consume now runs in an explicit local transaction (deferred `BEGIN`), so the outbox messages and the inbox processed marker commit or roll back atomically and the `AmbientTransactionWarning` suppression is no longer needed. PostgreSQL and SQL Server keep using a `TransactionScope`
 - Documentation: the getting-started guide, the transport articles and the package READMEs no longer show APIs that do not exist (`bus.AddConsumer`, `wire.AddConsumer`, `UseJsonSerializer`, `builder.AddBareWire(wire => ...)`). RabbitMQ examples register consumers via `ReceiveEndpoint(...).Consumer<TConsumer, TMessage>()` and declare a default exchange, the getting-started guide notes `amqps://` for production, and the Kafka, Amazon SQS, Azure Service Bus and Google Cloud Pub/Sub docs state that declarative consumer registration is not available yet on those transports
 
 ### Changed
 
+- **Behavior change:** consumers configured with `consumer.Retry(...)` are now actually retried. The consumer policy replaces the endpoint `RetryCount`/`RetryInterval` for that consumer (attempts are not multiplied); consumers without their own policy, raw consumers and sagas keep the endpoint retry. An empty retry configuration now fails `StartAsync` with `BareWireConfigurationException` before the bus is marked started. Item keys prefixed with `retry:` and `inbox:` in `MessageContext.Items` are reserved for the framework
 - **Breaking for SQLite users:** a consumer `DbContext` that shares `IOutboxConnectionAccessor.Current` must call `Database.UseTransaction(accessor.CurrentTransaction)`. `IOutboxConnectionAccessor.CurrentTransaction` is new (default `null` on providers that use a `TransactionScope`). The transaction is owned by the middleware: consumers must not commit, roll back or dispose it, otherwise the middleware throws `InvalidOperationException`
 - SQLite limitations documented: WAL read-then-write transactions can fail with `SQLITE_BUSY_SNAPSHOT` (start with a write), shared-cache SQLite is not supported for consume transactions, and suppressing `AmbientTransactionWarning` on a non-SQLite provider silently disables atomicity and is unsupported
 

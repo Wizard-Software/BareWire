@@ -87,7 +87,7 @@ public sealed class DefTransferConsumer(DefHitSink sink) : IConsumer<DefTransfer
 
 /// <summary>
 /// Colocated per-consumer settings for <see cref="DefTransferConsumer"/>: a single routing-key
-/// pattern (<c>transfer.eu.*</c>). Discovered by DI registration at start-up (no assembly scan) and
+/// pattern (<c>transfer.eu.*</c>) and a bounded retry policy. Discovered by DI registration at start-up (no assembly scan) and
 /// merged into the consumer's registration — this is the axis under test in Test A.
 /// </summary>
 public sealed class DefTransferConsumerDefinition : ConsumerDefinition<DefTransferConsumer>
@@ -97,6 +97,7 @@ public sealed class DefTransferConsumerDefinition : ConsumerDefinition<DefTransf
         IConsumerConfigurator<DefTransferConsumer> consumer)
     {
         consumer.RoutingKeys("transfer.eu.*");
+        consumer.Retry(r => r.Interval(2, TimeSpan.FromMilliseconds(150)));
     }
 }
 
@@ -254,7 +255,7 @@ public sealed class RabbitMqConsumerDefinitionTopologyTests(AspireFixture fixtur
 
     /// <summary>
     /// A DI-registered <see cref="DefTransferConsumerDefinition"/> supplies the consumer's routing-key
-    /// pattern (<c>transfer.eu.*</c>). The endpoint sets bounded retry; manual topology declares a
+    /// pattern (<c>transfer.eu.*</c>) and a bounded retry policy (the endpoint sets none); manual topology declares a
     /// dead-letter exchange/queue and the source queue's dead-letter arguments. A poison delivery on a
     /// key that matches the DEFINITION pattern is retried and ends up in the DLQ, while a delivery that
     /// reaches the queue (via the <c>#</c> binding) but does NOT match the definition pattern is never
@@ -299,10 +300,8 @@ public sealed class RabbitMqConsumerDefinitionTopologyTests(AspireFixture fixtur
 
                 rmq.ReceiveEndpoint(srcQueue, e =>
                 {
-                    // Endpoint-level bounded retry: the poison is redelivered before being dead-lettered.
-                    e.RetryCount = 2;
-                    e.RetryInterval = TimeSpan.FromMilliseconds(150);
-                    // No-arg overload: ALL routing config comes from the DI-discovered definition.
+                    // No endpoint-level retry: the bounded retry policy comes from the DI-discovered definition.
+                    // No-arg overload: ALL routing and retry config comes from the definition.
                     e.Consumer<DefTransferConsumer, DefTransfer>();
                 });
             },
@@ -318,7 +317,7 @@ public sealed class RabbitMqConsumerDefinitionTopologyTests(AspireFixture fixtur
             // Retry proof: the poison is dispatched at least twice (initial + retry) before dead-lettering.
             bool retried = await sink.WaitForCountAsync(2, DispatchTimeout, cts.Token);
             retried.Should().BeTrue(
-                because: "the endpoint RetryCount must redeliver the poison, so the definition-matched key is dispatched more than once");
+                because: "the definition retry policy must redeliver the poison, so the definition-matched key is dispatched more than once");
 
             await Task.Delay(StabilisationWindow, cts.Token);
 

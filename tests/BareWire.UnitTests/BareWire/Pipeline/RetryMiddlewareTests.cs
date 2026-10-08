@@ -347,4 +347,83 @@ public sealed class RetryMiddlewareTests
         Func<Task> act = () => retryTask;
         await act.Should().ThrowAsync<OperationCanceledException>();
     }
+
+    [Fact]
+    public async Task InvokeAsync_ConsumerRetryExhaustedMarkerPresent_DoesNotRetry()
+    {
+        // Arrange
+        int callCount = 0;
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(),
+            NullLogger<RetryMiddleware>.Instance,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+        var context = CreateContext();
+        context.Items[InternalItemKeys.ConsumerRetryExhausted] = true;
+
+        // Act
+        Func<Task> act = () => sut.InvokeAsync(context, _ =>
+        {
+            callCount++;
+            throw new InvalidOperationException("boom");
+        });
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        callCount.Should().Be(1);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ConsumerRetryExhaustedMarkerPresent_DoesNotLogRetriesExhausted()
+    {
+        // Arrange
+        CollectingLogger<RetryMiddleware> logger = new();
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(),
+            logger,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+        var context = CreateContext();
+        context.Items[InternalItemKeys.ConsumerRetryExhausted] = true;
+
+        // Act
+        Func<Task> act = () => sut.InvokeAsync(context, _ => throw new InvalidOperationException("boom"));
+
+        // Assert
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        logger.Messages.Should().NotContain(m => m.Contains("retries exhausted", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NoMarker_LogsRetriesExhausted()
+    {
+        // Positive control for the marker test above: without the marker the exhausted entry IS logged.
+        CollectingLogger<RetryMiddleware> logger = new();
+        var sut = new RetryMiddleware(
+            CreateIntervalPolicy(retryCount: 1),
+            logger,
+            Substitute.For<IBareWireInstrumentation>(),
+            "TestMessage");
+
+        Func<Task> act = () => sut.InvokeAsync(CreateContext(), _ => throw new InvalidOperationException("boom"));
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        logger.Messages.Should().Contain(m => m.Contains("retries exhausted", StringComparison.Ordinal));
+    }
+
+    private sealed class CollectingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) => Messages.Add(formatter(state, exception));
+    }
 }

@@ -43,7 +43,7 @@ internal sealed class RetryMiddleware : IMessageMiddleware
                 // Never retry cancellation — propagate immediately
                 throw;
             }
-            catch (Exception ex) when (_policy.ShouldRetry(ex, attempt))
+            catch (Exception ex) when (!IsHandledByConsumerRetry(context) && _policy.ShouldRetry(ex, attempt))
             {
                 TimeSpan delay = _policy.GetDelay(attempt);
                 RetryMiddlewareLogMessages.RetryingMessage(
@@ -67,12 +67,20 @@ internal sealed class RetryMiddleware : IMessageMiddleware
             }
             catch (Exception ex)
             {
-                RetryMiddlewareLogMessages.RetriesExhausted(
-                    _logger, context.MessageId, attempt, ex.GetType().Name);
+                // A consumer-level policy already logged its own "retries exhausted" entry; do not log a second one.
+                if (!IsHandledByConsumerRetry(context))
+                {
+                    RetryMiddlewareLogMessages.RetriesExhausted(
+                        _logger, context.MessageId, attempt, ex.GetType().Name);
+                }
+
                 throw;
             }
         }
     }
+
+    private static bool IsHandledByConsumerRetry(MessageContext context) =>
+        context.HasItems && context.Items.ContainsKey(InternalItemKeys.ConsumerRetryExhausted);
 }
 
 internal static partial class RetryMiddlewareLogMessages

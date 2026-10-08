@@ -696,6 +696,36 @@ public sealed class BareWireBusControlTests
     }
 
     /// <summary>
+    /// A consumer whose <c>Retry</c> delegate selects no strategy must fail fast at startup with a
+    /// <see cref="BareWireConfigurationException"/>, and the bus must not be left half-started.
+    /// </summary>
+    [Fact]
+    public async Task StartAsync_ConsumerRetryDelegateSelectsNoStrategy_ThrowsBareWireConfigurationException()
+    {
+        EndpointBinding binding = new()
+        {
+            EndpointName = "retry-validation-queue",
+            PrefetchCount = 1,
+            Consumers = [new ConsumerRegistration(typeof(RegionEuConsumer), typeof(TransferInitiated),
+                ConfigureRetry: static _ => { })],
+            RawConsumers = [],
+        };
+        BareWireBusControl control = CreateControlForMtStartupValidation(
+            [binding], Substitute.For<IDeserializerResolver>());
+
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+
+        (await act.Should().ThrowAsync<BareWireConfigurationException>())
+            .WithInnerException<InvalidOperationException>();
+
+        // Not left half-started: a second attempt fails with the same configuration error,
+        // not with "Bus is already started".
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    /// <summary>
     /// Creates a <see cref="BareWireBusControl"/> pre-configured with the supplied endpoint bindings
     /// and deserializer resolver. Used by the MT envelope startup-validation test; avoids duplicating
     /// the full <see cref="BareWireBus"/> wiring in each test case.
