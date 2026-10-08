@@ -11,7 +11,6 @@ using BareWire.Outbox.EntityFramework.Internal;
 using BareWire.Pipeline;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -63,22 +62,14 @@ internal enum OutboxStoreKind
 /// the same thing as SQLite's own <c>busy_timeout</c> pragma).
 /// </para>
 /// <para>
-/// <b>Ambient transaction warning.</b> <c>TransactionalOutboxMiddleware</c> opens a
-/// <see cref="System.Transactions.TransactionScope"/> around every consume, which Microsoft.Data.Sqlite
-/// cannot natively enlist in — EF Core surfaces this as <see cref="RelationalEventId.AmbientTransactionWarning"/>,
-/// which by default escalates to an exception. The DbContext registered here suppresses it, exactly like
-/// <c>TransactionalOutboxMiddlewareTests</c> in <c>OutboxIntegrationTests.cs</c> — this host still
-/// exercises the middleware's real commit-order logic, just without SQLite's own rollback semantics.
-/// </para>
-/// <para>
 /// <b>Why the gated consumer never blocks the database.</b> The middleware performs the Inbox
-/// <c>TryLockAsync</c> check — and its own row commits immediately, outside the
-/// <see cref="System.Transactions.TransactionScope"/> — BEFORE invoking the consumer, and opens the
-/// <see cref="System.Transactions.TransactionScope"/> before the consumer runs too. Microsoft.Data.Sqlite
-/// only begins an actual write transaction on the first data-modifying command issued after the scope
-/// opens; a consumer that awaits a gate before touching any database issues no command at all while
-/// blocked, so the open-but-idle connection under WAL never holds a write lock other connections would
-/// wait on.
+/// <c>TryLockAsync</c> check — and its own row commits immediately, outside the consume transaction —
+/// BEFORE invoking the consumer. On SQLite it then opens a local transaction at
+/// <see cref="System.Data.IsolationLevel.ReadUncommitted"/>, which Microsoft.Data.Sqlite maps to a
+/// deferred <c>BEGIN</c>: no write lock is taken when the transaction opens. The write lock is only
+/// acquired at the first write — the outbox / inbox persistence after the consumer returns — so a
+/// consumer that awaits a gate before returning issues no command while blocked, and under WAL the
+/// open-but-idle connection never holds a write lock other connections would wait on.
 /// </para>
 /// </remarks>
 internal sealed class OutboxInMemoryHost : IAsyncDisposable
@@ -158,8 +149,7 @@ internal sealed class OutboxInMemoryHost : IAsyncDisposable
             services: s =>
             {
                 s.AddBareWireOutbox(
-                    o => o.UseSqlite(connectionString)
-                        .ConfigureWarnings(w => w.Ignore(RelationalEventId.AmbientTransactionWarning)),
+                    o => o.UseSqlite(connectionString),
                     c =>
                     {
                         outbox(c);

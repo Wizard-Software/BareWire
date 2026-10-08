@@ -45,7 +45,6 @@ using BareWire.Serialization.Json;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
@@ -106,18 +105,8 @@ builder.Services.AddModulithTransport(transport, rabbitMqConnectionString);
 // deduplicated by message id. A publish made from inside a consumer (OrderPlacedBillingConsumer's
 // PaymentCaptured) is NOT buffered by this outbox — see the remark on that consumer.
 builder.Services.AddBareWireOutbox(
-    configureDbContext: options => options
-        .UseSqlite(modulithConnectionString)
-        // Microsoft.Data.Sqlite does not support enlisting in a System.Transactions ambient
-        // transaction (there is no distributed/ambient-transaction support in the SQLite ADO.NET
-        // provider at all). BareWire's transactional-outbox middleware wraps every consume in a
-        // TransactionScope so a consumer's OWN DbContext write can commit atomically with the
-        // outbox/inbox writes — this sample has no such write (module state lives in memory only),
-        // so there is nothing that needs that atomicity here. Without this suppression, EVERY
-        // message would fail at the inbox "mark processed" step with an
-        // AmbientTransactionWarning-turned-exception; ignoring it lets that write commit on its own
-        // (still correct — just not atomic with anything, which nothing here requires).
-        .ConfigureWarnings(w => w.Ignore(RelationalEventId.AmbientTransactionWarning)),
+    // On SQLite the outbox middleware wraps each consume in an explicit local transaction.
+    configureDbContext: options => options.UseSqlite(modulithConnectionString),
     configureOutbox: outbox =>
     {
         outbox.PollingInterval = TimeSpan.FromMilliseconds(200);

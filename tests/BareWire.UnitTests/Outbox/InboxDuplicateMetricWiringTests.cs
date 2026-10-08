@@ -8,6 +8,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
+using BareWire.Outbox.EntityFramework.Internal;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -68,10 +69,13 @@ public sealed class InboxDuplicateMetricWiringTests : IDisposable
         firstFilter.Diagnostics.Should().BeSameAs(secondFilter.Diagnostics);
     }
 
-    [Fact]
-    public async Task InvokeAsync_DuplicateWithEndpointName_TagsDuplicateWithEndpointName()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_DuplicateWithEndpointName_TagsDuplicateWithEndpointName(
+        bool useAmbientTransaction)
     {
-        TransactionalOutboxMiddleware middleware = CreateDuplicateMiddleware();
+        TransactionalOutboxMiddleware middleware = CreateDuplicateMiddleware(useAmbientTransaction);
         MessageContext context = CreateContext(endpointName: "orders-queue", messageTypeHeader: "Forged.Type");
 
         await middleware.InvokeAsync(context, _ => Task.CompletedTask);
@@ -81,10 +85,13 @@ public sealed class InboxDuplicateMetricWiringTests : IDisposable
             new KeyValuePair<string, object?>(InboxDiagnostics.ConsumerTypeTag, "orders-queue"));
     }
 
-    [Fact]
-    public async Task InvokeAsync_DuplicateWithoutEndpointName_TagsDuplicateAsUnknownNotHeaderValue()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_DuplicateWithoutEndpointName_TagsDuplicateAsUnknownNotHeaderValue(
+        bool useAmbientTransaction)
     {
-        TransactionalOutboxMiddleware middleware = CreateDuplicateMiddleware();
+        TransactionalOutboxMiddleware middleware = CreateDuplicateMiddleware(useAmbientTransaction);
         MessageContext context = CreateContext(endpointName: string.Empty, messageTypeHeader: "Forged.Type");
 
         await middleware.InvokeAsync(context, _ => Task.CompletedTask);
@@ -95,7 +102,7 @@ public sealed class InboxDuplicateMetricWiringTests : IDisposable
         _measurementTags[0].Select(t => t.Value).Should().NotContain("Forged.Type");
     }
 
-    private TransactionalOutboxMiddleware CreateDuplicateMiddleware()
+    private TransactionalOutboxMiddleware CreateDuplicateMiddleware(bool useAmbientTransaction)
     {
         IInboxStore inboxStore = Substitute.For<IInboxStore>();
         inboxStore
@@ -116,7 +123,8 @@ public sealed class InboxDuplicateMetricWiringTests : IDisposable
             new OutboxDbContext(dbOptions),
             Substitute.For<IOutboxStore>(),
             inboxFilter,
-            NullLogger<TransactionalOutboxMiddleware>.Instance);
+            NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new OutboxTransactionMode(useAmbientTransaction));
     }
 
     private static MessageContext CreateContext(string endpointName, string messageTypeHeader) =>

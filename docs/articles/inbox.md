@@ -8,7 +8,7 @@ The inbox pattern prevents duplicate message processing when the broker redelive
 2. The middleware checks whether `(MessageId, ConsumerType)` already exists in the inbox table
 3. If the entry exists and is marked as processed — the message is skipped (duplicate)
 4. If no entry exists — a lock row is inserted with an expiry time
-5. The consumer processes the message inside a `TransactionScope`
+5. The consumer processes the message inside a transaction — a `TransactionScope` on providers with ambient-transaction support (PostgreSQL, SQL Server), or an explicit local transaction on SQLite (see [Transactional Outbox](outbox.md#sqlite-explicit-local-transaction))
 6. On success, the entry is marked as processed — permanently preventing reprocessing
 
 ### Composite Key

@@ -85,6 +85,7 @@ public sealed class TransactionalOutboxInterceptorTests
             endpointName: "test-endpoint");
 
     private static (TransactionalOutboxMiddleware Middleware, IOutboxStore Store) CreateMiddleware(
+        bool useAmbientTransaction,
         OutboxOptions? options = null,
         ILogger<TransactionalOutboxMiddleware>? logger = null)
     {
@@ -110,6 +111,7 @@ public sealed class TransactionalOutboxInterceptorTests
             outboxStore,
             inboxFilter,
             logger ?? NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new OutboxTransactionMode(useAmbientTransaction),
             options);
 
         return (middleware, outboxStore);
@@ -163,10 +165,12 @@ public sealed class TransactionalOutboxInterceptorTests
         sut.TryIntercept(CreateMessage()).Should().BeFalse();
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerPublishesAndSucceeds_SavesInterceptedMessageToOutboxStore()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerPublishesAndSucceeds_SavesInterceptedMessageToOutboxStore(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         TransactionalOutboxInterceptor sut = CreateInterceptor();
         OutboundMessage message = CreateMessage();
         bool captured = false;
@@ -183,10 +187,12 @@ public sealed class TransactionalOutboxInterceptorTests
             Arg.Any<CancellationToken>());
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerPublishesThenThrows_DoesNotSaveInterceptedMessage()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerPublishesThenThrows_DoesNotSaveInterceptedMessage(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         TransactionalOutboxInterceptor sut = CreateInterceptor();
 
         Func<Task> act = () => middleware.InvokeAsync(CreateContext(), _ =>
@@ -199,10 +205,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await store.DidNotReceiveWithAnyArgs().SaveMessagesAsync(default!, default);
     }
 
-    [Fact]
-    public async Task TryIntercept_FromFlowCapturedInHandlerAfterMiddlewareCompleted_ReturnsFalseAndLogsWarning()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TryIntercept_FromFlowCapturedInHandlerAfterMiddlewareCompleted_ReturnsFalseAndLogsWarning(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         RecordingLogger<TransactionalOutboxInterceptor> logger = new();
         TransactionalOutboxInterceptor sut = CreateInterceptor(logger);
         TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -233,10 +241,12 @@ public sealed class TransactionalOutboxInterceptorTests
             .Should().Contain("TestEvent").And.NotContain("BW-MessageType");
     }
 
-    [Fact]
-    public async Task PublishAsync_FromFlowCapturedInHandlerAfterMiddlewareCompleted_ReachesTransport()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PublishAsync_FromFlowCapturedInHandlerAfterMiddlewareCompleted_ReachesTransport(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         RecordingLogger<TransactionalOutboxInterceptor> logger = new();
         TransactionalOutboxInterceptor interceptor = CreateInterceptor(logger);
         var (bus, adapter) = CreateBus(interceptor);
@@ -267,10 +277,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await bus.DisposeAsync();
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerExceedsMaxBufferedMessages_ThrowsBareWireExceptionAndSavesNothing()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerExceedsMaxBufferedMessages_ThrowsBareWireExceptionAndSavesNothing(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware(new OutboxOptions { MaxBufferedMessagesPerConsume = 2 });
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction, new OutboxOptions { MaxBufferedMessagesPerConsume = 2 });
         TransactionalOutboxInterceptor sut = CreateInterceptor();
 
         Func<Task> act = () => middleware.InvokeAsync(CreateContext(), _ =>
@@ -284,10 +296,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await store.DidNotReceiveWithAnyArgs().SaveMessagesAsync(default!, default);
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerBuffersExactlyMaxMessages_SavesThemAll()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerBuffersExactlyMaxMessages_SavesThemAll(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware(new OutboxOptions { MaxBufferedMessagesPerConsume = 2 });
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction, new OutboxOptions { MaxBufferedMessagesPerConsume = 2 });
         TransactionalOutboxInterceptor sut = CreateInterceptor();
 
         await middleware.InvokeAsync(CreateContext(), _ =>
@@ -305,10 +319,12 @@ public sealed class TransactionalOutboxInterceptorTests
     private static OutboundMessage CreateSizedMessage(int size)
         => new("rk", new Dictionary<string, string> { ["message-id"] = "m" }, new byte[size], "application/json");
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerExceedsMaxBufferedBytes_ThrowsBareWireExceptionAndSavesNothing()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerExceedsMaxBufferedBytes_ThrowsBareWireExceptionAndSavesNothing(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware(new OutboxOptions { MaxBufferedBytesPerConsume = 10 });
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction, new OutboxOptions { MaxBufferedBytesPerConsume = 10 });
         TransactionalOutboxInterceptor sut = CreateInterceptor();
 
         Func<Task> act = () => middleware.InvokeAsync(CreateContext(), _ =>
@@ -322,10 +338,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await store.DidNotReceiveWithAnyArgs().SaveMessagesAsync(default!, default);
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenHandlerBuffersExactlyMaxBytes_SavesThemAll()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenHandlerBuffersExactlyMaxBytes_SavesThemAll(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware(new OutboxOptions { MaxBufferedBytesPerConsume = 10 });
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction, new OutboxOptions { MaxBufferedBytesPerConsume = 10 });
         TransactionalOutboxInterceptor sut = CreateInterceptor();
 
         await middleware.InvokeAsync(CreateContext(), _ =>
@@ -351,10 +369,12 @@ public sealed class TransactionalOutboxInterceptorTests
         OutboxOptions.Default.MaxBufferedBytesPerConsume.Should().Be(67_108_864);
     }
 
-    [Fact]
-    public async Task IsCapturing_ReflectsAmbientBuffer_IncludingSealedOne()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task IsCapturing_ReflectsAmbientBuffer_IncludingSealedOne(bool useAmbientTransaction)
     {
-        var (middleware, _) = CreateMiddleware();
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction);
         TransactionalOutboxInterceptor sut = CreateInterceptor();
         bool during = false;
         TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -381,11 +401,13 @@ public sealed class TransactionalOutboxInterceptorTests
         sut.IsCapturing.Should().BeFalse();
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenInnerMiddlewareOverwritesRetryCallback_LogsWarning()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenInnerMiddlewareOverwritesRetryCallback_LogsWarning(bool useAmbientTransaction)
     {
         RecordingLogger<TransactionalOutboxMiddleware> logger = new();
-        var (middleware, _) = CreateMiddleware(logger: logger);
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction, logger: logger);
 
         await middleware.InvokeAsync(CreateContext(), ctx =>
         {
@@ -396,11 +418,13 @@ public sealed class TransactionalOutboxInterceptorTests
         logger.Entries.Should().ContainSingle(e => e.Level == LogLevel.Warning && e.Message.Contains("retry-attempt callback"));
     }
 
-    [Fact]
-    public async Task InvokeAsync_WhenRetryCallbackUntouched_DoesNotLogWarning()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WhenRetryCallbackUntouched_DoesNotLogWarning(bool useAmbientTransaction)
     {
         RecordingLogger<TransactionalOutboxMiddleware> logger = new();
-        var (middleware, _) = CreateMiddleware(logger: logger);
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction, logger: logger);
 
         await middleware.InvokeAsync(CreateContext(), _ => Task.CompletedTask);
 
@@ -418,10 +442,12 @@ public sealed class TransactionalOutboxInterceptorTests
         OutboxOptions.Default.MaxBufferedMessagesPerConsume.Should().Be(10_000);
     }
 
-    [Fact]
-    public async Task InvokeAsync_WithRealRetryMiddlewareInside_SavesOnlyTheSuccessfulAttemptsMessages()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_WithRealRetryMiddlewareInside_SavesOnlyTheSuccessfulAttemptsMessages(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         TransactionalOutboxInterceptor sut = CreateInterceptor();
         RetryMiddleware retry = new(
             new IntervalRetryPolicy(maxRetries: 3, interval: TimeSpan.Zero, handledExceptions: [], ignoredExceptions: []),
@@ -452,10 +478,12 @@ public sealed class TransactionalOutboxInterceptorTests
             Arg.Any<CancellationToken>());
     }
 
-    [Fact]
-    public async Task InvokeAsync_AfterCompletion_RetryCallbackIsNoLongerRegistered()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InvokeAsync_AfterCompletion_RetryCallbackIsNoLongerRegistered(bool useAmbientTransaction)
     {
-        var (middleware, _) = CreateMiddleware();
+        var (middleware, _) = CreateMiddleware(useAmbientTransaction);
         MessageContext context = CreateContext();
 
         await middleware.InvokeAsync(context, _ => Task.CompletedTask);
@@ -466,10 +494,12 @@ public sealed class TransactionalOutboxInterceptorTests
 
     // ── Real bus + outbox ─────────────────────────────────────────────────────
 
-    [Fact]
-    public async Task PublishAsync_ViaBusInsideOutboxMiddleware_IsNotSentToTransportAndIsSavedToOutbox()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PublishAsync_ViaBusInsideOutboxMiddleware_IsNotSentToTransportAndIsSavedToOutbox(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         var (bus, adapter) = CreateBus(CreateInterceptor());
 
         await middleware.InvokeAsync(CreateContext(), _ =>
@@ -484,10 +514,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await bus.DisposeAsync();
     }
 
-    [Fact]
-    public async Task PublishAsync_ViaBusWhenHandlerPublishesThenThrows_ReachesNeitherTransportNorOutbox()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PublishAsync_ViaBusWhenHandlerPublishesThenThrows_ReachesNeitherTransportNorOutbox(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         var (bus, adapter) = CreateBus(CreateInterceptor());
 
         Func<Task> act = () => middleware.InvokeAsync(CreateContext(), async _ =>
@@ -505,10 +537,12 @@ public sealed class TransactionalOutboxInterceptorTests
         await bus.DisposeAsync();
     }
 
-    [Fact]
-    public async Task RespondAsync_InsideOutboxMiddleware_IsBufferedWithCorrelationIdAndNotSentDirectly()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RespondAsync_InsideOutboxMiddleware_IsBufferedWithCorrelationIdAndNotSentDirectly(bool useAmbientTransaction)
     {
-        var (middleware, store) = CreateMiddleware();
+        var (middleware, store) = CreateMiddleware(useAmbientTransaction);
         var (bus, adapter) = CreateBus(CreateInterceptor());
         ConsumeContext<TestEvent> consumeContext = new(
             new TestEvent("request"),

@@ -99,7 +99,9 @@ public sealed class TransactionalInboxAtomicityE2ETests : IAsyncLifetime
             dbContext,
             outboxStore,
             inboxFilter,
-            NullLogger<TransactionalOutboxMiddleware>.Instance);
+            NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new BareWire.Outbox.EntityFramework.Internal.OutboxTransactionMode(
+                () => dbContext.Database.ProviderName));
 
         return (middleware, outboxStore);
     }

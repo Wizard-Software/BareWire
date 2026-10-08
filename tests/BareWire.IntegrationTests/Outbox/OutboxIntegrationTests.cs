@@ -8,7 +8,6 @@ using BareWire.Outbox;
 using BareWire.Outbox.EntityFramework;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
@@ -488,12 +487,9 @@ public sealed class EfCoreInboxStoreTests : IAsyncLifetime
 /// Integration tests for <see cref="TransactionalOutboxMiddleware"/> against SQLite in-memory.
 /// </summary>
 /// <remarks>
-/// SQLite does not support <c>System.Transactions.TransactionScope</c>. The middleware
-/// creates a <c>TransactionScope</c> that triggers a warning from the EF Core SQLite
-/// provider. The DbContext is configured with
-/// <c>ConfigureWarnings(w => w.Ignore(RelationalEventId.AmbientTransactionWarning))</c>
-/// so that the tests can exercise the middleware logic without transaction rollback
-/// semantics. Atomicity tests that rely on rollback are skipped on SQLite.
+/// SQLite does not support <c>System.Transactions.TransactionScope</c>, so on SQLite the middleware
+/// opens an explicit local transaction on the DbContext instead (rollback semantics are preserved).
+/// No warning suppression is needed.
 /// </remarks>
 public sealed class TransactionalOutboxMiddlewareTests : IAsyncLifetime
 {
@@ -523,14 +519,11 @@ public sealed class TransactionalOutboxMiddlewareTests : IAsyncLifetime
 
     /// <summary>
     /// Creates a new <see cref="OutboxDbContext"/> sharing the open SQLite connection.
-    /// The <see cref="RelationalEventId.AmbientTransactionWarning"/> is suppressed because
-    /// SQLite cannot participate in <see cref="System.Transactions.TransactionScope"/>.
     /// </summary>
     private OutboxDbContext CreateDbContext()
     {
         var options = new DbContextOptionsBuilder<OutboxDbContext>()
             .UseSqlite(_connection)
-            .ConfigureWarnings(w => w.Ignore(RelationalEventId.AmbientTransactionWarning))
             .Options;
 
         return new OutboxDbContext(options);
@@ -560,7 +553,9 @@ public sealed class TransactionalOutboxMiddlewareTests : IAsyncLifetime
             _dbContext,
             _outboxStore,
             _inboxFilter,
-            NullLogger<TransactionalOutboxMiddleware>.Instance);
+            NullLogger<TransactionalOutboxMiddleware>.Instance,
+            new BareWire.Outbox.EntityFramework.Internal.OutboxTransactionMode(
+                () => _dbContext.Database.ProviderName));
     }
 
     [Fact]

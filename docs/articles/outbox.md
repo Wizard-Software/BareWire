@@ -67,7 +67,7 @@ The `TransactionalOutboxMiddleware` automatically deduplicates messages on the c
 
 ## Consumer Business Writes: Single-Commit vs 2PC
 
-The inbox `ProcessedAt` marker is committed inside a `System.Transactions.TransactionScope`, atomically with the consumer's work. The middleware pins **one** physical connection for its own inbox/outbox writes, so the common case stays single-connection.
+The inbox `ProcessedAt` marker is committed atomically with the consumer's work: inside a `System.Transactions.TransactionScope` on providers that support ambient transactions (PostgreSQL, SQL Server), or inside an explicit local transaction on SQLite (see [SQLite](#sqlite-explicit-local-transaction) below). The middleware pins **one** physical connection for its own inbox/outbox writes, so the common case stays single-connection.
 
 A frequent pattern, though, is for the **consumer to also persist business state through its own `DbContext`** inside that same transaction (e.g. a `TransferConsumer` that updates the `Transfer` row). How that second write enlists decides whether the commit is one phase or two:
 
@@ -92,6 +92,58 @@ services.AddDbContext<TransferDbContext>((sp, options) =>
 > Use the `(IServiceProvider, DbContextOptionsBuilder)` overload so EF builds the options **per scope** — each per-message consumer scope binds to the live pinned connection. The consumer keeps calling `SaveChangesAsync()` as usual; running inside the middleware's `TransactionScope`, its write commits atomically with the outbox and inbox writes — now as one single-phase commit.
 
 > See: `samples/BareWire.Samples.TransactionalOutbox/`, `samples/BareWire.Samples.OrderedConsumers/`, and `samples/BareWire.Samples.InboxDeduplication/` — every sample whose consumer persists business state uses this single-commit pattern, so none requires 2PC.
+
+### SQLite: explicit local transaction
+
+SQLite has no `System.Transactions` support, so on SQLite the middleware does **not** use a
+`TransactionScope`. It opens an explicit local database transaction on the pinned connection instead
+(`ReadUncommitted`, which Microsoft.Data.Sqlite turns into a deferred `BEGIN`, so the write lock is taken
+only at the first write rather than for the whole handler). The inbox `ProcessedAt` marker and the buffered
+outbox messages commit or roll back together, exactly as on the other providers, and no
+`ConfigureWarnings(... AmbientTransactionWarning ...)` suppression is needed. Other providers keep using
+the `TransactionScope` described above.
+
+A consumer `DbContext` that shares the pinned connection (`IOutboxConnectionAccessor.Current`) **must** also
+join the transaction through `IOutboxConnectionAccessor.CurrentTransaction`, because Microsoft.Data.Sqlite
+rejects commands on a connection that has an open local transaction the command is not enlisted in:
+
+```csharp
+services.AddDbContext<MyConsumerDbContext>((sp, options) =>
+{
+    DbConnection? shared = sp.GetRequiredService<IOutboxConnectionAccessor>().Current;
+    options.UseSqlite(shared ?? new SqliteConnection(connectionString));
+});
+
+// In the consumer, before the first write:
+var accessor = serviceProvider.GetRequiredService<IOutboxConnectionAccessor>();
+if (accessor.CurrentTransaction is { } transaction)
+    await myDbContext.Database.UseTransactionAsync(transaction, cancellationToken);
+```
+
+> **Breaking change for SQLite users.** A consumer `DbContext` that shares `Current` on SQLite must now
+> call `Database.UseTransaction(accessor.CurrentTransaction)` (as above). Previously the shared
+> connection had no open transaction, and the warning suppression silently made the commit non-atomic.
+> `CurrentTransaction` is `null` on providers that use a `TransactionScope`, so the same code is safe there.
+
+Things to know on SQLite:
+
+- **The transaction belongs to the middleware.** Never call `Commit`, `Rollback` or `Dispose` on
+  `CurrentTransaction`, and never call `Database.CommitTransactionAsync()` after `UseTransaction`. If the
+  consumer ends the transaction, the middleware throws `InvalidOperationException` instead of silently
+  losing the exactly-once guarantee.
+- **WAL: start with a write.** In WAL mode a transaction that reads first and then writes can fail with
+  `SQLITE_BUSY_SNAPSHOT` if another connection committed in between. Have the consumer perform a write
+  before (or without) reading data that another writer may change.
+- **Shared cache is not supported** for consume transactions. With `Cache=Shared`, `ReadUncommitted`
+  enables `PRAGMA read_uncommitted = 1`, which allows dirty reads between connections that share the cache.
+- A consumer that opens its **own** connection to the same SQLite file may wait for the write lock held by
+  the pinned connection.
+- SQLite remains for development and testing only (`AllowNonAtomicProvider = true`, single dispatcher
+  instance) — see Horizontal Scaling below.
+
+> **Do not suppress `AmbientTransactionWarning` on a provider other than SQLite.** On a provider that
+> supports ambient transactions, suppressing the warning silently disables atomicity of the consume
+> transaction. This is unsupported.
 
 ## Publishing from a consumer
 

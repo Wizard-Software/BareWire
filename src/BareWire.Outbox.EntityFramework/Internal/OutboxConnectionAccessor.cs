@@ -10,4 +10,6 @@ namespace BareWire.Outbox.EntityFramework.Internal;
 internal sealed class OutboxConnectionAccessor : IOutboxConnectionAccessor
 {
     public DbConnection? Current => TransactionalOutboxMiddleware.CurrentConnection;
+
+    public DbTransaction? CurrentTransaction => TransactionalOutboxMiddleware.CurrentTransaction;
 }
