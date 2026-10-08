@@ -72,6 +72,12 @@ internal sealed partial class ReceiveEndpointRunner
     // Default OFF — the no-opt-in path is bit-identical to pre-18.5: _hasAnyMtEnvelope == false causes
     // ResolverFor(i) to return _deserializerResolver unchanged, with no allocation.
     private readonly bool[] _consumerUseMtEnvelope;
+
+    // Per-consumer retry middleware (null entry = consumer has no ConfigureRetry policy), indexed 1:1
+    // with _invokers, and one prebuilt terminator per policy-bearing consumer.
+    private readonly RetryMiddleware?[] _consumerRetry;
+    private readonly NextMiddleware?[] _consumerRetryTerminators;
+    private readonly bool _hasAnyConsumerRetry;
     private readonly bool _hasAnyMtEnvelope;
 
     // Built once in ctor when _hasAnyMtEnvelope is true; wraps the MT deserializer so ResolverFor(i)
@@ -226,11 +232,32 @@ internal sealed partial class ReceiveEndpointRunner
         // Build retry/DLQ middleware chain (task 8.12).
         List<IMessageMiddleware> middlewares = [];
 
+        ILogger<RetryMiddleware> retryLogger = loggerFactory is not null
+            ? loggerFactory.CreateLogger<RetryMiddleware>()
+            : Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance.CreateLogger<RetryMiddleware>();
+
+        // Per-consumer retry: a consumer's own policy (ConfigureRetry) REPLACES the endpoint-level
+        // RetryCount/RetryInterval for that consumer. A null entry means "no consumer policy" and the
+        // endpoint retry (if any) applies. Raw consumers and sagas have no ConfigureRetry and keep the
+        // endpoint retry. Built once at startup; one prebuilt terminator per consumer (no per-message closure).
+        _consumerRetry = binding.Consumers
+            .Select(c => RetryPolicyMaterializer.Materialize(c.ConfigureRetry) is { } policy
+                ? new RetryMiddleware(policy, retryLogger, instrumentation, c.MessageType.Name)
+                : null)
+            .ToArray();
+        _hasAnyConsumerRetry = Array.Exists(_consumerRetry, static r => r is not null);
+        _consumerRetryTerminators = new NextMiddleware?[_consumerRetry.Length];
+        for (int consumerIndex = 0; consumerIndex < _consumerRetry.Length; consumerIndex++)
+        {
+            if (_consumerRetry[consumerIndex] is not null)
+            {
+                int index = consumerIndex;
+                _consumerRetryTerminators[consumerIndex] = context => InvokeConsumerAttemptAsync(index, context);
+            }
+        }
+
         if (binding.RetryCount > 0)
         {
-            ILogger<RetryMiddleware> retryLogger = loggerFactory is not null
-                ? loggerFactory.CreateLogger<RetryMiddleware>()
-                : Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance.CreateLogger<RetryMiddleware>();
             IntervalRetryPolicy retryPolicy = new(
                 maxRetries: binding.RetryCount,
                 interval: binding.RetryInterval,
@@ -692,6 +719,93 @@ internal sealed partial class ReceiveEndpointRunner
         _hasAnyMtEnvelope && _consumerUseMtEnvelope[i] ? _mtResolver! : _deserializerResolver;
 
     /// <summary>
+    /// Invokes the selected typed consumer. Non-async fast path: when the consumer has no retry policy of its
+    /// own this is a direct pass-through to the invoker (no async state machine, no extra allocation).
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private Task InvokeSelectedConsumer(
+        int index,
+        MessageContext context,
+        string messageIdStr,
+        CancellationToken cancellationToken) =>
+        _hasAnyConsumerRetry && _consumerRetry[index] is not null
+            ? InvokeWithConsumerRetryAsync(index, context, cancellationToken)
+            : _invokers[index](
+                _scopeFactory,
+                context.RawBody,
+                context.Headers,
+                messageIdStr,
+                _publishEndpoint,
+                _sendEndpointProvider,
+                ResolverFor(index),  // D4: per-consumer MT envelope override (task 18.5)
+                _binding.EndpointName,
+                cancellationToken);
+
+    /// <summary>
+    /// Runs the consumer's own retry policy around the selected invoker. When the policy is exhausted the
+    /// failure is flagged so the endpoint-level <see cref="RetryMiddleware"/> does not re-run the consumer.
+    /// </summary>
+    private async Task InvokeWithConsumerRetryAsync(
+        int index,
+        MessageContext context,
+        CancellationToken cancellationToken)
+    {
+        _ = cancellationToken; // The terminator reads the same token from the context.
+
+        try
+        {
+            await _consumerRetry[index]!.InvokeAsync(context, _consumerRetryTerminators[index]!)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Consumer policy exhausted (or the exception is not covered by it): the endpoint retry must not
+            // re-run this consumer.
+            context.Items[InternalItemKeys.ConsumerRetryExhausted] = true;
+            throw;
+        }
+
+        // OUTSIDE the marker-setting catch: a captured deserialization failure is rethrown WITHOUT the marker,
+        // so the "try next invoker" fallback keeps the endpoint retry semantics for the next consumer.
+        if (context.HasItems
+            && context.Items.Remove(InternalItemKeys.ConsumerRetryCapturedException, out object? captured))
+        {
+            ((System.Runtime.ExceptionServices.ExceptionDispatchInfo)captured!).Throw();
+        }
+    }
+
+    /// <summary>
+    /// Single attempt of a consumer under its own retry policy. Deserialization failures are deterministic,
+    /// so they are captured (failure path only) instead of being retried, and rethrown by the caller.
+    /// </summary>
+    private async Task InvokeConsumerAttemptAsync(int index, MessageContext context)
+    {
+        try
+        {
+            await _invokers[index](
+                _scopeFactory,
+                context.RawBody,
+                context.Headers,
+                context.MessageIdString,
+                _publishEndpoint,
+                _sendEndpointProvider,
+                ResolverFor(index),
+                _binding.EndpointName,
+                context.CancellationToken).ConfigureAwait(false);
+        }
+        catch (Abstractions.Exceptions.UnknownPayloadException ex)
+        {
+            context.Items[InternalItemKeys.ConsumerRetryCapturedException] =
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+        }
+        catch (Abstractions.Exceptions.BareWireSerializationException ex)
+        {
+            context.Items[InternalItemKeys.ConsumerRetryCapturedException] =
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+        }
+    }
+
+    /// <summary>
     /// Bit-identical pre-ADR-030 typed selection: the BW-MessageType fast path (break-on-first by
     /// type name) plus the legacy blind sequential-deserialize fallback for type-less deliveries.
     /// Reached only when <see cref="_hasAnyRoutingKeys"/> is <see langword="false"/> (ADR-FIX-2 —
@@ -717,16 +831,7 @@ internal sealed partial class ReceiveEndpointRunner
             {
                 if (string.Equals(_consumerMessageTypeNames[i], bwMessageType, StringComparison.Ordinal))
                 {
-                    await _invokers[i](
-                        _scopeFactory,
-                        context.RawBody,
-                        context.Headers,
-                        messageIdStr,
-                        _publishEndpoint,
-                        _sendEndpointProvider,
-                        ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
-                        _binding.EndpointName,
-                        cancellationToken).ConfigureAwait(false);
+                    await InvokeSelectedConsumer(i, context, messageIdStr, cancellationToken).ConfigureAwait(false);
                     messageType = _consumerMessageTypeNames[i];
                     dispatched = true;
                     break;
@@ -741,19 +846,9 @@ internal sealed partial class ReceiveEndpointRunner
             // with external systems and raw interop scenarios.
             for (int i = 0; i < _invokers.Length; i++)
             {
-                ConsumerInvokerFactory.InvokerDelegate invoker = _invokers[i];
                 try
                 {
-                    await invoker(
-                        _scopeFactory,
-                        context.RawBody,
-                        context.Headers,
-                        messageIdStr,
-                        _publishEndpoint,
-                        _sendEndpointProvider,
-                        ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
-                        _binding.EndpointName,
-                        cancellationToken).ConfigureAwait(false);
+                    await InvokeSelectedConsumer(i, context, messageIdStr, cancellationToken).ConfigureAwait(false);
                     messageType = _binding.Consumers[i].MessageType.Name;
                     dispatched = true;
                     break;
@@ -887,16 +982,7 @@ internal sealed partial class ReceiveEndpointRunner
                 LogAmbiguousRoutingKeyMatch(_binding.EndpointName, messageIdStr);
             }
 
-            await _invokers[bestIdx](
-                _scopeFactory,
-                context.RawBody,
-                context.Headers,
-                messageIdStr,
-                _publishEndpoint,
-                _sendEndpointProvider,
-                ResolverFor(bestIdx),  // D4: per-consumer MT envelope override (task 18.5)
-                _binding.EndpointName,
-                cancellationToken).ConfigureAwait(false);
+            await InvokeSelectedConsumer(bestIdx, context, messageIdStr, cancellationToken).ConfigureAwait(false);
             return (true, _consumerMessageTypeNames[bestIdx]);
         }
 
@@ -906,16 +992,7 @@ internal sealed partial class ReceiveEndpointRunner
             if (string.Equals(_consumerMessageTypeNames[i], bwMessageType, StringComparison.Ordinal)
                 && _consumerPatterns[i].Length == 0)
             {
-                await _invokers[i](
-                    _scopeFactory,
-                    context.RawBody,
-                    context.Headers,
-                    messageIdStr,
-                    _publishEndpoint,
-                    _sendEndpointProvider,
-                    ResolverFor(i),  // D4: per-consumer MT envelope override (task 18.5)
-                    _binding.EndpointName,
-                    cancellationToken).ConfigureAwait(false);
+                await InvokeSelectedConsumer(i, context, messageIdStr, cancellationToken).ConfigureAwait(false);
                 return (true, _consumerMessageTypeNames[i]);
             }
         }
@@ -1094,16 +1171,7 @@ internal sealed partial class ReceiveEndpointRunner
         // has no TypeInfoResolver (no polymorphic dispatch) and the default STJ MaxDepth (64).
         try
         {
-            await _invokers[bestIdx](
-                _scopeFactory,
-                context.RawBody,
-                context.Headers,
-                messageIdStr,
-                _publishEndpoint,
-                _sendEndpointProvider,
-                ResolverFor(bestIdx),  // D4: per-consumer MT envelope override (task 18.5)
-                _binding.EndpointName,
-                cancellationToken).ConfigureAwait(false);
+            await InvokeSelectedConsumer(bestIdx, context, messageIdStr, cancellationToken).ConfigureAwait(false);
 
             return (true, _consumerMessageTypeNames[bestIdx]);
         }

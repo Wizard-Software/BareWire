@@ -53,6 +53,10 @@ public sealed class MessageContext
     /// Keys follow the convention "component:key" (e.g., "inbox:filtered").
     /// Lazy-initialized — zero allocation when unused.
     /// </summary>
+    /// <remarks>
+    /// Keys prefixed with <c>retry:</c> and <c>inbox:</c> are reserved for BareWire internals; do not use them
+    /// for application data.
+    /// </remarks>
     public IDictionary<string, object?> Items => _items ??= new(StringComparer.Ordinal);
 
     /// <summary>

@@ -8,6 +8,7 @@ using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
 using BareWire.Configuration;
 using BareWire.FlowControl;
+using BareWire.Pipeline.Retry;
 using BareWire.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -85,6 +86,10 @@ internal sealed partial class BareWireBusControl : IBusControl
         // BareWireConfigurationException FIRST — before any raw DI/NRE error can leak out (C1 / E6).
         bool transportRegistered = _adapter is not null;
         ConfigurationValidator.Validate(_configurator, transportRegistered);
+
+        // Consumer retry policies are materialized when the receive endpoints are constructed (after the bus is
+        // marked started), so an empty Retry delegate is validated here, before _started = true.
+        ValidateConsumerRetryPolicies();
 
         // Advisory diagnostic (SEC-13 / ADR-030 §Security): an endpoint that declares AcceptUntyped()
         // without a registered schema-validation middleware exposes a type-less foreign-input trust
@@ -345,6 +350,32 @@ internal sealed partial class BareWireBusControl : IBusControl
                 await budget.CancelAsync().ConfigureAwait(false);
 
             budget.Token.ThrowIfCancellationRequested();
+        }
+    }
+
+    private void ValidateConsumerRetryPolicies()
+    {
+        foreach (EndpointBinding binding in _endpointBindings)
+        {
+            foreach (ConsumerRegistration consumer in binding.Consumers)
+            {
+                if (consumer.ConfigureRetry is null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    _ = RetryPolicyMaterializer.Materialize(consumer.ConfigureRetry);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: $"{binding.EndpointName}:{consumer.ConsumerType.Name}.Retry",
+                        expectedValue: "a retry strategy (Immediate/Interval/Incremental/Exponential)",
+                        innerException: ex);
+                }
+            }
         }
     }
 

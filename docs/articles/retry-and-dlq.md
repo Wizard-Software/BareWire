@@ -15,6 +15,30 @@ rmq.ReceiveEndpoint("payments", e =>
 
 When a consumer throws an exception, BareWire retries the message up to `RetryCount` times with `RetryInterval` delay between attempts. After all retries are exhausted, the message is either nacked or routed to a Dead Letter Exchange.
 
+### Per-consumer retry
+
+A consumer can carry its own retry policy, either inline or in a [consumer definition](consumer-definitions.md):
+
+```csharp
+rmq.ReceiveEndpoint("payments", e =>
+{
+    e.RetryCount = 3;
+    e.RetryInterval = TimeSpan.FromSeconds(1);
+    e.Consumer<PaymentProcessor, ProcessPayment>(c =>
+        c.Retry(r => r.Exponential(4, TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(2))));
+});
+```
+
+A policy set with `consumer.Retry(...)` replaces the endpoint `RetryCount`/`RetryInterval` for that consumer; the two are not combined, so the message is not retried by both. Consumers without their own policy, raw consumers and sagas keep the endpoint retry.
+
+### Side effects of in-process retry
+
+Retries run inside the process, while the message is still being handled:
+
+- The delivery and its flow-control credit are held for the whole backoff.
+- When per-key ordering is disabled, the endpoint pump is blocked until the message succeeds or the retries are exhausted. For example, `Exponential(4, 200 ms, 2 s)` can hold the pump for about 3 seconds per poison message.
+- Keep consumer backoffs short, or rely on the dead letter queue and redelivery for longer delays.
+
 ## Dead Letter Exchange (DLX)
 
 RabbitMQ's native DLX mechanism routes failed messages to a separate queue for inspection and reprocessing.
@@ -93,7 +117,7 @@ rmq.ReceiveEndpoint("ordered-processing", e =>
 });
 ```
 
-- The head message is retried up to `MaxDeliveryAttempts` (reusing the endpoint `RetryCount`/`RetryInterval`).
+- The head message is retried up to `MaxDeliveryAttempts` (by the consumer's own retry policy if it has one, otherwise by the endpoint `RetryCount`/`RetryInterval`).
 - After the threshold, the message is dead-lettered (wire a DLX on the queue) and leaves the head of the key.
 - The key stream then **resumes** for subsequent messages. The skipped (parked) message is an ordering gap, which is logged — there is no permanent block.
 - Key release happens only **after the broker durably confirms** the parking of the head; if settlement fails, the key is not released (the head stays at the front and the operation is retried).

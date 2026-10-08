@@ -53,6 +53,46 @@ public sealed class TrackingRawConsumer : IRawConsumer
     }
 }
 
+// Typed probes for the per-consumer retry tests. Public: the generic invoker factory needs public types.
+public sealed record RetryProbe(string CorrelationId);
+public sealed record OtherRetryProbe(string CorrelationId);
+
+public sealed class FailingTypedConsumer(int failTimes) : IConsumer<RetryProbe>
+{
+    private int _callCount;
+
+    public int CallCount => Volatile.Read(ref _callCount);
+
+    public Task ConsumeAsync(ConsumeContext<RetryProbe> context)
+    {
+        int call = Interlocked.Increment(ref _callCount);
+        if (call <= failTimes)
+        {
+            throw new InvalidOperationException("Typed consumer failed intentionally.");
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+public sealed class FailingOtherTypedConsumer(int failTimes) : IConsumer<OtherRetryProbe>
+{
+    private int _callCount;
+
+    public int CallCount => Volatile.Read(ref _callCount);
+
+    public Task ConsumeAsync(ConsumeContext<OtherRetryProbe> context)
+    {
+        int call = Interlocked.Increment(ref _callCount);
+        if (call <= failTimes)
+        {
+            throw new InvalidOperationException("Typed consumer failed intentionally.");
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
 // Two record types with compatible JSON structure — used to reproduce BW-MessageType routing bug.
 // Must be public so ConsumerInvokerFactory can build delegates over these types.
 public sealed record TestOrderEvent(string? OrderId, string CorrelationId);
@@ -647,6 +687,120 @@ public sealed class ReceiveEndpointRunnerTests
             deliveryTag: 1UL);
     }
 
+    // ── Per-consumer retry helpers ────────────────────────────────────────────
+
+    internal static (
+        ReceiveEndpointRunner Runner,
+        FailingTypedConsumer Consumer,
+        ChannelWriter<InboundMessage> MessageWriter,
+        ITransportAdapter Adapter)
+        CreateRunnerWithFailingTypedConsumer(
+            int failTimes,
+            Action<IRetryConfigurator>? configureRetry,
+            int endpointRetryCount,
+            IReadOnlyList<string>? routingKeys = null)
+    {
+        FailingTypedConsumer consumer = new(failTimes);
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<RetryProbe>(Arg.Any<ReadOnlySequence<byte>>()).Returns(new RetryProbe("corr-1"));
+
+        var (runner, writer, adapter) = BuildRetryRunner(
+            [new ConsumerRegistration(
+                typeof(FailingTypedConsumer),
+                typeof(RetryProbe),
+                RoutingKeys: routingKeys,
+                ConfigureRetry: configureRetry)],
+            [(typeof(FailingTypedConsumer), consumer)],
+            deserializer,
+            endpointRetryCount);
+        return (runner, consumer, writer, adapter);
+    }
+
+    internal static (
+        ReceiveEndpointRunner Runner,
+        ChannelWriter<InboundMessage> MessageWriter,
+        ITransportAdapter Adapter)
+        BuildRetryRunner(
+            IReadOnlyList<ConsumerRegistration> consumers,
+            IReadOnlyList<(Type Type, object Instance)> instances,
+            IMessageDeserializer deserializer,
+            int endpointRetryCount)
+    {
+        Channel<InboundMessage> channel = Channel.CreateBounded<InboundMessage>(
+            new BoundedChannelOptions(4096) { SingleWriter = false, SingleReader = true });
+
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter>();
+        adapter.TransportName.Returns("test");
+        adapter.ConsumeAsync(
+                Arg.Any<string>(),
+                Arg.Any<FlowControlOptions>(),
+                Arg.Any<CancellationToken>())
+               .Returns(callInfo => ReadChannelAsync(channel.Reader, callInfo.ArgAt<CancellationToken>(2)));
+        adapter.SettleAsync(
+                Arg.Any<SettlementAction>(),
+                Arg.Any<InboundMessage>(),
+                Arg.Any<CancellationToken>())
+               .Returns(Task.CompletedTask);
+
+        IDeserializerResolver deserializerResolver = Substitute.For<IDeserializerResolver>();
+        deserializerResolver.Resolve(Arg.Any<string?>()).Returns(deserializer);
+
+        IServiceScopeFactory scopeFactory = Substitute.For<IServiceScopeFactory>();
+        IServiceScope scope = Substitute.For<IServiceScope>();
+        IServiceProvider provider = Substitute.For<IServiceProvider>();
+        scopeFactory.CreateScope().Returns(scope);
+        scope.ServiceProvider.Returns(provider);
+        foreach ((Type type, object instance) in instances)
+        {
+            provider.GetService(type).Returns(instance);
+        }
+
+        provider.GetService(typeof(IEnumerable<IMessageMiddleware>)).Returns(Array.Empty<IMessageMiddleware>());
+
+        EndpointBinding binding = new()
+        {
+            EndpointName = EndpointName,
+            PrefetchCount = 4,
+            RetryCount = endpointRetryCount,
+            RetryInterval = TimeSpan.Zero,
+            Consumers = consumers,
+            RawConsumers = [],
+        };
+
+        ReceiveEndpointRunner runner = new(
+            binding,
+            adapter,
+            deserializerResolver,
+            Substitute.For<IPublishEndpoint>(),
+            Substitute.For<ISendEndpointProvider>(),
+            scopeFactory,
+            new FlowController(NullLogger<FlowController>.Instance),
+            new NullInstrumentation(),
+            NullLogger<ReceiveEndpointRunner>.Instance,
+            loggerFactory: NullLoggerFactory.Instance);
+
+        return (runner, channel.Writer, adapter);
+    }
+
+    internal static InboundMessage MakeTypedMessage(
+        string id,
+        string messageType = nameof(RetryProbe),
+        string? routingKey = null)
+    {
+        Dictionary<string, string> headers = new() { ["BW-MessageType"] = messageType };
+        if (routingKey is not null)
+        {
+            headers["BW-RoutingKey"] = routingKey;
+        }
+
+        return new InboundMessage(
+            messageId: id,
+            headers: headers,
+            body: new ReadOnlySequence<byte>("""{"CorrelationId":"corr-1"}"""u8.ToArray()),
+            deliveryTag: 1UL);
+    }
+
     // ── Multi-consumer header-based dispatch tests (task 10.18) ──────────────
 
     [Fact]
@@ -949,6 +1103,158 @@ public sealed class ReceiveEndpointRunnerTests
         await adapter.Received(1).SettleAsync(
             SettlementAction.Nack,
             Arg.Is<InboundMessage>(m => m.MessageId == "msg-null-logger-retry"),
+            Arg.Any<CancellationToken>());
+    }
+
+    // ── Per-consumer retry (ConfigureRetry) ───────────────────────────────────
+
+    [Fact]
+    public async Task RunAsync_ConsumerRetryConfiguredWithoutEndpointRetry_RetriesAndAcks()
+    {
+        var (runner, consumer, writer, adapter) = CreateRunnerWithFailingTypedConsumer(
+            failTimes: 2, configureRetry: r => r.Interval(2, TimeSpan.Zero), endpointRetryCount: 0);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await writer.WriteAsync(MakeTypedMessage("msg-consumer-retry"), cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        consumer.CallCount.Should().Be(3);
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Ack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-consumer-retry"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunAsync_ConsumerRetryAndEndpointRetry_ConsumerPolicyReplacesEndpoint()
+    {
+        // Consumer: 1 retry; endpoint: 5 retries; consumer always fails.
+        var (runner, consumer, writer, adapter) = CreateRunnerWithFailingTypedConsumer(
+            failTimes: int.MaxValue, configureRetry: r => r.Interval(1, TimeSpan.Zero), endpointRetryCount: 5);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await writer.WriteAsync(MakeTypedMessage("msg-replace"), cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        consumer.CallCount.Should().Be(2, because: "1 attempt + 1 consumer retry, not multiplied by endpoint retries");
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Nack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-replace"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunAsync_NoConsumerRetryWithEndpointRetry_EndpointRetryStillApplies()
+    {
+        var (runner, consumer, writer, _) = CreateRunnerWithFailingTypedConsumer(
+            failTimes: int.MaxValue, configureRetry: null, endpointRetryCount: 2);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await writer.WriteAsync(MakeTypedMessage("msg-endpoint-retry"), cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        consumer.CallCount.Should().Be(3);
+    }
+
+    [Fact]
+    public async Task RunAsync_PatternAwareRoutingKeysConsumerRetry_RetriesAndAcks()
+    {
+        // Same scenario as the first test, dispatched through the pattern-aware (RoutingKeys) path, layer 1.
+        var (runner, consumer, writer, adapter) = CreateRunnerWithFailingTypedConsumer(
+            failTimes: 2,
+            configureRetry: r => r.Interval(2, TimeSpan.Zero),
+            endpointRetryCount: 0,
+            routingKeys: ["orders.*"]);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await writer.WriteAsync(MakeTypedMessage("msg-pattern-retry", routingKey: "orders.created"), cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        consumer.CallCount.Should().Be(3);
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Ack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-pattern-retry"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunAsync_PatternAwareCatchAllConsumerRetry_RetriesAndAcks()
+    {
+        // Layer 2 (no pattern matched -> catch-all of the type) with a consumer that has no routing keys,
+        // while another consumer of a different type declares patterns so the pattern-aware path is active.
+        FailingTypedConsumer consumer = new(failTimes: 2);
+        FailingOtherTypedConsumer other = new(failTimes: 0);
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<RetryProbe>(Arg.Any<ReadOnlySequence<byte>>()).Returns(new RetryProbe("c"));
+        deserializer.Deserialize<OtherRetryProbe>(Arg.Any<ReadOnlySequence<byte>>()).Returns(new OtherRetryProbe("c"));
+        var (runner, writer, adapter) = BuildRetryRunner(
+            [
+                new ConsumerRegistration(
+                    typeof(FailingTypedConsumer), typeof(RetryProbe),
+                    ConfigureRetry: r => r.Interval(2, TimeSpan.Zero)),
+                new ConsumerRegistration(
+                    typeof(FailingOtherTypedConsumer), typeof(OtherRetryProbe), RoutingKeys: ["other.*"]),
+            ],
+            [(typeof(FailingTypedConsumer), consumer), (typeof(FailingOtherTypedConsumer), other)],
+            deserializer,
+            endpointRetryCount: 0);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        await writer.WriteAsync(MakeTypedMessage("msg-layer2", routingKey: "no.match"), cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        consumer.CallCount.Should().Be(3);
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Ack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-layer2"),
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task RunAsync_LegacyFallbackDeserializationFailsOnPolicyConsumer_NextConsumerKeepsEndpointRetry()
+    {
+        // Two typed consumers, no BW-MessageType header (legacy blind fallback). The first has its own policy but
+        // cannot deserialize the payload; the second has no policy and fails twice. The endpoint retry (2) must
+        // still apply to the second consumer: the deserialization failure must not mark the consumer retry as
+        // exhausted.
+        FailingTypedConsumer first = new(failTimes: 0);
+        FailingOtherTypedConsumer second = new(failTimes: 2);
+        IMessageDeserializer deserializer = Substitute.For<IMessageDeserializer>();
+        deserializer.ContentType.Returns("application/json");
+        deserializer.Deserialize<RetryProbe>(Arg.Any<ReadOnlySequence<byte>>()).Returns((RetryProbe?)null);
+        deserializer.Deserialize<OtherRetryProbe>(Arg.Any<ReadOnlySequence<byte>>()).Returns(new OtherRetryProbe("c"));
+        var (runner, writer, adapter) = BuildRetryRunner(
+            [
+                new ConsumerRegistration(
+                    typeof(FailingTypedConsumer), typeof(RetryProbe),
+                    ConfigureRetry: r => r.Interval(3, TimeSpan.Zero)),
+                new ConsumerRegistration(typeof(FailingOtherTypedConsumer), typeof(OtherRetryProbe)),
+            ],
+            [(typeof(FailingTypedConsumer), first), (typeof(FailingOtherTypedConsumer), second)],
+            deserializer,
+            endpointRetryCount: 2);
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(5));
+        InboundMessage message = new(
+            messageId: "msg-fallback",
+            headers: new Dictionary<string, string>(),
+            body: new ReadOnlySequence<byte>("""{"CorrelationId":"corr-1"}"""u8.ToArray()),
+            deliveryTag: 1UL);
+        await writer.WriteAsync(message, cts.Token);
+        writer.Complete();
+
+        await runner.RunAsync(cts.Token);
+
+        first.CallCount.Should().Be(0);
+        second.CallCount.Should().Be(3, because: "endpoint RetryCount=2 still applies to the consumer without a policy");
+        await adapter.Received(1).SettleAsync(
+            SettlementAction.Ack,
+            Arg.Is<InboundMessage>(m => m.MessageId == "msg-fallback"),
             Arg.Any<CancellationToken>());
     }
 }
