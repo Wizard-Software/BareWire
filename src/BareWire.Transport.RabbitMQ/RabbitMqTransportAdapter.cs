@@ -28,6 +28,13 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     private readonly ConcurrentDictionary<string, IChannel> _activeConsumerChannels =
         new(StringComparer.Ordinal);
 
+    // Maps consumerChannelId → the consumer, so SettleAsync(Requeue) can cancel the AMQP consumer before
+    // the nack when the caller is shutting down. Looked up only by the BW-ConsumerChannelId header; entries
+    // are removed together with the channel (ReleaseConsumerChannelAsync / DisposeAsync) or when
+    // basic.consume fails.
+    private readonly ConcurrentDictionary<string, RabbitMqConsumer> _activeConsumers =
+        new(StringComparer.Ordinal);
+
     private long _deliveryTagCounter;
     private IConnection? _connection;
     private bool _disposed;
@@ -299,8 +306,9 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
         // Register the channel so SettleAsync can resolve it by consumer channel ID.
         _activeConsumerChannels[consumerChannelId] = consumerChannel;
+        _activeConsumers[consumerChannelId] = consumer;
 
-        string assignedTag = string.Empty;
+        string assignedTag;
         try
         {
             assignedTag = await consumerChannel.BasicConsumeAsync(
@@ -312,9 +320,25 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 arguments: null,
                 consumer: consumer,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // basic.consume failed: nothing was delivered, so drop the consumer registration and rethrow.
+            _activeConsumers.TryRemove(consumerChannelId, out _);
+            consumer.CompleteWriter();
+            throw;
+        }
 
-            await foreach (InboundMessage message in inboundChannel.Reader
-                .ReadAllAsync(cancellationToken)
+        consumer.AssignedTag = assignedTag;
+
+        // Flag the consumer as stopping the moment the caller's token fires, before the runner settles the
+        // in-flight message with Requeue (see SettleAsync).
+        await using CancellationTokenRegistration stopRegistration = cancellationToken.Register(
+            static state => ((RabbitMqConsumer)state!).RequestStop(), consumer);
+
+        try
+        {
+            await foreach (InboundMessage message in consumer.ReadUntilCancelledAsync(cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return message;
@@ -322,27 +346,52 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         }
         finally
         {
-            // Stop the broker from pushing new messages to this consumer, but keep the channel
-            // open so the caller can still settle (ACK/NACK) in-flight messages via SettleAsync.
-            // The channel lifecycle after this point:
-            //   - Normal path: the consumer pipeline calls IConsumerChannelManager.ReleaseConsumerChannelAsync
-            //     once all settlements are complete, which removes and closes the channel.
-            //   - Fallback: DisposeAsync closes any channels that were not explicitly released
-            //     (e.g. if the adapter is torn down before the pipeline calls Release).
-            inboundChannel.Writer.TryComplete();
-
-            try
+            // Shutdown order matters. The channel stays open (the caller still settles in-flight messages via
+            // SettleAsync; it is closed by ReleaseConsumerChannelAsync or DisposeAsync), but:
+            //   1. Cancel the AMQP consumer and wait for cancel-ok: from then on the broker cannot hand any
+            //      message back to this consumer. Bounded to a few seconds so a stuck broker cannot consume the
+            //      host's shutdown budget.
+            //   2. Complete the writer.
+            //   3. Hand back whatever is still buffered. Those deliveries were never given to the caller, so the
+            //      caller will never settle them; without this they stay unacknowledged until the channel closes
+            //      and their pooled buffers never return to ArrayPool. The drain neither releases FlowController
+            //      credits (these messages never received any) nor uses multiple: true (that would also settle
+            //      in-flight deliveries owned by the runner).
+            //   4. If the cancel did not complete (channel not open, failure or timeout) the consumer may still
+            //      be fed by the broker; close the channel so the broker returns every unsettled delivery once.
+            bool cancelled = await consumer.EnsureCancelledAsync().ConfigureAwait(false);
+            if (!cancelled && consumer.CancelFailure is { } cancelFailure)
             {
-                if (consumerChannel.IsOpen)
+                LogConsumeChannelCloseError(endpointName, cancelFailure);
+            }
+
+            consumer.CompleteWriter();
+
+            using (var drainTimeout = new CancellationTokenSource(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds))
+            {
+                RabbitMqConsumer.DrainResult drain =
+                    await consumer.DrainAndRequeueAsync(drainTimeout.Token).ConfigureAwait(false);
+                if (drain.FirstFailure is not null)
                 {
-                    await consumerChannel.BasicCancelAsync(assignedTag, noWait: false, cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                    LogShutdownDrainNackError(
+                        endpointName, drain.FirstFailedTag, drain.FirstFailedMessageId ?? string.Empty,
+                        drain.SkippedNacks, drain.FirstFailure);
                 }
             }
-            catch (Exception ex)
-            {
-                LogConsumeChannelCloseError(endpointName, ex);
-            }
 
+            if (!cancelled && consumerChannel.IsOpen)
+            {
+                try
+                {
+                    using var closeTimeout = new CancellationTokenSource(
+                        RabbitMqConsumer.ShutdownStepTimeoutMilliseconds);
+                    await consumerChannel.CloseAsync(closeTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    LogConsumeChannelCloseError(endpointName, ex);
+                }
+            }
         }
     }
 
@@ -390,6 +439,22 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 break;
 
             case SettlementAction.Requeue:
+                // While the caller is shutting down, cancel the AMQP consumer first (single-flight) so the
+                // broker cannot redeliver this very message to the consumer that is being stopped, which
+                // would count it as delivered twice. A failed cancel is logged once and the nack still goes out.
+                if (message.Headers.TryGetValue("BW-ConsumerChannelId", out string? requeueChannelId) &&
+                    _activeConsumers.TryGetValue(requeueChannelId, out RabbitMqConsumer? stoppingConsumer) &&
+                    stoppingConsumer.IsStopRequested)
+                {
+                    bool cancelled = await stoppingConsumer.EnsureCancelledAsync().ConfigureAwait(false);
+                    if (!cancelled && stoppingConsumer.TryClaimCancelFailureReport())
+                    {
+                        LogRequeueCancelFailed(
+                            message.MessageId,
+                            stoppingConsumer.CancelFailure);
+                    }
+                }
+
                 await channel.BasicNackAsync(
                     deliveryTag: message.DeliveryTag,
                     multiple: false,
@@ -564,6 +629,8 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     /// <inheritdoc />
     public async Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default)
     {
+        _activeConsumers.TryRemove(channelId, out _);
+
         if (!_activeConsumerChannels.TryRemove(channelId, out IChannel? channel))
         {
             // Already released or never registered — no-op (idempotent).
@@ -623,6 +690,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         }
 
         _activeConsumerChannels.Clear();
+        _activeConsumers.Clear();
 
         if (_connection is not null)
         {
@@ -738,6 +806,21 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Exception while closing consumer channel for endpoint '{EndpointName}'.")]
     private partial void LogConsumeChannelCloseError(string endpointName, Exception ex);
+
+    // Aggregated: reported once per shutdown for the FIRST failed requeue; the remaining buffered deliveries
+    // were disposed without a nack and are returned by the broker when the channel closes. Logs identifiers
+    // only, never headers or body.
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Failed to requeue buffered delivery {DeliveryTag} (message '{MessageId}') on endpoint " +
+                  "'{EndpointName}' during consumer shutdown; {SkippedNacks} further buffered deliveries were " +
+                  "disposed without a requeue and will be returned by the broker when the channel closes.")]
+    private partial void LogShutdownDrainNackError(
+        string endpointName, ulong deliveryTag, string messageId, int skippedNacks, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Cancelling the consumer before requeueing message '{MessageId}' failed; " +
+                  "the requeue is sent anyway.")]
+    private partial void LogRequeueCancelFailed(string messageId, Exception? ex);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Connection URI uses 'amqps://' but no TLS configuration was provided via ConfigureTls or SslOptions. " +
