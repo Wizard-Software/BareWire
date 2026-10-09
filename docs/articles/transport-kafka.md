@@ -93,11 +93,27 @@ builder.Services.AddBareWireKafka(kafka =>
 
 Offsets are committed only after a message is settled successfully, giving at-least-once delivery.
 
+The committed position of a partition advances only over a contiguous prefix of settled messages, so
+acknowledging a later message never commits past one that was returned:
+
+- `Requeue`, and `Nack` when the retry/DLQ pattern is disabled, hold the partition's commit position
+  at that message's offset until the consumer restarts. The message is then delivered again together
+  with the later messages of that partition (a `CooperativeSticky` rebalance normally does not take
+  away a partition that stays assigned). There is no immediate redelivery within the same session,
+  and delivery is at-least-once, so consumers must be idempotent. Enable the retry/DLQ pattern for
+  topics fed by untrusted producers: a single poison message otherwise pins the commit position in
+  every session.
+- `Reject` without the retry/DLQ pattern commits the offset and logs a warning.
+- With the retry/DLQ pattern enabled, a `Nack` is republished to the retry-topic as one more attempt
+  and reaches the DLQ-topic after `MaxRetries` attempts.
+- When too many messages of one partition are unsettled, that partition is paused briefly and resumed
+  once settlements catch up (back-pressure).
+
 ## Retry-topic and DLQ-topic pattern
 
 Kafka has no native dead letter queue, so BareWire emulates one. The pattern is **opt-in**: enable
 it inside `ConfigureRetryDlq`. When it is not enabled, deferring a message is not supported and a
-rejected message is logged without its offset being stored.
+rejected message is committed with a logged warning.
 
 ```csharp
 builder.Services.AddBareWireKafka(kafka =>
@@ -116,6 +132,8 @@ builder.Services.AddBareWireKafka(kafka =>
 A failed message is republished to a **retry-topic** (with exponential backoff) and, once retries
 are exhausted or the message is rejected, to a **DLQ-topic**. The retry-topic and DLQ-topic names
 are derived from the source topic by appending a suffix.
+A message dead-lettered while being consumed from the retry-topic lands on the retry-topic's own DLQ
+(`<source>.retry.DLQ`), because the suffix is appended idempotently.
 
 | Method | Purpose | Default |
 |--------|---------|---------|

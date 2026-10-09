@@ -1582,9 +1582,9 @@ internal sealed partial class ReceiveEndpointRunner
     private partial void LogConsumeLoopFaulted(string endpointName, Exception ex);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Message {MessageId} on endpoint '{EndpointName}' will be permanently lost — " +
-                  "no dead-letter exchange configured on the queue. " +
-                  "Consider adding x-dead-letter-exchange to the queue declaration or configuring RetryCount.")]
+        Message = "Message {MessageId} on endpoint '{EndpointName}' was negatively acknowledged with no " +
+                  "dead-letter destination configured — depending on the transport it is discarded or " +
+                  "redelivered later. Consider configuring a dead-letter destination or RetryCount.")]
     private partial void LogMessageLostNoDlx(string endpointName, string messageId);
 
     // Layer 3 (type-less dispatch) loggers — adhere to ADR-030 §Security: no raw routing-key or

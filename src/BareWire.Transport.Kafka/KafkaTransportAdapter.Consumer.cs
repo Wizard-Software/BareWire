@@ -63,17 +63,59 @@ internal sealed partial class KafkaTransportAdapter
         // Validate consumer-specific options (GroupId required; producer Validate() already ran in ctor).
         _options.ValidateConsumer();
 
+        // B17 / D3: per-partition tracking limit derived from the flow-control options the runner
+        // actually passed — queue capacity + messages in flight + the message in the poll loop's
+        // hand + the one in the reader's hand (the +2).
+        long trackingLimit = (long)flowControl.InternalQueueCapacity + flowControl.MaxInFlightMessages + 2;
+
+        if (trackingLimit > KafkaPartitionCommitTracker.MaxTrackedPerPartitionCeiling)
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(FlowControlOptions.InternalQueueCapacity),
+                optionValue: flowControl.InternalQueueCapacity.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                expectedValue: "InternalQueueCapacity + MaxInFlightMessages + 2 <= " +
+                    KafkaPartitionCommitTracker.MaxTrackedPerPartitionCeiling.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        string consumerId = Guid.NewGuid().ToString("N");
+
+        // The native consumer does not exist yet when the tracker is created (the revoked handler
+        // needs the tracker); the store callback closes over a local assigned right after the build.
+        IConsumer<byte[], byte[]>? nativeConsumer = null;
+        var commitTracker = new KafkaPartitionCommitTracker(
+            endpointName,
+            (int)trackingLimit,
+            tpo => nativeConsumer!.StoreOffset(tpo));
+
         var inboundChannel = Channel.CreateBounded<InboundMessage>(
             new BoundedChannelOptions(flowControl.InternalQueueCapacity)
             {
                 FullMode = flowControl.FullMode,
                 SingleWriter = true,
                 SingleReader = false,
+            },
+            itemDropped: dropped =>
+            {
+                // Drop* full modes silently evict a delivered message: it will never be settled, so
+                // pin the commit position at its offset (redelivered after restart) and free the entry.
+                TopicPartitionOffset? droppedTpo = _consumerRegistry.TryEvictOffset(consumerId, dropped.DeliveryTag);
+                if (droppedTpo is not null &&
+                    commitTracker.Hold(droppedTpo.Partition.Value, droppedTpo.Offset.Value))
+                {
+                    LogPartitionCommitHeld(consumerId, droppedTpo.Topic, droppedTpo.Partition.Value, droppedTpo.Offset.Value);
+                }
+
+                dropped.Dispose();
             });
 
-        string consumerId = Guid.NewGuid().ToString("N");
+        KafkaConsumer? kafkaConsumerRef = null;
+        nativeConsumer = BuildNativeConsumer(consumerId, commitTracker, () => kafkaConsumerRef);
 
-        IConsumer<byte[], byte[]> nativeConsumer = BuildNativeConsumer(consumerId);
+        if (_options.EnableAutoOffsetStore)
+        {
+            LogAutoOffsetStoreBypassesCommitTracker(consumerId);
+        }
 
         // SEC-1: a subscribed topic that is itself a retry/DLQ topic carries legitimate
         // library-stamped tracking headers; a source topic does not (they get stripped).
@@ -86,7 +128,9 @@ internal sealed partial class KafkaTransportAdapter
             consumerId: consumerId,
             topic: endpointName,
             logger: _logger,
-            isRetryOrDlqTopic: isRetryOrDlqTopic);
+            isRetryOrDlqTopic: isRetryOrDlqTopic,
+            commitTracker: commitTracker);
+        kafkaConsumerRef = kafkaConsumer;
 
         _consumerRegistry.Register(consumerId, kafkaConsumer);
 
@@ -112,12 +156,15 @@ internal sealed partial class KafkaTransportAdapter
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// Settlement is offset-based (Kafka has no per-message Ack/Nack). When the retry/DLQ pattern
-    /// is <b>disabled</b> (default — opt-in, ADR-002/ADR-010):
+    /// Settlement is offset-based (Kafka has no per-message Ack/Nack). The stored (committed)
+    /// position of a partition only ever advances over a <b>contiguous prefix</b> of messages that
+    /// were settled "forward", tracked by <see cref="KafkaPartitionCommitTracker"/>; an <c>Ack</c>
+    /// of a higher offset therefore never commits past a message that was returned. When the
+    /// retry/DLQ pattern is <b>disabled</b> (default — opt-in, ADR-002/ADR-010):
     /// <list type="bullet">
-    /// <item><term>Ack</term><description>Calls <c>IConsumer.StoreOffset(tpo with offset+1)</c>; librdkafka commits in background (D6).</description></item>
-    /// <item><term>Nack / Requeue</term><description>Does NOT store offset; message re-consumed from last committed offset after restart/rebalance.</description></item>
-    /// <item><term>Reject</term><description>Logs a warning and does NOT store offset (R1.2 back-compat).</description></item>
+    /// <item><term>Ack</term><description>Stores <c>offset + 1</c> only when the contiguous prefix advances; librdkafka commits in background (D6).</description></item>
+    /// <item><term>Nack / Requeue</term><description>Pins the partition commit position at this offset until the consumer restarts; the message (and any later messages of the partition) is redelivered after a restart. Later messages of the partition may therefore be delivered again — consumers must be idempotent. There is no redelivery within the same session.</description></item>
+    /// <item><term>Reject</term><description>Terminal: the offset is settled forward and a Warning is logged (no dead-letter destination exists).</description></item>
     /// <item><term>Defer</term><description>Throws <see cref="NotSupportedException"/> — requires the retry-topic to be enabled.</description></item>
     /// </list>
     /// </para>
@@ -125,10 +172,16 @@ internal sealed partial class KafkaTransportAdapter
     /// When the retry/DLQ pattern is <b>enabled</b> (ADR-010), failure actions are routed via
     /// <see cref="KafkaSettlementRouter"/>: <c>Defer</c> republishes to the retry-topic (exponential
     /// backoff) while attempts remain, else to the DLQ-topic; <c>Reject</c> dead-letters immediately;
-    /// <c>Nack</c> below the cap stays no-store, at the cap dead-letters (poison guard). On every
-    /// republish path the source offset is stored AFTER the republication is confirmed (D2 —
+    /// <c>Nack</c> below the cap is republished to the retry-topic as one more attempt, at the cap it
+    /// dead-letters (poison guard); <c>Requeue</c> pins the commit position like above. On every
+    /// republish path the source offset is settled AFTER the republication is confirmed (D2 —
     /// republish-then-store) so a failed republish does not lose the message. The wire-supplied
     /// <c>BW-RetryCount</c> is clamped to <c>[0, MaxRetryCount]</c> before routing (SEC-1).
+    /// </para>
+    /// <para>
+    /// A partition with too many unsettled offsets (<c>InternalQueueCapacity + MaxInFlightMessages + 2</c>)
+    /// is paused and resumed once settlements free capacity (back-pressure); the commit position is
+    /// never pinned by slowness alone.
     /// </para>
     /// <para>The offset-map entry is evicted exactly once, before routing, regardless of action (no unbounded buffers).</para>
     /// </remarks>
@@ -181,16 +234,24 @@ internal sealed partial class KafkaTransportAdapter
             switch (action)
             {
                 case SettlementAction.Ack:
-                    StoreSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
+                    CompleteSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
                     break;
 
                 case SettlementAction.Nack:
                 case SettlementAction.Requeue:
+                    HoldSourceOffset(consumer, tpo, consumerId);
                     LogNoStore(action, message.DeliveryTag, consumerId);
                     break;
 
                 case SettlementAction.Reject:
-                    LogRejectWithoutDlq(message.DeliveryTag, consumerId);
+                    // D1: terminal forward settlement — there is no dead-letter destination, and one
+                    // unhandled message must not freeze the partition commit position.
+                    if (tpo is not null)
+                    {
+                        LogRejectCommittedWithoutDlq(consumerId, tpo.Topic, tpo.Partition.Value, tpo.Offset.Value);
+                    }
+
+                    CompleteSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
                     break;
 
                 default:
@@ -216,10 +277,11 @@ internal sealed partial class KafkaTransportAdapter
         switch (outcome)
         {
             case SettlementOutcome.StoreOffset:
-                StoreSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
+                CompleteSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
                 break;
 
             case SettlementOutcome.NoStore:
+                HoldSourceOffset(consumer, tpo, consumerId);
                 LogNoStore(action, message.DeliveryTag, consumerId);
                 break;
 
@@ -229,7 +291,7 @@ internal sealed partial class KafkaTransportAdapter
                 await GetOrCreateRetryDlqProducer()
                     .RepublishToRetryAsync(message, sourceTopic, clampedRetryCount, retryDlq, cancellationToken)
                     .ConfigureAwait(false);
-                StoreSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
+                CompleteSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
                 LogRepublishedToRetry(message.DeliveryTag, consumerId, clampedRetryCount + 1);
                 break;
 
@@ -238,7 +300,7 @@ internal sealed partial class KafkaTransportAdapter
                 await GetOrCreateRetryDlqProducer()
                     .RepublishToDlqAsync(message, sourceTopic, reason, retryDlq, cancellationToken)
                     .ConfigureAwait(false);
-                StoreSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
+                CompleteSourceOffset(consumer, tpo, message.DeliveryTag, consumerId);
                 LogDeadLettered(message.DeliveryTag, consumerId, reason);
                 break;
 
@@ -250,18 +312,28 @@ internal sealed partial class KafkaTransportAdapter
 
     // ── SettleAsync helpers (R1.3) ─────────────────────────────────────────────
 
-    private void StoreSourceOffset(
+    private void CompleteSourceOffset(
         KafkaConsumer consumer, TopicPartitionOffset? tpo, ulong deliveryTag, string consumerId)
     {
         if (tpo is not null)
         {
-            // D6: explicit StoreOffset(TopicPartitionOffset) with offset+1 (avoid double +1, GAP-5).
-            var offsetToStore = new TopicPartitionOffset(tpo.TopicPartition, tpo.Offset + 1);
-            consumer.NativeConsumer.StoreOffset(offsetToStore);
+            // B17: the tracker stores offset + 1 itself, and only when the contiguous settled prefix
+            // of the partition advances (under the partition lock, so the position never regresses).
+            consumer.CommitTracker.Complete(tpo.Partition.Value, tpo.Offset.Value);
         }
         else
         {
             LogMissingOffsetForAck(deliveryTag, consumerId);
+        }
+    }
+
+    private void HoldSourceOffset(KafkaConsumer consumer, TopicPartitionOffset? tpo, string consumerId)
+    {
+        if (tpo is not null &&
+            consumer.CommitTracker.Hold(tpo.Partition.Value, tpo.Offset.Value))
+        {
+            // Logged once per partition per assignment (SEC-8) — never the body or headers.
+            LogPartitionCommitHeld(consumerId, tpo.Topic, tpo.Partition.Value, tpo.Offset.Value);
         }
     }
 
@@ -324,7 +396,10 @@ internal sealed partial class KafkaTransportAdapter
 
     // ── Consumer builder ──────────────────────────────────────────────────────
 
-    private IConsumer<byte[], byte[]> BuildNativeConsumer(string consumerId)
+    private IConsumer<byte[], byte[]> BuildNativeConsumer(
+        string consumerId,
+        KafkaPartitionCommitTracker commitTracker,
+        Func<KafkaConsumer?> consumerAccessor)
     {
         var config = new ConsumerConfig
         {
@@ -355,6 +430,12 @@ internal sealed partial class KafkaTransportAdapter
             .SetPartitionsRevokedHandler((_, partitions) =>
             {
                 LogPartitionsRevoked(consumerId, partitions.Count);
+
+                // B17: forget tracker state of the revoked (or lost) partitions so a late settlement
+                // can neither store an offset on a partition this member no longer owns nor leak
+                // into the next assignment. Confluent.Kafka invokes this handler for lost partitions too.
+                commitTracker.Revoke(partitions.Select(p => p.Partition.Value));
+                consumerAccessor()?.OnPartitionsRevoked(partitions.Select(p => p.TopicPartition));
             })
             .SetErrorHandler((_, error) =>
             {
@@ -382,12 +463,20 @@ internal sealed partial class KafkaTransportAdapter
     private partial void LogKafkaError(ErrorCode errorCode, string reason, string consumerId);
 
     [LoggerMessage(Level = LogLevel.Debug,
-        Message = "SettleAsync({Action}): not storing offset for DeliveryTag={DeliveryTag}, consumer={ConsumerId}.")]
+        Message = "SettleAsync({Action}): holding the partition commit position at this offset until restart for DeliveryTag={DeliveryTag}, consumer={ConsumerId}.")]
     private partial void LogNoStore(SettlementAction action, ulong deliveryTag, string consumerId);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SettleAsync(Reject): no DLQ configured — message DeliveryTag={DeliveryTag}, consumer={ConsumerId} will be re-consumed from last committed offset (DLQ support in R1.3).")]
-    private partial void LogRejectWithoutDlq(ulong deliveryTag, string consumerId);
+        Message = "SettleAsync(Reject): no dead-letter destination configured — rejected message on {Topic}[{Partition}] offset {Offset}, consumer={ConsumerId} is committed and will not be redelivered.")]
+    private partial void LogRejectCommittedWithoutDlq(string consumerId, string topic, int partition, long offset);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Kafka consumer {ConsumerId}: commit position of {Topic}[{Partition}] is held at offset {Offset} (a message was returned, nacked or dropped); the message and later messages of the partition are redelivered after a consumer restart.")]
+    private partial void LogPartitionCommitHeld(string consumerId, string topic, int partition, long offset);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Kafka consumer {ConsumerId}: EnableAutoOffsetStore is on — librdkafka stores offsets itself, so the contiguous-prefix commit guarantee does not apply.")]
+    private partial void LogAutoOffsetStoreBypassesCommitTracker(string consumerId);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "SettleAsync(Ack): no TopicPartitionOffset found for DeliveryTag={DeliveryTag}, consumer={ConsumerId}. Offset not stored.")]

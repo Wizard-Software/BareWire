@@ -449,6 +449,148 @@ public sealed class KafkaE2ETests(AspireFixture fixture)
         dlqMsg.Should().NotBeNull();
     }
 
+    // ── E2E-K5b: Nack counted as a retry attempt (B17) ──────────────────────
+
+    private static KafkaTransportOptions EnableRetryDlq(KafkaTransportOptions opts)
+    {
+        opts.RetryDlq.Enabled = true;
+        opts.RetryDlq.MaxRetryCount = 3;
+        opts.RetryDlq.BaseDelay = TimeSpan.FromMilliseconds(50);
+        opts.RetryDlq.BackoffMultiplier = 2.0;
+        opts.RetryDlq.MaxDelay = TimeSpan.FromSeconds(1);
+        return opts;
+    }
+
+    private static async Task DeploySourceRetryDlqAsync(
+        KafkaTransportAdapter adapter, string sourceTopic, CancellationToken ct)
+    {
+        var configurator = new KafkaTopologyConfigurator();
+        foreach (string topic in new[] { sourceTopic, $"{sourceTopic}.retry", $"{sourceTopic}.DLQ" })
+        {
+            configurator.DeclareQueue(
+                topic, durable: true, autoDelete: false,
+                configure: q => q.Argument(KafkaTopologyArguments.Partitions, 1));
+        }
+
+        await adapter.DeployTopologyAsync(configurator.Build(), ct);
+    }
+
+    /// <summary>
+    /// B17 / D2: Nack on the source topic (no <c>BW-RetryCount</c>) is republished to the retry
+    /// topic as attempt 1, and the source offset is committed (a fresh consumer of the same
+    /// group does not see the nacked message again).
+    /// </summary>
+    [Fact]
+    [Trait("Category", "E2E")]
+    public async Task RetryTopic_OnNackFromSourceTopic_RepublishesWithRetryCountOne()
+    {
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(60));
+        string suffix = Guid.NewGuid().ToString("N");
+        string sourceTopic = $"e2e-nack-{suffix}";
+        string retryTopic = $"{sourceTopic}.retry";
+        string groupId = $"grp-{suffix}";
+
+        await using (KafkaTransportAdapter adapter = CreateAdapter(groupId, o => EnableRetryDlq(o)))
+        {
+            await DeploySourceRetryDlqAsync(adapter, sourceTopic, cts.Token);
+            await adapter.SendBatchAsync(
+                [
+                    new OutboundMessage(sourceTopic, new Dictionary<string, string>(),
+                        Encoding.UTF8.GetBytes("{\"n\":1}"), "application/json"),
+                    new OutboundMessage(sourceTopic, new Dictionary<string, string>(),
+                        Encoding.UTF8.GetBytes("{\"n\":2}"), "application/json"),
+                ],
+                cts.Token);
+
+            // Nack offset 0 (republished to retry), ack offset 1 — commit must cover both.
+            int seen = 0;
+            await foreach (InboundMessage msg in adapter.ConsumeAsync(sourceTopic, StandardFlow(), cts.Token))
+            {
+                await adapter.SettleAsync(seen == 0 ? SettlementAction.Nack : SettlementAction.Ack, msg, cts.Token);
+                msg.Dispose();
+                if (++seen == 2) { break; }
+            }
+
+            // Retry topic carries the nacked message with BW-RetryCount == 1.
+            InboundMessage retryMsg = await ConsumeOneAndSettleAsync(
+                adapter, retryTopic, SettlementAction.Ack, cts.Token,
+                inspect: msg =>
+                {
+                    msg.Headers.Should().ContainKey("BW-RetryCount");
+                    msg.Headers["BW-RetryCount"].Should().Be("1");
+                    Encoding.UTF8.GetString(ReadSequenceToArray(msg.Body)).Should().Be("{\"n\":1}");
+                });
+            retryMsg.Should().NotBeNull();
+        }
+
+        // A fresh consumer of the same group on the source topic must see nothing (both offsets committed).
+        await using KafkaTransportAdapter fresh = CreateAdapter(groupId, o => EnableRetryDlq(o));
+        using CancellationTokenSource quietCts = new(TimeSpan.FromSeconds(8));
+        Func<Task> consumeAgain = async () =>
+        {
+            await foreach (InboundMessage _ in fresh.ConsumeAsync(sourceTopic, StandardFlow(), quietCts.Token))
+            {
+                break;
+            }
+        };
+        await consumeAgain.Should().ThrowAsync<OperationCanceledException>(
+            "the nacked source offset was committed after the retry republication");
+    }
+
+    /// <summary>
+    /// B17 / D2 / R12: a handler that always Nacks is retried up to <c>MaxRetryCount</c> times and
+    /// then dead-lettered (the poison guard is reachable for source-topic Nack).
+    /// </summary>
+    [Fact]
+    [Trait("Category", "E2E")]
+    public async Task Dlq_OnRepeatedNack_DeadLettersAfterMaxRetryCount()
+    {
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(90));
+        string suffix = Guid.NewGuid().ToString("N");
+        string sourceTopic = $"e2e-nackdlq-{suffix}";
+        string retryTopic = $"{sourceTopic}.retry";
+        // A message dead-lettered while consumed from the retry topic is resolved against that topic's
+        // name (suffix appended idempotently per suffix), so it lands on "<retry>.DLQ".
+        string dlqTopic = $"{retryTopic}.DLQ";
+        string groupId = $"grp-{suffix}";
+
+        await using KafkaTransportAdapter adapter = CreateAdapter(groupId, o => EnableRetryDlq(o));
+        await DeploySourceRetryDlqAsync(adapter, sourceTopic, cts.Token);
+        var dlqConfigurator = new KafkaTopologyConfigurator();
+        dlqConfigurator.DeclareQueue(
+            dlqTopic, durable: true, autoDelete: false,
+            configure: q => q.Argument(KafkaTopologyArguments.Partitions, 1));
+        await adapter.DeployTopologyAsync(dlqConfigurator.Build(), cts.Token);
+        await adapter.SendBatchAsync(
+            [new OutboundMessage(sourceTopic, new Dictionary<string, string>(),
+                Encoding.UTF8.GetBytes("{\"step\":\"poison\"}"), "application/json")],
+            cts.Token);
+
+        // Source: Nack -> retry (attempt 1)
+        await ConsumeOneAndSettleAsync(adapter, sourceTopic, SettlementAction.Nack, cts.Token);
+
+        // Retry topic: Nack attempts 1 and 2 are republished again; attempt 3 (== MaxRetryCount) goes to the DLQ.
+        List<string> retryCounts = [];
+        await foreach (InboundMessage msg in adapter.ConsumeAsync(retryTopic, StandardFlow(), cts.Token))
+        {
+            retryCounts.Add(msg.Headers["BW-RetryCount"]);
+            await adapter.SettleAsync(SettlementAction.Nack, msg, cts.Token);
+            msg.Dispose();
+            if (retryCounts.Count == 3) { break; }
+        }
+
+        retryCounts.Should().Equal("1", "2", "3");
+
+        InboundMessage dlqMsg = await ConsumeOneAndSettleAsync(
+            adapter, dlqTopic, SettlementAction.Ack, cts.Token,
+            inspect: msg =>
+            {
+                msg.Headers["BW-DeadLettered"].Should().Be("true");
+                msg.Headers["BW-DeadLetterReason"].Should().Be("nack-exhausted");
+            });
+        dlqMsg.Should().NotBeNull();
+    }
+
     // ── E2E-K6: Consumer group rebalance ─────────────────────────────────────
 
     /// <summary>

@@ -10,7 +10,10 @@ internal enum SettlementOutcome
     /// <summary>Store the source offset (Ack — message processed).</summary>
     StoreOffset,
 
-    /// <summary>Do not store the offset (Nack/Requeue below the retry cap — replay from last commit).</summary>
+    /// <summary>
+    /// Hold the partition commit position at this offset (Requeue) — the message is redelivered
+    /// after a consumer restart.
+    /// </summary>
     NoStore,
 
     /// <summary>Republish to the retry-topic with backoff, then store the source offset.</summary>
@@ -60,9 +63,10 @@ internal static class KafkaSettlementRouter
             // Reject: dead-letter immediately, regardless of retry count.
             SettlementAction.Reject => SettlementOutcome.RepublishDlqThenStore,
 
-            // Nack: replay from the last commit while attempts remain; on exhaustion dead-letter
-            // to break a poison-message replay loop (poison guard).
-            SettlementAction.Nack when currentRetryCount < maxRetryCount => SettlementOutcome.NoStore,
+            // Nack: counted as an attempt — republish to the retry-topic (incrementing BW-RetryCount)
+            // while attempts remain; on exhaustion dead-letter to break a poison-message loop
+            // (poison guard). On the source topic the retry count starts at 0.
+            SettlementAction.Nack when currentRetryCount < maxRetryCount => SettlementOutcome.RepublishRetryThenStore,
             SettlementAction.Nack => SettlementOutcome.RepublishDlqThenStore,
 
             _ => throw new ArgumentOutOfRangeException(

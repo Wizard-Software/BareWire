@@ -226,4 +226,135 @@ public sealed class KafkaTransportAdapterTests(AspireFixture fixture)
 
         await defer.Should().ThrowAsync<NotSupportedException>();
     }
+
+    // ── SettleAsync — commit position must not pass unsettled offsets (B17) ──
+
+    /// <summary>
+    /// Consumes one session from <paramref name="topicName"/>, settling the n-th delivered message
+    /// with <c>actions[n]</c>, and returns the bodies in delivery order. Leaving the enumeration
+    /// closes the consumer, which commits the stored offsets.
+    /// </summary>
+    private static async Task<List<string>> RunSessionAsync(
+        KafkaTransportAdapter adapter,
+        string topicName,
+        SettlementAction[] actions,
+        CancellationToken ct)
+    {
+        FlowControlOptions flow = new() { MaxInFlightMessages = 10, InternalQueueCapacity = 100 };
+        List<string> bodies = [];
+
+        await foreach (InboundMessage msg in adapter.ConsumeAsync(topicName, flow, ct))
+        {
+            bodies.Add(Encoding.UTF8.GetString(ReadSequenceToArray(msg.Body)));
+            await adapter.SettleAsync(actions[bodies.Count - 1], msg, ct);
+            msg.Dispose();
+
+            if (bodies.Count == actions.Length)
+            {
+                break;
+            }
+        }
+
+        return bodies;
+    }
+
+    [Fact]
+    public async Task SettleAsync_RequeueBetweenAcks_RedeliveryStartsAtRequeuedOffset()
+    {
+        // Arrange — one partition, three messages, one consumer group
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(60));
+        string suffix = Guid.NewGuid().ToString("N");
+        string topicName = $"t-requeue-{suffix}";
+        string groupId = $"grp-{suffix}";
+
+        await using (KafkaTransportAdapter first = CreateAdapter(groupId))
+        {
+            await DeployTopicAsync(first, topicName, partitions: 1, cts.Token);
+            await first.SendBatchAsync(
+                [MakeMessage(topicName, "{\"n\":1}"), MakeMessage(topicName, "{\"n\":2}"), MakeMessage(topicName, "{\"n\":3}")],
+                cts.Token);
+
+            // Act — ack offset 0, requeue offset 1, ack offset 2, then leave (Close() commits stored offsets)
+            List<string> bodies = await RunSessionAsync(
+                first,
+                topicName,
+                [SettlementAction.Ack, SettlementAction.Requeue, SettlementAction.Ack],
+                cts.Token);
+            bodies.Should().Equal("{\"n\":1}", "{\"n\":2}", "{\"n\":3}");
+        }
+
+        // Assert — a fresh consumer in the same group starts at the requeued offset 1 (not 0, not past 2)
+        await using KafkaTransportAdapter second = CreateAdapter(groupId);
+        using CancellationTokenSource redeliveryCts = new(TimeSpan.FromSeconds(20));
+        InboundMessage redelivered = await ConsumeOneAsync(second, topicName, redeliveryCts.Token);
+        Encoding.UTF8.GetString(ReadSequenceToArray(redelivered.Body)).Should().Be("{\"n\":2}");
+    }
+
+    [Fact]
+    public async Task SettleAsync_NackWithoutRetry_HoldsCommitAcrossRestarts()
+    {
+        // Arrange — retry/DLQ disabled (default): Nack pins the partition commit position
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(90));
+        string suffix = Guid.NewGuid().ToString("N");
+        string topicName = $"t-nack-{suffix}";
+        string groupId = $"grp-{suffix}";
+
+        await using (KafkaTransportAdapter first = CreateAdapter(groupId))
+        {
+            await DeployTopicAsync(first, topicName, partitions: 1, cts.Token);
+            await first.SendBatchAsync(
+                [MakeMessage(topicName, "{\"n\":1}"), MakeMessage(topicName, "{\"n\":2}")],
+                cts.Token);
+
+            // Act — session 1: nack offset 0, ack offset 1
+            List<string> bodies = await RunSessionAsync(
+                first, topicName, [SettlementAction.Nack, SettlementAction.Ack], cts.Token);
+            bodies.Should().Equal("{\"n\":1}", "{\"n\":2}");
+        }
+
+        // Session 2 — the nacked message is redelivered first; nack it again, ack the next one
+        await using (KafkaTransportAdapter second = CreateAdapter(groupId))
+        {
+            List<string> bodies = await RunSessionAsync(
+                second, topicName, [SettlementAction.Nack, SettlementAction.Ack], cts.Token);
+            bodies.Should().StartWith("{\"n\":1}");
+        }
+
+        // Session 3 — still pinned at offset 0 (accepted behaviour without retry/DLQ)
+        await using KafkaTransportAdapter third = CreateAdapter(groupId);
+        using CancellationTokenSource redeliveryCts = new(TimeSpan.FromSeconds(20));
+        InboundMessage redelivered = await ConsumeOneAsync(third, topicName, redeliveryCts.Token);
+        Encoding.UTF8.GetString(ReadSequenceToArray(redelivered.Body)).Should().Be("{\"n\":1}");
+    }
+
+    [Fact]
+    public async Task SettleAsync_RejectWithoutDlq_CommitsPastRejectedMessage()
+    {
+        // Arrange — retry/DLQ disabled: Reject is a terminal forward settlement (Warning logged)
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(60));
+        string suffix = Guid.NewGuid().ToString("N");
+        string topicName = $"t-reject-{suffix}";
+        string groupId = $"grp-{suffix}";
+
+        await using (KafkaTransportAdapter first = CreateAdapter(groupId))
+        {
+            await DeployTopicAsync(first, topicName, partitions: 1, cts.Token);
+            await first.SendBatchAsync(
+                [MakeMessage(topicName, "{\"n\":1}"), MakeMessage(topicName, "{\"n\":2}")],
+                cts.Token);
+
+            // Act — reject offset 0, ack offset 1
+            List<string> bodies = await RunSessionAsync(
+                first, topicName, [SettlementAction.Reject, SettlementAction.Ack], cts.Token);
+            bodies.Should().Equal("{\"n\":1}", "{\"n\":2}");
+
+            await first.SendBatchAsync([MakeMessage(topicName, "{\"n\":3}")], cts.Token);
+        }
+
+        // Assert — the rejected message is not redelivered; the first delivery is the new message
+        await using KafkaTransportAdapter second = CreateAdapter(groupId);
+        using CancellationTokenSource redeliveryCts = new(TimeSpan.FromSeconds(20));
+        InboundMessage next = await ConsumeOneAsync(second, topicName, redeliveryCts.Token);
+        Encoding.UTF8.GetString(ReadSequenceToArray(next.Body)).Should().Be("{\"n\":3}");
+    }
 }

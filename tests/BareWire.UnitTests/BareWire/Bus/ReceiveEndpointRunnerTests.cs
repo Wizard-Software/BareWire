@@ -384,13 +384,13 @@ public sealed class ReceiveEndpointRunnerTests
         // Act
         await runner.RunAsync(cts.Token);
 
-        // Assert — warning about permanently lost message must be logged.
+        // Assert — warning about the missing dead-letter destination must be logged.
         IEnumerable<NSubstitute.Core.ICall> warningCalls = logger.ReceivedCalls()
             .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log)
                 && c.GetArguments()[0] is LogLevel level
                 && level == LogLevel.Warning
-                && c.GetArguments()[2]?.ToString()?.Contains("permanently lost") == true);
-        warningCalls.Should().NotBeEmpty("expected a Warning log about 'permanently lost'");
+                && c.GetArguments()[2]?.ToString()?.Contains("no dead-letter destination configured") == true);
+        warningCalls.Should().NotBeEmpty("expected a Warning log about the missing dead-letter destination");
     }
 
     [Fact]
@@ -407,13 +407,13 @@ public sealed class ReceiveEndpointRunnerTests
         // Act
         await runner.RunAsync(cts.Token);
 
-        // Assert — no "permanently lost" warning when DLX is configured.
+        // Assert — no missing-dead-letter-destination warning when DLX is configured.
         IEnumerable<NSubstitute.Core.ICall> warningCalls = logger.ReceivedCalls()
             .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log)
                 && c.GetArguments()[0] is LogLevel level
                 && level == LogLevel.Warning
-                && c.GetArguments()[2]?.ToString()?.Contains("permanently lost") == true);
-        warningCalls.Should().BeEmpty("should not warn about 'permanently lost' when DLX is configured");
+                && c.GetArguments()[2]?.ToString()?.Contains("no dead-letter destination configured") == true);
+        warningCalls.Should().BeEmpty("should not warn about the missing dead-letter destination when DLX is configured");
     }
 
     [Fact]
