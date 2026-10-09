@@ -42,15 +42,15 @@ internal sealed class OutboxBuffer
             if (_messages.Count >= _maxMessages)
             {
                 throw new BareWireException(
-                    $"The transactional outbox buffer for a single consume operation reached its limit of " +
-                    $"{_maxMessages} messages (MaxBufferedMessagesPerConsume). The consume transaction is rolled back.");
+                    $"The outbox buffer for a single consume operation reached its limit of " +
+                    $"{_maxMessages} messages (MaxBufferedMessagesPerConsume). The consume operation fails.");
             }
 
             if (_bufferedBytes + message.Body.Length > _maxBytes)
             {
                 throw new BareWireException(
-                    $"The transactional outbox buffer for a single consume operation reached its limit of " +
-                    $"{_maxBytes} bytes (MaxBufferedBytesPerConsume). The consume transaction is rolled back.");
+                    $"The outbox buffer for a single consume operation reached its limit of " +
+                    $"{_maxBytes} bytes (MaxBufferedBytesPerConsume). The consume operation fails.");
             }
 
             _messages.Add(message);

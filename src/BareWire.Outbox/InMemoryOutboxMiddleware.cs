@@ -12,10 +12,24 @@ internal sealed partial class InMemoryOutboxMiddleware : IMessageMiddleware
 
     internal static OutboxBuffer? Current => _current.Value;
 
+    private readonly int _maxBufferedMessages;
+    private readonly long _maxBufferedBytes;
+
     internal InMemoryOutboxMiddleware(IOutboxStore outboxStore, ILogger<InMemoryOutboxMiddleware> logger)
+        : this(outboxStore, logger, OutboxOptions.Default)
+    {
+    }
+
+    internal InMemoryOutboxMiddleware(
+        IOutboxStore outboxStore,
+        ILogger<InMemoryOutboxMiddleware> logger,
+        OutboxOptions options)
     {
         _outboxStore = outboxStore ?? throw new ArgumentNullException(nameof(outboxStore));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ArgumentNullException.ThrowIfNull(options);
+        _maxBufferedMessages = options.MaxBufferedMessagesPerConsume;
+        _maxBufferedBytes = options.MaxBufferedBytesPerConsume;
     }
 
     public async Task InvokeAsync(MessageContext context, NextMiddleware nextMiddleware)
@@ -23,12 +37,21 @@ internal sealed partial class InMemoryOutboxMiddleware : IMessageMiddleware
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(nextMiddleware);
 
-        var buffer = new OutboxBuffer();
+        var buffer = new OutboxBuffer(_maxBufferedMessages, _maxBufferedBytes);
         _current.Value = buffer;
+
+        // In-process retries (RetryMiddleware sits inside this middleware) re-run the handler on the
+        // same buffer; discard what the failed attempt published so only the successful attempt's
+        // messages reach the outbox.
+        Action retryCallback = buffer.Clear;
+        context.Items[WellKnownItemKeys.RetryAttemptStarting] = retryCallback;
 
         try
         {
             await nextMiddleware(context).ConfigureAwait(false);
+
+            // No message may be appended once the snapshot is taken for persistence.
+            buffer.Seal();
 
             if (!buffer.IsEmpty)
             {
@@ -46,7 +69,17 @@ internal sealed partial class InMemoryOutboxMiddleware : IMessageMiddleware
         }
         finally
         {
+            // Also stops background work from a failed attempt from appending after the buffer is discarded.
+            buffer.Seal();
             _current.Value = null;
+
+            if (!context.Items.TryGetValue(WellKnownItemKeys.RetryAttemptStarting, out object? slot)
+                || !ReferenceEquals(slot, retryCallback))
+            {
+                InMemoryOutboxMiddlewareLogMessages.RetryCallbackOverwritten(_logger, context.MessageId);
+            }
+
+            context.Items.Remove(WellKnownItemKeys.RetryAttemptStarting);
         }
     }
 }
@@ -68,4 +101,12 @@ internal static partial class InMemoryOutboxMiddlewareLogMessages
         ILogger logger,
         Guid messageId,
         int messageCount);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "The retry-attempt callback registered by the in-memory outbox for message {MessageId} was " +
+                  "overwritten or removed by other middleware; messages from failed retry attempts may be duplicated")]
+    internal static partial void RetryCallbackOverwritten(
+        ILogger logger,
+        Guid messageId);
 }
