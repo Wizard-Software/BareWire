@@ -337,27 +337,44 @@ internal sealed partial class ReceiveEndpointRunner
                     ? channelId
                     : null;
 
-                // Wait for credit (ADR-004: credit-based flow control).
-                while (creditManager.TryGrantCredits(1) == 0)
-                {
-                    await creditManager.WaitForCreditAsync(cancellationToken).ConfigureAwait(false);
-                }
-
                 long bodyLength = message.Body.Length;
-                creditManager.TrackInflightBytes(bodyLength);
+                bool creditGranted = false;
+                long sequence;
 
-                // Assign the arrival sequence AFTER credit and BEFORE fan-out (ADR-026 §1c). Snapshot it
-                // into a local so the ordered path never closes over the mutating loop variable.
-                long sequence = arrivalSequence++;
-
-                if (orderedStage is not null)
+                // Read -> handoff window: until the message reaches its owner (a lane after a successful
+                // EnqueueAsync, or the sequential try/finally below) this read loop owns it. Cancellation
+                // while waiting for credit or for a lane slot must not leak the pooled buffer or the credit.
+                try
                 {
-                    // Ordered path: fan out to a fixed lane. The lane owns its TerminatorState and runs its
-                    // messages sequentially, so credit release / dispose / health-check happen on the lane
-                    // when the message completes — not here. (R8.5 lane assignment is interim; fixed-lane
-                    // key hashing lands in R8.6.)
-                    await orderedStage.EnqueueAsync(message, sequence, bodyLength).ConfigureAwait(false);
-                    continue;
+                    // Wait for credit (ADR-004: credit-based flow control).
+                    while (creditManager.TryGrantCredits(1) == 0)
+                    {
+                        await creditManager.WaitForCreditAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
+                    creditManager.TrackInflightBytes(bodyLength);
+                    creditGranted = true;
+
+                    // Assign the arrival sequence AFTER credit and BEFORE fan-out (ADR-026 §1c). Snapshot it
+                    // into a local so the ordered path never closes over the mutating loop variable.
+                    sequence = arrivalSequence++;
+
+                    if (orderedStage is not null)
+                    {
+                        // Ordered path: fan out to a fixed lane. The lane owns its TerminatorState and runs its
+                        // messages sequentially, so credit release / dispose / health-check happen on the lane
+                        // when the message completes — not here. Until EnqueueAsync succeeds the read loop owns
+                        // the message (a cancelled write does not enqueue it). (R8.5 lane assignment is interim;
+                        // fixed-lane key hashing lands in R8.6.)
+                        await orderedStage.EnqueueAsync(message, sequence, bodyLength).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    await AbandonBeforeHandoffAsync(message, creditManager, creditGranted, bodyLength)
+                        .ConfigureAwait(false);
+                    throw;
                 }
 
                 // Sequential path (per-key ordering OFF): unchanged pre-per-key-ordering behavior, using the
@@ -461,6 +478,45 @@ internal sealed partial class ReceiveEndpointRunner
     {
         int configured = _binding.Ordering?.Concurrency ?? _binding.ConcurrentMessageLimit;
         return configured < 1 ? 1 : configured;
+    }
+
+    /// <summary>
+    /// Returns a message that was read from the transport but never handed to its owner (the sequential
+    /// try/finally or a lane) because the runner was cancelled while waiting for credit or a lane slot:
+    /// requeues it, releases its credit if one was granted, and disposes it.
+    /// </summary>
+    private async ValueTask AbandonBeforeHandoffAsync(
+        InboundMessage message,
+        CreditManager creditManager,
+        bool creditGranted,
+        long bodyLength)
+    {
+        try
+        {
+            // The runner token is already cancelled; the requeue must still reach the transport.
+            await _adapter.SettleAsync(SettlementAction.Requeue, message, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Explicit handling: log and continue cleanup; the caller rethrows the original cancellation.
+            LogSettlementError(_binding.EndpointName, message.MessageId, SettlementAction.Requeue, ex);
+        }
+        finally
+        {
+            if (creditGranted)
+            {
+                creditManager.ReleaseInflight(1, bodyLength);
+            }
+
+            message.Dispose();
+
+            BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
+            if (healthStatus == BusStatus.Degraded)
+            {
+                LogFlowControlDegraded(_binding.EndpointName);
+            }
+        }
     }
 
     /// <summary>
