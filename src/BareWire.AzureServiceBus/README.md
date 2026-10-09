@@ -15,15 +15,21 @@ dotnet add package BareWire.AzureServiceBus
 
 ## Usage — single call
 
-> **Consumer registration:** this transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on it. To consume messages today, use the RabbitMQ or in-memory transport — see the [BareWire documentation](https://barewire.wizardsoftware.pl).
-
 ```csharp
 builder.Services.AddBareWireWithAzureServiceBus(
-    transport => transport.ConnectionString(connectionString),
+    transport =>
+    {
+        transport.ConnectionString(connectionString);
+
+        transport.ReceiveEndpoint("orders", e =>
+            e.Consumer<OrderCreatedConsumer, OrderCreated>());
+    },
     bus =>
     {
         // middleware, serializers...
     });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
 ```
 
 The optional `bus` delegate may be omitted when you only need transport defaults:

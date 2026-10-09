@@ -1,7 +1,10 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Transport.AWS.SQS.Configuration;
 
 internal sealed class SqsConfigurator : ISqsConfigurator
 {
+    private readonly List<SqsEndpointConfiguration> _endpoints = [];
     private SqsAuthMode _authMode = SqsAuthMode.DefaultChain;
     private string _instanceProfileRoleName = string.Empty;
     private string _accessKeyId = string.Empty;
@@ -79,6 +82,16 @@ internal sealed class SqsConfigurator : ISqsConfigurator
 
     // Every field is explicitly threaded into options to prevent silent defaults
     // (mirror ASB configurator GAP-3 fix).
+    public void ReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(queueName);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var endpoint = new SqsEndpointConfiguration(queueName);
+        configure(endpoint);
+        _endpoints.Add(endpoint);
+    }
+
     internal SqsTransportOptions Build()
     {
         var options = new SqsTransportOptions();
@@ -133,6 +146,8 @@ internal sealed class SqsConfigurator : ISqsConfigurator
         }
 
         options.EnableContentBasedDeduplication = _enableContentBasedDeduplication;
+
+        options.EndpointConfigurations = _endpoints.ToArray();
 
         options.Validate();
 

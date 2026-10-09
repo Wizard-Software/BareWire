@@ -8,8 +8,6 @@ form.
 
 ## Registration
 
-> **Consumer registration:** the Google Cloud Pub/Sub transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
-
 ### Single call — bundle package (recommended)
 
 The `BareWire.Google.PubSub` bundle depends on both the core and the Pub/Sub transport and exposes
@@ -91,6 +89,50 @@ builder.Services.AddBareWirePubSub(cfg =>
 An emulator endpoint set under any non-emulator auth mode is rejected at startup, so production
 credentials can never be silently downgraded to plaintext gRPC.
 
+## Receive endpoints
+
+A receive endpoint binds one or more consumers to a Pub/Sub subscription. The endpoint name is the
+subscription id:
+
+```csharp
+builder.Services.AddBareWireWithPubSub(
+    transport =>
+    {
+        transport.ProjectId("my-gcp-project");
+        transport.MaxInFlightMessages(200);
+
+        transport.ReceiveEndpoint("orders-sub", e =>
+        {
+            e.PrefetchCount = 32;           // in-flight credit limit enforced by the BareWire core
+            e.ConcurrentMessageLimit = 8;   // concurrent handler invocations
+            e.RetryCount = 3;
+            e.RetryInterval = TimeSpan.FromSeconds(1);
+
+            e.Consumer<OrderCreatedConsumer, OrderCreated>();
+        });
+    });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
+```
+
+Consumers are resolved from the container, so register each consumer type (for example `services.AddTransient<OrderCreatedConsumer>()`). The topic and subscription must already exist — topology is manual, so provision them out of
+band (infrastructure as code, `gcloud`, or a deployment step) before the bus starts. An endpoint can
+also host a raw consumer (`e.RawConsumer<T>()`), a saga state machine (`e.StateMachineSaga<T>()`),
+several typed consumers, and per-key ordering; see [Publishing and Consuming](publishing-and-consuming.md).
+
+Things to know:
+
+- `PrefetchCount` is not a Pub/Sub setting. It is the credit limit the BareWire core uses to bound
+  unsettled messages for the endpoint; the per-pull message cap is `MaxOutstandingMessages`.
+- `MaxInFlightMessages` is shared by all endpoints on the transport. Set it to at least the sum of
+  the `PrefetchCount` values of all endpoints; otherwise a pulled message can be skipped while the
+  in-flight registry is full, and it is redelivered after the acknowledgement deadline.
+- Poison messages: a failing message is released for redelivery. It only reaches a dead-letter topic
+  if the subscription has a `DeadLetterPolicy` (see [Dead-letter topics](#dead-letter-topics)).
+  Without one, a poison message is redelivered indefinitely.
+- `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
+- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+
 ## Ordering keys
 
 Call `EnableMessageOrdering()` so subscriptions are created with `enable_message_ordering` during
@@ -137,6 +179,7 @@ All settings are configured through `IPubSubConfigurator`:
 | `MaxOutstandingBytes(long)` | 67,108,864 (64 MiB) | Maximum total byte size of in-flight message bodies. |
 | `MaxInFlightMessages(int)` | 100 | Maximum concurrent in-flight (consumed but not yet settled) messages tracked by the registry. |
 | `EnableMessageOrdering()` | off | Creates subscriptions with message ordering enabled. |
+| `ReceiveEndpoint(string, Action<IReceiveEndpointConfigurator>)` | — | Binds consumers to a subscription (endpoint name = subscription id). See [Receive endpoints](#receive-endpoints). |
 
 ```csharp
 builder.Services.AddBareWirePubSub(cfg =>

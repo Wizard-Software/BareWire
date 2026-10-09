@@ -8,8 +8,6 @@ encryption at rest are all supported.
 
 ## Registration
 
-> **Consumer registration:** the Amazon SQS transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
-
 The ergonomic path is the bundle package `BareWire.AWS.SQS`, which registers the core engine and
 the SQS transport in one call via `AddBareWireWithSqs`. The `bus` delegate is optional — omit it
 when transport defaults are enough:
@@ -51,7 +49,7 @@ services.AddBareWireSqs(sqs =>
     // sqs.UseInstanceProfileCredentials("MyAppRole"); // or an explicit role name
 
     // Explicit static credentials (local development only):
-    // sqs.UseExplicitCredentials("AKIAIOSFODNN7EXAMPLE", "<secret>");
+    // sqs.UseExplicitCredentials("<access-key-id>", "<secret-access-key>");
 });
 ```
 
@@ -68,9 +66,56 @@ services.AddBareWireSqs(sqs =>
 });
 ```
 
+## Receive endpoints
+
+A receive endpoint binds one or more consumers to an SQS queue. The endpoint name is the queue name:
+
+```csharp
+builder.Services.AddBareWireWithSqs(
+    transport =>
+    {
+        transport.Region("eu-central-1");
+        transport.MaxInFlightMessages(200);
+
+        transport.ReceiveEndpoint("orders", e =>
+        {
+            e.PrefetchCount = 32;           // in-flight credit limit enforced by the BareWire core
+            e.ConcurrentMessageLimit = 8;   // concurrent handler invocations
+            e.RetryCount = 3;
+            e.RetryInterval = TimeSpan.FromSeconds(1);
+
+            e.Consumer<OrderCreatedConsumer, OrderCreated>();
+        });
+    });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
+```
+
+Consumers are resolved from the container, so register each consumer type (for example `services.AddTransient<OrderCreatedConsumer>()`). The queue must already exist — topology is manual, so provision it out of band (infrastructure
+as code, the AWS console, or a deployment step) before the bus starts. An endpoint can also host a
+raw consumer (`e.RawConsumer<T>()`), a saga state machine (`e.StateMachineSaga<T>()`), several typed
+consumers, and per-key ordering; see [Publishing and Consuming](publishing-and-consuming.md).
+
+Things to know:
+
+- `PrefetchCount` is not an SQS setting. It is the credit limit the BareWire core uses to bound
+  unsettled messages for the endpoint; the number of messages fetched per call is set by
+  `MaxNumberOfMessages`.
+- `MaxInFlightMessages` is shared by all endpoints on the transport. Set it to at least the sum of
+  the `PrefetchCount` values of all endpoints; otherwise a received message can be skipped while
+  the in-flight registry is full, and it reappears after the visibility timeout with a growing
+  receive count.
+- Poison messages: a failing message is released for redelivery, and `Reject` deliberately leaves the
+  message on the queue. It only reaches a dead-letter queue if the source queue has a `RedrivePolicy`
+  (`maxReceiveCount` plus a dead-letter queue). Without one, a poison message is redelivered
+  indefinitely.
+- `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
+- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+
 ## Long-polling consumer
 
-The consumer uses SQS long polling to minimise empty-receive calls. `WaitTimeSeconds` (0–20,
+Each [receive endpoint](#receive-endpoints) runs one long-polling consumer loop on its queue, which
+uses SQS long polling to minimise empty-receive calls. `WaitTimeSeconds` (0–20,
 default 20) sets the poll duration, `MaxNumberOfMessages` (1–10, default 10) the batch size per
 `ReceiveMessage` call, `VisibilityTimeout` (default 30 s) the window before an unsettled message
 becomes visible again, and `MaxInFlightMessages` (default 100) bounds the consumed-but-unsettled
@@ -153,7 +198,8 @@ new QueueDeclaration("payments", Arguments: new Dictionary<string, object>
 | `VisibilityTimeout(TimeSpan)`          | 30 s        | Default message visibility timeout |
 | `WaitTimeSeconds(int)`                 | 20          | Long-poll wait time (0–20) |
 | `MaxNumberOfMessages(int)`             | 10          | Max messages per `ReceiveMessage` (1–10) |
-| `MaxInFlightMessages(int)`             | 100         | Max concurrent in-flight messages |
+| `MaxInFlightMessages(int)`             | 100         | Max concurrent in-flight messages, shared by all receive endpoints |
+| `ReceiveEndpoint(string, Action<IReceiveEndpointConfigurator>)` | none | Binds consumers to a queue (endpoint name = queue name) |
 | `ContentBasedDeduplication()`          | off         | Skip explicit dedup id (broker hashes body) |
 
 ## See also

@@ -1,5 +1,6 @@
 using System.Globalization;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.AWS.SQS.Configuration;
 
 namespace BareWire.Transport.AWS.SQS;
 
@@ -252,4 +253,10 @@ internal sealed class SqsTransportOptions
                                "Using http transmits credentials in plain text (SEC-01).");
         }
     }
+
+    /// <summary>
+    /// The accumulated receive endpoint configurations produced by
+    /// <c>ISqsConfigurator.ReceiveEndpoint</c>.
+    /// </summary>
+    public IReadOnlyList<SqsEndpointConfiguration> EndpointConfigurations { get; set; } = [];
 }

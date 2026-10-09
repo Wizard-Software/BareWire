@@ -16,8 +16,6 @@ dotnet add package BareWire.Transport.AzureServiceBus  # or the transport alone
 
 ## Registration
 
-> **Consumer registration:** the Azure Service Bus transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
-
 ### Single call — bundle (recommended)
 
 `AddBareWireWithAzureServiceBus` registers the transport adapter and the core engine together.
@@ -94,6 +92,50 @@ The Azure SDK refreshes the token automatically — BareWire does not run its ow
 > exception messages. Only the namespace host (a non-secret identifier) appears in diagnostic
 > output.
 
+## Receive endpoints
+
+A receive endpoint binds one or more consumers to a queue (the endpoint name is the queue's entity
+path):
+
+```csharp
+builder.Services.AddBareWireWithAzureServiceBus(
+    transport =>
+    {
+        transport.ConnectionString(connectionString);
+
+        transport.ReceiveEndpoint("orders", e =>
+        {
+            e.PrefetchCount = 32;           // in-flight credit limit enforced by the BareWire core
+            e.ConcurrentMessageLimit = 8;   // concurrent handler invocations
+            e.RetryCount = 3;
+            e.RetryInterval = TimeSpan.FromSeconds(1);
+
+            e.Consumer<OrderCreatedConsumer, OrderCreated>();
+        });
+    });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
+```
+
+Consumers are resolved from the container, so register each consumer type (for example `services.AddTransient<OrderCreatedConsumer>()`). The queue must already exist — topology is manual, so provision it out of band (infrastructure
+as code, the Azure portal, or a deployment step) before the bus starts. An endpoint can also host a
+raw consumer (`e.RawConsumer<T>()`), a saga state machine (`e.StateMachineSaga<T>()`), several typed
+consumers, and per-key ordering; see [Publishing and Consuming](publishing-and-consuming.md).
+
+Things to know:
+
+- The endpoint's `PrefetchCount` is not the Service Bus prefetch. It is the credit limit the BareWire
+  core uses to bound unsettled messages for the endpoint. Broker-side prefetch is controlled
+  separately with the transport-level `PrefetchCount(int)` option (see
+  [Transport Options](#transport-options)).
+- Poison messages are dead-lettered natively: a rejected message goes to the queue's dead-letter
+  sub-queue, and a message that is abandoned repeatedly is moved there once the queue's
+  `MaxDeliveryCount` is exceeded. Make sure the queue has a `MaxDeliveryCount` suited to your retry
+  policy; if it is set too high, a poison message keeps being redelivered for a long time before it
+  is dead-lettered.
+- `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
+- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+
 ## Sessions
 
 Azure Service Bus sessions provide FIFO ordering per `SessionId`. Enable them with `UseSessions`,
@@ -142,6 +184,7 @@ Configure these on `IAzureServiceBusConfigurator` inside the `transport` / `asb`
 | `UseSasAuth(string)` | — | SAS authentication via connection string. |
 | `ConnectionString(string)` | — | Legacy alias for `UseSasAuth`. |
 | `UseEntraIdAuth(string, TokenCredential)` | — | Entra ID authentication against the namespace host. |
+| `ReceiveEndpoint(string, Action<IReceiveEndpointConfigurator>)` | — | Binds consumers to a queue (endpoint name = queue entity path). See [Receive endpoints](#receive-endpoints). |
 | `PrefetchCount(int)` | `0` | Messages pre-fetched into a local buffer. `0` is safest for PeekLock — pre-fetched messages start their lock timer immediately. |
 | `MaxConcurrentCalls(int)` | `1` | Maximum messages processed concurrently per consumer. |
 | `UseSessions(int)` | off | Enables FIFO-per-`SessionId` processing; the argument bounds concurrent sessions (default `1`). |

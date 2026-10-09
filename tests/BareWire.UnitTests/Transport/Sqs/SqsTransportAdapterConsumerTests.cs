@@ -6,6 +6,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.AWS.SQS;
+using BareWire.Transport.AWS.SQS.Internal;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
@@ -431,5 +432,87 @@ public sealed class SqsTransportAdapterConsumerTests
         // Second settle must throw (evict-once).
         Func<Task> act = async () => await adapter.SettleAsync(SettlementAction.Ack, received!);
         await act.Should().ThrowAsync<BareWire.Abstractions.Exceptions.BareWireTransportException>();
+    }
+
+    // ── Shared in-flight registry across concurrent endpoints ────────────────
+
+    [Fact]
+    public async Task ConsumeAsync_TwoConcurrentEndpoints_ShareSingleInFlightRegistryAndBothSettle()
+    {
+        // The registry is created eagerly in the constructor, so concurrent ConsumeAsync calls (one per
+        // receive endpoint) cannot race on a lazy initialization and register into an abandoned instance.
+        var sqsClient = Substitute.For<IAmazonSQS>();
+        sqsClient.GetQueueUrlAsync(Arg.Any<string>(), Arg.Any<CancellationToken>())
+            .Returns(callInfo => Task.FromResult(new GetQueueUrlResponse
+            {
+                QueueUrl = "https://sqs.eu-central-1.amazonaws.com/123/" + callInfo.ArgAt<string>(0),
+            }));
+
+        var served = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+        sqsClient.ReceiveMessageAsync(
+                Arg.Any<ReceiveMessageRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                string queueUrl = callInfo.Arg<ReceiveMessageRequest>().QueueUrl;
+                if (served.AddOrUpdate(queueUrl, 1, static (_, n) => n + 1) == 1)
+                {
+                    return Task.FromResult(new ReceiveMessageResponse
+                    {
+                        Messages =
+                        [
+                            new Message
+                            {
+                                MessageId = "msg-" + queueUrl,
+                                ReceiptHandle = "rh-" + queueUrl,
+                                Body = "{}",
+                                MessageAttributes = [],
+                            },
+                        ],
+                    });
+                }
+
+                throw new OperationCanceledException();
+            });
+
+        sqsClient.DeleteMessageAsync(
+                Arg.Any<DeleteMessageRequest>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.FromResult(new DeleteMessageResponse()));
+
+        var adapter = new SqsTransportAdapter(
+            DefaultOptions(),
+            NullLogger<SqsTransportAdapter>.Instance,
+            sqsClient);
+
+        SqsInFlightRegistry registryBefore = adapter.InFlightRegistry;
+
+        async Task<InboundMessage> ConsumeFirstAsync(string queue)
+        {
+            using var cts = new CancellationTokenSource();
+            await foreach (InboundMessage msg in adapter.ConsumeAsync(
+                queue, new FlowControlOptions { InternalQueueCapacity = 10 }, cts.Token))
+            {
+                cts.Cancel();
+                return msg;
+            }
+
+            throw new InvalidOperationException("No message was received.");
+        }
+
+        InboundMessage[] received = await Task.WhenAll(ConsumeFirstAsync("queue-a"), ConsumeFirstAsync("queue-b"));
+
+        adapter.InFlightRegistry.Should().BeSameAs(registryBefore);
+        foreach (InboundMessage message in received)
+        {
+            await adapter.SettleAsync(SettlementAction.Ack, message, TestContext.Current.CancellationToken);
+        }
+
+        await sqsClient.Received(1).DeleteMessageAsync(
+            Arg.Is<DeleteMessageRequest>(r => r.ReceiptHandle.EndsWith("queue-a", StringComparison.Ordinal)),
+            Arg.Any<CancellationToken>());
+        await sqsClient.Received(1).DeleteMessageAsync(
+            Arg.Is<DeleteMessageRequest>(r => r.ReceiptHandle.EndsWith("queue-b", StringComparison.Ordinal)),
+            Arg.Any<CancellationToken>());
     }
 }

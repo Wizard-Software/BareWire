@@ -1,3 +1,5 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Transport.Google.PubSub.Configuration;
 
 /// <summary>
@@ -99,4 +101,19 @@ public interface IPubSubConfigurator
     /// When called, subscriptions are created with <c>enable_message_ordering = true</c>.
     /// </summary>
     void EnableMessageOrdering();
+
+    /// <summary>
+    /// Declares a receive endpoint that consumes the given Pub/Sub subscription and binds consumers,
+    /// raw consumers and sagas to it.
+    /// </summary>
+    /// <param name="subscriptionId">The Pub/Sub subscription id (within the configured project) consumed by this endpoint.</param>
+    /// <param name="configure">A delegate that configures the endpoint via <see cref="IReceiveEndpointConfigurator"/>.</param>
+    /// <remarks>
+    /// <para>
+    /// The subscription is not created by this call — provision it out of band or via the topology configuration.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="subscriptionId"/> is <see langword="null"/> or empty.</exception>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="configure"/> is <see langword="null"/>.</exception>
+    void ReceiveEndpoint(string subscriptionId, Action<IReceiveEndpointConfigurator> configure);
 }

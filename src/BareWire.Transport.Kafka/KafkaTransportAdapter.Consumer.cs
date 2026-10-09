@@ -381,7 +381,7 @@ internal sealed partial class KafkaTransportAdapter
     /// tracking headers are legitimate and preserved on consumption — SEC-1). Only meaningful when
     /// the retry/DLQ pattern is enabled; returns <see langword="false"/> otherwise.
     /// </summary>
-    private bool IsRetryOrDlqTopic(string topic)
+    internal bool IsRetryOrDlqTopic(string topic)
     {
         KafkaRetryDlqOptions retryDlq = _options.RetryDlq;
 

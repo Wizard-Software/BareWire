@@ -1,3 +1,4 @@
+using BareWire.Abstractions.Configuration;
 using Confluent.Kafka;
 
 namespace BareWire.Transport.Kafka.Configuration;
@@ -63,4 +64,20 @@ public interface IKafkaConfigurator
     /// <param name="configure">A delegate that configures the pattern via <see cref="IKafkaRetryDlqConfigurator"/>.</param>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="configure"/> is <see langword="null"/>.</exception>
     void ConfigureRetryDlq(Action<IKafkaRetryDlqConfigurator> configure);
+
+    /// <summary>
+    /// Declares a receive endpoint that consumes the given Kafka topic with the transport-wide
+    /// consumer group and binds consumers, raw consumers and sagas to it.
+    /// </summary>
+    /// <param name="topicName">The Kafka topic consumed by this endpoint.</param>
+    /// <param name="configure">A delegate that configures the endpoint via <see cref="IReceiveEndpointConfigurator"/>.</param>
+    /// <remarks>
+    /// <para>
+    /// All endpoints share the transport-wide consumer group configured via <see cref="ConsumerGroup"/>.
+    /// The topic is not created by this call — provision it out of band or via the topology configuration.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="topicName"/> is <see langword="null"/> or empty.</exception>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="configure"/> is <see langword="null"/>.</exception>
+    void ReceiveEndpoint(string topicName, Action<IReceiveEndpointConfigurator> configure);
 }

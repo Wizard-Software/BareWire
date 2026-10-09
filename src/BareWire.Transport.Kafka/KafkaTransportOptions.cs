@@ -1,4 +1,5 @@
 using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.Kafka.Configuration;
 using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
 
@@ -213,4 +214,10 @@ internal sealed class KafkaTransportOptions
                 expectedValue: "A non-empty consumer group id (e.g. my-service-group)");
         }
     }
+
+    /// <summary>
+    /// The accumulated receive endpoint configurations produced by
+    /// <c>IKafkaConfigurator.ReceiveEndpoint</c>.
+    /// </summary>
+    public IReadOnlyList<KafkaEndpointConfiguration> EndpointConfigurations { get; set; } = [];
 }

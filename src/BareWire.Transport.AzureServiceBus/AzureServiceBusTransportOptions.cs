@@ -1,4 +1,5 @@
 using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.AzureServiceBus.Configuration;
 
 namespace BareWire.Transport.AzureServiceBus;
 
@@ -285,4 +286,10 @@ internal sealed class AzureServiceBusTransportOptions
                 expectedValue: "A non-negative TimeSpan (>= 00:00:00)");
         }
     }
+
+    /// <summary>
+    /// The accumulated receive endpoint configurations produced by
+    /// <c>IAzureServiceBusConfigurator.ReceiveEndpoint</c>.
+    /// </summary>
+    public IReadOnlyList<AzureServiceBusEndpointConfiguration> EndpointConfigurations { get; set; } = [];
 }
