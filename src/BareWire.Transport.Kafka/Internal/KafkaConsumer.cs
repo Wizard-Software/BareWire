@@ -49,6 +49,19 @@ namespace BareWire.Transport.Kafka.Internal;
 /// </remarks>
 internal sealed partial class KafkaConsumer : IAsyncDisposable
 {
+    /// <summary>
+    /// Per-partition tracking limit used when no tracker is injected: the default
+    /// <c>InternalQueueCapacity</c> (1000) + <c>MaxInFlightMessages</c> (100) + 2 (the message in the
+    /// poll loop's hand and the one in the reader's hand).
+    /// </summary>
+    internal const int DefaultMaxTrackedPerPartition = 1_102;
+
+    /// <summary>
+    /// Consume timeout used while a partition is paused by the commit tracker, so the poll loop
+    /// re-checks <see cref="KafkaPartitionCommitTracker.HasCapacity"/> and resumes the partition.
+    /// </summary>
+    private static readonly TimeSpan TrackerResumePollInterval = TimeSpan.FromMilliseconds(100);
+
     private readonly IConsumer<byte[], byte[]> _consumer;
     private readonly Channel<InboundMessage> _channel;
     private readonly KafkaConsumerRegistry _registry;
@@ -56,6 +69,13 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     private readonly string _topic;
     private readonly bool _isRetryOrDlqTopic;
     private readonly ILogger _logger;
+    private readonly KafkaPartitionCommitTracker _commitTracker;
+
+    /// <summary>
+    /// Partitions paused by the commit tracker because they reached the per-partition tracking
+    /// limit (D3). Touched only on the poll thread (poll loop and rebalance handlers).
+    /// </summary>
+    private readonly HashSet<TopicPartition> _pausedByTracker = [];
 
     private long _deliveryTagCounter;
     private CancellationTokenSource? _loopCts;
@@ -69,7 +89,8 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         string consumerId,
         string topic,
         ILogger logger,
-        bool isRetryOrDlqTopic = false)
+        bool isRetryOrDlqTopic = false,
+        KafkaPartitionCommitTracker? commitTracker = null)
     {
         ArgumentNullException.ThrowIfNull(consumer);
         ArgumentNullException.ThrowIfNull(channel);
@@ -85,6 +106,8 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         _topic = topic;
         _isRetryOrDlqTopic = isRetryOrDlqTopic;
         _logger = logger;
+        _commitTracker = commitTracker
+            ?? new KafkaPartitionCommitTracker(topic, DefaultMaxTrackedPerPartition, consumer.StoreOffset);
     }
 
     /// <summary>
@@ -97,6 +120,24 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     /// Used by <c>SettleAsync</c> to call <c>StoreOffset</c>.
     /// </summary>
     internal IConsumer<byte[], byte[]> NativeConsumer => _consumer;
+
+    /// <summary>
+    /// Gets the per-partition commit tracker. <c>SettleAsync</c> routes every offset settlement
+    /// through it so the stored position only advances over a contiguous settled prefix (B17).
+    /// </summary>
+    internal KafkaPartitionCommitTracker CommitTracker => _commitTracker;
+
+    /// <summary>
+    /// Forgets partitions removed by a rebalance from the tracker-pause set. Invoked from the
+    /// revoked handler, which Confluent.Kafka runs on the poll thread.
+    /// </summary>
+    internal void OnPartitionsRevoked(IEnumerable<TopicPartition> partitions)
+    {
+        foreach (TopicPartition partition in partitions)
+        {
+            _pausedByTracker.Remove(partition);
+        }
+    }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -192,7 +233,11 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
                 {
                     // Blocking poll — returns null when no message is ready (e.g. end of partition
                     // when consumeResultFields includes end-of-partition events).
-                    result = _consumer.Consume(cancellationToken);
+                    // While a partition is paused by the commit tracker the loop must wake up
+                    // periodically to notice that settlements freed capacity (D3).
+                    result = _pausedByTracker.Count > 0
+                        ? _consumer.Consume(TrackerResumePollInterval)
+                        : _consumer.Consume(cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -209,12 +254,24 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
                 // Null result means end-of-partition marker (when EOF events are enabled).
                 // We don't request EOF events in our ConsumerConfig so this should not occur,
                 // but guard defensively.
+                if (_pausedByTracker.Count > 0)
+                {
+                    ResumeTrackerPausedPartitions(paused);
+                }
+
                 if (result is null || result.IsPartitionEOF)
                 {
                     continue;
                 }
 
-                InboundMessage message = BuildMessage(result);
+                InboundMessage message = BuildMessage(result, out TopicPartitionOffset tpo);
+
+                // B17: register the delivered offset; at the per-partition limit pause that partition
+                // (back-pressure) instead of ever pinning the commit position.
+                if (_commitTracker.Track(tpo.Partition.Value, tpo.Offset.Value))
+                {
+                    PauseForTracker(tpo.TopicPartition);
+                }
 
                 // D3 Pause/Resume: attempt a synchronous write first.
                 if (_channel.Writer.TryWrite(message))
@@ -264,6 +321,7 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
                         if (!_channel.Writer.TryWrite(message))
                         {
                             _registry.TryEvictOffset(_consumerId, message.DeliveryTag);
+                            HoldAbandoned(tpo);
                             message.Dispose();
                             LogMessageDropped(_consumerId, message.DeliveryTag);
                         }
@@ -278,11 +336,15 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
                     catch (OperationCanceledException)
                     {
                         // Disposing the message since nobody will consume it.
+                        _registry.TryEvictOffset(_consumerId, message.DeliveryTag);
+                        HoldAbandoned(tpo);
                         message.Dispose();
                         break;
                     }
                     catch (ChannelClosedException)
                     {
+                        _registry.TryEvictOffset(_consumerId, message.DeliveryTag);
+                        HoldAbandoned(tpo);
                         message.Dispose();
                         break;
                     }
@@ -303,7 +365,7 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
 
     // ── Message construction ──────────────────────────────────────────────────
 
-    private InboundMessage BuildMessage(ConsumeResult<byte[], byte[]> result)
+    private InboundMessage BuildMessage(ConsumeResult<byte[], byte[]> result, out TopicPartitionOffset tpo)
     {
         // D4: Wrap without copy. ConsumeResult.Message.Value is byte[] handed to the caller
         // by ownership — librdkafka does NOT free it after Consume returns (unlike RabbitMQ).
@@ -334,7 +396,9 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         ulong deliveryTag = (ulong)Interlocked.Increment(ref _deliveryTagCounter);
 
         // Record DeliveryTag → TopicPartitionOffset so SettleAsync can commit the right offset.
-        _registry.StoreOffset(_consumerId, deliveryTag, result.TopicPartitionOffset);
+        // PERF-4: ConsumeResult.TopicPartitionOffset allocates on every access — read it once.
+        tpo = result.TopicPartitionOffset;
+        _registry.StoreOffset(_consumerId, deliveryTag, tpo);
 
         return new InboundMessage(
             messageId: messageId,
@@ -424,12 +488,81 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     {
         try
         {
-            IEnumerable<TopicPartition> assigned = _consumer.Assignment;
+            // Partitions paused by the commit tracker stay paused until they regain capacity.
+            IEnumerable<TopicPartition> assigned = _pausedByTracker.Count == 0
+                ? _consumer.Assignment
+                : _consumer.Assignment.Where(tp => !_pausedByTracker.Contains(tp)).ToList();
             _consumer.Resume(assigned);
         }
         catch (Exception ex)
         {
             LogResumeError(ex);
+        }
+    }
+
+    private void PauseForTracker(TopicPartition partition)
+    {
+        if (!_pausedByTracker.Add(partition))
+        {
+            return;
+        }
+
+        try
+        {
+            _consumer.Pause([partition]);
+            LogPartitionPausedByTracker(_consumerId, partition.Topic, partition.Partition.Value);
+        }
+        catch (KafkaException ex)
+        {
+            _pausedByTracker.Remove(partition);
+            LogPauseError(ex);
+        }
+    }
+
+    private void ResumeTrackerPausedPartitions(bool channelPaused)
+    {
+        List<TopicPartition>? resumable = null;
+
+        foreach (TopicPartition partition in _pausedByTracker)
+        {
+            if (_commitTracker.HasCapacity(partition.Partition.Value))
+            {
+                (resumable ??= []).Add(partition);
+            }
+        }
+
+        if (resumable is null)
+        {
+            return;
+        }
+
+        foreach (TopicPartition partition in resumable)
+        {
+            _pausedByTracker.Remove(partition);
+        }
+
+        // When the whole consumer is paused for channel back-pressure, ResumeAll resumes these
+        // partitions (they are no longer tracker-paused) once the channel drains.
+        if (channelPaused)
+        {
+            return;
+        }
+
+        try
+        {
+            _consumer.Resume(resumable);
+        }
+        catch (KafkaException ex)
+        {
+            LogResumeError(ex);
+        }
+    }
+
+    private void HoldAbandoned(TopicPartitionOffset tpo)
+    {
+        if (_commitTracker.Hold(tpo.Partition.Value, tpo.Offset.Value))
+        {
+            LogPartitionCommitHeld(_consumerId, tpo.Topic, tpo.Partition.Value, tpo.Offset.Value);
         }
     }
 
@@ -450,6 +583,14 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Kafka consumer {ConsumerId}: message DeliveryTag={DeliveryTag} dropped by the bounded channel (non-Wait FullMode); offset entry evicted, message will be re-consumed from the last committed offset.")]
     private partial void LogMessageDropped(string consumerId, ulong deliveryTag);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "Kafka consumer {ConsumerId}: partition {Topic}[{Partition}] reached the unsettled-offset limit — pausing it until settlements free capacity.")]
+    private partial void LogPartitionPausedByTracker(string consumerId, string topic, int partition);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Kafka consumer {ConsumerId}: holding the commit position of {Topic}[{Partition}] at offset {Offset} because a delivered message was abandoned before it could be handled; it will be redelivered after a restart.")]
+    private partial void LogPartitionCommitHeld(string consumerId, string topic, int partition, long offset);
 
     [LoggerMessage(Level = LogLevel.Error,
         Message = "Kafka consumer error: code={ErrorCode}, reason={Reason}.")]

@@ -56,15 +56,15 @@ public sealed class KafkaSettlementRouterTests
             .Should().Be(SettlementOutcome.RepublishDlqThenStore);
     }
 
-    // ── Nack (no-store below cap, DLQ at cap — poison guard) ────────────────────
+    // ── Nack (counted retry below cap, DLQ at cap — poison guard) ───────────────
 
     [Theory]
     [InlineData(0)]
     [InlineData(2)]
-    public void Decide_Nack_BelowCap_ReturnsNoStore(int retryCount)
+    public void Decide_Nack_BelowCap_ReturnsRepublishRetryThenStore(int retryCount)
     {
         KafkaSettlementRouter.Decide(SettlementAction.Nack, retryCount, MaxRetryCount)
-            .Should().Be(SettlementOutcome.NoStore);
+            .Should().Be(SettlementOutcome.RepublishRetryThenStore);
     }
 
     [Theory]
