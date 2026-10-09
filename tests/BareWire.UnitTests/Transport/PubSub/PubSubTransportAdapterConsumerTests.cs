@@ -2,6 +2,7 @@ using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.Google.PubSub;
+using BareWire.Transport.Google.PubSub.Internal;
 using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Grpc.Core;
@@ -240,6 +241,70 @@ public sealed class PubSubTransportAdapterConsumerTests
             Arg.Any<string>(),
             Arg.Is<IEnumerable<string>>(ids => ids.Contains(AckId)),
             Arg.Is<int>(d => d == 0),
+            Arg.Any<CancellationToken>());
+    }
+
+    // ── Shared in-flight registry across concurrent endpoints ────────────────
+
+    [Fact]
+    public async Task ConsumeAsync_TwoConcurrentEndpoints_ShareSingleInFlightRegistryAndBothSettle()
+    {
+        // The registry is created eagerly in the constructor, so concurrent ConsumeAsync calls (one per
+        // receive endpoint) cannot race on a lazy initialization and register into an abandoned instance.
+        var (adapter, _, subscriber) = CreateAdapterWithMocks();
+
+        var served = new System.Collections.Concurrent.ConcurrentDictionary<string, int>();
+        subscriber.PullAsync(
+                Arg.Any<SubscriptionName>(),
+                Arg.Any<int>(),
+                Arg.Any<CancellationToken>())
+            .Returns(callInfo =>
+            {
+                string subscription = callInfo.Arg<SubscriptionName>().SubscriptionId;
+                if (served.AddOrUpdate(subscription, 1, static (_, n) => n + 1) == 1)
+                {
+                    return Task.FromResult(BuildPullResponse(ackId: "ack-" + subscription, body: []));
+                }
+
+                throw new OperationCanceledException();
+            });
+
+        subscriber.AcknowledgeAsync(
+                Arg.Any<string>(),
+                Arg.Any<IEnumerable<string>>(),
+                Arg.Any<CancellationToken>())
+            .Returns(Task.CompletedTask);
+
+        PubSubInFlightRegistry registryBefore = adapter.InFlightRegistry;
+
+        async Task<InboundMessage> ConsumeFirstAsync(string subscription)
+        {
+            using var cts = new CancellationTokenSource();
+            await foreach (InboundMessage msg in adapter.ConsumeAsync(
+                subscription, new FlowControlOptions { InternalQueueCapacity = 10 }, cts.Token))
+            {
+                cts.Cancel();
+                return msg;
+            }
+
+            throw new InvalidOperationException("No message was received.");
+        }
+
+        InboundMessage[] received = await Task.WhenAll(ConsumeFirstAsync("sub-a"), ConsumeFirstAsync("sub-b"));
+
+        adapter.InFlightRegistry.Should().BeSameAs(registryBefore);
+        foreach (InboundMessage message in received)
+        {
+            await adapter.SettleAsync(SettlementAction.Ack, message, TestContext.Current.CancellationToken);
+        }
+
+        await subscriber.Received(1).AcknowledgeAsync(
+            Arg.Any<string>(),
+            Arg.Is<IEnumerable<string>>(ids => ids.Contains("ack-sub-a")),
+            Arg.Any<CancellationToken>());
+        await subscriber.Received(1).AcknowledgeAsync(
+            Arg.Any<string>(),
+            Arg.Is<IEnumerable<string>>(ids => ids.Contains("ack-sub-b")),
             Arg.Any<CancellationToken>());
     }
 }

@@ -1,5 +1,6 @@
 using System.Globalization;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Transport.Google.PubSub.Configuration;
 
 namespace BareWire.Transport.Google.PubSub;
 
@@ -220,4 +221,10 @@ internal sealed class PubSubTransportOptions
                 expectedValue: "A TimeSpan between 10 and 600 seconds (Google Cloud Pub/Sub ack deadline range)");
         }
     }
+
+    /// <summary>
+    /// The accumulated receive endpoint configurations produced by
+    /// <c>IPubSubConfigurator.ReceiveEndpoint</c>.
+    /// </summary>
+    public IReadOnlyList<PubSubEndpointConfiguration> EndpointConfigurations { get; set; } = [];
 }

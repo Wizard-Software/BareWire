@@ -1,6 +1,8 @@
 using AwesomeAssertions;
+using BareWire.Transport.Kafka;
 using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace BareWire.UnitTests.Transport.Kafka;
 
@@ -219,5 +221,60 @@ public sealed class KafkaConsumerHeaderTests
         // Assert — library-stamped tracking headers survive on the retry/DLQ topic
         merged["BW-RetryCount"].Should().Be("2");
         merged["BW-OriginalTopic"].Should().Be("orders");
+    }
+
+    // ── Receive endpoint on a retry/DLQ-suffixed topic (pins suffix-based trust) ──
+
+    [Theory]
+    [InlineData("orders.retry")]
+    [InlineData("orders.DLQ")]
+    public void MergeHeaders_EndpointOnRetryOrDlqSuffixedTopic_KeepsTrackingHeadersBecauseTrustIsSuffixBased(string topic)
+    {
+        // A ReceiveEndpoint declared on a "<topic>.retry" / "<topic>.DLQ" topic (retry/DLQ pattern enabled)
+        // is treated as a library-owned topic purely by its name suffix: the tracking headers are kept.
+        // This pins the current behaviour — producers to those topics must be restricted via broker ACLs.
+        var adapter = new KafkaTransportAdapter(
+            new KafkaTransportOptions
+            {
+                BootstrapServers = "localhost:9092",
+                GroupId = "test-group",
+                RetryDlq = new KafkaRetryDlqOptions { Enabled = true },
+            },
+            NullLogger<KafkaTransportAdapter>.Instance);
+
+        var wireHeaders = new Headers();
+        wireHeaders.Add("BW-RetryCount", System.Text.Encoding.UTF8.GetBytes("2"));
+        wireHeaders.Add("BW-OriginalTopic", System.Text.Encoding.UTF8.GetBytes("orders"));
+
+        bool isRetryOrDlq = adapter.IsRetryOrDlqTopic(topic);
+        Dictionary<string, string> merged = KafkaConsumer.MergeHeaders(
+            wireHeaders, topic: topic, partition: 0, consumerId: "c-1", isRetryOrDlqTopic: isRetryOrDlq);
+
+        isRetryOrDlq.Should().BeTrue();
+        merged["BW-RetryCount"].Should().Be("2");
+        merged["BW-OriginalTopic"].Should().Be("orders");
+    }
+
+    [Fact]
+    public void MergeHeaders_EndpointOnSourceTopic_StripsTrackingHeadersEvenWhenRetryDlqEnabled()
+    {
+        var adapter = new KafkaTransportAdapter(
+            new KafkaTransportOptions
+            {
+                BootstrapServers = "localhost:9092",
+                GroupId = "test-group",
+                RetryDlq = new KafkaRetryDlqOptions { Enabled = true },
+            },
+            NullLogger<KafkaTransportAdapter>.Instance);
+
+        var wireHeaders = new Headers();
+        wireHeaders.Add("BW-RetryCount", System.Text.Encoding.UTF8.GetBytes("2"));
+
+        bool isRetryOrDlq = adapter.IsRetryOrDlqTopic("orders");
+        Dictionary<string, string> merged = KafkaConsumer.MergeHeaders(
+            wireHeaders, topic: "orders", partition: 0, consumerId: "c-1", isRetryOrDlqTopic: isRetryOrDlq);
+
+        isRetryOrDlq.Should().BeFalse();
+        merged.Should().NotContainKey("BW-RetryCount");
     }
 }

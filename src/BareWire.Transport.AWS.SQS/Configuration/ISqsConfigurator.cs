@@ -1,3 +1,5 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Transport.AWS.SQS.Configuration;
 
 /// <summary>
@@ -124,4 +126,19 @@ public interface ISqsConfigurator
     /// is present.
     /// </remarks>
     void ContentBasedDeduplication();
+
+    /// <summary>
+    /// Declares a receive endpoint that consumes the given SQS queue and binds consumers,
+    /// raw consumers and sagas to it.
+    /// </summary>
+    /// <param name="queueName">The SQS queue name consumed by this endpoint.</param>
+    /// <param name="configure">A delegate that configures the endpoint via <see cref="IReceiveEndpointConfigurator"/>.</param>
+    /// <remarks>
+    /// <para>
+    /// The queue is not created by this call — provision it out of band or via the topology configuration.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="queueName"/> is <see langword="null"/> or empty.</exception>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="configure"/> is <see langword="null"/>.</exception>
+    void ReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure);
 }

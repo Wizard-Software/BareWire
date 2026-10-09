@@ -82,6 +82,7 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
 
         _options = options;
         _logger = logger;
+        _inFlightRegistry = new SqsInFlightRegistry(options.MaxInFlightMessages);
     }
 
     /// <summary>

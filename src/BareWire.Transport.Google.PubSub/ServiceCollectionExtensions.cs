@@ -1,3 +1,4 @@
+using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.Google.PubSub.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -40,6 +41,27 @@ public static class ServiceCollectionExtensions
         PubSubTransportOptions options = configurator.Build();
 
         services.TryAddSingleton(options);
+
+        // Register endpoint bindings so the core bus can start consume loops. Dead-letter exchange and
+        // routing key stay null: the x-dead-letter-* arguments are AMQP-specific and this transport
+        // dead-letters natively.
+        List<EndpointBinding> bindings = options.EndpointConfigurations
+            .Select(e => new EndpointBinding
+            {
+                EndpointName = e.QueueName,
+                PrefetchCount = e.PrefetchCount,
+                ConcurrentMessageLimit = e.ConcurrentMessageLimit,
+                Ordering = e.Ordering,
+                Consumers = e.ConsumerRegistrations,
+                RawConsumers = e.RawConsumerTypes,
+                SagaTypes = e.SagaTypes,
+                RetryCount = e.RetryCount,
+                RetryInterval = e.RetryInterval,
+                SerializerOverrideType = e.SerializerOverrideType,
+                DeserializerOverrideType = e.DeserializerOverrideType,
+            })
+            .ToList();
+        services.TryAddSingleton<IReadOnlyList<EndpointBinding>>(bindings);
 
         services.TryAddSingleton<ITransportAdapter>(sp => new PubSubTransportAdapter(
             sp.GetRequiredService<PubSubTransportOptions>(),

@@ -15,15 +15,22 @@ dotnet add package BareWire.Kafka
 
 ## Usage — single call
 
-> **Consumer registration:** this transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on it. To consume messages today, use the RabbitMQ or in-memory transport — see the [BareWire documentation](https://barewire.wizardsoftware.pl).
-
 ```csharp
 builder.Services.AddBareWireWithKafka(
-    transport => transport.BootstrapServers("localhost:9092"),
+    transport =>
+    {
+        transport.BootstrapServers("localhost:9092");
+        transport.ConsumerGroup("order-processing");
+
+        transport.ReceiveEndpoint("orders", e =>
+            e.Consumer<OrderCreatedConsumer, OrderCreated>());
+    },
     bus =>
     {
         // middleware, serializers...
     });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
 ```
 
 The optional `bus` delegate may be omitted when you only need transport defaults:

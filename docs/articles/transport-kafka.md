@@ -12,8 +12,6 @@ layer is in place.
 
 ## Registration
 
-> **Consumer registration:** the Kafka transport does not yet expose `ReceiveEndpoint` on its configurator, so consumers cannot be bound declaratively on this transport, and runtime `IBus.ConnectReceiveEndpoint` is not supported yet either. The examples below configure the transport and the core bus only. To consume messages today, use the [RabbitMQ](transport-rabbitmq.md#receive-endpoints) or [in-memory](transport-inmemory.md) transport.
-
 As with every BareWire transport, you register the **core engine** and the **Kafka transport**
 together. There are two ways to do it (see [Configuration](configuration.md) for the full
 rationale).
@@ -69,11 +67,72 @@ semantics within a single producer session. Ordering is preserved by mapping eac
 partition, so messages that share a key keep their relative order. No producer-side tuning is
 required beyond `BootstrapServers`.
 
+## Receive endpoints
+
+A receive endpoint binds one or more consumers to a Kafka topic. The endpoint name is the topic
+name:
+
+```csharp
+builder.Services.AddBareWireWithKafka(
+    transport =>
+    {
+        transport.BootstrapServers("localhost:9092");
+        transport.ConsumerGroup("order-processing");
+
+        transport.ReceiveEndpoint("orders", e =>
+        {
+            e.PrefetchCount = 32;           // in-flight credit limit enforced by the BareWire core
+            e.ConcurrentMessageLimit = 8;   // concurrent handler invocations
+            e.RetryCount = 3;
+            e.RetryInterval = TimeSpan.FromSeconds(1);
+
+            e.Consumer<OrderCreatedConsumer, OrderCreated>();
+        });
+    });
+
+builder.Services.AddTransient<OrderCreatedConsumer>();
+```
+
+Consumers are resolved from the container, so register each consumer type (for example `services.AddTransient<OrderCreatedConsumer>()`). `ConsumerGroup` is required as soon as an endpoint is declared; the configuration fails fast
+otherwise. The topic must already exist — topology is manual, so provision it out of band (with your
+usual Kafka tooling) before the bus starts. An endpoint can also host a raw consumer
+(`e.RawConsumer<T>()`), a saga state machine (`e.StateMachineSaga<T>()`), several typed consumers,
+and per-key ordering; see [Publishing and Consuming](publishing-and-consuming.md).
+
+Things to know:
+
+- `PrefetchCount` is not a broker setting. It is the credit limit the BareWire core uses to bound
+  unsettled messages for the endpoint (on Kafka it also caps the tracked, unsettled messages per
+  consumer).
+- All endpoints share the transport-wide consumer group. Each endpoint runs its own Kafka consumer
+  client, so every endpoint start or stop triggers a group rebalance. Prefer few endpoints, and
+  `CooperativeSticky` assignment to keep rebalances incremental.
+- Poison messages: without `ConfigureRetryDlq`, a rejected message is committed (with a logged
+  warning) and a `Nack`/`Requeue` pins the partition's commit position, so the message is redelivered
+  after a restart. Enable the [retry-topic and DLQ-topic pattern](#retry-topic-and-dlq-topic-pattern)
+  to get a bounded number of attempts and a dead-letter topic.
+- With `ConfigureRetryDlq` enabled, retries are only processed if you also declare a separate
+  endpoint on the retry topic, because each endpoint subscribes to exactly one topic:
+
+  ```csharp
+  transport.ReceiveEndpoint("orders", e => e.Consumer<OrderCreatedConsumer, OrderCreated>());
+  transport.ReceiveEndpoint("orders.retry", e => e.Consumer<OrderCreatedConsumer, OrderCreated>());
+  ```
+
+- Access control: an endpoint on a `.retry` or `.DLQ` topic keeps the retry-tracking headers of the
+  messages it reads (the trust decision is based on the topic name suffix). Restrict write access to
+  those topics with broker ACLs so that only trusted producers (the BareWire transport itself) can
+  publish to them.
+- `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
+- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+
 ## Consumer groups
 
-Consuming uses Kafka consumer groups. All consumers that share a `ConsumerGroup` id coordinate
-partition assignment and offset commits through the Kafka group coordinator. A group id is
-**required** to consume.
+Consuming uses Kafka consumer groups. Every [receive endpoint](#receive-endpoints) consumes its
+topic as a member of the transport-wide `ConsumerGroup`, so all endpoints (and all application
+instances) that share the group id coordinate partition assignment and offset commits through the
+Kafka group coordinator. A group id is **required** to consume. Each endpoint uses its own Kafka
+consumer client, so starting or stopping an endpoint causes a group rebalance.
 
 ```csharp
 builder.Services.AddBareWireKafka(kafka =>
@@ -170,6 +229,7 @@ A `bw.kafka.config.<x>` key is forwarded to the topic's broker-side `Configs["<x
 |-------------------------------|---------|---------|
 | `BootstrapServers(string)` | Comma-separated `host:port` broker list | required |
 | `ConsumerGroup(string)` | Consumer group id | required to consume |
+| `ReceiveEndpoint(string, Action<IReceiveEndpointConfigurator>)` | Binds consumers to a topic (endpoint name = topic name) | none |
 | `ConsumerAutoOffsetReset(AutoOffsetReset)` | Offset reset policy when no committed offset exists | `Earliest` |
 | `ConsumerPartitionAssignmentStrategy(KafkaPartitionAssignmentStrategy)` | Partition assignment / rebalance strategy | `CooperativeSticky` |
 | `ConfigureRetryDlq(Action<IKafkaRetryDlqConfigurator>)` | Retry-topic + DLQ-topic pattern | disabled (opt-in) |

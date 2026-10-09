@@ -1,7 +1,10 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Transport.Google.PubSub.Configuration;
 
 internal sealed class PubSubConfigurator : IPubSubConfigurator
 {
+    private readonly List<PubSubEndpointConfiguration> _endpoints = [];
     private PubSubAuthMode _authMode = PubSubAuthMode.ApplicationDefault;
     private string _projectId = string.Empty;
     private string _serviceAccountJsonPath = string.Empty;
@@ -71,6 +74,16 @@ internal sealed class PubSubConfigurator : IPubSubConfigurator
     }
 
     // Every field is explicitly threaded into options to prevent silent defaults.
+    public void ReceiveEndpoint(string subscriptionId, Action<IReceiveEndpointConfigurator> configure)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(subscriptionId);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var endpoint = new PubSubEndpointConfiguration(subscriptionId);
+        configure(endpoint);
+        _endpoints.Add(endpoint);
+    }
+
     internal PubSubTransportOptions Build()
     {
         var options = new PubSubTransportOptions();
@@ -118,6 +131,8 @@ internal sealed class PubSubConfigurator : IPubSubConfigurator
         }
 
         options.EnableMessageOrdering = _enableMessageOrdering;
+
+        options.EndpointConfigurations = _endpoints.ToArray();
 
         options.Validate();
 

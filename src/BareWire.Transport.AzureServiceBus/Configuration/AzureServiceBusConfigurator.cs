@@ -1,7 +1,10 @@
+using BareWire.Abstractions.Configuration;
+
 namespace BareWire.Transport.AzureServiceBus.Configuration;
 
 internal sealed class AzureServiceBusConfigurator : IAzureServiceBusConfigurator
 {
+    private readonly List<AzureServiceBusEndpointConfiguration> _endpoints = [];
     private string? _connectionString;
     private int? _prefetchCount;
     private int? _maxConcurrentCalls;
@@ -68,6 +71,16 @@ internal sealed class AzureServiceBusConfigurator : IAzureServiceBusConfigurator
         _maxAutoLockRenewDuration = duration;
     }
 
+    public void ReceiveEndpoint(string queueName, Action<IReceiveEndpointConfigurator> configure)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(queueName);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var endpoint = new AzureServiceBusEndpointConfiguration(queueName);
+        configure(endpoint);
+        _endpoints.Add(endpoint);
+    }
+
     internal AzureServiceBusTransportOptions Build()
     {
         var options = new AzureServiceBusTransportOptions();
@@ -113,6 +126,8 @@ internal sealed class AzureServiceBusConfigurator : IAzureServiceBusConfigurator
         {
             options.MaxAutoLockRenewDuration = _maxAutoLockRenewDuration.Value;
         }
+
+        options.EndpointConfigurations = _endpoints.ToArray();
 
         options.Validate();
 

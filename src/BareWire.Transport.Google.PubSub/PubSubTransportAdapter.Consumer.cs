@@ -18,9 +18,16 @@ namespace BareWire.Transport.Google.PubSub;
 /// </summary>
 internal sealed partial class PubSubTransportAdapter
 {
-    // Shared in-flight registry — one instance per adapter (one Pub/Sub project endpoint).
+    // Shared in-flight registry — one instance per adapter, shared by every concurrent ConsumeAsync call
+    // (one per receive endpoint). Created eagerly in the constructor: lazy initialization would race when
+    // several endpoint runners start in parallel and entries would land in an abandoned registry.
     // Bounded by MaxInFlightMessages (PERF-3 mitigation).
-    private PubSubInFlightRegistry? _inFlightRegistry;
+    private readonly PubSubInFlightRegistry _inFlightRegistry;
+
+    /// <summary>
+    /// Gets the single in-flight registry shared by all consumers of this adapter. Exposed for tests.
+    /// </summary>
+    internal PubSubInFlightRegistry InFlightRegistry => _inFlightRegistry;
 
     /// <inheritdoc />
     /// <remarks>
@@ -46,9 +53,6 @@ internal sealed partial class PubSubTransportAdapter
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await EnsureClientsAsync(cancellationToken).ConfigureAwait(false);
-
-        // Lazily create the registry (one per adapter instance).
-        _inFlightRegistry ??= new PubSubInFlightRegistry(_options.MaxInFlightMessages);
 
         var subscriptionName = SubscriptionName.FromProjectSubscription(_options.ProjectId, endpointName);
 
@@ -113,14 +117,6 @@ internal sealed partial class PubSubTransportAdapter
     {
         ArgumentNullException.ThrowIfNull(message);
         ObjectDisposedException.ThrowIf(_disposed, this);
-
-        if (_inFlightRegistry is null)
-        {
-            throw new BareWireTransportException(
-                message: "Cannot settle message: no consumer has been started on this adapter.",
-                transportName: TransportName,
-                endpointAddress: null);
-        }
 
         // Evict-once: returns null on miss or when already evicted.
         (string AckId, string SubscriptionName)? entry =
@@ -244,7 +240,7 @@ internal sealed partial class PubSubTransportAdapter
                         System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
 
                     // Check registry capacity before allocating the InboundMessage body buffer (PERF-3).
-                    if (_inFlightRegistry!.Count >= _options.MaxInFlightMessages)
+                    if (_inFlightRegistry.Count >= _options.MaxInFlightMessages)
                     {
                         LogRegistryFull(deliveryTag, subscriptionNameStr);
                         continue;
@@ -286,7 +282,7 @@ internal sealed partial class PubSubTransportAdapter
                         pooledBuffer: pooledBuffer);
 
                     // Register BEFORE writing to channel (evict on any drop path — PERF-3).
-                    bool registered = _inFlightRegistry!.TryRegister(
+                    bool registered = _inFlightRegistry.TryRegister(
                         deliveryTag, receivedMessage.AckId, subscriptionNameStr);
 
                     if (!registered)
@@ -304,7 +300,7 @@ internal sealed partial class PubSubTransportAdapter
                     {
                         // Channel is full under Drop* FullMode.
                         // PERF-3: evict from registry on every drop path.
-                        _inFlightRegistry!.TryEvict(deliveryTag);
+                        _inFlightRegistry.TryEvict(deliveryTag);
                         inbound.Dispose();
                         LogMessageDropped(deliveryTag, subscriptionNameStr);
                     }

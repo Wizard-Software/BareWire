@@ -80,6 +80,7 @@ internal sealed partial class PubSubTransportAdapter : ITransportAdapter, IAsync
 
         _options = options;
         _logger = logger;
+        _inFlightRegistry = new PubSubInFlightRegistry(options.MaxInFlightMessages);
     }
 
     /// <summary>

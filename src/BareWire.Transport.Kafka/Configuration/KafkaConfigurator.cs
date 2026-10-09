@@ -1,3 +1,4 @@
+using BareWire.Abstractions.Configuration;
 using BareWire.Transport.Kafka.Internal;
 using Confluent.Kafka;
 
@@ -5,6 +6,7 @@ namespace BareWire.Transport.Kafka.Configuration;
 
 internal sealed class KafkaConfigurator : IKafkaConfigurator
 {
+    private readonly List<KafkaEndpointConfiguration> _endpoints = [];
     private string? _bootstrapServers;
     private string? _groupId;
     private AutoOffsetReset? _autoOffsetReset;
@@ -42,6 +44,16 @@ internal sealed class KafkaConfigurator : IKafkaConfigurator
         _retryDlqOptions = retryDlqConfigurator.Build();
     }
 
+    public void ReceiveEndpoint(string topicName, Action<IReceiveEndpointConfigurator> configure)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(topicName);
+        ArgumentNullException.ThrowIfNull(configure);
+
+        var endpoint = new KafkaEndpointConfiguration(topicName);
+        configure(endpoint);
+        _endpoints.Add(endpoint);
+    }
+
     internal KafkaTransportOptions Build()
     {
         var options = new KafkaTransportOptions();
@@ -69,6 +81,15 @@ internal sealed class KafkaConfigurator : IKafkaConfigurator
         if (_retryDlqOptions is not null)
         {
             options.RetryDlq = _retryDlqOptions;
+        }
+
+        options.EndpointConfigurations = _endpoints.ToArray();
+
+        // Fail fast on a missing consumer group when endpoints are declared, instead of failing later
+        // inside the consume loop.
+        if (_endpoints.Count > 0)
+        {
+            options.ValidateConsumer();
         }
 
         options.Validate();
