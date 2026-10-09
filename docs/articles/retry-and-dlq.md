@@ -31,12 +31,26 @@ rmq.ReceiveEndpoint("payments", e =>
 
 A policy set with `consumer.Retry(...)` replaces the endpoint `RetryCount`/`RetryInterval` for that consumer; the two are not combined, so the message is not retried by both. Consumers without their own policy, raw consumers and sagas keep the endpoint retry.
 
+### Limits
+
+Retry configuration is validated when the bus starts. An out-of-range value makes `StartAsync` throw a `BareWireConfigurationException` that names the offending option, so a misconfiguration never surfaces later while a message is being handled:
+
+| Setting | Allowed range |
+|---|---|
+| Retry count (`RetryCount`, or the `retryCount` argument of `Interval`/`Incremental`/`Exponential`) | 0 to 100 |
+| Every single delay (`RetryInterval`, `interval`, `initial`, `maxInterval`) | 0 to 1 hour |
+| `Incremental` largest delay (`initial + increment * (retryCount - 1)`) | at most 1 hour |
+
+The endpoint `RetryInterval` is only checked when `RetryCount` is greater than zero. At runtime every computed delay is additionally clamped to one hour.
+
 ### Side effects of in-process retry
 
 Retries run inside the process, while the message is still being handled:
 
 - The delivery and its flow-control credit are held for the whole backoff.
 - When per-key ordering is disabled, the endpoint pump is blocked until the message succeeds or the retries are exhausted. For example, `Exponential(4, 200 ms, 2 s)` can hold the pump for about 3 seconds per poison message.
+- The consumer concurrency slot and the sequential read loop (or the per-key ordered lane) are held as well, so one poisoned message can stall the endpoint for the whole backoff. With the maximum configuration (100 retries of 1 hour each) that is about 100 hours, and the bus health check can report `Degraded` meanwhile.
+- The broker may give up before the backoff ends: RabbitMQ closes the channel after `consumer_timeout` (30 minutes by default), Azure Service Bus message locks expire, SQS makes the message visible again after the visibility timeout, and Kafka triggers a rebalance after `max.poll.interval.ms`. The limits above do not account for these timeouts.
 - Keep consumer backoffs short, or rely on the dead letter queue and redelivery for longer delays.
 
 ## Dead Letter Exchange (DLX)

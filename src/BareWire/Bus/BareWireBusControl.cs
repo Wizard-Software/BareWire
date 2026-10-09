@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
@@ -87,9 +88,9 @@ internal sealed partial class BareWireBusControl : IBusControl
         bool transportRegistered = _adapter is not null;
         ConfigurationValidator.Validate(_configurator, transportRegistered);
 
-        // Consumer retry policies are materialized when the receive endpoints are constructed (after the bus is
-        // marked started), so an empty Retry delegate is validated here, before _started = true.
-        ValidateConsumerRetryPolicies();
+        // Retry policies are materialized when the receive endpoints are constructed (after the bus is
+        // marked started), so an empty or out-of-range retry configuration is validated here, before _started = true.
+        ValidateRetryPolicies();
 
         // Advisory diagnostic (SEC-13 / ADR-030 §Security): an endpoint that declares AcceptUntyped()
         // without a registered schema-validation middleware exposes a type-less foreign-input trust
@@ -353,16 +354,42 @@ internal sealed partial class BareWireBusControl : IBusControl
         }
     }
 
-    private void ValidateConsumerRetryPolicies()
+    /// <summary>
+    /// Validates every endpoint-level and consumer-level retry configuration. Runs before the bus is marked
+    /// started, so an invalid policy aborts the start instead of failing later while a message is delivered.
+    /// </summary>
+    internal void ValidateRetryPolicies()
     {
+        const string ConsumerRetryExpected = "retryCount 0..100; each delay 00:00:00..01:00:00";
+
         foreach (EndpointBinding binding in _endpointBindings)
         {
+            if (binding.RetryCount is < 0 or > RetryPolicyLimits.MaxRetryCount)
+            {
+                throw new BareWireConfigurationException(
+                    optionName: $"{binding.EndpointName}.RetryCount",
+                    optionValue: binding.RetryCount.ToString(CultureInfo.InvariantCulture),
+                    expectedValue: $"0..{RetryPolicyLimits.MaxRetryCount.ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            // The interval is only used when retries are enabled.
+            if (binding.RetryCount > 0
+                && (binding.RetryInterval < TimeSpan.Zero || binding.RetryInterval > RetryPolicyLimits.MaxDelay))
+            {
+                throw new BareWireConfigurationException(
+                    optionName: $"{binding.EndpointName}.RetryInterval",
+                    optionValue: binding.RetryInterval.ToString("c", CultureInfo.InvariantCulture),
+                    expectedValue: $"00:00:00..{RetryPolicyLimits.MaxDelay.ToString("c", CultureInfo.InvariantCulture)}");
+            }
+
             foreach (ConsumerRegistration consumer in binding.Consumers)
             {
                 if (consumer.ConfigureRetry is null)
                 {
                     continue;
                 }
+
+                string optionName = $"{binding.EndpointName}:{consumer.ConsumerType.Name}.Retry";
 
                 try
                 {
@@ -371,8 +398,15 @@ internal sealed partial class BareWireBusControl : IBusControl
                 catch (InvalidOperationException ex)
                 {
                     throw new BareWireConfigurationException(
-                        optionName: $"{binding.EndpointName}:{consumer.ConsumerType.Name}.Retry",
-                        expectedValue: "a retry strategy (Immediate/Interval/Incremental/Exponential)",
+                        optionName: optionName,
+                        expectedValue: "a retry strategy (Interval/Incremental/Exponential)",
+                        innerException: ex);
+                }
+                catch (ArgumentOutOfRangeException ex)
+                {
+                    throw new BareWireConfigurationException(
+                        optionName: optionName,
+                        expectedValue: ConsumerRetryExpected,
                         innerException: ex);
                 }
             }

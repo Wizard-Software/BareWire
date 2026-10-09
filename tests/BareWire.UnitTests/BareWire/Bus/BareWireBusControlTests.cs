@@ -726,6 +726,121 @@ public sealed class BareWireBusControlTests
     }
 
     /// <summary>
+    /// A consumer retry policy beyond the allowed bounds must fail fast at startup with a
+    /// <see cref="BareWireConfigurationException"/> wrapping the original argument error.
+    /// </summary>
+    [Fact]
+    public async Task StartAsync_ConsumerRetryExceedsLimits_ThrowsBareWireConfigurationException()
+    {
+        EndpointBinding binding = new()
+        {
+            EndpointName = "retry-limits-queue",
+            PrefetchCount = 1,
+            Consumers = [new ConsumerRegistration(typeof(RegionEuConsumer), typeof(TransferInitiated),
+                ConfigureRetry: static r => r.Exponential(int.MaxValue, TimeSpan.Zero, TimeSpan.MaxValue))],
+            RawConsumers = [],
+        };
+        BareWireBusControl control = CreateControlForMtStartupValidation(
+            [binding], Substitute.For<IDeserializerResolver>());
+
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+
+        var assertion = await act.Should().ThrowAsync<BareWireConfigurationException>();
+        assertion.WithInnerException<ArgumentOutOfRangeException>();
+        assertion.Which.OptionName.Should().Be($"retry-limits-queue:{nameof(RegionEuConsumer)}.Retry");
+        assertion.Which.ExpectedValue.Should().Contain("100").And.NotContain("Immediate");
+
+        // Not left half-started.
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StartAsync_EndpointRetryCountExceedsLimit_ThrowsBareWireConfigurationException()
+    {
+        BareWireBusControl control = CreateControlWithEndpointRetry(retryCount: 101, retryInterval: TimeSpan.Zero);
+
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+
+        var assertion = await act.Should().ThrowAsync<BareWireConfigurationException>();
+        assertion.Which.OptionName.Should().Be("retry-endpoint-queue.RetryCount");
+        assertion.Which.OptionValue.Should().Be("101");
+
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StartAsync_EndpointRetryIntervalExceedsLimit_ThrowsBareWireConfigurationException()
+    {
+        BareWireBusControl control = CreateControlWithEndpointRetry(retryCount: 1, retryInterval: TimeSpan.FromHours(2));
+
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+
+        var assertion = await act.Should().ThrowAsync<BareWireConfigurationException>();
+        assertion.Which.OptionName.Should().Be("retry-endpoint-queue.RetryInterval");
+
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StartAsync_EndpointRetryIntervalIsNegative_ThrowsBareWireConfigurationException()
+    {
+        BareWireBusControl control = CreateControlWithEndpointRetry(retryCount: 1, retryInterval: TimeSpan.FromSeconds(-1));
+
+        Func<Task> act = () => control.StartAsync(CancellationToken.None);
+
+        var assertion = await act.Should().ThrowAsync<BareWireConfigurationException>();
+        assertion.Which.OptionName.Should().Be("retry-endpoint-queue.RetryInterval");
+
+        // Not left half-started: the second attempt fails the same way, not with "already started".
+        await act.Should().ThrowAsync<BareWireConfigurationException>();
+
+        await control.DisposeAsync();
+    }
+
+    [Fact]
+    public void ValidateRetryPolicies_EndpointRetryCountIsZeroAndIntervalExceedsLimit_DoesNotThrow()
+    {
+        // The interval is irrelevant when no retries are configured.
+        BareWireBusControl control = CreateControlWithEndpointRetry(retryCount: 0, retryInterval: TimeSpan.FromHours(2));
+
+        Action act = () => control.ValidateRetryPolicies();
+
+        act.Should().NotThrow();
+    }
+
+    [Theory]
+    [InlineData(100, 3600)]
+    [InlineData(1, 0)]
+    public void ValidateRetryPolicies_EndpointRetryEqualsLimit_DoesNotThrow(int retryCount, int intervalSeconds)
+    {
+        BareWireBusControl control = CreateControlWithEndpointRetry(retryCount, TimeSpan.FromSeconds(intervalSeconds));
+
+        Action act = () => control.ValidateRetryPolicies();
+
+        act.Should().NotThrow();
+    }
+
+    private static BareWireBusControl CreateControlWithEndpointRetry(int retryCount, TimeSpan retryInterval)
+    {
+        EndpointBinding binding = new()
+        {
+            EndpointName = "retry-endpoint-queue",
+            PrefetchCount = 1,
+            Consumers = [],
+            RawConsumers = [],
+            RetryCount = retryCount,
+            RetryInterval = retryInterval,
+        };
+        return CreateControlForMtStartupValidation([binding], Substitute.For<IDeserializerResolver>());
+    }
+
+    /// <summary>
     /// Creates a <see cref="BareWireBusControl"/> pre-configured with the supplied endpoint bindings
     /// and deserializer resolver. Used by the MT envelope startup-validation test; avoids duplicating
     /// the full <see cref="BareWireBus"/> wiring in each test case.

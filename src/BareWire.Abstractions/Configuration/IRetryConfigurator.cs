@@ -14,22 +14,25 @@ namespace BareWire.Abstractions.Configuration;
 public interface IRetryConfigurator
 {
     /// <summary>Retries a fixed number of times with a constant interval between attempts.</summary>
-    /// <param name="retryCount">Maximum number of retry attempts.</param>
-    /// <param name="interval">Constant delay between attempts.</param>
+    /// <param name="retryCount">Maximum number of retry attempts (0 to 100).</param>
+    /// <param name="interval">Constant delay between attempts (0 to 1 hour).</param>
     /// <returns>The same configurator instance, enabling fluent chaining.</returns>
     IRetryConfigurator Interval(int retryCount, TimeSpan interval);
 
     /// <summary>Retries with a linearly increasing (incremental) interval.</summary>
-    /// <param name="retryCount">Maximum number of retry attempts.</param>
-    /// <param name="initial">Delay before the first retry.</param>
-    /// <param name="increment">Amount added to the delay after each attempt.</param>
+    /// <param name="retryCount">Maximum number of retry attempts (0 to 100).</param>
+    /// <param name="initial">Delay before the first retry (0 to 1 hour).</param>
+    /// <param name="increment">
+    /// Amount added to the delay after each attempt. The largest resulting delay,
+    /// <c>initial + increment * (retryCount - 1)</c>, must not exceed 1 hour.
+    /// </param>
     /// <returns>The same configurator instance, enabling fluent chaining.</returns>
     IRetryConfigurator Incremental(int retryCount, TimeSpan initial, TimeSpan increment);
 
     /// <summary>Retries with an exponentially growing interval bounded to a range.</summary>
-    /// <param name="retryCount">Maximum number of retry attempts.</param>
+    /// <param name="retryCount">Maximum number of retry attempts (0 to 100).</param>
     /// <param name="minInterval">Lower bound for the delay.</param>
-    /// <param name="maxInterval">Upper bound for the delay.</param>
+    /// <param name="maxInterval">Upper bound for the delay (at most 1 hour).</param>
     /// <returns>The same configurator instance, enabling fluent chaining.</returns>
     IRetryConfigurator Exponential(int retryCount, TimeSpan minInterval, TimeSpan maxInterval);
 
