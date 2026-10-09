@@ -225,4 +225,55 @@ public sealed class ExponentialRetryPolicyTests
                 because: "when min == max the clamp must produce the constant interval regardless of jitter");
         }
     }
+
+    [Fact]
+    public void Constructor_WhenMaxIntervalIsTimeSpanMaxValue_ThrowsArgumentOutOfRangeException()
+    {
+        Action act = () => _ = CreatePolicy(maxRetries: 100, minInterval: TimeSpan.Zero, maxInterval: TimeSpan.MaxValue);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("maxInterval");
+    }
+
+    [Fact]
+    public void Constructor_WhenMaxIntervalExceedsOneHourByOneTick_ThrowsArgumentOutOfRangeException()
+    {
+        Action act = () => _ = CreatePolicy(
+            minInterval: TimeSpan.Zero, maxInterval: TimeSpan.FromHours(1) + TimeSpan.FromTicks(1));
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("maxInterval");
+    }
+
+    [Fact]
+    public void Constructor_WhenMaxIntervalEqualsOneHour_DoesNotThrow()
+    {
+        Action act = () => _ = CreatePolicy(minInterval: TimeSpan.Zero, maxInterval: TimeSpan.FromHours(1));
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void GetDelay_WhenAttemptIsExtreme_ReturnsDelayWithinBounds()
+    {
+        // Characterization of existing behaviour with min > 0 (passes before the fix).
+        var min = TimeSpan.FromMilliseconds(1);
+        var max = TimeSpan.FromHours(1);
+        ExponentialRetryPolicy policy = CreatePolicy(minInterval: min, maxInterval: max);
+
+        TimeSpan delay = policy.GetDelay(int.MaxValue);
+
+        delay.Should().BeGreaterThanOrEqualTo(min);
+        delay.Should().BeLessThanOrEqualTo(max);
+    }
+
+    [Fact]
+    public void GetDelay_WhenMinIntervalIsZeroAndAttemptIsExtreme_DoesNotThrow()
+    {
+        // 0 * Infinity would be NaN, which TimeSpan.FromMilliseconds rejects.
+        ExponentialRetryPolicy policy = CreatePolicy(minInterval: TimeSpan.Zero, maxInterval: TimeSpan.FromHours(1));
+
+        TimeSpan delay = policy.GetDelay(int.MaxValue);
+
+        delay.Should().BeGreaterThanOrEqualTo(TimeSpan.Zero);
+        delay.Should().BeLessThanOrEqualTo(TimeSpan.FromHours(1));
+    }
 }

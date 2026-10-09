@@ -45,14 +45,16 @@ internal sealed class RetryMiddleware : IMessageMiddleware
             }
             catch (Exception ex) when (!IsHandledByConsumerRetry(context) && _policy.ShouldRetry(ex, attempt))
             {
-                TimeSpan delay = _policy.GetDelay(attempt);
+                // Compute the delay once: policies with jitter return a different value on every call, and the
+                // logged value must be the one actually awaited.
+                TimeSpan delay = RetryPolicyLimits.Clamp(_policy.GetDelay(attempt));
                 RetryMiddlewareLogMessages.RetryingMessage(
                     _logger, context.MessageId, attempt + 1, _policy.MaxRetries, delay, ex.GetType().Name);
 
                 // Retry-branch only (never on the 0-B/op success path); TagList is a struct — no heap alloc.
                 _instrumentation.RecordRetryAttempt(context.EndpointName, _messageTypeTag, ex.GetType().Name);
 
-                await _policy.DelayAsync(attempt, context.CancellationToken).ConfigureAwait(false);
+                await _policy.DelayAsync(delay, context.CancellationToken).ConfigureAwait(false);
 
                 // Let outer middleware (e.g. the transactional outbox) discard side effects buffered by the
                 // failed attempt. HasItems keeps this allocation-free when nothing registered a callback.

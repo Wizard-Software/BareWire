@@ -4,7 +4,9 @@ using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Pipeline;
 using BareWire.Pipeline;
 using BareWire.Pipeline.Retry;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
 using NSubstitute;
 
 namespace BareWire.UnitTests.Core.Pipeline;
@@ -425,5 +427,58 @@ public sealed class RetryMiddlewareTests
             TState state,
             Exception? exception,
             Func<TState, Exception?, string> formatter) => Messages.Add(formatter(state, exception));
+    }
+
+    [Fact]
+    public async Task InvokeAsync_PolicyWithJitter_LogsTheDelayThatIsActuallyAwaitedAsync()
+    {
+        // Arrange — exponential policy applies random jitter, so two GetDelay calls would differ.
+        var fakeTime = new FakeTimeProvider();
+        var policy = new ExponentialRetryPolicy(
+            3, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(60), [], [], fakeTime);
+        var logger = new DelayCapturingLogger();
+        var sut = new RetryMiddleware(
+            policy, logger, Substitute.For<IBareWireInstrumentation>(), "TestMessage");
+        int calls = 0;
+
+        // Act
+        Task invocation = sut.InvokeAsync(CreateContext(), _ =>
+            ++calls == 1 ? throw new InvalidOperationException("boom") : Task.CompletedTask);
+
+        // Assert — the awaited delay equals the logged one (Task.Delay works at millisecond granularity,
+        // while jitter is sub-millisecond, hence the 1 ms step; two independent jitter draws differ by seconds).
+        logger.LoggedDelay.Should().NotBeNull();
+        TimeSpan logged = logger.LoggedDelay!.Value;
+        fakeTime.Advance(logged - TimeSpan.FromMilliseconds(1));
+        invocation.IsCompleted.Should().BeFalse();
+        fakeTime.Advance(TimeSpan.FromMilliseconds(1));
+        await invocation.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        calls.Should().Be(2);
+    }
+
+    private sealed class DelayCapturingLogger : ILogger<RetryMiddleware>
+    {
+        public TimeSpan? LoggedDelay { get; private set; }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (state is IReadOnlyList<KeyValuePair<string, object?>> pairs)
+            {
+                foreach (KeyValuePair<string, object?> pair in pairs)
+                {
+                    if (pair.Key == "Delay" && pair.Value is TimeSpan delay)
+                        LoggedDelay = delay;
+                }
+            }
+        }
     }
 }

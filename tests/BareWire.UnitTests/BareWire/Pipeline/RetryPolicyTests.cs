@@ -205,4 +205,71 @@ public sealed class RetryPolicyTests
         // Assert
         result.Should().BeFalse(because: "the exception type is not in the handled list");
     }
+
+    // ------------------------------------------------------------------ upper bounds
+
+    [Fact]
+    public void Constructor_WhenMaxRetriesExceedsLimit_ThrowsArgumentOutOfRangeException()
+    {
+        Action act = () => _ = CreatePolicy(maxRetries: 101);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("maxRetries");
+    }
+
+    [Fact]
+    public void Constructor_WhenMaxRetriesEqualsLimit_DoesNotThrow()
+    {
+        Action act = () => _ = CreatePolicy(maxRetries: 100);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public async Task DelayAsync_WhenPolicyDelayExceedsMaxDelay_CompletesExactlyAtMaxDelayAsync()
+    {
+        // Arrange — a policy whose raw delay is TimeSpan.MaxValue; Task.Delay(TimeSpan.MaxValue) would throw.
+        var fakeTime = new FakeTimeProvider();
+        var policy = new HugeDelayPolicy(fakeTime);
+
+        // Act
+        Task delay = policy.DelayAsync(attempt: 0, ct: CancellationToken.None);
+        fakeTime.Advance(RetryPolicyLimits.MaxDelay - TimeSpan.FromTicks(1));
+        bool completedEarly = delay.IsCompleted;
+        fakeTime.Advance(TimeSpan.FromTicks(1));
+        await delay.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        // Assert
+        completedEarly.Should().BeFalse();
+        delay.IsCompletedSuccessfully.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task DelayAsync_WhenExplicitDelayExceedsMaxDelay_CompletesExactlyAtMaxDelayAsync()
+    {
+        var fakeTime = new FakeTimeProvider();
+        var policy = new HugeDelayPolicy(fakeTime);
+
+        Task delay = policy.DelayAsync(TimeSpan.MaxValue, CancellationToken.None);
+        fakeTime.Advance(RetryPolicyLimits.MaxDelay - TimeSpan.FromTicks(1));
+        bool completedEarly = delay.IsCompleted;
+        fakeTime.Advance(TimeSpan.FromTicks(1));
+        await delay.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        completedEarly.Should().BeFalse();
+        delay.IsCompletedSuccessfully.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Clamp_WhenDelayIsNegative_ReturnsZero() =>
+        RetryPolicyLimits.Clamp(TimeSpan.FromSeconds(-1)).Should().Be(TimeSpan.Zero);
+
+    [Fact]
+    public void Clamp_WhenDelayIsWithinLimit_ReturnsSameValue() =>
+        RetryPolicyLimits.Clamp(TimeSpan.FromMinutes(5)).Should().Be(TimeSpan.FromMinutes(5));
+
+    private sealed class HugeDelayPolicy(TimeProvider timeProvider)
+        : RetryPolicy(1, [], [], timeProvider)
+    {
+        internal override TimeSpan GetDelay(int attempt) => TimeSpan.MaxValue;
+    }
 }

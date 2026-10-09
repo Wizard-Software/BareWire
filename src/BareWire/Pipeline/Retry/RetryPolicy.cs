@@ -17,6 +17,14 @@ internal abstract class RetryPolicy
         if (maxRetries < 0)
             throw new ArgumentOutOfRangeException(nameof(maxRetries), "MaxRetries must be non-negative.");
 
+        if (maxRetries > RetryPolicyLimits.MaxRetryCount)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxRetries),
+                maxRetries,
+                $"MaxRetries must not exceed {RetryPolicyLimits.MaxRetryCount}.");
+        }
+
         MaxRetries = maxRetries;
         HandledExceptions = handledExceptions ?? throw new ArgumentNullException(nameof(handledExceptions));
         IgnoredExceptions = ignoredExceptions ?? throw new ArgumentNullException(nameof(ignoredExceptions));
@@ -55,9 +63,12 @@ internal abstract class RetryPolicy
         return true;
     }
 
-    internal Task DelayAsync(int attempt, CancellationToken ct)
-    {
-        TimeSpan delay = GetDelay(attempt);
-        return Task.Delay(delay, _timeProvider, ct);
-    }
+    internal Task DelayAsync(int attempt, CancellationToken ct) => DelayAsync(GetDelay(attempt), ct);
+
+    /// <summary>
+    /// Waits for <paramref name="delay"/>, clamped to <see cref="RetryPolicyLimits.MaxDelay"/>, so a caller that
+    /// already computed (and logged) the delay awaits exactly that value.
+    /// </summary>
+    internal Task DelayAsync(TimeSpan delay, CancellationToken ct) =>
+        Task.Delay(RetryPolicyLimits.Clamp(delay), _timeProvider, ct);
 }

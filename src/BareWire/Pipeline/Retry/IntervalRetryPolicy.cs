@@ -15,6 +15,14 @@ internal sealed class IntervalRetryPolicy : RetryPolicy
         if (interval < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(interval), "Interval must be non-negative.");
 
+        if (interval > RetryPolicyLimits.MaxDelay)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(interval),
+                interval,
+                $"Interval must not exceed {RetryPolicyLimits.MaxDelay}.");
+        }
+
         _interval = interval;
     }
 

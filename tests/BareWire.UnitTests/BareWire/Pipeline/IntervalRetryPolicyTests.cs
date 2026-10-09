@@ -38,4 +38,28 @@ public sealed class IntervalRetryPolicyTests
         // Assert
         act.Should().NotThrow();
     }
+
+    [Fact]
+    public void Constructor_WhenIntervalExceedsOneHourByOneTick_ThrowsArgumentOutOfRangeException()
+    {
+        Action act = () => _ = new IntervalRetryPolicy(
+            maxRetries: 3,
+            interval: TimeSpan.FromHours(1) + TimeSpan.FromTicks(1),
+            handledExceptions: [],
+            ignoredExceptions: []);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("interval");
+    }
+
+    [Fact]
+    public void Constructor_WhenIntervalEqualsOneHour_DoesNotThrow()
+    {
+        Action act = () => _ = new IntervalRetryPolicy(
+            maxRetries: 3,
+            interval: TimeSpan.FromHours(1),
+            handledExceptions: [],
+            ignoredExceptions: []);
+
+        act.Should().NotThrow();
+    }
 }

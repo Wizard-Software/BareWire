@@ -73,4 +73,66 @@ public sealed class IncrementalRetryPolicyTests
         // Assert: 0 + 6s * 2 = 12s (mutant * → / would yield 3s)
         result.Should().Be(TimeSpan.FromSeconds(12));
     }
+
+    private static IncrementalRetryPolicy Create(int maxRetries, TimeSpan initial, TimeSpan increment) =>
+        new(maxRetries, initial, increment, [], []);
+
+    [Fact]
+    public void Constructor_WhenInitialExceedsOneHourByOneTick_ThrowsArgumentOutOfRangeException()
+    {
+        Action act = () => _ = Create(3, TimeSpan.FromHours(1) + TimeSpan.FromTicks(1), TimeSpan.Zero);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("initial");
+    }
+
+    [Fact]
+    public void Constructor_WhenInitialEqualsOneHour_DoesNotThrow()
+    {
+        Action act = () => _ = Create(3, TimeSpan.FromHours(1), TimeSpan.Zero);
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void Constructor_WhenLargestComputedDelayExceedsOneHour_ThrowsArgumentOutOfRangeException()
+    {
+        // 99 * 37 s = 3663 s > 1 h
+        Action act = () => _ = Create(100, TimeSpan.Zero, TimeSpan.FromSeconds(37));
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("increment");
+    }
+
+    [Fact]
+    public void Constructor_WhenIncrementIsHugeAndMaxRetriesIsLarge_ThrowsInsteadOfOverflowing()
+    {
+        Action act = () => _ = Create(100, TimeSpan.Zero, TimeSpan.MaxValue);
+
+        act.Should().Throw<ArgumentOutOfRangeException>().WithParameterName("increment");
+    }
+
+    [Fact]
+    public void Constructor_WhenLargestComputedDelayEqualsOneHour_DoesNotThrow()
+    {
+        // last delay (attempt 1) = 30 min + 30 min = exactly 1 h
+        Action act = () => _ = Create(2, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
+
+        act.Should().NotThrow();
+    }
+
+    [Fact]
+    public void GetDelay_WhenAttemptIsExtreme_SaturatesAtMaxDelayWithoutOverflow()
+    {
+        IncrementalRetryPolicy policy = Create(2, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
+
+        policy.GetDelay(int.MaxValue).Should().Be(TimeSpan.FromHours(1));
+    }
+
+    [Fact]
+    public void GetDelay_WhenIncrementIsNegative_ReturnsZeroInsteadOfNegative()
+    {
+        // Characterization of existing behaviour (passes before the fix).
+        IncrementalRetryPolicy policy = Create(5, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(-1));
+
+        policy.GetDelay(3).Should().Be(TimeSpan.Zero);
+    }
 }
