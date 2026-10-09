@@ -1,6 +1,7 @@
 using System.Text;
 using AwesomeAssertions;
 using BareWire.Abstractions;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.RabbitMQ;
@@ -31,7 +32,9 @@ public sealed class RabbitMqTransportAdapterTests(AspireFixture fixture)
     private static OutboundMessage MakeMessage(string routingKey = "test-lifecycle") =>
         new(
             routingKey: routingKey,
-            headers: new Dictionary<string, string>(),
+            // An empty BW-Exchange explicitly targets the AMQP default exchange; the adapter fails fast
+            // when neither this header nor the DefaultExchange option resolves an exchange.
+            headers: new Dictionary<string, string> { ["BW-Exchange"] = "" },
             body: Encoding.UTF8.GetBytes("{\"ping\":true}"),
             contentType: "application/json");
 
@@ -119,5 +122,29 @@ public sealed class RabbitMqTransportAdapterTests(AspireFixture fixture)
 
         // Assert — no exception means graceful shutdown
         await act.Should().NotThrowAsync();
+    }
+
+    // ── SendBatchAsync — exchange resolution ──────────────────────────────────
+
+    [Fact]
+    public async Task SendBatchAsync_WithoutExchangeHeaderAndDefaultExchange_ThrowsTransportException()
+    {
+        // Arrange — no DefaultExchange option and no BW-Exchange header on the message
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(30));
+        await using RabbitMqTransportAdapter adapter = CreateAdapter();
+
+        OutboundMessage message = new(
+            routingKey: "test-no-exchange",
+            headers: new Dictionary<string, string>(),
+            body: Encoding.UTF8.GetBytes("{\"ping\":true}"),
+            contentType: "application/json");
+
+        // Act
+        Func<Task> act = async () => await adapter.SendBatchAsync([message], cts.Token);
+
+        // Assert — the adapter fails fast with a configuration error wrapped in a transport exception
+        (await act.Should().ThrowAsync<BareWireTransportException>())
+            .WithInnerException<BareWireConfigurationException>()
+            .WithMessage("*No exchange resolved*");
     }
 }

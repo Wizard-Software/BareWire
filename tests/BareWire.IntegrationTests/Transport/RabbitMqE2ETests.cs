@@ -380,7 +380,8 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
         byte[] messageBody = SerializeToJson(new TestOrder("ORD-NACK-01", 55.00m, "EUR"));
         OutboundMessage mainMessage = new(
             routingKey: mainQueueName,
-            headers: new Dictionary<string, string>(),
+            // Empty BW-Exchange explicitly targets the AMQP default exchange (no DefaultExchange configured).
+            headers: new Dictionary<string, string> { ["BW-Exchange"] = "" },
             body: messageBody,
             contentType: "application/json");
 
@@ -606,6 +607,8 @@ public sealed class RabbitMqE2ETests(AspireFixture fixture)
                 routingKey: queueName,
                 headers: new Dictionary<string, string>
                 {
+                    // Empty BW-Exchange explicitly targets the AMQP default exchange.
+                    ["BW-Exchange"] = "",
                     ["X-Seq"] = i.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 },
                 body: Encoding.UTF8.GetBytes($"{{\"seq\":{i}}}"),
