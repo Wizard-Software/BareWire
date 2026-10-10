@@ -51,7 +51,7 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// in the partial batch is processed individually (do NOT assume a full batch was returned, R-4).
 /// </para>
 /// </remarks>
-internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
+internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzureServiceBusReceiveControl
 {
     private readonly ServiceBusReceiver _receiver;
     private readonly Channel<InboundMessage> _channel;
@@ -61,9 +61,16 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
     private readonly ILogger _logger;
 
     private ulong _deliveryTagCounter;
+    private readonly AzureServiceBusShutdownBudget _shutdownBudget;
+
     private CancellationTokenSource? _loopCts;
     private Task? _loopTask;
+    private Task? _receiveStopTask;
+    private Task? _stopTask;
     private bool _disposed;
+
+    /// <summary>Time shared by every broker call made while this consumer hands its messages back.</summary>
+    internal static readonly TimeSpan ShutdownDrainBudget = TimeSpan.FromSeconds(5);
 
     internal AzureServiceBusConsumer(
         ServiceBusReceiver receiver,
@@ -71,7 +78,8 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
         AzureServiceBusConsumerRegistry registry,
         string consumerId,
         string endpointName,
-        ILogger logger)
+        ILogger logger,
+        TimeSpan? shutdownBudget = null)
     {
         ArgumentNullException.ThrowIfNull(receiver);
         ArgumentNullException.ThrowIfNull(channel);
@@ -86,6 +94,7 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
         _consumerId = consumerId;
         _endpointName = endpointName;
         _logger = logger;
+        _shutdownBudget = new AzureServiceBusShutdownBudget(shutdownBudget ?? ShutdownDrainBudget);
     }
 
     /// <summary>Gets the unique id of this consumer instance.</summary>
@@ -94,49 +103,80 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Starts the polling loop on a dedicated long-running task (D-1).
+    /// Starts the polling loop on a dedicated long-running task (D-1). The loop token is linked to
+    /// <paramref name="consumeToken"/>, so receiving stops the moment the consumer is cancelled — before
+    /// the caller settles the messages it still holds.
     /// </summary>
-    internal void StartLoop()
+    internal void StartLoop(CancellationToken consumeToken)
     {
-        _loopCts = new CancellationTokenSource();
+        _loopCts = CancellationTokenSource.CreateLinkedTokenSource(consumeToken);
+        CancellationToken loopToken = _loopCts.Token;
 
         // D-1: dedicated long-running task so the async poll does not occupy a thread-pool thread
         // for the full lifetime of the consumer when many consumers are active.
+        // The scheduling token is deliberately not passed: the loop body must always run to its finally.
         _loopTask = Task.Factory.StartNew(
-            async () => await RunLoopAsync(_loopCts.Token).ConfigureAwait(false),
-            _loopCts.Token,
+            async () => await RunLoopAsync(loopToken).ConfigureAwait(false),
+            CancellationToken.None,
             TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
             TaskScheduler.Default).Unwrap();
     }
 
+    /// <inheritdoc />
+    public bool IsStopRequested => _loopCts?.IsCancellationRequested ?? false;
+
+    /// <inheritdoc />
+    public Task EnsureReceiveStoppedAsync() =>
+        SingleFlight(ref _receiveStopTask, StopReceivingAsync);
+
     /// <summary>
-    /// Signals the polling loop to stop, completes the channel writer, unregisters this
-    /// consumer from the registry, and closes the receiver.
+    /// Stops receiving, hands back what is buffered, unregisters this consumer and closes the receiver.
+    /// Order: stop receive loop, complete the writer, drain (evict, abandon within the shared budget,
+    /// dispose), unregister, close. Single-flight and never throws.
     /// </summary>
-    internal async Task StopAsync()
+    internal Task StopAsync() => SingleFlight(ref _stopTask, StopCoreAsync);
+
+    private async Task StopReceivingAsync()
     {
         if (_loopCts is not null)
         {
             await _loopCts.CancelAsync().ConfigureAwait(false);
         }
 
-        if (_loopTask is not null)
+        if (_loopTask is null)
         {
-            try
-            {
-                await _loopTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected — the loop was cancelled.
-            }
-            catch (Exception ex)
-            {
-                LogLoopStopError(ex);
-            }
+            return;
         }
 
+        try
+        {
+            await _loopTask.WaitAsync(AzureServiceBusShutdownDrain.ReceiveStopTimeout).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected — the loop was cancelled.
+        }
+        catch (TimeoutException)
+        {
+            LogReceiveStopTimedOut(_consumerId, _endpointName);
+        }
+        catch (Exception ex)
+        {
+            AzureServiceBusErrorInfo error = AzureServiceBusErrorInfo.From(ex);
+            LogLoopStopError(error.ExceptionType, error.FailureReason);
+        }
+    }
+
+    private async Task StopCoreAsync()
+    {
+        await EnsureReceiveStoppedAsync().ConfigureAwait(false);
+
         _channel.Writer.TryComplete();
+
+        await AzureServiceBusShutdownDrain.DrainAsync(
+            _channel.Reader, _registry, _consumerId, _endpointName, abandon: true, _shutdownBudget, _logger)
+            .ConfigureAwait(false);
+
         _registry.Unregister(_consumerId);
 
         try
@@ -145,7 +185,39 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            LogReceiverCloseError(ex);
+            AzureServiceBusErrorInfo error = AzureServiceBusErrorInfo.From(ex);
+            LogReceiverCloseError(error.ExceptionType, error.FailureReason);
+        }
+    }
+
+    // Runs 'work' at most once; every caller gets the same task, which never faults ('work' handles its errors).
+    private static Task SingleFlight(ref Task? slot, Func<Task> work)
+    {
+        if (Volatile.Read(ref slot) is { } existing)
+        {
+            return existing;
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref slot, completion.Task, null) is { } prior)
+        {
+            return prior;
+        }
+
+        _ = RunAsync(work, completion);
+        return completion.Task;
+
+        static async Task RunAsync(Func<Task> work, TaskCompletionSource completion)
+        {
+            try
+            {
+                await work().ConfigureAwait(false);
+                completion.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                completion.TrySetException(ex);
+            }
         }
     }
 
@@ -162,6 +234,7 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         await _receiver.DisposeAsync().ConfigureAwait(false);
         _loopCts?.Dispose();
+        _shutdownBudget.Dispose();
     }
 
     // ── Polling loop ──────────────────────────────────────────────────────────
@@ -191,7 +264,8 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    LogReceiveError(ex);
+                    AzureServiceBusErrorInfo error = AzureServiceBusErrorInfo.From(ex);
+                    LogReceiveError(error.ExceptionType, error.FailureReason);
                     // Transient error — back off briefly and retry.
                     try
                     {
@@ -211,13 +285,18 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
                     continue;
                 }
 
-                foreach (ServiceBusReceivedMessage received in batch)
+                for (int i = 0; i < batch.Count; i++)
                 {
                     if (cancellationToken.IsCancellationRequested)
                     {
-                        break;
+                        // Received but never registered: hand the rest of the batch back right away
+                        // instead of leaving it locked until the lock expires.
+                        await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
+                            _receiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
+                        return;
                     }
 
+                    ServiceBusReceivedMessage received = batch[i];
                     InboundMessage message = BuildMessage(received);
 
                     // Back-pressure: block the loop until the bounded channel can accept a write.
@@ -242,17 +321,13 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
                             LogMessageDropped(_consumerId, _endpointName, message.DeliveryTag);
                         }
                     }
-                    catch (OperationCanceledException)
+                    catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
                     {
-                        // Disposing the message — nobody will consume it.
+                        // Nobody will consume this message or the rest of the batch: release them all.
                         _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
                         message.Dispose();
-                        return;
-                    }
-                    catch (ChannelClosedException)
-                    {
-                        _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
-                        message.Dispose();
+                        await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
+                            _receiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
                         return;
                     }
                 }
@@ -314,16 +389,20 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable
     private partial void LogConsumerStopped(string consumerId, string queueName);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus consumer: error receiving messages. Will retry after back-off.")]
-    private partial void LogReceiveError(Exception exception);
+        Message = "Azure Service Bus consumer: error receiving messages ({ExceptionType}, Reason={FailureReason}). Will retry after back-off.")]
+    private partial void LogReceiveError(string exceptionType, string failureReason);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus consumer loop terminated with an unexpected error.")]
-    private partial void LogLoopStopError(Exception exception);
+        Message = "Azure Service Bus consumer loop terminated with an unexpected error ({ExceptionType}, Reason={FailureReason}).")]
+    private partial void LogLoopStopError(string exceptionType, string failureReason);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Azure Service Bus receiver Close() threw an exception during shutdown.")]
-    private partial void LogReceiverCloseError(Exception exception);
+        Message = "Azure Service Bus receiver Close() threw an exception during shutdown ({ExceptionType}, Reason={FailureReason}).")]
+    private partial void LogReceiverCloseError(string exceptionType, string failureReason);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Azure Service Bus consumer {ConsumerId} on queue '{QueueName}': the receive loop did not stop in time; continuing shutdown.")]
+    private partial void LogReceiveStopTimedOut(string consumerId, string queueName);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Azure Service Bus consumer {ConsumerId} on queue '{QueueName}': message DeliveryTag={DeliveryTag} dropped by the bounded channel (non-Wait FullMode); registry entry evicted, PeekLock will expire and the message will be redelivered.")]

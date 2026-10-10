@@ -29,6 +29,12 @@ internal sealed partial class PubSubTransportAdapter
     /// </summary>
     internal PubSubInFlightRegistry InFlightRegistry => _inFlightRegistry;
 
+    /// <summary>
+    /// Gets or sets the total time a stopping consumer may spend on broker calls while handing back
+    /// the messages it still holds. Defaults to five seconds; settable for tests only.
+    /// </summary>
+    internal TimeSpan ShutdownDrainBudget { get; set; } = TimeSpan.FromSeconds(5);
+
     /// <inheritdoc />
     /// <remarks>
     /// <para>
@@ -64,23 +70,34 @@ internal sealed partial class PubSubTransportAdapter
                 SingleReader = false,
             });
 
+        // The polling loop runs on its own token, linked to the consume token, so that disposing the
+        // enumerator stops it even when the consume token is never cancelled.
+        using var pollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var shutdownBudget = new PubSubShutdownBudget(ShutdownDrainBudget);
+
+        string subscriptionNameStr = subscriptionName.ToString();
+
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            subscriptionName, flowControl, inboundChannel.Writer, cancellationToken);
+            subscriptionName, flowControl, inboundChannel.Writer, shutdownBudget, pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
         {
-            await foreach (InboundMessage message in inboundChannel.Reader
-                .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (InboundMessage message in PubSubShutdownDrain
+                .ReadUntilCancelledAsync(inboundChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
                 yield return message;
             }
         }
         finally
         {
-            // Signal the polling loop to stop (if not already cancelled).
-            inboundChannel.Writer.TryComplete();
+            // Shutdown order matters. Messages the caller already holds are settled by the caller through
+            // SettleAsync; everything else this consumer received must go back to the broker:
+            //   1. Stop the polling loop and wait for it (it hands back what it received after cancellation).
+            //   2. Drain the buffer: dispose each message, evict its registry entry and make it deliverable
+            //      again, all within one shared time budget so a stuck broker cannot stall shutdown.
+            await pollingCts.CancelAsync().ConfigureAwait(false);
             try
             {
                 await pollingTask.ConfigureAwait(false);
@@ -89,6 +106,10 @@ internal sealed partial class PubSubTransportAdapter
             {
                 // Expected on graceful cancellation.
             }
+
+            await PubSubShutdownDrain.DrainAndReleaseAsync(
+                inboundChannel.Reader, _inFlightRegistry, _subscriber!, subscriptionNameStr,
+                shutdownBudget, _logger).ConfigureAwait(false);
         }
     }
 
@@ -187,6 +208,7 @@ internal sealed partial class PubSubTransportAdapter
         SubscriptionName subscriptionName,
         FlowControlOptions flowControl,
         ChannelWriter<InboundMessage> writer,
+        PubSubShutdownBudget shutdownBudget,
         CancellationToken cancellationToken)
     {
         int maxMessages = Math.Min(_options.MaxOutstandingMessages, flowControl.InternalQueueCapacity);
@@ -214,7 +236,8 @@ internal sealed partial class PubSubTransportAdapter
                 }
                 catch (Exception ex)
                 {
-                    LogPollingError(subscriptionNameStr, ex.Message);
+                    PubSubErrorInfo error = PubSubErrorInfo.From(ex);
+                    LogPollingError(subscriptionNameStr, error.ExceptionType, error.StatusCode);
                     // Brief pause before retry to avoid tight error loops.
                     await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken)
                         .ConfigureAwait(false);
@@ -229,12 +252,19 @@ internal sealed partial class PubSubTransportAdapter
                     continue;
                 }
 
-                foreach (ReceivedMessage receivedMessage in response.ReceivedMessages)
+                for (int messageIndex = 0; messageIndex < response.ReceivedMessages.Count; messageIndex++)
                 {
                     if (cancellationToken.IsCancellationRequested)
                     {
+                        // Received but never registered or buffered: give the rest of the batch back now
+                        // instead of leaving it leased until the ack deadline expires.
+                        await PubSubShutdownDrain.ReleaseUnprocessedAsync(
+                            _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
+                            shutdownBudget, _logger).ConfigureAwait(false);
                         break;
                     }
+
+                    ReceivedMessage receivedMessage = response.ReceivedMessages[messageIndex];
 
                     ulong deliveryTag =
                         System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
@@ -313,7 +343,8 @@ internal sealed partial class PubSubTransportAdapter
         }
         catch (Exception ex)
         {
-            LogPollingFatalError(subscriptionNameStr, ex.Message);
+            PubSubErrorInfo error = PubSubErrorInfo.From(ex);
+            LogPollingFatalError(subscriptionNameStr, error.ExceptionType, error.StatusCode);
         }
         finally
         {
@@ -333,12 +364,14 @@ internal sealed partial class PubSubTransportAdapter
     private partial void LogConsumerStopped(string subscriptionName);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Pub/Sub polling error for subscription '{SubscriptionName}': {ErrorMessage}. Retrying.")]
-    private partial void LogPollingError(string subscriptionName, string errorMessage);
+        Message = "Pub/Sub polling error for subscription '{SubscriptionName}': {ExceptionType}, " +
+                  "StatusCode={StatusCode}. Retrying.")]
+    private partial void LogPollingError(string subscriptionName, string exceptionType, string statusCode);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Pub/Sub polling fatal error for subscription '{SubscriptionName}': {ErrorMessage}. Consumer loop exiting.")]
-    private partial void LogPollingFatalError(string subscriptionName, string errorMessage);
+        Message = "Pub/Sub polling fatal error for subscription '{SubscriptionName}': {ExceptionType}, " +
+                  "StatusCode={StatusCode}. Consumer loop exiting.")]
+    private partial void LogPollingFatalError(string subscriptionName, string exceptionType, string statusCode);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Pub/Sub in-flight registry full — dropping message DeliveryTag={DeliveryTag} for subscription '{SubscriptionName}'.")]

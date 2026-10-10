@@ -35,6 +35,11 @@ internal sealed class AzureServiceBusConsumerRegistry
     private readonly ConcurrentDictionary<string, AzureServiceBusConsumer> _consumers =
         new(StringComparer.Ordinal);
 
+    // Receive-stop handles of every registered consumer (session and non-session), resolved by SettleAsync
+    // while a consumer is stopping.
+    private readonly ConcurrentDictionary<string, IAzureServiceBusReceiveControl> _receiveControls =
+        new(StringComparer.Ordinal);
+
     // Per-consumer delivery-tag → (message, receiver) map.
     // Two-level to avoid cross-consumer DeliveryTag collisions (D-2).
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)>> _messageMaps =
@@ -56,6 +61,7 @@ internal sealed class AzureServiceBusConsumerRegistry
         ArgumentNullException.ThrowIfNull(consumer);
 
         _consumers[consumerId] = consumer;
+        _receiveControls[consumerId] = consumer;
         _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
     }
@@ -65,9 +71,19 @@ internal sealed class AzureServiceBusConsumerRegistry
     /// creating a fresh empty message map and session index without adding to
     /// <see cref="AllConsumers"/> (session consumers are tracked separately by the adapter).
     /// </summary>
-    internal void RegisterSession(string consumerId)
+    /// <param name="consumerId">The session consumer id.</param>
+    /// <param name="receiveControl">
+    /// Optional receive-stop handle, so that <c>SettleAsync</c> can wait for the session receive loops to stop
+    /// before it abandons a message while the consumer is stopping.
+    /// </param>
+    internal void RegisterSession(string consumerId, IAzureServiceBusReceiveControl? receiveControl = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(consumerId);
+
+        if (receiveControl is not null)
+        {
+            _receiveControls[consumerId] = receiveControl;
+        }
 
         _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
@@ -79,9 +95,26 @@ internal sealed class AzureServiceBusConsumerRegistry
     internal void Unregister(string consumerId)
     {
         _consumers.TryRemove(consumerId, out _);
+        _receiveControls.TryRemove(consumerId, out _);
         _messageMaps.TryRemove(consumerId, out _);
         _sessionIndex.TryRemove(consumerId, out _);
     }
+
+    /// <summary>
+    /// Looks up the receive-stop handle of a registered consumer (session or non-session).
+    /// </summary>
+    internal bool TryGetReceiveControl(
+        string consumerId,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IAzureServiceBusReceiveControl? control) =>
+        _receiveControls.TryGetValue(consumerId, out control);
+
+    /// <summary>Gets the number of in-flight messages currently tracked for <paramref name="consumerId"/>.</summary>
+    internal int InFlightCount(string consumerId) =>
+        _messageMaps.TryGetValue(
+            consumerId,
+            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>? map)
+            ? map.Count
+            : 0;
 
     /// <summary>
     /// Returns all registered consumers as a snapshot list.

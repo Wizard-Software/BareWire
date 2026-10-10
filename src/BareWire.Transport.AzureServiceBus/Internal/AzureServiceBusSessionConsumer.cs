@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Azure.Messaging.ServiceBus;
 using BareWire.Abstractions;
@@ -55,7 +56,7 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// operations. The receive loop and renew task therefore share the same receiver instance safely.
 /// </para>
 /// </remarks>
-internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
+internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable, IAzureServiceBusReceiveControl
 {
     // Minimum sleep floor in the renew loop, avoiding busy-spinning when locked-until is in the past.
     private static readonly TimeSpan RenewMinFloor = TimeSpan.FromSeconds(2);
@@ -74,9 +75,23 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
     // Accept-side concurrency gate (D-12/VER-3).
     private readonly SemaphoreSlim _acceptGate;
 
+    private readonly AzureServiceBusShutdownBudget _shutdownBudget;
+
+    // Completion handles of the per-session receive loops and of the whole per-session tasks. They let
+    // EnsureReceiveStoppedAsync wait for in-flight receive calls and StopAsync wait for session teardown.
+    private readonly ConcurrentDictionary<long, Task> _receiveLoops = new();
+    private readonly ConcurrentDictionary<long, Task> _sessionTasks = new();
+
     private ulong _deliveryTagCounter;
-    private CancellationTokenSource? _outerCts;
+    private long _taskSequence;
+
+    // Linked to the consume token. Stops ONLY the accept loop and the receive loops: session receivers stay
+    // open (lock renewed, settlement possible) until _teardownCts is cancelled by StopAsync.
+    private CancellationTokenSource? _receiveCts;
+    private CancellationTokenSource? _teardownCts;
     private Task? _outerTask;
+    private Task? _receiveStopTask;
+    private Task? _stopTask;
     private bool _disposed;
 
     internal AzureServiceBusSessionConsumer(
@@ -87,7 +102,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
         string consumerId,
         Channel<InboundMessage> outputChannel,
         FlowControlOptions flowControl,
-        ILogger logger)
+        ILogger logger,
+        TimeSpan? shutdownBudget = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
@@ -107,6 +123,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
         _flowControl = flowControl;
         _logger = logger;
 
+        _shutdownBudget = new AzureServiceBusShutdownBudget(
+            shutdownBudget ?? AzureServiceBusConsumer.ShutdownDrainBudget);
         _acceptGate = new SemaphoreSlim(options.MaxConcurrentSessions, options.MaxConcurrentSessions);
     }
 
@@ -121,48 +139,126 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Starts the outer accept loop on a dedicated long-running task.
+    /// Starts the outer accept loop on a dedicated long-running task. <paramref name="consumeToken"/> stops
+    /// session accepting and receiving; it does NOT close the session receivers — the caller may still
+    /// settle in-flight messages on them until <see cref="StopAsync"/> runs.
     /// </summary>
-    internal void StartLoop()
+    internal void StartLoop(CancellationToken consumeToken)
     {
-        _outerCts = new CancellationTokenSource();
+        _receiveCts = CancellationTokenSource.CreateLinkedTokenSource(consumeToken);
+        _teardownCts = new CancellationTokenSource();
+        CancellationToken receiveToken = _receiveCts.Token;
 
+        // The scheduling token is deliberately not passed: the loop body must always run to its finally.
         _outerTask = Task.Factory.StartNew(
-            async () => await RunAcceptLoopAsync(_outerCts.Token).ConfigureAwait(false),
-            _outerCts.Token,
+            async () => await RunAcceptLoopAsync(receiveToken).ConfigureAwait(false),
+            CancellationToken.None,
             TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
             TaskScheduler.Default).Unwrap();
     }
 
+    /// <inheritdoc />
+    public bool IsStopRequested => _receiveCts?.IsCancellationRequested ?? false;
+
+    /// <inheritdoc />
+    public Task EnsureReceiveStoppedAsync() =>
+        SingleFlight(ref _receiveStopTask, StopReceivingAsync);
+
     /// <summary>
-    /// Signals the outer accept loop to stop and waits for it to finish.
-    /// Completes the output channel writer so callers draining the channel receive EOF.
+    /// Stops receiving, waits for the per-session tasks to tear their receivers down, hands back whatever is
+    /// still buffered and unregisters this consumer. Closing a session receiver releases its locks, so
+    /// buffered messages are only evicted and disposed — never abandoned one by one. Single-flight and
+    /// never throws.
     /// </summary>
-    internal async Task StopAsync()
+    internal Task StopAsync() => SingleFlight(ref _stopTask, StopCoreAsync);
+
+    private async Task StopReceivingAsync()
     {
-        if (_outerCts is not null)
+        if (_receiveCts is not null)
         {
-            await _outerCts.CancelAsync().ConfigureAwait(false);
+            await _receiveCts.CancelAsync().ConfigureAwait(false);
         }
 
-        if (_outerTask is not null)
+        await WaitBoundedAsync(_outerTask is null ? [] : [_outerTask]).ConfigureAwait(false);
+        await WaitBoundedAsync([.. _receiveLoops.Values]).ConfigureAwait(false);
+    }
+
+    private async Task StopCoreAsync()
+    {
+        await EnsureReceiveStoppedAsync().ConfigureAwait(false);
+
+        // The runner has settled its in-flight messages by now (this runs from the enumerator's finally), so
+        // the session receivers may be torn down.
+        if (_teardownCts is not null)
+        {
+            await _teardownCts.CancelAsync().ConfigureAwait(false);
+        }
+
+        await WaitBoundedAsync([.. _sessionTasks.Values]).ConfigureAwait(false);
+
+        _outputChannel.Writer.TryComplete();
+
+        await AzureServiceBusShutdownDrain.DrainAsync(
+            _outputChannel.Reader, _registry, _consumerId, _endpointName, abandon: false, _shutdownBudget, _logger)
+            .ConfigureAwait(false);
+
+        _registry.Unregister(_consumerId);
+    }
+
+    private async Task WaitBoundedAsync(IReadOnlyList<Task> tasks)
+    {
+        if (tasks.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).WaitAsync(AzureServiceBusShutdownDrain.ReceiveStopTimeout).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected — the loops were cancelled.
+        }
+        catch (TimeoutException)
+        {
+            LogStopTimedOut(_consumerId, _endpointName);
+        }
+        catch (Exception ex)
+        {
+            LogOuterLoopStopError(AzureServiceBusErrorInfo.From(ex));
+        }
+    }
+
+    // Runs 'work' at most once; every caller gets the same task, which never faults ('work' handles its errors).
+    private static Task SingleFlight(ref Task? slot, Func<Task> work)
+    {
+        if (Volatile.Read(ref slot) is { } existing)
+        {
+            return existing;
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (Interlocked.CompareExchange(ref slot, completion.Task, null) is { } prior)
+        {
+            return prior;
+        }
+
+        _ = RunAsync(work, completion);
+        return completion.Task;
+
+        static async Task RunAsync(Func<Task> work, TaskCompletionSource completion)
         {
             try
             {
-                await _outerTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected — the outer loop was cancelled.
+                await work().ConfigureAwait(false);
+                completion.TrySetResult();
             }
             catch (Exception ex)
             {
-                LogOuterLoopStopError(ex);
+                completion.TrySetException(ex);
             }
         }
-
-        _outputChannel.Writer.TryComplete();
-        _registry.Unregister(_consumerId);
     }
 
     /// <inheritdoc />
@@ -177,7 +273,9 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
 
         await StopAsync().ConfigureAwait(false);
 
-        _outerCts?.Dispose();
+        _receiveCts?.Dispose();
+        _teardownCts?.Dispose();
+        _shutdownBudget.Dispose();
         _acceptGate.Dispose();
     }
 
@@ -238,7 +336,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 catch (Exception ex)
                 {
                     _acceptGate.Release();
-                    LogAcceptSessionError(ex);
+                    LogAcceptSessionError(AzureServiceBusErrorInfo.From(ex));
 
                     try
                     {
@@ -266,8 +364,13 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 // receiver so neither the AMQP link nor the semaphore slot leaks.
                 // On the success path the permit is released exactly once by the task's finally.
                 bool dispatched = false;
+                long taskId = Interlocked.Increment(ref _taskSequence);
+                var sessionDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _sessionTasks[taskId] = sessionDone.Task;
                 try
                 {
+                    // The scheduling token is deliberately not passed: once a session is accepted the task
+                    // must run so it can release the permit and dispose the receiver.
                     _ = Task.Factory.StartNew(
                         async () =>
                         {
@@ -278,9 +381,11 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                             finally
                             {
                                 _acceptGate.Release();
+                                _sessionTasks.TryRemove(taskId, out _);
+                                sessionDone.TrySetResult();
                             }
                         },
-                        outerToken,
+                        CancellationToken.None,
                         TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
                         TaskScheduler.Default).Unwrap();
 
@@ -292,6 +397,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                     // to avoid leaking either resource. Do NOT re-throw: the outer accept loop
                     // should continue accepting sessions if possible.
                     _acceptGate.Release();
+                    _sessionTasks.TryRemove(taskId, out _);
+                    sessionDone.TrySetResult();
 
                     try
                     {
@@ -299,10 +406,10 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                     }
                     catch (Exception disposeEx)
                     {
-                        LogSessionReceiverDisposeError(disposeEx, sessionId);
+                        LogSessionReceiverDisposeError(AzureServiceBusErrorInfo.From(disposeEx), sessionId);
                     }
 
-                    LogAcceptSessionError(ex);
+                    LogAcceptSessionError(AzureServiceBusErrorInfo.From(ex));
                 }
 
                 _ = dispatched; // suppress unused-variable warning
@@ -319,7 +426,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
     private async Task ProcessSessionAsync(
         ServiceBusSessionReceiver sessionReceiver,
         string sessionId,
-        CancellationToken outerCancellationToken)
+        CancellationToken receiveToken)
     {
         // Per-session bounded channel (D-9/PERF-1):
         // SingleWriter = true is legal because this session task is the ONLY writer.
@@ -328,9 +435,11 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
         Channel<InboundMessage> sessionChannel = Channel.CreateBounded<InboundMessage>(
             BuildSessionChannelOptions(_flowControl.InternalQueueCapacity));
 
-        // Per-session CTS — shared by the receive loop and the renew task.
+        // Teardown scope of this session — shared by the renew task and the forwarding task. It is cancelled
+        // only once the consumer is being torn down (after the caller settled its in-flight messages) or
+        // when the session ends on its own, NOT when receiving merely stops.
         using CancellationTokenSource sessionCts =
-            CancellationTokenSource.CreateLinkedTokenSource(outerCancellationToken);
+            CancellationTokenSource.CreateLinkedTokenSource(_teardownCts!.Token);
 
         CancellationToken sessionToken = sessionCts.Token;
 
@@ -354,9 +463,22 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
 
         bool sessionLockLost = false;
 
+        // Registered before the loop starts so EnsureReceiveStoppedAsync can never miss an in-flight receive.
+        long loopId = Interlocked.Increment(ref _taskSequence);
+        var loopDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _receiveLoops[loopId] = loopDone.Task;
+
         try
         {
-            await RunSessionReceiveLoopAsync(sessionReceiver, sessionId, sessionChannel, sessionToken).ConfigureAwait(false);
+            try
+            {
+                await RunSessionReceiveLoopAsync(sessionReceiver, sessionId, sessionChannel, receiveToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _receiveLoops.TryRemove(loopId, out _);
+                loopDone.TrySetResult();
+            }
         }
         catch (ServiceBusException sbEx) when (sbEx.Reason == ServiceBusFailureReason.SessionLockLost)
         {
@@ -366,16 +488,24 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            // Outer cancellation — normal shutdown.
+            // Consume token cancelled — normal shutdown.
         }
         catch (Exception ex)
         {
-            LogSessionReceiveError(ex, sessionId);
+            LogSessionReceiveError(AzureServiceBusErrorInfo.From(ex), sessionId);
         }
         finally
         {
+            // Receiving stopped because the consumer is stopping: the caller may still settle the messages it
+            // holds from this session, so the receiver (and its lock renewal) must stay alive until StopAsync
+            // tears the consumer down. A session that ended on its own (idle, lock lost) is released at once.
+            if (receiveToken.IsCancellationRequested && !sessionLockLost)
+            {
+                await WaitForTeardownAsync().ConfigureAwait(false);
+            }
+
             // Cleanup sequence (D-11/VER-2):
-            // 1. Cancel the session CTS (stops receive loop and renew task peer).
+            // 1. Cancel the session CTS (stops the renew task and the forwarding task).
             await sessionCts.CancelAsync().ConfigureAwait(false);
 
             // 2. Wait for renew task to finish.
@@ -384,7 +514,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 await renewTask.ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { LogRenewTaskError(ex, sessionId); }
+            catch (Exception ex) { LogRenewTaskError(AzureServiceBusErrorInfo.From(ex), sessionId); }
 
             // 3. Complete the per-session channel so the drain task terminates.
             sessionChannel.Writer.TryComplete();
@@ -395,22 +525,40 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 await drainTask.ConfigureAwait(false);
             }
             catch (OperationCanceledException) { }
-            catch (Exception ex) { LogDrainTaskError(ex, sessionId); }
+            catch (Exception ex) { LogDrainTaskError(AzureServiceBusErrorInfo.From(ex), sessionId); }
+
+            // Messages that never left the per-session channel are not consumed by anyone.
+            while (sessionChannel.Reader.TryRead(out InboundMessage? unforwarded))
+            {
+                unforwarded.Dispose();
+            }
 
             // 5. Bulk-evict all in-flight registry entries for this session (D-11/VER-2).
             _registry.EvictAllForSession(_consumerId, sessionId);
 
-            // 6. Dispose the session receiver.
+            // 6. Dispose the session receiver (this also releases the locks of its unsettled messages).
             try
             {
                 await sessionReceiver.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                LogSessionReceiverDisposeError(ex, sessionId);
+                LogSessionReceiverDisposeError(AzureServiceBusErrorInfo.From(ex), sessionId);
             }
 
             LogSessionReleased(_consumerId, _endpointName, sessionId, sessionLockLost);
+        }
+    }
+
+    private async Task WaitForTeardownAsync()
+    {
+        try
+        {
+            await Task.Delay(Timeout.Infinite, _teardownCts!.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected — StopAsync signalled the teardown.
         }
     }
 
@@ -443,7 +591,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                LogReceiveError(ex, sessionId);
+                LogReceiveError(AzureServiceBusErrorInfo.From(ex), sessionId);
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false);
@@ -462,14 +610,17 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 break;
             }
 
-            foreach (ServiceBusReceivedMessage received in batch)
+            for (int i = 0; i < batch.Count; i++)
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
-                    break;
+                    // Received but never registered: hand the rest of the batch back right away.
+                    await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
+                        sessionReceiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
+                    return;
                 }
 
-                InboundMessage message = BuildMessage(received, sessionReceiver, sessionId);
+                InboundMessage message = BuildMessage(batch[i], sessionReceiver, sessionId);
 
                 // Back-pressure: block until the per-session channel can accept a write.
                 // PERF-1 drop-detection: check TryWrite result.
@@ -484,16 +635,12 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                         LogMessageDropped(_consumerId, _endpointName, message.DeliveryTag, sessionId);
                     }
                 }
-                catch (OperationCanceledException)
+                catch (Exception ex) when (ex is OperationCanceledException or ChannelClosedException)
                 {
                     _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
                     message.Dispose();
-                    return;
-                }
-                catch (ChannelClosedException)
-                {
-                    _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
-                    message.Dispose();
+                    await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
+                        sessionReceiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
                     return;
                 }
             }
@@ -606,7 +753,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    LogRenewError(ex, sessionId);
+                    LogRenewError(AzureServiceBusErrorInfo.From(ex), sessionId);
                     // Continue retrying — transient error.
                 }
             }
@@ -715,38 +862,42 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable
     private partial void LogRenewDurationExceeded(string consumerId, string queueName, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error accepting session on queue. Will back off and retry.")]
-    private partial void LogAcceptSessionError(Exception exception);
+        Message = "Azure Service Bus session consumer: error accepting session on queue. Will back off and retry ({Error}).")]
+    private partial void LogAcceptSessionError(AzureServiceBusErrorInfo error);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error receiving messages for session '{SessionId}'. Will retry after back-off.")]
-    private partial void LogReceiveError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: error receiving messages for session '{SessionId}'. Will retry after back-off ({Error}).")]
+    private partial void LogReceiveError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: unexpected error in session '{SessionId}' receive loop.")]
-    private partial void LogSessionReceiveError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: unexpected error in session '{SessionId}' receive loop ({Error}).")]
+    private partial void LogSessionReceiveError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error in renew task for session '{SessionId}'.")]
-    private partial void LogRenewError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: error in renew task for session '{SessionId}' ({Error}).")]
+    private partial void LogRenewError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error in renew task for session '{SessionId}' during shutdown.")]
-    private partial void LogRenewTaskError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: error in renew task for session '{SessionId}' during shutdown ({Error}).")]
+    private partial void LogRenewTaskError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error in drain task for session '{SessionId}' during shutdown.")]
-    private partial void LogDrainTaskError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: error in drain task for session '{SessionId}' during shutdown ({Error}).")]
+    private partial void LogDrainTaskError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer: error disposing session receiver for session '{SessionId}'.")]
-    private partial void LogSessionReceiverDisposeError(Exception exception, string sessionId);
+        Message = "Azure Service Bus session consumer: error disposing session receiver for session '{SessionId}' ({Error}).")]
+    private partial void LogSessionReceiverDisposeError(AzureServiceBusErrorInfo error, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "Azure Service Bus session consumer loop terminated with an unexpected error.")]
-    private partial void LogOuterLoopStopError(Exception exception);
+        Message = "Azure Service Bus session consumer loop terminated with an unexpected error ({Error}).")]
+    private partial void LogOuterLoopStopError(AzureServiceBusErrorInfo error);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': message DeliveryTag={DeliveryTag} dropped by the per-session bounded channel (non-Wait FullMode); registry entry evicted. SessionId='{SessionId}'.")]
     private partial void LogMessageDropped(string consumerId, string queueName, ulong deliveryTag, string sessionId);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': session tasks did not stop in time; continuing shutdown.")]
+    private partial void LogStopTimedOut(string consumerId, string queueName);
 }

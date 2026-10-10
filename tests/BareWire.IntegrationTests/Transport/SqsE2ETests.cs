@@ -419,6 +419,25 @@ public sealed class SqsE2ETests
                 break;
             }
 
+            // SQS only redrives on a receive attempt that exceeds maxReceiveCount, so the source queue
+            // must keep being polled after the Reject; the broker (not the consumer) moves the message.
+            using CancellationTokenSource pumpCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
+            Task sourcePump = Task.Run(async () =>
+            {
+                try
+                {
+                    await foreach (InboundMessage ignored in adapter.ConsumeAsync(
+                        sourceName, StandardFlow(), pumpCts.Token))
+                    {
+                        // Any delivery here is unexpected; the redrive policy should divert it.
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected on shutdown.
+                }
+            }, CancellationToken.None);
+
             // Poll the DLQ until the message arrives or the budget expires.
             bool arrivedInDlq = false;
 
@@ -428,6 +447,9 @@ public sealed class SqsE2ETests
                 await adapter.SettleAsync(SettlementAction.Ack, dlqMsg, cts.Token);
                 break;
             }
+
+            await pumpCts.CancelAsync();
+            await sourcePump;
 
             arrivedInDlq.Should().BeTrue(
                 because: "after Reject with maxReceiveCount=1, the RedrivePolicy must move the message to the DLQ");

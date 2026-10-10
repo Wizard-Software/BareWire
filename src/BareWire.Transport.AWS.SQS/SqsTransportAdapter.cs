@@ -248,18 +248,29 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                 // PERF-1: Build O(n) dictionaries from the response lists ONCE before the
                 // per-entry loop. Successful and Failed are unordered — index by Id for O(1)
                 // TryGetValue per entry instead of O(n) FirstOrDefault scans inside the loop.
+                // AWSSDK.SQS v4 leaves response collections null (not empty) when the service returns
+                // none of them, so both lists are null-checked rather than assumed present.
+                List<SendMessageBatchResultEntry>? successful = response.Successful;
+                List<BatchResultErrorEntry>? failed = response.Failed;
+
                 var successById = new Dictionary<string, SendMessageBatchResultEntry>(
-                    response.Successful.Count, StringComparer.Ordinal);
-                foreach (SendMessageBatchResultEntry s in response.Successful)
+                    successful?.Count ?? 0, StringComparer.Ordinal);
+                if (successful is not null)
                 {
-                    successById[s.Id] = s;
+                    foreach (SendMessageBatchResultEntry s in successful)
+                    {
+                        successById[s.Id] = s;
+                    }
                 }
 
                 var failedById = new Dictionary<string, BatchResultErrorEntry>(
-                    response.Failed.Count, StringComparer.Ordinal);
-                foreach (BatchResultErrorEntry f in response.Failed)
+                    failed?.Count ?? 0, StringComparer.Ordinal);
+                if (failed is not null)
                 {
-                    failedById[f.Id] = f;
+                    foreach (BatchResultErrorEntry f in failed)
+                    {
+                        failedById[f.Id] = f;
+                    }
                 }
 
                 for (int j = 0; j < chunkSize; j++)
@@ -419,7 +430,15 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
                         cancellationToken)
                     .ConfigureAwait(false);
 
-                string dlqArn = dlqAttrs.Attributes["QueueArn"];
+                // AWSSDK.SQS v4 returns null (not an empty dictionary) when no attributes come back.
+                if (dlqAttrs.Attributes is null ||
+                    !dlqAttrs.Attributes.TryGetValue("QueueArn", out string? dlqArn))
+                {
+                    throw new BareWireTransportException(
+                        message: $"SQS did not return a QueueArn for dead-letter queue '{spec.DeadLetterQueueName}'.",
+                        transportName: TransportName,
+                        endpointAddress: null);
+                }
 
                 string sourceUrl = await GetOrResolveQueueUrlAsync(queue.Name, cancellationToken)
                     .ConfigureAwait(false);
@@ -532,17 +551,7 @@ internal sealed partial class SqsTransportAdapter : ITransportAdapter, IAsyncDis
 
     private AmazonSQSClient BuildClient()
     {
-        var config = new AmazonSQSConfig();
-
-        if (!string.IsNullOrEmpty(_options.RegionEndpoint))
-        {
-            config.RegionEndpoint = RegionEndpoint.GetBySystemName(_options.RegionEndpoint);
-        }
-
-        if (!string.IsNullOrEmpty(_options.ServiceUrl))
-        {
-            config.ServiceURL = _options.ServiceUrl;
-        }
+        AmazonSQSConfig config = SqsClientConfigFactory.Create(_options);
 
         return _options.AuthMode switch
         {

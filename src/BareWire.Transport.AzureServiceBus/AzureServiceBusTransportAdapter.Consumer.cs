@@ -103,14 +103,14 @@ internal sealed partial class AzureServiceBusTransportAdapter
             logger: _logger);
 
         _consumerRegistry.Register(consumerId, consumer);
-        consumer.StartLoop();
+        consumer.StartLoop(cancellationToken);
 
         LogConsumerRegistered(consumerId, endpointName);
 
         try
         {
-            await foreach (InboundMessage message in inboundChannel.Reader
-                .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (InboundMessage message in AzureServiceBusShutdownDrain
+                .ReadUntilCancelledAsync(inboundChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
                 yield return message;
             }
@@ -156,22 +156,23 @@ internal sealed partial class AzureServiceBusTransportAdapter
             logger: _logger);
 
         // Session consumers are tracked in _sessionConsumers, not in _consumerRegistry._consumers.
-        // RegisterSession creates the message map and session index without touching AllConsumers().
-        _consumerRegistry.RegisterSession(consumerId);
+        // RegisterSession creates the message map and session index without touching AllConsumers(); the
+        // receive-stop handle lets SettleAsync wait for the receive loops before it abandons a message.
+        _consumerRegistry.RegisterSession(consumerId, sessionConsumer);
 
         lock (_sessionConsumersLock)
         {
             _sessionConsumers.Add(sessionConsumer);
         }
 
-        sessionConsumer.StartLoop();
+        sessionConsumer.StartLoop(cancellationToken);
 
         LogSessionConsumerRegistered(consumerId, endpointName);
 
         try
         {
-            await foreach (InboundMessage message in outputChannel.Reader
-                .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (InboundMessage message in AzureServiceBusShutdownDrain
+                .ReadUntilCancelledAsync(outputChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
                 yield return message;
             }
@@ -231,6 +232,15 @@ internal sealed partial class AzureServiceBusTransportAdapter
         }
 
         AzureServiceBusSettlementOperation operation = AzureServiceBusSettlementRouter.Map(action);
+
+        // A requeue while the consumer is stopping must not race the receive loop: if it were still running,
+        // the broker could hand the abandoned message straight back to this very consumer.
+        if (operation == AzureServiceBusSettlementOperation.Abandon &&
+            _consumerRegistry.TryGetReceiveControl(consumerId, out IAzureServiceBusReceiveControl? receiveControl) &&
+            receiveControl.IsStopRequested)
+        {
+            await receiveControl.EnsureReceiveStoppedAsync().ConfigureAwait(false);
+        }
 
         try
         {
