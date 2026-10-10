@@ -262,6 +262,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     {
         ArgumentNullException.ThrowIfNull(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+        ValidateFlowControl(flowControl);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         try
@@ -285,14 +286,22 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 cancellationToken)
             .ConfigureAwait(false);
 
+        // ValidateFlowControl guarantees MaxInFlightMessages > 0 at int level, so the narrowing cast is safe.
+        ushort prefetchCount = (ushort)Math.Min(flowControl.MaxInFlightMessages, ushort.MaxValue);
+
         await consumerChannel.BasicQosAsync(
             prefetchSize: 0,
-            prefetchCount: (ushort)Math.Min(flowControl.MaxInFlightMessages, ushort.MaxValue),
+            prefetchCount: prefetchCount,
             global: false,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
+        // Invariant: the broker never has more than prefetchCount unacknowledged deliveries for this consumer
+        // (basic.qos with global: false applies per consumer, and there is one consumer per channel), so a
+        // buffer of at least that size cannot be full while the writer is open. The buffer stays bounded
+        // (at most ushort.MaxValue entries).
+        int bufferCapacity = Math.Max(flowControl.InternalQueueCapacity, prefetchCount);
         Channel<InboundMessage> inboundChannel = Channel.CreateBounded<InboundMessage>(
-            new BoundedChannelOptions(flowControl.InternalQueueCapacity)
+            new BoundedChannelOptions(bufferCapacity)
             {
                 FullMode = flowControl.FullMode,
                 SingleWriter = true,
@@ -392,6 +401,24 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                     LogConsumeChannelCloseError(endpointName, ex);
                 }
             }
+        }
+    }
+
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        // Checked on the int values, before any narrowing to ushort (a negative value would wrap to a huge prefetch,
+        // and 0 means an unlimited AMQP prefetch).
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            // Defence-in-depth guarding the "buffer >= prefetch" invariant: if that invariant ever changed,
+            // the Drop* modes would silently lose deliveries without settling them with the broker.
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "RabbitMQ consumers support only BoundedChannelFullMode.Wait.");
         }
     }
 

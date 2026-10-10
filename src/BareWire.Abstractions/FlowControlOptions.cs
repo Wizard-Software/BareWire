@@ -27,6 +27,12 @@ public sealed class FlowControlOptions
     /// received from the transport before they are handed off to consumer handlers.
     /// Defaults to <c>1,000</c>.
     /// </summary>
+    /// <remarks>
+    /// The RabbitMQ transport raises its internal buffer to at least the prefetch count
+    /// (<see cref="MaxInFlightMessages"/>, capped at 65535), so that a full prefetch window always fits.
+    /// Its worst-case buffer memory is therefore the prefetch count multiplied by the message body size;
+    /// <see cref="MaxInFlightBytes"/> does not bound that buffer.
+    /// </remarks>
     public int InternalQueueCapacity { get; set; } = 1_000;
 
     /// <summary>
