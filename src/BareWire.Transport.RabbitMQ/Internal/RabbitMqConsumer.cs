@@ -282,7 +282,9 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
                 return;
             }
 
-            // Buffer full: nack-requeue so the broker can redeliver it later or to another consumer.
+            // Reaching this point means the "buffer >= prefetch" invariant is broken (the adapter sizes the
+            // buffer to hold at least a full prefetch window). Kept as a defensive fallback: nack-requeue so the
+            // broker can redeliver the message later or to another consumer.
             await Channel.BasicNackAsync(deliveryTag, multiple: false, requeue: true, cancellationToken)
                 .ConfigureAwait(false);
         }
