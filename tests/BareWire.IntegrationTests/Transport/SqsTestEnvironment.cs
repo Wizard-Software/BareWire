@@ -89,7 +89,6 @@ internal static class SqsTestEnvironment
             {
                 ServiceURL = ServiceUrl,
                 AuthenticationRegion = "us-east-1",
-                RegionEndpoint = RegionEndpoint.USEast1,
             });
 
         try

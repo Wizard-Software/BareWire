@@ -29,6 +29,12 @@ internal sealed partial class SqsTransportAdapter
     /// </summary>
     internal SqsInFlightRegistry InFlightRegistry => _inFlightRegistry;
 
+    /// <summary>
+    /// Gets or sets the total time a stopping consumer may spend on broker calls while handing back
+    /// the messages it still holds. Defaults to five seconds; settable for tests only.
+    /// </summary>
+    internal TimeSpan ShutdownDrainBudget { get; set; } = TimeSpan.FromSeconds(5);
+
     /// <inheritdoc />
     /// <remarks>
     /// <para>
@@ -66,23 +72,32 @@ internal sealed partial class SqsTransportAdapter
                 SingleReader = false,
             });
 
+        // The polling loop runs on its own token, linked to the consume token, so that disposing the
+        // enumerator stops it even when the consume token is never cancelled.
+        using var pollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var shutdownBudget = new SqsShutdownBudget(ShutdownDrainBudget);
+
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            queueUrl, endpointName, flowControl, inboundChannel.Writer, cancellationToken);
+            queueUrl, endpointName, flowControl, inboundChannel.Writer, shutdownBudget, pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
         {
-            await foreach (InboundMessage message in inboundChannel.Reader
-                .ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (InboundMessage message in SqsShutdownDrain
+                .ReadUntilCancelledAsync(inboundChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
                 yield return message;
             }
         }
         finally
         {
-            // Signal the polling loop to stop (if not already cancelled).
-            inboundChannel.Writer.TryComplete();
+            // Shutdown order matters. Messages the caller already holds are settled by the caller through
+            // SettleAsync; everything else this consumer received must go back to the broker:
+            //   1. Stop the polling loop and wait for it (it hands back what it received after cancellation).
+            //   2. Drain the buffer: dispose each message, evict its registry entry and make it visible
+            //      again, all within one shared time budget so a stuck broker cannot stall shutdown.
+            await pollingCts.CancelAsync().ConfigureAwait(false);
             try
             {
                 await pollingTask.ConfigureAwait(false);
@@ -91,6 +106,10 @@ internal sealed partial class SqsTransportAdapter
             {
                 // Expected on graceful cancellation.
             }
+
+            await SqsShutdownDrain.DrainAndReleaseAsync(
+                inboundChannel.Reader, _inFlightRegistry, _client!, queueUrl, endpointName,
+                shutdownBudget, _logger).ConfigureAwait(false);
         }
     }
 
@@ -190,6 +209,7 @@ internal sealed partial class SqsTransportAdapter
         string endpointName,
         FlowControlOptions flowControl,
         ChannelWriter<InboundMessage> writer,
+        SqsShutdownBudget shutdownBudget,
         CancellationToken cancellationToken)
     {
         int maxMessages = Math.Min(_options.MaxNumberOfMessages, flowControl.InternalQueueCapacity);
@@ -221,19 +241,34 @@ internal sealed partial class SqsTransportAdapter
                 }
                 catch (Exception ex)
                 {
-                    LogPollingError(endpointName, ex.Message);
+                    SqsErrorInfo error = SqsErrorInfo.From(ex);
+                    LogPollingError(endpointName, error.ExceptionType, error.ErrorCode, error.StatusCode);
                     // Brief pause before retry to avoid tight error loops.
                     await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken)
                         .ConfigureAwait(false);
                     continue;
                 }
 
-                foreach (Message sqsMessage in response.Messages)
+                // AWSSDK.SQS v4 leaves Messages null (not empty) when the long poll times out.
+                List<Message>? receivedMessages = response.Messages;
+                if (receivedMessages is null || receivedMessages.Count == 0)
+                {
+                    continue;
+                }
+
+                for (int messageIndex = 0; messageIndex < receivedMessages.Count; messageIndex++)
                 {
                     if (cancellationToken.IsCancellationRequested)
                     {
+                        // Received but never registered or buffered: give the rest of the batch back now
+                        // instead of leaving it invisible until the visibility timeout expires.
+                        await SqsShutdownDrain.ReleaseUnprocessedAsync(
+                            _client!, queueUrl, endpointName, receivedMessages, messageIndex,
+                            shutdownBudget, _logger).ConfigureAwait(false);
                         break;
                     }
+
+                    Message sqsMessage = receivedMessages[messageIndex];
 
                     ulong deliveryTag =
                         System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
@@ -334,7 +369,8 @@ internal sealed partial class SqsTransportAdapter
         }
         catch (Exception ex)
         {
-            LogPollingFatalError(endpointName, ex.Message);
+            SqsErrorInfo error = SqsErrorInfo.From(ex);
+            LogPollingFatalError(endpointName, error.ExceptionType, error.ErrorCode, error.StatusCode);
         }
         finally
         {
@@ -354,12 +390,14 @@ internal sealed partial class SqsTransportAdapter
     private partial void LogConsumerStopped(string queueName);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS polling error for queue '{QueueName}': {ErrorMessage}. Retrying.")]
-    private partial void LogPollingError(string queueName, string errorMessage);
+        Message = "SQS polling error for queue '{QueueName}': {ExceptionType}, ErrorCode={ErrorCode}, " +
+                  "StatusCode={StatusCode}. Retrying.")]
+    private partial void LogPollingError(string queueName, string exceptionType, string errorCode, int statusCode);
 
     [LoggerMessage(Level = LogLevel.Error,
-        Message = "SQS polling fatal error for queue '{QueueName}': {ErrorMessage}. Consumer loop exiting.")]
-    private partial void LogPollingFatalError(string queueName, string errorMessage);
+        Message = "SQS polling fatal error for queue '{QueueName}': {ExceptionType}, ErrorCode={ErrorCode}, " +
+                  "StatusCode={StatusCode}. Consumer loop exiting.")]
+    private partial void LogPollingFatalError(string queueName, string exceptionType, string errorCode, int statusCode);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "SQS in-flight registry full — dropping message DeliveryTag={DeliveryTag} for queue '{QueueName}'.")]

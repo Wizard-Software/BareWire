@@ -87,6 +87,21 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
         _logger = logger;
     }
 
+    /// <summary>
+    /// Creates an adapter that uses an already-built <see cref="ServiceBusClient"/>. Intended for tests that
+    /// substitute the client; the adapter takes ownership and disposes it.
+    /// </summary>
+    internal AzureServiceBusTransportAdapter(
+        AzureServiceBusTransportOptions options,
+        ILogger<AzureServiceBusTransportAdapter> logger,
+        ServiceBusClient client)
+        : this(options, logger)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+
+        _client = client;
+    }
+
     /// <inheritdoc />
     public string TransportName => "AzureServiceBus";
 
