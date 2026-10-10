@@ -331,22 +331,36 @@ internal sealed partial class ReceiveEndpointRunner
                 .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken)
                 .ConfigureAwait(false))
             {
-                // Capture the channel ID from the first message — all messages on the same
-                // ConsumeAsync stream share the same BW-ConsumerChannelId.
-                consumerChannelId ??= message.Headers.TryGetValue("BW-ConsumerChannelId", out string? channelId)
-                    ? channelId
-                    : null;
-
-                long bodyLength = message.Body.Length;
+                long bodyLength = 0;
                 bool creditGranted = false;
                 long sequence;
 
+                // The action used when the window below faults with a non-cancellation exception. It names
+                // the phase that failed: a fault that is a property of the MESSAGE (header read, body length,
+                // ordering-key resolution) is Nack so a poison delivery is not redelivered forever; a fault
+                // that is a property of the RUNNER or its environment (credit wait, lane write) is Requeue.
+                SettlementAction faultAction = SettlementAction.Nack;
+
                 // Read -> handoff window: until the message reaches its owner (a lane after a successful
-                // EnqueueAsync, or the sequential try/finally below) this read loop owns it. Cancellation
-                // while waiting for credit or for a lane slot must not leak the pooled buffer or the credit.
+                // WriteAsync, or the sequential try/finally below) this read loop owns it. Cancellation or a
+                // fault anywhere in this window must not leak the pooled buffer, the credit, or the delivery.
+                // Nack behavior is transport-dependent: RabbitMQ and InMemory reject the delivery, while
+                // ASB/SQS/Pub-Sub/Kafka redeliver it until the broker limit. The endpoint is not restarted
+                // (the exception still propagates and ends the loop) and PoisonContract is intentionally
+                // bypassed because the message never reached a lane.
                 try
                 {
-                    // Wait for credit (ADR-004: credit-based flow control).
+                    // Message-specific phase (Nack): header and body-length reads.
+                    // Capture the channel ID from the first message — all messages on the same
+                    // ConsumeAsync stream share the same BW-ConsumerChannelId.
+                    consumerChannelId ??= message.Headers.TryGetValue("BW-ConsumerChannelId", out string? channelId)
+                        ? channelId
+                        : null;
+
+                    bodyLength = message.Body.Length;
+
+                    // Runner-specific phase (Requeue): wait for credit (ADR-004: credit-based flow control).
+                    faultAction = SettlementAction.Requeue;
                     while (creditManager.TryGrantCredits(1) == 0)
                     {
                         await creditManager.WaitForCreditAsync(cancellationToken).ConfigureAwait(false);
@@ -363,16 +377,32 @@ internal sealed partial class ReceiveEndpointRunner
                     {
                         // Ordered path: fan out to a fixed lane. The lane owns its TerminatorState and runs its
                         // messages sequentially, so credit release / dispose / health-check happen on the lane
-                        // when the message completes — not here. Until EnqueueAsync succeeds the read loop owns
+                        // when the message completes — not here. Until WriteAsync succeeds the read loop owns
                         // the message (a cancelled write does not enqueue it). (R8.5 lane assignment is interim;
                         // fixed-lane key hashing lands in R8.6.)
-                        await orderedStage.EnqueueAsync(message, sequence, bodyLength).ConfigureAwait(false);
+
+                        // Message-specific phase (Nack): ordering-key resolution depends on the headers.
+                        faultAction = SettlementAction.Nack;
+                        int laneIndex = orderedStage.ResolveLaneIndex(message, sequence);
+
+                        // Runner-specific phase (Requeue): the lane write.
+                        faultAction = SettlementAction.Requeue;
+                        await orderedStage.WriteAsync(laneIndex, message, sequence, bodyLength).ConfigureAwait(false);
                         continue;
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    await AbandonBeforeHandoffAsync(message, creditManager, creditGranted, bodyLength)
+                    await AbandonBeforeHandoffAsync(
+                            message, creditManager, creditGranted, bodyLength, SettlementAction.Requeue)
+                        .ConfigureAwait(false);
+                    throw;
+                }
+                catch (Exception)
+                {
+                    // Not logged here: the outer catch logs the fault (LogConsumeLoopFaulted) and rethrows.
+                    // The exception is never inspected, so nothing from it (e.g. an ordering key) is leaked.
+                    await AbandonBeforeHandoffAsync(message, creditManager, creditGranted, bodyLength, faultAction)
                         .ConfigureAwait(false);
                     throw;
                 }
@@ -482,39 +512,64 @@ internal sealed partial class ReceiveEndpointRunner
 
     /// <summary>
     /// Returns a message that was read from the transport but never handed to its owner (the sequential
-    /// try/finally or a lane) because the runner was cancelled while waiting for credit or a lane slot:
-    /// requeues it, releases its credit if one was granted, and disposes it.
+    /// try/finally or a lane) because the read-to-handoff window was abandoned — by cancellation or by a
+    /// fault: settles it with <paramref name="action"/>, releases its credit if one was granted, and
+    /// disposes it.
     /// </summary>
+    /// <remarks>
+    /// <see cref="SettlementAction.Requeue"/> puts the delivery back for another attempt.
+    /// <see cref="SettlementAction.Nack"/> behavior is transport-dependent: RabbitMQ and InMemory reject the
+    /// delivery, while ASB, SQS, Pub/Sub and Kafka redeliver it until the broker limit. The endpoint is not
+    /// restarted, and <c>PoisonContract</c> is intentionally bypassed because the message never reached a lane.
+    /// Cleanup never replaces the caller's in-flight exception: settlement errors are logged, and a credit
+    /// release against an already disposed <see cref="CreditManager"/> is ignored, so the message is always
+    /// disposed.
+    /// </remarks>
     private async ValueTask AbandonBeforeHandoffAsync(
         InboundMessage message,
         CreditManager creditManager,
         bool creditGranted,
-        long bodyLength)
+        long bodyLength,
+        SettlementAction action)
     {
         try
         {
-            // The runner token is already cancelled; the requeue must still reach the transport.
-            await _adapter.SettleAsync(SettlementAction.Requeue, message, CancellationToken.None)
-                .ConfigureAwait(false);
+            if (action == SettlementAction.Nack && !_binding.HasDeadLetterExchange)
+            {
+                LogMessageLostNoDlx(_binding.EndpointName, message.MessageId);
+            }
+
+            // The runner token may already be cancelled; the settlement must still reach the transport.
+            await _adapter.SettleAsync(action, message, CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            // Explicit handling: log and continue cleanup; the caller rethrows the original cancellation.
-            LogSettlementError(_binding.EndpointName, message.MessageId, SettlementAction.Requeue, ex);
+            // Explicit handling: log and continue cleanup; the caller rethrows the original exception.
+            LogSettlementError(_binding.EndpointName, message.MessageId, action, ex);
         }
         finally
         {
-            if (creditGranted)
+            try
             {
-                creditManager.ReleaseInflight(1, bodyLength);
+                if (creditGranted)
+                {
+                    creditManager.ReleaseInflight(1, bodyLength);
+                }
             }
-
-            message.Dispose();
-
-            BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
-            if (healthStatus == BusStatus.Degraded)
+            catch (ObjectDisposedException)
             {
-                LogFlowControlDegraded(_binding.EndpointName);
+                // The credit manager is disposed only during endpoint teardown, when the accounting is moot.
+                // Swallowed so it can neither skip message.Dispose() nor replace the caller's original fault.
+            }
+            finally
+            {
+                message.Dispose();
+
+                BusStatus healthStatus = _flowController.CheckHealth(_binding.EndpointName);
+                if (healthStatus == BusStatus.Degraded)
+                {
+                    LogFlowControlDegraded(_binding.EndpointName);
+                }
             }
         }
     }
@@ -1357,41 +1412,28 @@ internal sealed partial class ReceiveEndpointRunner
         }
 
         /// <summary>
-        /// Routes a message to its fixed lane (R8.6 fixed-lane key hashing) and hands off ownership of
-        /// credit release / disposal to that lane. Returns when the item is accepted by the lane channel
-        /// (not when processing completes) — this is what enables cross-key parallelism while keeping
-        /// per-lane FIFO order.
+        /// Resolves the fixed lane (R8.6 fixed-lane key hashing) for a message. The same key always maps to
+        /// the same lane (fixed-lane affinity), so all messages sharing a key are processed sequentially by
+        /// one lane worker.
         /// </summary>
         /// <remarks>
         /// The ordering key is resolved from the message headers via <see cref="OrderingKeyResolver.Resolve"/>
-        /// using the configured key source (header name / correlation-id / keyless). The key is then mapped
-        /// to a stable lane index via <see cref="OrderingKeyResolver.ResolveLaneIndex"/>: the same key always
-        /// maps to the same lane (fixed-lane affinity), ensuring that all messages sharing a key are processed
-        /// sequentially by one lane worker.
-        /// <para>
-        /// Keyless messages (no resolved key) fall back to round-robin over the arrival sequence — they are
-        /// distributed across lanes without ordering guarantees, preserving pre-per-key-ordering parallel
-        /// throughput for unkeyed traffic.
-        /// </para>
-        /// <para>
-        /// Lane channels are bounded (<c>BoundedChannelFullMode.Wait</c>). When a lane is full the
-        /// single reader stalls on <c>WriteAsync</c> until a lane worker drains the head — backpressure
-        /// that is transient, not a deadlock (workers drain independently of the reader). Under hot-key
-        /// skew this causes a brief cross-lane head-of-line delay for other lanes while the reader is
-        /// blocked writing to the full lane. The bound is on message count only, NOT bytes.
-        /// Poison-message anti-starvation is R8.12.
-        /// </para>
+        /// using the configured key source (header name / correlation-id / keyless), then mapped to a lane
+        /// index via <see cref="OrderingKeyResolver.ResolveLaneIndex"/>. Keyless messages fall back to
+        /// round-robin over the arrival sequence — distributed across lanes without ordering guarantees.
         /// <para>
         /// C4 re-map detection (R8.12): if the message carries a <c>BW-MappingEpoch</c> header, the
         /// resolved epoch is observed by <see cref="MappingEpochTracker"/> for the target lane. An epoch
         /// change triggers a Warning log (opaque token only — S2). No header = no detection (D2).
         /// </para>
+        /// <para>
+        /// Any exception leaving this method is a message-specific fault; it must never carry the ordering
+        /// key or a header value (S1/S2).
+        /// </para>
         /// </remarks>
-        internal async ValueTask EnqueueAsync(InboundMessage message, long arrivalSequence, long bodyLength)
+        internal int ResolveLaneIndex(InboundMessage message, long arrivalSequence)
         {
             // R8.6: resolve the ordering key from headers and map to a FIXED lane.
-            // The same key always maps to the same lane (key→lane affinity), so messages sharing a key
-            // are queued into one lane channel and processed sequentially — preserving per-key FIFO order.
             // Key value is NOT logged or thrown (SEC S1/S2 discipline — ADR-026 §NIE WOLNO).
             // The raw key never leaves this method except to ResolveLaneIndex (hash) and, on a re-map
             // change, to MappingEpochTracker.Observe where it is immediately converted to an opaque token.
@@ -1410,11 +1452,24 @@ internal sealed partial class ReceiveEndpointRunner
                 _epochTracker.Observe(laneIndex, epoch, key);
             }
 
-            Lane lane = _lanes[laneIndex];
-            await lane.Channel.Writer
-                .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken)
-                .ConfigureAwait(false);
+            return laneIndex;
         }
+
+        /// <summary>
+        /// Hands off a message to the lane resolved by <see cref="ResolveLaneIndex"/> and with it ownership
+        /// of credit release / disposal. Completes when the item is accepted by the lane channel (not when
+        /// processing completes) — this is what enables cross-key parallelism while keeping per-lane FIFO.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately not <c>async</c>: it returns the channel writer's <see cref="ValueTask"/> directly so
+        /// the synchronous-completion path allocates no state machine. Lane channels are bounded
+        /// (<c>BoundedChannelFullMode.Wait</c>); when a lane is full the single reader stalls until a lane
+        /// worker drains the head — transient backpressure, not a deadlock. Under hot-key skew this causes a
+        /// brief cross-lane head-of-line delay. The bound is on message count only, NOT bytes.
+        /// </remarks>
+        internal ValueTask WriteAsync(int laneIndex, InboundMessage message, long arrivalSequence, long bodyLength)
+            => _lanes[laneIndex].Channel.Writer
+                .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken);
 
         /// <summary>Completes all lane channels and awaits in-flight lane drain.</summary>
         internal async Task CompleteAsync()
