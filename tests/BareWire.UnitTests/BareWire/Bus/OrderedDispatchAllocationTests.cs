@@ -106,18 +106,19 @@ public sealed class OrderedDispatchAllocationTests
     // tight enough to catch real regressions — a per-message new byte[256] injection raises
     // the delta to ~256 B/msg, sitting at the boundary (see falsification test).
     //
-    // Debug (unoptimized): 640 B/msg. In Debug builds the JIT does NOT promote async state
-    // machines to stack frames, so EnqueueAsync (ordered path) and WriteAsync<WorkItem>
-    // allocate their state machines on the heap per invocation. These are structural
-    // Debug-only allocations (~486 B/msg measured 2026-06-25) that vanish in Release
-    // (JIT devirtualization + async-state-machine stack promotion). They are NOT production
-    // regressions — the ADR-026 §8 invariant applies to the Release (JIT-optimized)
-    // configuration. The Debug tolerance covers the known ~486 B/msg overhead plus 256 B
-    // noise headroom, rounded up to 640 B/msg.
-    // Falsification in Debug uses the wider tolerance to remain sensitive: injecting
-    // new byte[256] per message must still push the delta above this wider ceiling.
+    // Debug (unoptimized): 512 B/msg. In Debug builds the JIT does NOT promote async state
+    // machines to stack frames, so async paths on the ordered pipeline allocate their state
+    // machines on the heap per invocation. These are structural Debug-only allocations that
+    // vanish in Release (JIT devirtualization + async-state-machine stack promotion). They are
+    // NOT production regressions — the ADR-026 §8 invariant applies to the Release
+    // (JIT-optimized) configuration. Measured Debug delta: ~335 B/msg (2026-10-10, after the
+    // lane write became a non-async ValueTask pass-through; it was ~460 B/msg before).
+    // The tolerance sits between that baseline and the falsification result (~635 B/msg with
+    // a per-message new byte[256] injection), leaving ~175 B/msg noise headroom on the gate and
+    // ~120 B/msg margin for the falsification test. Re-measure both when the ordered path
+    // changes shape.
 #if DEBUG
-    private const long DeltaToleranceBytesPerMessage = 640L;
+    private const long DeltaToleranceBytesPerMessage = 512L;
 #else
     private const long DeltaToleranceBytesPerMessage = 256L;
 #endif

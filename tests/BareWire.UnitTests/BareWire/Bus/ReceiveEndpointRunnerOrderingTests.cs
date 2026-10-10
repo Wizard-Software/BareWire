@@ -995,9 +995,9 @@ public sealed class ReceiveEndpointRunnerOrderingTests
         private int _settleTarget = int.MaxValue;
 
         // Delivery tracking: incremented each time ConsumeAsync yields a message to the runner.
-        // The runner's await foreach only advances after it has credit AND completed EnqueueAsync, so
-        // _delivered reflects messages that have actually been accepted into the pipeline. The
-        // no-deadlock saturation probe reads DeliveredCount and waits for it to plateau.
+        // The runner's await foreach only advances after it has credit AND completed the lane
+        // WriteAsync, so _delivered reflects messages that have actually been accepted into the
+        // pipeline. The no-deadlock saturation probe reads DeliveredCount and waits for it to plateau.
         private int _delivered;
 
         /// <summary>Number of messages yielded into the pipeline so far (credit consumed + enqueued).</summary>

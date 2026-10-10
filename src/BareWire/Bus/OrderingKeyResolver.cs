@@ -49,7 +49,7 @@ namespace BareWire.Bus;
 /// </para>
 /// <para>
 /// <strong>Typed selector — delivered by <see cref="ResolveTyped"/> (R8.13 seam):</strong> The hot
-/// fan-out path (<c>ReceiveEndpointRunner.EnqueueAsync</c>) runs on the raw
+/// fan-out path (<c>OrderedDispatchStage.ResolveLaneIndex</c>) runs on the raw
 /// <see cref="BareWire.Abstractions.Transport.InboundMessage"/> BEFORE deserialization and calls
 /// <see cref="Resolve"/> (header / correlation-id only — both readable from raw headers without
 /// deserialization, preserving ADR-003 zero-copy). The typed selector reads a CLR property that
