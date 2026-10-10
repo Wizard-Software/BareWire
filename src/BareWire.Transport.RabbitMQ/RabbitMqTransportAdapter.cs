@@ -23,8 +23,9 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly CancellationTokenSource _disposeCts = new();
 
-    // Maps endpoint name → the IChannel used for that consumer, so SettleAsync can ACK/NACK
-    // messages on the correct channel without threading channel references through InboundMessage.
+    // Maps consumerChannelId (the BW-ConsumerChannelId header stamped on every delivery) → the IChannel that
+    // delivered it, so SettleAsync can ACK/NACK messages on the correct channel without threading channel
+    // references through InboundMessage.
     private readonly ConcurrentDictionary<string, IChannel> _activeConsumerChannels =
         new(StringComparer.Ordinal);
 
@@ -34,6 +35,9 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     // basic.consume fails.
     private readonly ConcurrentDictionary<string, RabbitMqConsumer> _activeConsumers =
         new(StringComparer.Ordinal);
+
+    private const string ChannelIdHeaderName = "BW-ConsumerChannelId";
+    private const int MaxLoggedChannelIdLength = 64;
 
     private long _deliveryTagCounter;
     private IConnection? _connection;
@@ -434,9 +438,25 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
         if (channel is null)
         {
+            // Formatting happens only on this failure path; the success path allocates nothing extra.
+            string reason;
+            string? loggedChannelId;
+            if (message.Headers.TryGetValue(ChannelIdHeaderName, out string? headerValue) &&
+                !string.IsNullOrEmpty(headerValue))
+            {
+                loggedChannelId = TruncateChannelId(headerValue);
+                reason = $"the consumer channel '{loggedChannelId}' is no longer active.";
+            }
+            else
+            {
+                loggedChannelId = null;
+                reason = $"the message carries no {ChannelIdHeaderName} header.";
+            }
+
+            LogSettlementChannelNotFound(message.MessageId, action, message.DeliveryTag, loggedChannelId);
+
             throw new BareWireTransportException(
-                message: $"No active consumer channel found for delivery tag {message.DeliveryTag}. " +
-                         "The consumer may have been cancelled before settlement.",
+                message: $"Delivery tag {message.DeliveryTag} cannot be settled: {reason}",
                 transportName: TransportName,
                 endpointAddress: null);
         }
@@ -469,7 +489,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 // While the caller is shutting down, cancel the AMQP consumer first (single-flight) so the
                 // broker cannot redeliver this very message to the consumer that is being stopped, which
                 // would count it as delivered twice. A failed cancel is logged once and the nack still goes out.
-                if (message.Headers.TryGetValue("BW-ConsumerChannelId", out string? requeueChannelId) &&
+                if (message.Headers.TryGetValue(ChannelIdHeaderName, out string? requeueChannelId) &&
                     _activeConsumers.TryGetValue(requeueChannelId, out RabbitMqConsumer? stoppingConsumer) &&
                     stoppingConsumer.IsStopRequested)
                 {
@@ -624,34 +644,21 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     private IChannel? ResolveChannelForMessage(InboundMessage message)
     {
-        // Primary path: look up by the unique consumer channel ID stamped on each message.
-        if (message.Headers.TryGetValue("BW-ConsumerChannelId", out string? channelId) &&
+        // A delivery tag is valid only on the channel that issued it, so settlement must use exactly that
+        // channel. There is deliberately no heuristic fallback: settling on another channel would ack someone
+        // else's message or close the channel with PRECONDITION_FAILED.
+        if (message.Headers.TryGetValue(ChannelIdHeaderName, out string? channelId) &&
             !string.IsNullOrEmpty(channelId) &&
-            _activeConsumerChannels.TryGetValue(channelId, out IChannel? channelById))
+            _activeConsumerChannels.TryGetValue(channelId, out IChannel? channel))
         {
-            return channelById;
-        }
-
-        // Fast path: exactly one active consumer — use its channel directly.
-        if (_activeConsumerChannels.Count == 1)
-        {
-            foreach (IChannel ch in _activeConsumerChannels.Values)
-            {
-                return ch;
-            }
-        }
-
-        // Fallback: return any open channel.
-        foreach (IChannel ch in _activeConsumerChannels.Values)
-        {
-            if (ch.IsOpen)
-            {
-                return ch;
-            }
+            return channel;
         }
 
         return null;
     }
+
+    private static string TruncateChannelId(string channelId) =>
+        channelId.Length <= MaxLoggedChannelIdLength ? channelId : channelId[..MaxLoggedChannelIdLength];
 
     /// <inheritdoc />
     public async Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default)
@@ -814,6 +821,12 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     [LoggerMessage(Level = LogLevel.Information, Message = "RabbitMQ connection recovery succeeded.")]
     private partial void LogRecoverySucceeded();
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Cannot settle message {MessageId} ({Action}, delivery tag {DeliveryTag}): consumer channel " +
+                  "'{ChannelId}' not found. The message stays unacknowledged on its original channel.")]
+    private partial void LogSettlementChannelNotFound(
+        string messageId, SettlementAction action, ulong deliveryTag, string? channelId);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Exception while closing RabbitMQ connection during dispose.")]
     private partial void LogConnectionCloseError(Exception ex);
