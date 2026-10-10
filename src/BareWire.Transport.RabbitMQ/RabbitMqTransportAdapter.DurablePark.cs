@@ -15,7 +15,7 @@ internal sealed partial class RabbitMqTransportAdapter
         CancellationToken cancellationToken = default)
     {
         // Resolve the consumer channel BEFORE creating the confirm channel.
-        // If the channel cannot be found the head stays unacknowledged (C3 invariant).
+        // If the channel cannot be found the head stays unacknowledged.
         IChannel? consumerChannel = ResolveChannelForMessage(message);
         if (consumerChannel is null)
         {
@@ -60,7 +60,7 @@ internal sealed partial class RabbitMqTransportAdapter
 
             // mandatory:true ensures the broker rejects (via basic.return surfaced as
             // PublishException.IsReturn=true) if the dead-letter exchange has no bound queue,
-            // preventing a false durable-ack that would break C3.
+            // preventing a false durable-ack that would break the durable-park invariant.
             await confirmChannel.BasicPublishAsync<BasicProperties>(
                 exchange: deadLetterExchange,
                 routingKey: deadLetterRoutingKey,
@@ -104,7 +104,7 @@ internal sealed partial class RabbitMqTransportAdapter
         }
 
         // Re-publication was durably confirmed by the broker.
-        // ACK the original delivery ONLY now — this is the C3 invariant:
+        // ACK the original delivery ONLY now — the durable-park invariant:
         // the ordering key must not be released before the head is durably parked.
         await consumerChannel.BasicAckAsync(
             deliveryTag: message.DeliveryTag,
