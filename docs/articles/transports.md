@@ -30,7 +30,9 @@ Every transport offers the same two registration shapes described in [Configurat
 
 - **Bundle (recommended)** — one package, one call: `AddBareWireWith{Transport}(transport => …, bus => …)`.
 - **Two calls** — register the transport adapter and the core separately with `AddBareWire{Transport}(…)`
-  followed by `AddBareWire(…)`. Use this form when an application hosts **more than one transport**.
+  followed by `AddBareWire(…)`. Use this form when you want to reference the core and transport packages separately.
+
+A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Support for hosting several transports in one service collection is planned.
 
 ```csharp
 // Bundle — the common single-transport case

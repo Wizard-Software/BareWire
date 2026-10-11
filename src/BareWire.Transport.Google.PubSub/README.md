@@ -49,7 +49,7 @@ services.AddBareWirePubSub(cfg =>
 
 | BareWire `FlowControlOptions` | Pub/Sub equivalent |
 |-------------------------------|-------------------|
-| `MaxInFlightMessages` (registry limit) | In-flight registry size — messages above this are not pulled |
+| `MaxInFlightMessages` (registry limit) | In-flight limit shared by all endpoints; pulling pauses when it is full |
 | `MaxOutstandingMessages` (options) | `maxMessages` per Pull call — limits outstanding message count |
 | `InternalQueueCapacity` (flow control) | Bounded `Channel<InboundMessage>` capacity |
 

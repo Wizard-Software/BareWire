@@ -109,4 +109,137 @@ public sealed class PubSubInFlightRegistryTests
         act.Should().ThrowExactly<ArgumentOutOfRangeException>()
             .WithParameterName("maxSize");
     }
+
+    [Theory]
+    [InlineData(0, 100, 100)]
+    [InlineData(1, 100, 100)]
+    [InlineData(2, 100, 50)]
+    [InlineData(3, 100, 33)]
+    [InlineData(4, 10, 2)]
+    [InlineData(200, 100, 1)]
+    public void GetFairShare_WithActiveConsumers_CapsRequestToLimitDividedByConsumers(
+        int consumers, int limit, int expectedCap)
+    {
+        var registry = new PubSubInFlightRegistry(limit);
+        for (int i = 0; i < consumers; i++)
+        {
+            registry.EnterConsumer();
+        }
+
+        registry.GetFairShare(limit).Should().Be(expectedCap);
+        registry.GetFairShare(1).Should().Be(1, "the cap never raises a smaller request");
+        registry.GetFairShare(0).Should().Be(0);
+    }
+
+    [Fact]
+    public void ExitConsumer_WithoutEnter_NeverDropsBelowZero()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 10);
+
+        registry.ExitConsumer();
+        registry.EnterConsumer();
+
+        registry.ActiveConsumers.Should().Be(1);
+        registry.ExitConsumer();
+        registry.ExitConsumer();
+        registry.ActiveConsumers.Should().Be(0);
+    }
+
+    [Fact]
+    public void TryReserve_WhenPartiallyFull_GrantsOnlyFreeSlots()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 5);
+        registry.TryRegister(1UL, "a1", "sub-a");
+        registry.TryRegister(2UL, "a2", "sub-a");
+
+        int granted = registry.TryReserve(10);
+
+        granted.Should().Be(3);
+        registry.Count.Should().Be(5, "reserved slots count as occupied");
+        registry.TryReserve(1).Should().Be(0, "no free slot is left");
+    }
+
+    [Fact]
+    public void TryReserve_ConcurrentCallers_NeverExceedMaxSize()
+    {
+        const int maxSize = 50;
+        const int callers = 8;
+        var registry = new PubSubInFlightRegistry(maxSize);
+        int totalGranted = 0;
+
+        Parallel.For(0, callers, new ParallelOptions { MaxDegreeOfParallelism = callers }, _ =>
+        {
+            for (int i = 0; i < 100; i++)
+            {
+                Interlocked.Add(ref totalGranted, registry.TryReserve(3));
+            }
+        });
+
+        totalGranted.Should().Be(maxSize);
+        registry.Count.Should().Be(maxSize);
+    }
+
+    [Fact]
+    public void ReleaseReservations_ReturnsSlots()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 4);
+        registry.TryReserve(4).Should().Be(4);
+
+        registry.ReleaseReservations(3);
+
+        registry.Count.Should().Be(1);
+        registry.TryReserve(10).Should().Be(3);
+    }
+
+    [Fact]
+    public void RegisterReserved_ConvertsReservationIntoEntryWithoutChangingCount()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 2);
+        registry.TryReserve(2).Should().Be(2);
+
+        bool registered = registry.RegisterReserved(1UL, "a1", "sub-a");
+
+        registered.Should().BeTrue();
+        registry.Count.Should().Be(2);
+        registry.TryEvict(1UL).Should().NotBeNull();
+        registry.Count.Should().Be(1);
+    }
+
+    [Fact]
+    public void RegisterReserved_DuplicateTag_ReturnsFalseAndKeepsReservation()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 2);
+        registry.TryReserve(2);
+        registry.RegisterReserved(1UL, "a1", "sub-a").Should().BeTrue();
+
+        bool duplicate = registry.RegisterReserved(1UL, "a1b", "sub-a");
+
+        duplicate.Should().BeFalse();
+        registry.Count.Should().Be(2, "the failed registration leaves its reservation to the caller");
+    }
+
+    [Fact]
+    public void TryEvict_RegisteredEntry_DecrementsCount()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 3);
+        registry.TryRegister(1UL, "a1", "sub-a");
+        registry.TryRegister(2UL, "a2", "sub-a");
+
+        registry.TryEvict(1UL);
+        registry.TryEvict(1UL); // second evict must not decrement again
+        registry.TryEvict(99UL); // unknown tag must not decrement
+
+        registry.Count.Should().Be(1);
+    }
+
+    [Fact]
+    public void TryRegister_DuplicateTag_ReturnsFalseAndDoesNotLeakSlot()
+    {
+        var registry = new PubSubInFlightRegistry(maxSize: 3);
+        registry.TryRegister(1UL, "a1", "sub-a").Should().BeTrue();
+
+        registry.TryRegister(1UL, "a1b", "sub-a").Should().BeFalse();
+
+        registry.Count.Should().Be(1);
+    }
 }

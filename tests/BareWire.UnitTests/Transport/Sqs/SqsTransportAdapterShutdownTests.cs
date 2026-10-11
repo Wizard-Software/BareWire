@@ -150,7 +150,8 @@ public sealed class SqsTransportAdapterShutdownTests
         using var cts = new CancellationTokenSource();
 
         IAsyncEnumerator<InboundMessage> enumerator = await ReadFirstAsync(adapter, idle, cts.Token);
-        adapter.InFlightRegistry.Count.Should().Be(5);
+        // 5 registered entries plus the 10 slots reserved for the long poll that is pending right now.
+        adapter.InFlightRegistry.Count.Should().Be(15);
 
         await cts.CancelAsync();
         await enumerator.DisposeAsync().AsTask().WaitAsync(_guard, TestContext.Current.CancellationToken);

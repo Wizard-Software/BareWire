@@ -101,8 +101,7 @@ builder.Services.AddBareWireWithRabbitMq(transport =>
 > **Note:** `amqp://guest:guest@localhost` is for local development only. In production use `amqps://` with credentials from configuration — see [TLS and mutual TLS](transport-rabbitmq.md#tls-and-mutual-tls).
 
 `AddBareWireWithRabbitMq` takes an optional second `bus` delegate for core configuration
-(middleware, serializers); consumers are bound on receive endpoints inside the `transport` delegate. For an application that needs more
-than one transport — or finer control over package references — register the core and transport
+(middleware, serializers); consumers are bound on receive endpoints inside the `transport` delegate. For an application that needs finer control over package references, register the core and transport
 separately instead; see [Configuration](configuration.md#bus-registration) for all three
 registration paths and why the engine and transport are layered the way they are.
 

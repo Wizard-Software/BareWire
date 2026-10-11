@@ -35,6 +35,12 @@ internal sealed partial class PubSubTransportAdapter
     /// </summary>
     internal TimeSpan ShutdownDrainBudget { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Fixed pause of a pull loop whose endpoint buffer or the shared registry has no free slot. Slots are
+    /// freed by settlement, which is fast compared with a pull round trip, so the pause does not back off.
+    /// </summary>
+    internal static readonly TimeSpan RegistryFullBackoff = TimeSpan.FromMilliseconds(100);
+
     /// <inheritdoc />
     /// <remarks>
     /// <para>
@@ -43,9 +49,12 @@ internal sealed partial class PubSubTransportAdapter
     /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (ADR-004).
     /// </para>
     /// <para>
-    /// Each message is registered in the <see cref="PubSubInFlightRegistry"/> immediately after
-    /// a successful <c>TryWrite</c>. On every drop path (registry full, <c>TryWrite</c> failure
-    /// under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
+    /// Before every pull the loop atomically reserves slots in the shared <see cref="PubSubInFlightRegistry"/>
+    /// (at most the free room of the endpoint buffer, <c>flowControl.MaxInFlightMessages</c>) and requests only
+    /// that many messages; each received message converts one reservation into a registry entry before it is
+    /// buffered. Unused reservations are returned when the iteration ends, and messages that cannot be
+    /// registered are handed back to the broker in one batch call. On every drop path (<c>TryWrite</c>
+    /// failure under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
     /// prevent unbounded growth (PERF-3).
     /// </para>
     /// </remarks>
@@ -77,9 +86,13 @@ internal sealed partial class PubSubTransportAdapter
 
         string subscriptionNameStr = subscriptionName.ToString();
 
+        // Messages buffered for this endpoint and not yet handed to the caller. An interlocked counter is used
+        // instead of Channel.Reader.Count, which bounded-channel consumers must not depend on.
+        var buffered = new BufferedCounter();
+
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            subscriptionName, flowControl, inboundChannel.Writer, shutdownBudget, pollingCts.Token);
+            subscriptionName, flowControl, inboundChannel.Writer, buffered, shutdownBudget, pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
@@ -87,6 +100,7 @@ internal sealed partial class PubSubTransportAdapter
             await foreach (InboundMessage message in PubSubShutdownDrain
                 .ReadUntilCancelledAsync(inboundChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
+                buffered.Decrement();
                 yield return message;
             }
         }
@@ -208,6 +222,7 @@ internal sealed partial class PubSubTransportAdapter
         SubscriptionName subscriptionName,
         FlowControlOptions flowControl,
         ChannelWriter<InboundMessage> writer,
+        BufferedCounter buffered,
         PubSubShutdownBudget shutdownBudget,
         CancellationToken cancellationToken)
     {
@@ -218,122 +233,145 @@ internal sealed partial class PubSubTransportAdapter
 
         LogConsumerStarted(subscriptionNameStr);
 
+        // The endpoint buffer never holds more than the prefetch window (flowControl.MaxInFlightMessages).
+        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
+        bool paused = false;
+
+        _inFlightRegistry.EnterConsumer();
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                PullResponse response;
+                // Reserve slots atomically BEFORE calling the broker: concurrent endpoints can never hold more
+                // than MaxInFlightMessages in total, and no message is pulled that cannot be registered.
+                // The request is capped to this endpoint's fair share of the registry so an idle subscription
+                // can never pin the whole shared limit while a busy one is starved.
+                int requested = _inFlightRegistry.GetFairShare(
+                    Math.Min(maxMessages, bufferCapacity - buffered.Value));
+                int granted = requested > 0 ? _inFlightRegistry.TryReserve(requested) : 0;
+
+                if (granted == 0)
+                {
+                    if (!paused)
+                    {
+                        paused = true;
+                        LogReceivePaused(subscriptionNameStr);
+                    }
+
+                    await Task.Delay(RegistryFullBackoff, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                paused = false;
+                int used = 0;
+                TimeSpan backoff = TimeSpan.Zero;
+
                 try
                 {
-                    response = await _subscriber!.PullAsync(
-                        subscriptionName,
-                        maxMessages,
-                        cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    PubSubErrorInfo error = PubSubErrorInfo.From(ex);
-                    LogPollingError(subscriptionNameStr, error.ExceptionType, error.StatusCode);
-                    // Brief pause before retry to avoid tight error loops.
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken)
-                        .ConfigureAwait(false);
-                    continue;
-                }
-
-                // Back-off on empty response to avoid busy-spin and unnecessary RPC cost.
-                if (response.ReceivedMessages.Count == 0)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken)
-                        .ConfigureAwait(false);
-                    continue;
-                }
-
-                for (int messageIndex = 0; messageIndex < response.ReceivedMessages.Count; messageIndex++)
-                {
-                    if (cancellationToken.IsCancellationRequested)
+                    PullResponse? response = null;
+                    try
                     {
-                        // Received but never registered or buffered: give the rest of the batch back now
-                        // instead of leaving it leased until the ack deadline expires.
-                        await PubSubShutdownDrain.ReleaseUnprocessedAsync(
-                            _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
-                            shutdownBudget, _logger).ConfigureAwait(false);
+                        response = await _subscriber!.PullAsync(
+                            subscriptionName,
+                            granted,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
                         break;
                     }
-
-                    ReceivedMessage receivedMessage = response.ReceivedMessages[messageIndex];
-
-                    ulong deliveryTag =
-                        System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
-
-                    // Check registry capacity before allocating the InboundMessage body buffer (PERF-3).
-                    if (_inFlightRegistry.Count >= _options.MaxInFlightMessages)
+                    catch (Exception ex)
                     {
-                        LogRegistryFull(deliveryTag, subscriptionNameStr);
-                        continue;
+                        PubSubErrorInfo error = PubSubErrorInfo.From(ex);
+                        LogPollingError(subscriptionNameStr, error.ExceptionType, error.StatusCode);
+                        // Brief pause before retry to avoid tight error loops; served AFTER the reservation
+                        // is released (below) so the pause never pins registry slots.
+                        backoff = TimeSpan.FromSeconds(1);
                     }
 
-                    PubsubMessage pubsubMessage = receivedMessage.Message;
-
-                    // MapInbound: Pub/Sub Attributes → BareWire headers.
-                    Dictionary<string, string> headers = PubSubHeaderMapper.MapInbound(
-                        pubsubMessage.Attributes);
-
-                    // Propagate ordering key into BareWire headers if present (R5.1 pass-through).
-                    if (!string.IsNullOrEmpty(pubsubMessage.OrderingKey))
+                    if (response is not null && response.ReceivedMessages.Count == 0)
                     {
-                        headers[PubSubHeaderMapper.OrderingKeyHeader] = pubsubMessage.OrderingKey;
+                        // Back-off on empty response to avoid busy-spin and unnecessary RPC cost.
+                        backoff = TimeSpan.FromMilliseconds(100);
                     }
-
-                    // Copy body bytes to a pooled buffer to give InboundMessage proper ownership (ADR-003).
-                    ReadOnlyMemory<byte> bodyMemory = pubsubMessage.Data.Memory;
-                    byte[]? pooledBuffer = null;
-                    ReadOnlySequence<byte> bodySequence;
-
-                    if (bodyMemory.Length > 0)
+                    else if (response is not null)
                     {
-                        pooledBuffer = ArrayPool<byte>.Shared.Rent(bodyMemory.Length);
-                        bodyMemory.CopyTo(pooledBuffer);
-                        bodySequence = new ReadOnlySequence<byte>(pooledBuffer, 0, bodyMemory.Length);
+                        for (int messageIndex = 0; messageIndex < response.ReceivedMessages.Count; messageIndex++)
+                        {
+                            if (cancellationToken.IsCancellationRequested)
+                            {
+                                // Received but never registered or buffered: give the rest of the batch back now
+                                // instead of leaving it leased until the ack deadline expires.
+                                await PubSubShutdownDrain.ReleaseUnprocessedAsync(
+                                    _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
+                                    shutdownBudget, _logger).ConfigureAwait(false);
+                                break;
+                            }
+
+                            ReceivedMessage receivedMessage = response.ReceivedMessages[messageIndex];
+
+                            ulong deliveryTag =
+                                System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
+
+                            // Convert one reservation into a registry entry BEFORE building the InboundMessage, so
+                            // a message that cannot be registered never allocates a body buffer. The broker may
+                            // return more than requested (index >= granted) or the tag may collide.
+                            if (messageIndex >= granted
+                                || !_inFlightRegistry.RegisterReserved(
+                                    deliveryTag, receivedMessage.AckId, subscriptionNameStr))
+                            {
+                                // The rest of the batch goes back in ONE batch call with its own budget: the
+                                // shutdown budget's clock must not start during normal work.
+                                LogRegistryFull(response.ReceivedMessages.Count - messageIndex, subscriptionNameStr);
+                                using var releaseBudget = new PubSubShutdownBudget(ShutdownDrainBudget);
+                                await PubSubShutdownDrain.ReleaseUnprocessedAsync(
+                                    _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
+                                    releaseBudget, _logger).ConfigureAwait(false);
+                                break;
+                            }
+
+                            used++;
+
+                            InboundMessage inbound;
+                            try
+                            {
+                                inbound = BuildInboundMessage(receivedMessage.Message, deliveryTag);
+                            }
+                            catch
+                            {
+                                // Never leave a registered entry behind that no consumer can ever settle.
+                                _inFlightRegistry.TryEvict(deliveryTag);
+                                throw;
+                            }
+
+                            // Attempt to write to the bounded channel.
+                            bool written = writer.TryWrite(inbound);
+
+                            if (written)
+                            {
+                                buffered.Increment();
+                            }
+                            else
+                            {
+                                // Channel is full under Drop* FullMode.
+                                // PERF-3: evict from registry on every drop path.
+                                _inFlightRegistry.TryEvict(deliveryTag);
+                                inbound.Dispose();
+                                LogMessageDropped(deliveryTag, subscriptionNameStr);
+                            }
+                        }
                     }
-                    else
-                    {
-                        bodySequence = ReadOnlySequence<byte>.Empty;
-                    }
+                }
+                finally
+                {
+                    // Reservations that never became entries (empty pull, error, cancellation, refusal).
+                    _inFlightRegistry.ReleaseReservations(granted - used);
+                }
 
-                    var inbound = new InboundMessage(
-                        messageId: pubsubMessage.MessageId,
-                        headers: headers,
-                        body: bodySequence,
-                        deliveryTag: deliveryTag,
-                        pooledBuffer: pooledBuffer);
-
-                    // Register BEFORE writing to channel (evict on any drop path — PERF-3).
-                    bool registered = _inFlightRegistry.TryRegister(
-                        deliveryTag, receivedMessage.AckId, subscriptionNameStr);
-
-                    if (!registered)
-                    {
-                        // Registry rejected (race — count reached max between our check and TryAdd).
-                        inbound.Dispose();
-                        LogRegistryFull(deliveryTag, subscriptionNameStr);
-                        continue;
-                    }
-
-                    // Attempt to write to the bounded channel.
-                    bool written = writer.TryWrite(inbound);
-
-                    if (!written)
-                    {
-                        // Channel is full under Drop* FullMode.
-                        // PERF-3: evict from registry on every drop path.
-                        _inFlightRegistry.TryEvict(deliveryTag);
-                        inbound.Dispose();
-                        LogMessageDropped(deliveryTag, subscriptionNameStr);
-                    }
+                if (backoff > TimeSpan.Zero)
+                {
+                    await Task.Delay(backoff, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -348,9 +386,58 @@ internal sealed partial class PubSubTransportAdapter
         }
         finally
         {
+            _inFlightRegistry.ExitConsumer();
             writer.TryComplete();
             LogConsumerStopped(subscriptionNameStr);
         }
+    }
+
+    private static InboundMessage BuildInboundMessage(PubsubMessage pubsubMessage, ulong deliveryTag)
+    {
+        // MapInbound: Pub/Sub Attributes → BareWire headers.
+        Dictionary<string, string> headers = PubSubHeaderMapper.MapInbound(
+            pubsubMessage.Attributes);
+
+        // Propagate ordering key into BareWire headers if present (R5.1 pass-through).
+        if (!string.IsNullOrEmpty(pubsubMessage.OrderingKey))
+        {
+            headers[PubSubHeaderMapper.OrderingKeyHeader] = pubsubMessage.OrderingKey;
+        }
+
+        // Copy body bytes to a pooled buffer to give InboundMessage proper ownership (ADR-003).
+        ReadOnlyMemory<byte> bodyMemory = pubsubMessage.Data.Memory;
+        byte[]? pooledBuffer = null;
+        ReadOnlySequence<byte> bodySequence;
+
+        if (bodyMemory.Length > 0)
+        {
+            pooledBuffer = ArrayPool<byte>.Shared.Rent(bodyMemory.Length);
+            bodyMemory.CopyTo(pooledBuffer);
+            bodySequence = new ReadOnlySequence<byte>(pooledBuffer, 0, bodyMemory.Length);
+        }
+        else
+        {
+            bodySequence = ReadOnlySequence<byte>.Empty;
+        }
+
+        return new InboundMessage(
+            messageId: pubsubMessage.MessageId,
+            headers: headers,
+            body: bodySequence,
+            deliveryTag: deliveryTag,
+            pooledBuffer: pooledBuffer);
+    }
+
+    /// <summary>Interlocked count of messages buffered for one endpoint and not yet handed to the caller.</summary>
+    private sealed class BufferedCounter
+    {
+        private int _value;
+
+        internal int Value => Volatile.Read(ref _value);
+
+        internal void Increment() => Interlocked.Increment(ref _value);
+
+        internal void Decrement() => Interlocked.Decrement(ref _value);
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -374,8 +461,13 @@ internal sealed partial class PubSubTransportAdapter
     private partial void LogPollingFatalError(string subscriptionName, string exceptionType, string statusCode);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Pub/Sub in-flight registry full — dropping message DeliveryTag={DeliveryTag} for subscription '{SubscriptionName}'.")]
-    private partial void LogRegistryFull(ulong deliveryTag, string subscriptionName);
+        Message = "Pub/Sub in-flight registry rejected a received message for subscription '{SubscriptionName}' — " +
+                  "returning {Count} message(s) to the broker so they become deliverable again.")]
+    private partial void LogRegistryFull(int count, string subscriptionName);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "In-flight registry or endpoint buffer full for subscription '{SubscriptionName}'; pausing pull.")]
+    private partial void LogReceivePaused(string subscriptionName);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Pub/Sub channel full (Drop mode) — dropping message DeliveryTag={DeliveryTag} for subscription '{SubscriptionName}'.")]

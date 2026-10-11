@@ -1,6 +1,7 @@
 using System.Diagnostics.Metrics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
@@ -81,6 +82,21 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configure);
+
+        // Fail fast when another transport's adapter is already registered: the core bus resolves exactly one
+        // non-keyed ITransportAdapter and one endpoint list, so this transport would be silently ignored.
+        // Runs before configure(...) and any TryAdd/Replace so a rejected call leaves no partial registration.
+        if (services.Any(d => d.ServiceType == typeof(ITransportAdapter) && !d.IsKeyedService)
+            && !services.Any(d => d.ServiceType == typeof(InMemoryTransportOptions)))
+        {
+            throw new BareWireConfigurationException(
+                optionName: "AddBareWireInMemory",
+                optionValue: "another transport is already registered",
+                expectedValue: "a single transport per service collection. Multiple transports in one service " +
+                               "collection are not supported yet: the bus resolves exactly one ITransportAdapter and " +
+                               "one list of receive endpoints, so a second transport's adapter and endpoints would be " +
+                               "ignored. Register only one AddBareWire<Transport>(...) call per service collection");
+        }
 
         var configurator = new InMemoryConfigurator();
         configure(configurator);

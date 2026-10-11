@@ -42,8 +42,8 @@ builder.Services.AddBareWireWithKafka(transport => transport.BootstrapServers("l
 ## Equivalent two-call registration
 
 `AddBareWireWithKafka` is sugar over the explicit two-call form, which remains fully supported
-(use it when you need to register multiple transports, or want the core and transport packages
-referenced separately):
+(use it when you want the core and transport packages referenced
+separately):
 
 ```csharp
 builder.Services.AddBareWireKafka(transport => transport.BootstrapServers("localhost:9092"));

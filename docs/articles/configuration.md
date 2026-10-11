@@ -60,10 +60,11 @@ builder.Services.AddBareWire(bus => { /* middleware, serializer mappings, ... */
 ```
 
 `AddBareWireWith{Transport}` is exactly this pair behind one method, so the two paths are
-equivalent. The two-call form is fully supported and is the path to use when an application needs
-**more than one transport** — call `AddBareWire` once and register each transport on its own
-endpoints (a bundle call registers the core internally, so two bundle calls would register the
-core twice).
+equivalent. The two-call form is fully supported and is the path to use when you want to reference the core
+and transport packages separately or need full control over registration (a bundle call registers
+the core internally).
+
+A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Support for hosting several transports in one service collection is planned.
 
 > **Deprecated:** earlier versions configured the transport with `cfg.UseRabbitMQ(...)` *inside*
 > the `AddBareWire` delegate. That marker is now an obsolete no-op — any host/credentials passed

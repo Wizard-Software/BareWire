@@ -41,8 +41,8 @@ builder.Services.AddBareWireWithAzureServiceBus(transport => transport.Connectio
 ## Equivalent two-call registration
 
 `AddBareWireWithAzureServiceBus` is sugar over the explicit two-call form, which remains fully
-supported (use it when you need to register multiple transports, or want the core and transport
-packages referenced separately):
+supported (use it when you want the core and transport packages referenced
+separately):
 
 ```csharp
 builder.Services.AddBareWireAzureServiceBus(transport => transport.ConnectionString(connectionString));
