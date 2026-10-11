@@ -325,6 +325,12 @@ internal sealed partial class ReceiveEndpointRunner
         // loop is the sole writer (single-reader invariant); no Interlocked needed.
         long arrivalSequence = 0;
 
+        // Message-specific handoff faults seen back to back. Written only by this loop (single reader), so no
+        // Interlocked. A redelivery of the message that faulted last is not a new fault (transports that
+        // redeliver immediately would otherwise stop the endpoint with one poison message).
+        int consecutiveHandoffFaults = 0;
+        string? lastFaultedMessageId = null;
+
         try
         {
             await foreach (InboundMessage message in _adapter
@@ -345,9 +351,10 @@ internal sealed partial class ReceiveEndpointRunner
                 // WriteAsync, or the sequential try/finally below) this read loop owns it. Cancellation or a
                 // fault anywhere in this window must not leak the pooled buffer, the credit, or the delivery.
                 // Nack behavior is transport-dependent: RabbitMQ and InMemory reject the delivery, while
-                // ASB/SQS/Pub-Sub/Kafka redeliver it until the broker limit. The endpoint is not restarted
-                // (the exception still propagates and ends the loop) and PoisonContract is intentionally
-                // bypassed because the message never reached a lane.
+                // ASB/SQS/Pub-Sub/Kafka redeliver it until the broker limit. A message-specific fault (Nack)
+                // does not end the loop until MaxConsecutiveHandoffFaults distinct messages fault in a row;
+                // an infrastructure fault (Requeue) and reaching that limit propagate the exception and end
+                // the loop. PoisonContract is intentionally bypassed because the message never reached a lane.
                 try
                 {
                     // Message-specific phase (Nack): header and body-length reads.
@@ -388,6 +395,8 @@ internal sealed partial class ReceiveEndpointRunner
                         // Runner-specific phase (Requeue): the lane write.
                         faultAction = SettlementAction.Requeue;
                         await orderedStage.WriteAsync(laneIndex, message, sequence, bodyLength).ConfigureAwait(false);
+                        consecutiveHandoffFaults = 0;
+                        lastFaultedMessageId = null;
                         continue;
                     }
                 }
@@ -398,14 +407,49 @@ internal sealed partial class ReceiveEndpointRunner
                         .ConfigureAwait(false);
                     throw;
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
-                    // Not logged here: the outer catch logs the fault (LogConsumeLoopFaulted) and rethrows.
-                    // The exception is never inspected, so nothing from it (e.g. an ordering key) is leaked.
+                    string messageId = message.MessageId; // first statement: the message is disposed below
+
                     await AbandonBeforeHandoffAsync(message, creditManager, creditGranted, bodyLength, faultAction)
                         .ConfigureAwait(false);
+
+                    if (faultAction == SettlementAction.Nack)
+                    {
+                        // A redelivery of the message that faulted last is not a new consecutive fault.
+                        // An empty MessageId cannot be compared, so it always counts.
+                        bool isRedelivery = !string.IsNullOrEmpty(messageId)
+                            && string.Equals(messageId, lastFaultedMessageId, StringComparison.Ordinal);
+                        if (!isRedelivery)
+                        {
+                            consecutiveHandoffFaults++;
+                        }
+
+                        lastFaultedMessageId = messageId;
+
+                        if (consecutiveHandoffFaults < MaxConsecutiveHandoffFaults)
+                        {
+                            // Only the exception type is logged — its message may carry header (ordering-key) values.
+                            LogHandoffFaultContinuing(
+                                _binding.EndpointName,
+                                messageId,
+                                ex.GetType().Name,
+                                consecutiveHandoffFaults,
+                                MaxConsecutiveHandoffFaults);
+                            _instrumentation.RecordFailure(
+                                _binding.EndpointName, UnknownMessageType, HandoffFaultReason);
+                            continue;
+                        }
+                    }
+
+                    // Infrastructure fault, or the consecutive-fault limit was reached: the outer catch logs
+                    // LogConsumeLoopFaulted and the loop ends.
                     throw;
                 }
+
+                // The message left the window: it is now owned by the sequential path below.
+                consecutiveHandoffFaults = 0;
+                lastFaultedMessageId = null;
 
                 // Sequential path (per-key ordering OFF): unchanged pre-per-key-ordering behavior, using the
                 // [ThreadStatic] terminator pool. Fully awaited before the next message is read.
@@ -519,8 +563,10 @@ internal sealed partial class ReceiveEndpointRunner
     /// <remarks>
     /// <see cref="SettlementAction.Requeue"/> puts the delivery back for another attempt.
     /// <see cref="SettlementAction.Nack"/> behavior is transport-dependent: RabbitMQ and InMemory reject the
-    /// delivery, while ASB, SQS, Pub/Sub and Kafka redeliver it until the broker limit. The endpoint is not
-    /// restarted, and <c>PoisonContract</c> is intentionally bypassed because the message never reached a lane.
+    /// delivery, while ASB, SQS, Pub/Sub and Kafka redeliver it until the broker limit. The caller decides whether
+    /// the consume loop continues (a message-specific fault, up to a limit of consecutive faults) or ends (an
+    /// infrastructure fault); the endpoint is never restarted. <c>PoisonContract</c> is intentionally bypassed
+    /// because the message never reached a lane.
     /// Cleanup never replaces the caller's in-flight exception: settlement errors are logged, and a credit
     /// release against an already disposed <see cref="CreditManager"/> is ignored, so the message is always
     /// disposed.
@@ -1118,6 +1164,16 @@ internal sealed partial class ReceiveEndpointRunner
         return (false, "unknown");
     }
 
+    // Consecutive message-specific handoff faults (on distinct messages) tolerated before the consume loop
+    // is stopped. Guards against an infrastructure fault misclassified as a message fault spinning the loop.
+    internal const int MaxConsecutiveHandoffFaults = 10;
+
+    // error_type tag for a message Nacked before handoff (reuses RecordFailure; stable metric-tag contract).
+    private const string HandoffFaultReason = "HandoffFault";
+
+    // messageType tag used when the message type is not known (the message never reached a consumer).
+    private const string UnknownMessageType = "unknown";
+
     /// <summary>
     /// Maximum accepted raw-body size (in bytes) for the type-less dispatch path (layer 3) before
     /// deserialization is attempted. Secure-by-default v1 internal constant — the payload is
@@ -1635,6 +1691,13 @@ internal sealed partial class ReceiveEndpointRunner
     [LoggerMessage(Level = LogLevel.Error,
         Message = "Consume loop faulted for endpoint '{EndpointName}'. The endpoint has stopped consuming.")]
     private partial void LogConsumeLoopFaulted(string endpointName, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Message {MessageId} on endpoint '{EndpointName}' faulted before handoff ({ExceptionType}) " +
+                  "and was negatively acknowledged; the consume loop continues " +
+                  "({ConsecutiveFaults}/{MaxConsecutiveFaults} consecutive).")]
+    private partial void LogHandoffFaultContinuing(
+        string endpointName, string messageId, string exceptionType, int consecutiveFaults, int maxConsecutiveFaults);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Message {MessageId} on endpoint '{EndpointName}' was negatively acknowledged with no " +
