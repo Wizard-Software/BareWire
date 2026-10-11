@@ -76,6 +76,81 @@ public sealed class BareWireBusTests
         return (bus, adapter, serializer);
     }
 
+    // Thread-safe capture of SendBatchAsync batches; the publish pump calls the adapter on a
+    // thread-pool thread, so tests must never read a plain List<T> written by the pump.
+    private sealed class BatchCapture
+    {
+        private readonly Lock _gate = new();
+        private readonly List<IReadOnlyList<OutboundMessage>> _batches = [];
+
+        // Snapshot copy taken under the lock.
+        public IReadOnlyList<OutboundMessage>[] Batches
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _batches.ToArray();
+                }
+            }
+        }
+
+        // Wires adapter.SendBatchAsync to record each batch and acknowledge every message.
+        public static BatchCapture Attach(ITransportAdapter adapter, TimeSpan? sendDelay = null)
+        {
+            BatchCapture capture = new();
+            adapter.SendBatchAsync(
+                    Arg.Any<IReadOnlyList<OutboundMessage>>(),
+                    Arg.Any<CancellationToken>())
+                   .Returns(callInfo => capture.RecordAsync(
+                       callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0),
+                       sendDelay,
+                       callInfo.ArgAt<CancellationToken>(1)));
+            return capture;
+        }
+
+        // Polls every 10 ms until at least `expected` batches are captured or the timeout elapses;
+        // returns the snapshot either way so the caller's assertion reports the real count.
+        public async Task<IReadOnlyList<OutboundMessage>[]> WaitForBatchesAsync(
+            int expected = 1, int timeoutMs = 5_000)
+        {
+            await WaitUntilAsync(() => Batches.Length >= expected, timeoutMs);
+            return Batches;
+        }
+
+        private async Task<IReadOnlyList<SendResult>> RecordAsync(
+            IReadOnlyList<OutboundMessage> messages, TimeSpan? sendDelay, CancellationToken cancellationToken)
+        {
+            if (sendDelay is { } delay)
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+
+            lock (_gate)
+            {
+                _batches.Add(messages);
+            }
+
+            return messages.Select(static _ => new SendResult(true, 0UL)).ToList();
+        }
+    }
+
+    // Polls `condition` every 10 ms until it holds or the timeout elapses; never throws on timeout so the
+    // caller's own assertion reports the failure.
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5_000)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     // ── BusId ─────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -98,9 +173,6 @@ public sealed class BareWireBusTests
 
         BusTestMessage message = new("hello");
         await bus.PublishAsync(message, CancellationToken.None);
-
-        // Give the background task a moment to flush.
-        await Task.Delay(50);
 
         serializer.Received(1).Serialize(message, Arg.Any<IBufferWriter<byte>>());
 
@@ -426,8 +498,9 @@ public sealed class BareWireBusTests
         byte[] payload = [1, 2, 3];
         await bus.PublishRawAsync(payload, "application/octet-stream", CancellationToken.None);
 
-        // Give the background task time to flush.
-        await Task.Delay(50);
+        // Wait for the publish pump to flush.
+        await WaitUntilAsync(() => adapter.ReceivedCalls().Any(
+            static c => c.GetMethodInfo().Name == nameof(ITransportAdapter.SendBatchAsync)));
 
         await adapter.Received(1).SendBatchAsync(
             Arg.Is<IReadOnlyList<OutboundMessage>>(msgs =>
@@ -477,18 +550,8 @@ public sealed class BareWireBusTests
     public async Task SendAsync_WithQueueSchemeUri_SetsBwExchangeToEmpty()
     {
         // Arrange — capture messages sent to the adapter.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Uri queueUri = new("queue://localhost/amq.gen-reply-queue");
@@ -497,8 +560,7 @@ public sealed class BareWireBusTests
         // Act
         await endpoint.SendAsync(new BusTestMessage("response"), CancellationToken.None);
 
-        // Give the background publisher time to flush.
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — the outbound message must carry BW-Exchange="" to trigger default-exchange delivery.
         capturedBatches.Should().HaveCount(1);
@@ -513,18 +575,8 @@ public sealed class BareWireBusTests
     public async Task SendAsync_WithQueueSchemeUriAndCorrelationId_ExtractsCorrelationIdFromQuery()
     {
         // Arrange
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         string corrId = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
@@ -533,7 +585,7 @@ public sealed class BareWireBusTests
 
         // Act
         await endpoint.SendAsync(new BusTestMessage("response"), CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — correlation-id must be present in the outbound headers.
         capturedBatches.Should().HaveCount(1);
@@ -551,18 +603,8 @@ public sealed class BareWireBusTests
     public async Task SendAsync_WithExchangeScheme_SetsExchangeHeaderAndClearsRoutingKey()
     {
         // Arrange — capture messages sent to the adapter.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Uri exchangeUri = new("exchange:my-exchange");
@@ -571,8 +613,7 @@ public sealed class BareWireBusTests
         // Act
         await endpoint.SendAsync(new BusTestMessage("event"), CancellationToken.None);
 
-        // Give the background publisher time to flush.
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — BW-Exchange must be set to the exchange name and RoutingKey must be empty.
         capturedBatches.Should().HaveCount(1);
@@ -588,18 +629,8 @@ public sealed class BareWireBusTests
     public async Task SendAsync_WithNonQueueSchemeUri_DoesNotSetBwExchange()
     {
         // Arrange
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Uri regularUri = new("rabbitmq://localhost/some-queue");
@@ -607,7 +638,7 @@ public sealed class BareWireBusTests
 
         // Act
         await endpoint.SendAsync(new BusTestMessage("direct"), CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — BW-Exchange header must not be present for a non-queue: URI.
         capturedBatches.Should().HaveCount(1);
@@ -623,18 +654,8 @@ public sealed class BareWireBusTests
     public async Task PublishAsync_WithCustomHeaders_MergesHeaders()
     {
         // Arrange — capture outbound messages.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         var customHeaders = new Dictionary<string, string>
@@ -645,7 +666,7 @@ public sealed class BareWireBusTests
 
         // Act
         await bus.PublishAsync(new BusTestMessage("hello"), customHeaders, CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — custom headers must be present alongside framework headers.
         capturedBatches.Should().HaveCount(1);
@@ -666,18 +687,8 @@ public sealed class BareWireBusTests
     public async Task PublishAsync_WithMessageIdHeader_UsesProvidedMessageId()
     {
         // Arrange — capture outbound messages.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Guid originalMessageId = new("a1b2c3d4-e5f6-7890-abcd-ef1234567890");
@@ -688,7 +699,7 @@ public sealed class BareWireBusTests
 
         // Act
         await bus.PublishAsync(new BusTestMessage("redeliver"), headers, CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — the outbound message-id must equal the caller-supplied value, not a new Guid.
         capturedBatches.Should().HaveCount(1);
@@ -725,32 +736,45 @@ public sealed class BareWireBusTests
     public async Task PublishAsync_WithRoutingKeyMapping_UsesResolvedKey()
     {
         // Arrange — capture outbound messages.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
 
         IRoutingKeyResolver resolver = Substitute.For<IRoutingKeyResolver>();
         resolver.Resolve<BusTestMessage>().Returns("order.created");
 
         var (bus, adapter, _) = CreateBus(routingKeyResolver: resolver);
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         // Act
         await bus.PublishAsync(new BusTestMessage("hello"), CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — the outbound message must carry the mapped routing key.
         capturedBatches.Should().HaveCount(1);
         OutboundMessage sent = capturedBatches[0][0];
         sent.RoutingKey.Should().Be("order.created");
+
+        await bus.DisposeAsync();
+    }
+
+    // Guards the wait semantics of BatchCapture.WaitForBatchesAsync (not the production publish path):
+    // a transport send slower than the former fixed 50 ms wait must still be observed.
+    [Fact]
+    public async Task PublishAsync_WhenTransportSendIsSlow_CaptureObservesBatchAfterPumpCompletes()
+    {
+        // Arrange — the adapter acknowledges only after 200 ms, well beyond a fixed 50 ms wait.
+        IRoutingKeyResolver resolver = Substitute.For<IRoutingKeyResolver>();
+        resolver.Resolve<BusTestMessage>().Returns("order.created");
+        var (bus, adapter, _) = CreateBus(routingKeyResolver: resolver);
+        BatchCapture capture = BatchCapture.Attach(adapter, sendDelay: TimeSpan.FromMilliseconds(200));
+        bus.StartPublishing();
+
+        // Act
+        await bus.PublishAsync(new BusTestMessage("slow"), CancellationToken.None);
+        var batches = await capture.WaitForBatchesAsync();
+
+        // Assert
+        batches.Should().HaveCount(1);
+        batches[0][0].RoutingKey.Should().Be("order.created");
 
         await bus.DisposeAsync();
     }
@@ -764,18 +788,8 @@ public sealed class BareWireBusTests
     public async Task SendRawAsync_WithQueueSchemeUri_SetsBwExchangeToEmpty()
     {
         // Arrange — capture messages sent to the adapter.
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Uri queueUri = new("queue://localhost/amq.gen-reply-queue");
@@ -785,7 +799,7 @@ public sealed class BareWireBusTests
 
         // Act
         await endpoint.SendRawAsync(payload, "application/vnd.masstransit+json", CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — the outbound message must carry BW-Exchange="" to trigger default-exchange delivery.
         capturedBatches.Should().HaveCount(1);
@@ -804,18 +818,8 @@ public sealed class BareWireBusTests
     public async Task SendRawAsync_WithExchangeSchemeUri_SetsExchangeHeaderAndClearsRoutingKey()
     {
         // Arrange
-        var capturedBatches = new List<IReadOnlyList<OutboundMessage>>();
         var (bus, adapter, _) = CreateBus();
-        adapter.SendBatchAsync(
-                Arg.Any<IReadOnlyList<OutboundMessage>>(),
-                Arg.Any<CancellationToken>())
-               .Returns(callInfo =>
-               {
-                   capturedBatches.Add(callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0));
-                   var messages = callInfo.ArgAt<IReadOnlyList<OutboundMessage>>(0);
-                   return Task.FromResult<IReadOnlyList<SendResult>>(
-                       messages.Select(static _ => new SendResult(true, 0UL)).ToList());
-               });
+        BatchCapture capture = BatchCapture.Attach(adapter);
         bus.StartPublishing();
 
         Uri exchangeUri = new("exchange:my-fanout");
@@ -825,7 +829,7 @@ public sealed class BareWireBusTests
 
         // Act
         await endpoint.SendRawAsync(payload, "application/json", CancellationToken.None);
-        await Task.Delay(50);
+        var capturedBatches = await capture.WaitForBatchesAsync();
 
         // Assert — BW-Exchange must be the exchange name and RoutingKey must be empty.
         capturedBatches.Should().HaveCount(1);
