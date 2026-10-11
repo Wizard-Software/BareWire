@@ -32,8 +32,7 @@ builder.Services.AddBareWireWithPubSub(transport => transport.ProjectId("my-gcp-
 ### Two calls — core and transport registered separately
 
 `AddBareWireWithPubSub` is sugar over the explicit pair. Use the two-call form when you reference
-the core and transport packages separately, or when an application registers more than one
-transport:
+the core and transport packages separately:
 
 ```csharp
 builder.Services.AddBareWirePubSub(transport => transport.ProjectId("my-gcp-project"));
@@ -124,14 +123,20 @@ Things to know:
 
 - `PrefetchCount` is not a Pub/Sub setting. It is the credit limit the BareWire core uses to bound
   unsettled messages for the endpoint; the per-pull message cap is `MaxOutstandingMessages`.
-- `MaxInFlightMessages` is shared by all endpoints on the transport. Set it to at least the sum of
-  the `PrefetchCount` values of all endpoints; otherwise a pulled message can be skipped while the
-  in-flight registry is full, and it is redelivered after the acknowledgement deadline.
+- `MaxInFlightMessages` is shared by all endpoints on the transport. Slots are reserved atomically
+  before each pull, and a pull never asks Pub/Sub for more messages than the free slots, so a
+  message is never pulled only to be skipped. Each endpoint also buffers at most its `PrefetchCount`
+  messages. When the limit is exhausted, pulling pauses until a slot frees up. If a pulled message
+  still cannot be registered, it is returned to the subscription immediately (acknowledgement
+  deadline set to 0, in one call) instead of waiting for the acknowledgement deadline to expire.
+  Sizing `MaxInFlightMessages` to at least the sum of the `PrefetchCount` values of all endpoints is a
+  performance hint, not a correctness requirement: with a smaller limit, an endpoint may wait for a
+  free slot.
 - Poison messages: a failing message is released for redelivery. It only reaches a dead-letter topic
   if the subscription has a `DeadLetterPolicy` (see [Dead-letter topics](#dead-letter-topics)).
   Without one, a poison message is redelivered indefinitely.
 - `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
-- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+- Only one transport can be registered per service collection: registering a second, different transport throws `BareWireConfigurationException`, and support for hosting several transports in one service collection is planned.
 
 ## Ordering keys
 
@@ -159,6 +164,21 @@ exceeding the configured delivery-attempt count are forwarded to the dead-letter
 being redelivered indefinitely. For this to work, the subscription's service account requires the
 `roles/pubsub.publisher` IAM role on the dead-letter topic — environment/IAM configuration granted
 outside BareWire.
+
+## Minimum IAM roles
+
+Grant only the roles each part of the transport needs:
+
+| Capability | Role | Used for |
+|------------|------|----------|
+| Consume | `roles/pubsub.subscriber` on the subscription | pull, acknowledge and modify the acknowledgement deadline |
+| Publish | `roles/pubsub.publisher` on the topic | publish |
+| Deploy topology | `roles/pubsub.editor` on the project (or equivalent custom role) | create topics and subscriptions |
+
+Publishing and topology deployment are separate from consuming: an application that only consumes
+does not need the publisher or editor roles, and an application that deploys topology out of band
+does not need the editor role at runtime. For dead-lettering, see
+[Dead-letter topics](#dead-letter-topics) for the additional roles Pub/Sub requires.
 
 ## Header mapping
 

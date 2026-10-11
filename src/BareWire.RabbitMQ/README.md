@@ -38,8 +38,8 @@ builder.Services.AddBareWireWithRabbitMq(transport => transport.Host("localhost"
 ## Equivalent two-call registration
 
 `AddBareWireWithRabbitMq` is sugar over the explicit two-call form, which remains fully
-supported (use it when you need to register multiple transports, or want the core and
-transport packages referenced separately):
+supported (use it when you want the core and transport packages referenced
+separately):
 
 ```csharp
 builder.Services.AddBareWireRabbitMq(transport =>

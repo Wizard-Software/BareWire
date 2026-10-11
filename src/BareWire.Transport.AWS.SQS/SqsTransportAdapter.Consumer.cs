@@ -35,6 +35,12 @@ internal sealed partial class SqsTransportAdapter
     /// </summary>
     internal TimeSpan ShutdownDrainBudget { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Fixed pause of a polling loop whose endpoint buffer or the shared registry has no free slot. Slots are
+    /// freed by settlement, which is fast compared with long polling, so the pause does not back off.
+    /// </summary>
+    internal static readonly TimeSpan RegistryFullBackoff = TimeSpan.FromMilliseconds(100);
+
     /// <inheritdoc />
     /// <remarks>
     /// <para>
@@ -44,9 +50,12 @@ internal sealed partial class SqsTransportAdapter
     /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (ADR-004).
     /// </para>
     /// <para>
-    /// Each message is registered in the <see cref="SqsInFlightRegistry"/> immediately after
-    /// a successful <c>TryWrite</c>. On every drop path (registry full, <c>TryWrite</c> failure
-    /// under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
+    /// Before every receive the loop atomically reserves slots in the shared <see cref="SqsInFlightRegistry"/>
+    /// (at most the free room of the endpoint buffer, <c>flowControl.MaxInFlightMessages</c>) and requests only
+    /// that many messages; each received message converts one reservation into a registry entry before it is
+    /// buffered. Unused reservations are returned when the iteration ends, and messages that cannot be
+    /// registered are handed back to the broker in one batch call. On every drop path (<c>TryWrite</c>
+    /// failure under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
     /// prevent unbounded growth (PERF-3).
     /// </para>
     /// </remarks>
@@ -77,9 +86,13 @@ internal sealed partial class SqsTransportAdapter
         using var pollingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var shutdownBudget = new SqsShutdownBudget(ShutdownDrainBudget);
 
+        // Messages buffered for this endpoint and not yet handed to the caller. An interlocked counter is used
+        // instead of Channel.Reader.Count, which bounded-channel consumers must not depend on.
+        var buffered = new BufferedCounter();
+
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            queueUrl, endpointName, flowControl, inboundChannel.Writer, shutdownBudget, pollingCts.Token);
+            queueUrl, endpointName, flowControl, inboundChannel.Writer, buffered, shutdownBudget, pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
@@ -87,6 +100,7 @@ internal sealed partial class SqsTransportAdapter
             await foreach (InboundMessage message in SqsShutdownDrain
                 .ReadUntilCancelledAsync(inboundChannel.Reader, cancellationToken).ConfigureAwait(false))
             {
+                buffered.Decrement();
                 yield return message;
             }
         }
@@ -209,6 +223,7 @@ internal sealed partial class SqsTransportAdapter
         string endpointName,
         FlowControlOptions flowControl,
         ChannelWriter<InboundMessage> writer,
+        BufferedCounter buffered,
         SqsShutdownBudget shutdownBudget,
         CancellationToken cancellationToken)
     {
@@ -217,149 +232,144 @@ internal sealed partial class SqsTransportAdapter
 
         LogConsumerStarted(endpointName);
 
+        // The endpoint buffer never holds more than the prefetch window (flowControl.MaxInFlightMessages).
+        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
+        bool paused = false;
+
+        _inFlightRegistry.EnterConsumer();
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                ReceiveMessageResponse response;
+                // Reserve slots atomically BEFORE calling the broker: concurrent endpoints can never hold more
+                // than MaxInFlightMessages in total, and no message is received that cannot be registered.
+                // The request is capped to this endpoint's fair share of the registry so one endpoint's
+                // long poll can never pin the whole shared limit while another is starved.
+                int requested = _inFlightRegistry.GetFairShare(
+                    Math.Min(maxMessages, bufferCapacity - buffered.Value));
+                int granted = requested > 0 ? _inFlightRegistry.TryReserve(requested) : 0;
+
+                if (granted == 0)
+                {
+                    if (!paused)
+                    {
+                        paused = true;
+                        LogReceivePaused(endpointName);
+                    }
+
+                    await Task.Delay(RegistryFullBackoff, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                paused = false;
+                int used = 0;
+
                 try
                 {
-                    response = await _client!.ReceiveMessageAsync(
-                        new ReceiveMessageRequest
-                        {
-                            QueueUrl = queueUrl,
-                            WaitTimeSeconds = _options.WaitTimeSeconds,
-                            MaxNumberOfMessages = maxMessages,
-                            MessageAttributeNames = ["All"],
-                            MessageSystemAttributeNames = ["MessageGroupId", "SequenceNumber", "MessageDeduplicationId"],
-                        },
-                        cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    SqsErrorInfo error = SqsErrorInfo.From(ex);
-                    LogPollingError(endpointName, error.ExceptionType, error.ErrorCode, error.StatusCode);
-                    // Brief pause before retry to avoid tight error loops.
-                    await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken)
-                        .ConfigureAwait(false);
-                    continue;
-                }
-
-                // AWSSDK.SQS v4 leaves Messages null (not empty) when the long poll times out.
-                List<Message>? receivedMessages = response.Messages;
-                if (receivedMessages is null || receivedMessages.Count == 0)
-                {
-                    continue;
-                }
-
-                for (int messageIndex = 0; messageIndex < receivedMessages.Count; messageIndex++)
-                {
-                    if (cancellationToken.IsCancellationRequested)
+                    ReceiveMessageResponse response;
+                    try
                     {
-                        // Received but never registered or buffered: give the rest of the batch back now
-                        // instead of leaving it invisible until the visibility timeout expires.
-                        await SqsShutdownDrain.ReleaseUnprocessedAsync(
-                            _client!, queueUrl, endpointName, receivedMessages, messageIndex,
-                            shutdownBudget, _logger).ConfigureAwait(false);
+                        response = await _client!.ReceiveMessageAsync(
+                            new ReceiveMessageRequest
+                            {
+                                QueueUrl = queueUrl,
+                                WaitTimeSeconds = _options.WaitTimeSeconds,
+                                MaxNumberOfMessages = granted,
+                                MessageAttributeNames = ["All"],
+                                MessageSystemAttributeNames = ["MessageGroupId", "SequenceNumber", "MessageDeduplicationId"],
+                            },
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
                         break;
                     }
-
-                    Message sqsMessage = receivedMessages[messageIndex];
-
-                    ulong deliveryTag =
-                        System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
-
-                    // Check registry capacity before allocating the InboundMessage body buffer.
-                    if (_inFlightRegistry.Count >= _options.MaxInFlightMessages)
+                    catch (Exception ex)
                     {
-                        // PERF-3: registry at capacity — skip this message.
-                        // It will become visible again after its visibility timeout.
-                        LogRegistryFull(deliveryTag, endpointName);
+                        SqsErrorInfo error = SqsErrorInfo.From(ex);
+                        LogPollingError(endpointName, error.ExceptionType, error.ErrorCode, error.StatusCode);
+                        // Brief pause before retry to avoid tight error loops.
+                        await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken)
+                            .ConfigureAwait(false);
                         continue;
                     }
 
-                    Dictionary<string, string> headers = SqsHeaderMapper.MapInbound(
-                        sqsMessage.MessageAttributes);
-
-                    // Stamp trusted FIFO system attributes AFTER MapInbound (SEC-3 anti-squatting).
-                    // System attributes are set by the SQS broker (not the sender) and cannot be
-                    // forged via MessageAttributes. Stamping after MapInbound ensures broker values
-                    // always win over any sender-supplied MessageAttribute with the same BW key.
-                    if (sqsMessage.Attributes is not null)
+                    // AWSSDK.SQS v4 leaves Messages null (not empty) when the long poll times out.
+                    List<Message>? receivedMessages = response.Messages;
+                    if (receivedMessages is null || receivedMessages.Count == 0)
                     {
-                        if (sqsMessage.Attributes.TryGetValue("MessageGroupId", out string? gid) &&
-                            !string.IsNullOrEmpty(gid))
-                        {
-                            headers[SqsHeaderMapper.MessageGroupIdHeader] = gid;
-                        }
-
-                        if (sqsMessage.Attributes.TryGetValue("SequenceNumber", out string? seq) &&
-                            !string.IsNullOrEmpty(seq))
-                        {
-                            headers[SqsHeaderMapper.SequenceNumberHeader] = seq;
-                        }
-                    }
-
-                    // Determine content type from headers for body decoding.
-                    string contentType = headers.TryGetValue("content-type", out string? ct)
-                        ? ct
-                        : "application/json";
-
-                    // Decode the body back to bytes (Base64 for binary, UTF-8 for text).
-                    ReadOnlyMemory<byte> bodyMemory =
-                        SqsHeaderMapper.DecodeBodyBytes(sqsMessage.Body, contentType);
-
-                    // Copy to a pooled buffer to give InboundMessage proper ownership/lifetime.
-                    byte[]? pooledBuffer = null;
-                    ReadOnlySequence<byte> bodySequence;
-
-                    if (bodyMemory.Length > 0)
-                    {
-                        pooledBuffer = ArrayPool<byte>.Shared.Rent(bodyMemory.Length);
-                        bodyMemory.CopyTo(pooledBuffer);
-                        bodySequence = new ReadOnlySequence<byte>(
-                            pooledBuffer, 0, bodyMemory.Length);
-                    }
-                    else
-                    {
-                        bodySequence = ReadOnlySequence<byte>.Empty;
-                    }
-
-                    var inbound = new InboundMessage(
-                        messageId: sqsMessage.MessageId,
-                        headers: headers,
-                        body: bodySequence,
-                        deliveryTag: deliveryTag,
-                        pooledBuffer: pooledBuffer);
-
-                    // Register BEFORE writing to channel (evict on any drop path — PERF-3).
-                    bool registered = _inFlightRegistry.TryRegister(
-                        deliveryTag, sqsMessage.ReceiptHandle, queueUrl);
-
-                    if (!registered)
-                    {
-                        // Registry rejected (race — count reached max between our check and TryAdd).
-                        // PERF-3: evict path — return pooled buffer.
-                        inbound.Dispose();
-                        LogRegistryFull(deliveryTag, endpointName);
                         continue;
                     }
 
-                    // Attempt to write to the bounded channel.
-                    bool written = writer.TryWrite(inbound);
-
-                    if (!written)
+                    for (int messageIndex = 0; messageIndex < receivedMessages.Count; messageIndex++)
                     {
-                        // Channel is full under Drop* FullMode (Wait mode would block, not return false).
-                        // PERF-3: evict from registry on every drop path.
-                        _inFlightRegistry.TryEvict(deliveryTag);
-                        inbound.Dispose();
-                        LogMessageDropped(deliveryTag, endpointName);
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            // Received but never registered or buffered: give the rest of the batch back now
+                            // instead of leaving it invisible until the visibility timeout expires.
+                            await SqsShutdownDrain.ReleaseUnprocessedAsync(
+                                _client!, queueUrl, endpointName, receivedMessages, messageIndex,
+                                shutdownBudget, _logger).ConfigureAwait(false);
+                            break;
+                        }
+
+                        Message sqsMessage = receivedMessages[messageIndex];
+
+                        ulong deliveryTag =
+                            System.Threading.Interlocked.Increment(ref _deliveryTagCounter);
+
+                        // Convert one reservation into a registry entry BEFORE building the InboundMessage, so
+                        // a message that cannot be registered never allocates a body buffer. The broker may
+                        // return more than requested (index >= granted) or the tag may collide.
+                        if (messageIndex >= granted
+                            || !_inFlightRegistry.RegisterReserved(deliveryTag, sqsMessage.ReceiptHandle, queueUrl))
+                        {
+                            // The rest of the batch goes back in ONE batch call (keeps FIFO group order) with
+                            // its own budget: the shutdown budget's clock must not start during normal work.
+                            LogRegistryFull(receivedMessages.Count - messageIndex, endpointName);
+                            using var releaseBudget = new SqsShutdownBudget(ShutdownDrainBudget);
+                            await SqsShutdownDrain.ReleaseUnprocessedAsync(
+                                _client!, queueUrl, endpointName, receivedMessages, messageIndex,
+                                releaseBudget, _logger).ConfigureAwait(false);
+                            break;
+                        }
+
+                        used++;
+
+                        InboundMessage inbound;
+                        try
+                        {
+                            inbound = BuildInboundMessage(sqsMessage, deliveryTag);
+                        }
+                        catch
+                        {
+                            // Never leave a registered entry behind that no consumer can ever settle.
+                            _inFlightRegistry.TryEvict(deliveryTag);
+                            throw;
+                        }
+
+                        // Attempt to write to the bounded channel.
+                        bool written = writer.TryWrite(inbound);
+
+                        if (written)
+                        {
+                            buffered.Increment();
+                        }
+                        else
+                        {
+                            // Channel is full under Drop* FullMode (Wait mode would block, not return false).
+                            // PERF-3: evict from registry on every drop path.
+                            _inFlightRegistry.TryEvict(deliveryTag);
+                            inbound.Dispose();
+                            LogMessageDropped(deliveryTag, endpointName);
+                        }
                     }
+                }
+                finally
+                {
+                    // Reservations that never became entries (empty poll, error, cancellation, refusal).
+                    _inFlightRegistry.ReleaseReservations(granted - used);
                 }
             }
         }
@@ -374,9 +384,79 @@ internal sealed partial class SqsTransportAdapter
         }
         finally
         {
+            _inFlightRegistry.ExitConsumer();
             writer.TryComplete();
             LogConsumerStopped(endpointName);
         }
+    }
+
+    private static InboundMessage BuildInboundMessage(Message sqsMessage, ulong deliveryTag)
+    {
+        Dictionary<string, string> headers = SqsHeaderMapper.MapInbound(
+            sqsMessage.MessageAttributes);
+
+        // Stamp trusted FIFO system attributes AFTER MapInbound (SEC-3 anti-squatting).
+        // System attributes are set by the SQS broker (not the sender) and cannot be
+        // forged via MessageAttributes. Stamping after MapInbound ensures broker values
+        // always win over any sender-supplied MessageAttribute with the same BW key.
+        if (sqsMessage.Attributes is not null)
+        {
+            if (sqsMessage.Attributes.TryGetValue("MessageGroupId", out string? gid) &&
+                !string.IsNullOrEmpty(gid))
+            {
+                headers[SqsHeaderMapper.MessageGroupIdHeader] = gid;
+            }
+
+            if (sqsMessage.Attributes.TryGetValue("SequenceNumber", out string? seq) &&
+                !string.IsNullOrEmpty(seq))
+            {
+                headers[SqsHeaderMapper.SequenceNumberHeader] = seq;
+            }
+        }
+
+        // Determine content type from headers for body decoding.
+        string contentType = headers.TryGetValue("content-type", out string? ct)
+            ? ct
+            : "application/json";
+
+        // Decode the body back to bytes (Base64 for binary, UTF-8 for text).
+        ReadOnlyMemory<byte> bodyMemory =
+            SqsHeaderMapper.DecodeBodyBytes(sqsMessage.Body, contentType);
+
+        // Copy to a pooled buffer to give InboundMessage proper ownership/lifetime.
+        byte[]? pooledBuffer = null;
+        ReadOnlySequence<byte> bodySequence;
+
+        if (bodyMemory.Length > 0)
+        {
+            pooledBuffer = ArrayPool<byte>.Shared.Rent(bodyMemory.Length);
+            bodyMemory.CopyTo(pooledBuffer);
+            bodySequence = new ReadOnlySequence<byte>(
+                pooledBuffer, 0, bodyMemory.Length);
+        }
+        else
+        {
+            bodySequence = ReadOnlySequence<byte>.Empty;
+        }
+
+        return new InboundMessage(
+            messageId: sqsMessage.MessageId,
+            headers: headers,
+            body: bodySequence,
+            deliveryTag: deliveryTag,
+            pooledBuffer: pooledBuffer);
+    }
+
+    /// <summary>Interlocked count of messages buffered for one endpoint and not yet handed to the caller.</summary>
+    private sealed class BufferedCounter
+    {
+        private int _value;
+
+        internal int Value => Volatile.Read(ref _value);
+
+        internal void Increment() => Interlocked.Increment(ref _value);
+
+        internal void Decrement() => Interlocked.Decrement(ref _value);
     }
 
     // ── Logging ───────────────────────────────────────────────────────────────
@@ -400,8 +480,13 @@ internal sealed partial class SqsTransportAdapter
     private partial void LogPollingFatalError(string queueName, string exceptionType, string errorCode, int statusCode);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS in-flight registry full — dropping message DeliveryTag={DeliveryTag} for queue '{QueueName}'.")]
-    private partial void LogRegistryFull(ulong deliveryTag, string queueName);
+        Message = "SQS in-flight registry rejected a received message for queue '{QueueName}' — returning " +
+                  "{Count} message(s) to the broker so they become visible again.")]
+    private partial void LogRegistryFull(int count, string queueName);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "In-flight registry or endpoint buffer full for endpoint '{EndpointName}'; pausing receive.")]
+    private partial void LogReceivePaused(string endpointName);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "SQS channel full (Drop mode) — dropping message DeliveryTag={DeliveryTag} for queue '{QueueName}'.")]

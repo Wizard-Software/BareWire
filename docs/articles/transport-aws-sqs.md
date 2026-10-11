@@ -22,8 +22,7 @@ builder.Services.AddBareWireWithSqs(
 ```
 
 `AddBareWireWithSqs` is sugar over the explicit two-call form, which remains fully supported (use
-it when you register more than one transport, or reference the core and transport packages
-separately):
+it when you reference the core and transport packages separately):
 
 ```csharp
 builder.Services.AddBareWireSqs(transport => transport.Region("eu-central-1"));
@@ -101,16 +100,21 @@ Things to know:
 - `PrefetchCount` is not an SQS setting. It is the credit limit the BareWire core uses to bound
   unsettled messages for the endpoint; the number of messages fetched per call is set by
   `MaxNumberOfMessages`.
-- `MaxInFlightMessages` is shared by all endpoints on the transport. Set it to at least the sum of
-  the `PrefetchCount` values of all endpoints; otherwise a received message can be skipped while
-  the in-flight registry is full, and it reappears after the visibility timeout with a growing
-  receive count.
+- `MaxInFlightMessages` is shared by all endpoints on the transport. Slots are reserved atomically
+  before each receive call, and a receive call never asks SQS for more messages than the free slots,
+  so a message is never received only to be skipped. Each endpoint also buffers at most its
+  `PrefetchCount` messages. When the limit is exhausted, receiving pauses until a slot frees up. If a
+  received message still cannot be registered, it is returned to the queue immediately (visibility
+  timeout set to 0, in one batch call) instead of waiting for the visibility timeout to expire.
+  Sizing `MaxInFlightMessages` to at least the sum of the `PrefetchCount` values of all endpoints is a
+  performance hint, not a correctness requirement: with a smaller limit, an endpoint may wait up to
+  `WaitTimeSeconds` for a free slot.
 - Poison messages: a failing message is released for redelivery, and `Reject` deliberately leaves the
   message on the queue. It only reaches a dead-letter queue if the source queue has a `RedrivePolicy`
   (`maxReceiveCount` plus a dead-letter queue). Without one, a poison message is redelivered
   indefinitely.
 - `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
-- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+- Only one transport can be registered per service collection: registering a second, different transport throws `BareWireConfigurationException`, and support for hosting several transports in one service collection is planned.
 
 ## Long-polling consumer
 
@@ -184,6 +188,31 @@ new QueueDeclaration("payments", Arguments: new Dictionary<string, object>
     ["bw.sqs.kms-data-key-reuse-period"] = 300,       // optional, 60–86400
 });
 ```
+
+## Minimum IAM permissions
+
+Grant the application role only what each part of the transport calls. Consuming a queue needs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "sqs:GetQueueUrl",
+    "sqs:ReceiveMessage",
+    "sqs:DeleteMessage",
+    "sqs:ChangeMessageVisibility"
+  ],
+  "Resource": "arn:aws:sqs:eu-central-1:123456789012:orders"
+}
+```
+
+`sqs:ChangeMessageVisibility` also covers the batch variant used to release messages. Publishing to
+a queue needs `sqs:GetQueueUrl` and `sqs:SendMessage` (also used for batched sends). Deploying
+topology is a separate concern: creating queues and configuring dead-letter redrive needs
+`sqs:CreateQueue`, `sqs:GetQueueAttributes` and `sqs:SetQueueAttributes`. Give these topology
+permissions to a deployment role rather than to the running application when you deploy topology out
+of band. For a queue encrypted with a customer-managed KMS key, consumers additionally need
+`kms:Decrypt` on that key and publishers need `kms:GenerateDataKey`.
 
 ## Configurator options
 

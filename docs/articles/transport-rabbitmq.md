@@ -47,9 +47,7 @@ builder.Services.AddBareWireWithRabbitMq(transport => transport.Host("amqp://loc
 ### 2. Two calls — core and transport registered separately
 
 `AddBareWireWithRabbitMq` is sugar over the explicit pair. Use the two-call form when you reference
-the core and transport packages separately, or when an application registers more than one
-transport (a bundle call registers the core internally, so two bundle calls would register it
-twice):
+the core and transport packages separately (a bundle call registers the core internally):
 
 ```csharp
 builder.Services.AddTransient<OrderConsumer>();

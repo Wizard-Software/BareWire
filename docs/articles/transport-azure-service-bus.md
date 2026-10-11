@@ -41,8 +41,7 @@ builder.Services.AddBareWireWithAzureServiceBus(
 ### Two calls — transport and core registered separately
 
 `AddBareWireWithAzureServiceBus` is sugar over the explicit two-call form, which remains fully
-supported. Use it when you reference the core and transport packages separately, or when an
-application registers more than one transport:
+supported. Use it when you reference the core and transport packages separately:
 
 ```csharp
 builder.Services.AddBareWireAzureServiceBus(transport => transport.ConnectionString(connectionString));
@@ -134,7 +133,7 @@ Things to know:
   policy; if it is set too high, a poison message keeps being redelivered for a long time before it
   is dead-lettered.
 - `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
-- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+- Only one transport can be registered per service collection: registering a second, different transport throws `BareWireConfigurationException`, and support for hosting several transports in one service collection is planned.
 
 ## Sessions
 

@@ -35,7 +35,9 @@ public sealed class PubSubTransportAdapterShutdownTests
         MaxInFlightMessages = 5_000,
     };
 
-    private static FlowControlOptions Flow() => new() { InternalQueueCapacity = 3_000 };
+    // The prefetch window (MaxInFlightMessages) caps how many messages an endpoint may buffer, so it is raised
+    // to the channel capacity to let these tests buffer thousands of messages.
+    private static FlowControlOptions Flow() => new() { InternalQueueCapacity = 3_000, MaxInFlightMessages = 3_000 };
 
     private static PullResponse Batch(int count)
     {
@@ -149,7 +151,9 @@ public sealed class PubSubTransportAdapterShutdownTests
         using var cts = new CancellationTokenSource();
 
         IAsyncEnumerator<InboundMessage> enumerator = await ReadFirstAsync(adapter, idle, cts.Token);
-        adapter.InFlightRegistry.Count.Should().Be(5);
+        // 5 registered entries plus the 1000 slots reserved for the pull that is pending right now
+        // (MaxOutstandingMessages default).
+        adapter.InFlightRegistry.Count.Should().Be(1_005);
 
         await cts.CancelAsync();
         await enumerator.DisposeAsync().AsTask().WaitAsync(_guard, TestContext.Current.CancellationToken);

@@ -193,14 +193,14 @@ internal static partial class PubSubShutdownDrain
     }
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Pub/Sub shutdown release budget exhausted for subscription '{SubscriptionName}': " +
+        Message = "Pub/Sub release of unprocessed messages: budget exhausted for subscription '{SubscriptionName}': " +
                   "{SkippedCount} message(s) were disposed without being made deliverable again " +
                   "(first MessageId={MessageId}). They are redelivered after their ack deadline.")]
     private static partial void LogBudgetExhausted(
         ILogger logger, string subscriptionName, int skippedCount, string messageId);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Pub/Sub shutdown release failed for subscription '{SubscriptionName}': {SkippedCount} " +
+        Message = "Pub/Sub release of unprocessed messages failed for subscription '{SubscriptionName}': {SkippedCount} " +
                   "message(s) were disposed without being made deliverable again (first MessageId={MessageId}, " +
                   "{ExceptionType}, StatusCode={StatusCode}). They are redelivered after their ack deadline.")]
     private static partial void LogReleaseFailed(

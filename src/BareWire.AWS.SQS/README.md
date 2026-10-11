@@ -41,8 +41,8 @@ builder.Services.AddBareWireWithSqs(transport => transport.Region("eu-central-1"
 ## Equivalent two-call registration
 
 `AddBareWireWithSqs` is sugar over the explicit two-call form, which remains fully supported
-(use it when you need to register multiple transports, or want the core and transport packages
-referenced separately):
+(use it when you want the core and transport packages referenced
+separately):
 
 ```csharp
 builder.Services.AddBareWireSqs(transport => transport.Region("eu-central-1"));

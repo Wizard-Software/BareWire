@@ -225,14 +225,14 @@ internal static partial class SqsShutdownDrain
     }
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS shutdown release budget exhausted for queue '{QueueName}': {SkippedCount} message(s) were " +
+        Message = "SQS release of unprocessed messages: budget exhausted for queue '{QueueName}': {SkippedCount} message(s) were " +
                   "disposed without being made visible again (first MessageId={MessageId}). " +
                   "They reappear after their visibility timeout.")]
     private static partial void LogBudgetExhausted(
         ILogger logger, string queueName, int skippedCount, string messageId);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS shutdown release failed for queue '{QueueName}': {SkippedCount} message(s) were disposed " +
+        Message = "SQS release of unprocessed messages failed for queue '{QueueName}': {SkippedCount} message(s) were disposed " +
                   "without being made visible again (first MessageId={MessageId}, {ExceptionType}, " +
                   "ErrorCode={ErrorCode}, StatusCode={StatusCode}). They reappear after their visibility timeout.")]
     private static partial void LogReleaseFailed(
@@ -240,7 +240,7 @@ internal static partial class SqsShutdownDrain
         string exceptionType, string errorCode, int statusCode);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS shutdown release partially failed for queue '{QueueName}': {FailedCount} entr(ies) were " +
+        Message = "SQS release of unprocessed messages partially failed for queue '{QueueName}': {FailedCount} entr(ies) were " +
                   "rejected (first MessageId={MessageId}, ErrorCode={ErrorCode}). " +
                   "They reappear after their visibility timeout.")]
     private static partial void LogReleasePartiallyFailed(

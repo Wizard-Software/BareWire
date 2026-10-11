@@ -50,7 +50,7 @@ builder.Services.AddBareWireWithKafka(transport => transport.BootstrapServers("l
 ### 2. Two calls — core and transport registered separately
 
 `AddBareWireWithKafka` is sugar over the explicit pair. Use the two-call form when you reference
-the core and transport packages separately, or when an application needs more than one transport:
+the core and transport packages separately:
 
 ```csharp
 builder.Services.AddBareWireKafka(kafka => kafka.BootstrapServers("localhost:9092"));
@@ -124,7 +124,7 @@ Things to know:
   those topics with broker ACLs so that only trusted producers (the BareWire transport itself) can
   publish to them.
 - `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
-- Only one transport per DI container can declare receive endpoints: the bindings come from a single registration, so if a second transport is registered in the same container, its `ReceiveEndpoint` declarations are ignored.
+- Only one transport can be registered per service collection: registering a second, different transport throws `BareWireConfigurationException`, and support for hosting several transports in one service collection is planned.
 
 ## Consumer groups
 

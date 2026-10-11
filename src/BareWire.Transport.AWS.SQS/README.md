@@ -48,7 +48,7 @@ services.AddBareWireSqs(sqs =>
 | `VisibilityTimeout(TimeSpan)`   | 30 s     | Default message visibility timeout                          |
 | `WaitTimeSeconds(int)`          | 20       | SQS long-poll wait time (0–20)                              |
 | `MaxNumberOfMessages(int)`      | 10       | Max messages per `ReceiveMessage` call (1–10)               |
-| `MaxInFlightMessages(int)`      | 100      | Max concurrent in-flight messages in registry               |
+| `MaxInFlightMessages(int)`      | 100      | Max in-flight messages, shared by all endpoints; receiving pauses when full |
 
 ## Capabilities
 
