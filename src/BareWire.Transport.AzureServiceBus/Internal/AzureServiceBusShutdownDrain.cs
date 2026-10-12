@@ -61,7 +61,7 @@ internal static partial class AzureServiceBusShutdownDrain
         while (reader.TryRead(out InboundMessage? message))
         {
             string messageId = message.MessageId;
-            (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)? entry =
+            (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)? entry =
                 registry.TryEvictMessage(consumerId, message.DeliveryTag);
             message.Dispose();
 

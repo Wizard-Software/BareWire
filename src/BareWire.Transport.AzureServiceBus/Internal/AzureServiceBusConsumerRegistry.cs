@@ -25,7 +25,8 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// <para>
 /// <b>Session support (R2.2 / D-11):</b> When a session is released or the session lock is
 /// lost, <see cref="EvictAllForSession"/> removes all in-flight entries for that session in
-/// bulk, preventing unbounded registry growth under session churn.
+/// bulk, preventing unbounded registry growth under session churn. The session index also counts the
+/// settlements of the session that are still inside the SDK call (see <see cref="SessionPendingSettlementCount"/>).
 /// <see cref="ServiceBusSessionReceiver"/> inherits from <see cref="ServiceBusReceiver"/>, so
 /// settlement methods work polymorphically — no separate settlement path is needed.
 /// </para>
@@ -42,7 +43,7 @@ internal sealed class AzureServiceBusConsumerRegistry
 
     // Per-consumer delivery-tag → (message, receiver) map.
     // Two-level to avoid cross-consumer DeliveryTag collisions (D-2).
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)>> _messageMaps =
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>> _messageMaps =
         new(StringComparer.Ordinal);
 
     // Per-consumer, per-session → set of delivery tags.
@@ -69,7 +70,7 @@ internal sealed class AzureServiceBusConsumerRegistry
         _consumers[consumerId] = consumer;
         _receiveControls[consumerId] = consumer;
         _settling[consumerId] = new SettlementCounter();
-        _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
+        _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
     }
 
@@ -93,7 +94,7 @@ internal sealed class AzureServiceBusConsumerRegistry
         }
 
         _settling[consumerId] = new SettlementCounter();
-        _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
+        _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
     }
 
@@ -157,7 +158,7 @@ internal sealed class AzureServiceBusConsumerRegistry
     internal int InFlightCount(string consumerId) =>
         _messageMaps.TryGetValue(
             consumerId,
-            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>? map)
+            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>? map)
             ? map.Count
             : 0;
 
@@ -192,9 +193,9 @@ internal sealed class AzureServiceBusConsumerRegistry
     {
         if (_messageMaps.TryGetValue(
             consumerId,
-            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>? map))
+            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>? map))
         {
-            map[deliveryTag] = (message, receiver);
+            map[deliveryTag] = (message, receiver, sessionId);
         }
 
         // Register in session index for bulk eviction (D-11).
@@ -215,20 +216,74 @@ internal sealed class AzureServiceBusConsumerRegistry
     /// <see cref="ServiceBusReceiver"/> for the given consumer and delivery tag.
     /// Returns <see langword="null"/> when no entry exists (already evicted or unknown tag).
     /// </summary>
-    internal (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)? TryEvictMessage(
+    /// <param name="consumerId">The consumer that received the message.</param>
+    /// <param name="deliveryTag">The per-consumer delivery tag.</param>
+    /// <param name="releaseSessionTag">
+    /// When <see langword="true"/> (default) the tag is also removed from the session index. Pass
+    /// <see langword="false"/> only from <c>SettleAsync</c>, which keeps the tag counted while the SDK settlement
+    /// call is running and releases it afterwards through <see cref="ReleaseSessionTag"/>.
+    /// </param>
+    internal (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)? TryEvictMessage(
         string consumerId,
-        ulong deliveryTag)
+        ulong deliveryTag,
+        bool releaseSessionTag = true)
     {
         if (_messageMaps.TryGetValue(
             consumerId,
-            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>? map) &&
-            map.TryRemove(deliveryTag, out (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver) entry))
+            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>? map) &&
+            map.TryRemove(
+                deliveryTag,
+                out (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId) entry))
         {
+            if (releaseSessionTag)
+            {
+                ReleaseSessionTag(consumerId, entry.SessionId, deliveryTag);
+            }
+
             return entry;
         }
 
         return null;
     }
+
+    /// <summary>
+    /// Removes <paramref name="deliveryTag"/> from the tag set of its session. A no-op when the session id is
+    /// <see langword="null"/>, or when the consumer or the session set is already gone.
+    /// </summary>
+    /// <remarks>
+    /// Only looks the set up and removes the tag — it never creates a set and never removes one. An empty set stays
+    /// until <see cref="EvictAllForSession"/> removes it, so a late release cannot race with a concurrent
+    /// <see cref="StoreMessage"/> that adds to the same set. Delivery tags are monotonic per consumer, so a late
+    /// release can never hit the tag set of a newer session that reuses the same session id.
+    /// </remarks>
+    /// <param name="consumerId">The consumer that owned the message.</param>
+    /// <param name="sessionId">The session id stored in the registry entry.</param>
+    /// <param name="deliveryTag">The delivery tag to remove.</param>
+    internal void ReleaseSessionTag(string consumerId, string? sessionId, ulong deliveryTag)
+    {
+        if (sessionId is not null &&
+            _sessionIndex.TryGetValue(
+                consumerId,
+                out ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>? consumerIndex) &&
+            consumerIndex.TryGetValue(sessionId, out ConcurrentDictionary<ulong, bool>? tagSet))
+        {
+            tagSet.TryRemove(deliveryTag, out _);
+        }
+    }
+
+    /// <summary>
+    /// Gets the number of delivery tags of the session that are registered or still inside a settlement call.
+    /// Returns 0 when the consumer or the session is not tracked.
+    /// </summary>
+    /// <param name="consumerId">The consumer that owns the session.</param>
+    /// <param name="sessionId">The session to count.</param>
+    internal int SessionPendingSettlementCount(string consumerId, string sessionId) =>
+        _sessionIndex.TryGetValue(
+            consumerId,
+            out ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>? consumerIndex) &&
+        consumerIndex.TryGetValue(sessionId, out ConcurrentDictionary<ulong, bool>? tagSet)
+            ? tagSet.Count
+            : 0;
 
     // ── Session bulk eviction (D-11 / VER-2 / R2.2) ──────────────────────────
 
@@ -240,7 +295,8 @@ internal sealed class AzureServiceBusConsumerRegistry
     /// <remarks>
     /// Idempotent — safe to call when the session or consumer is not registered.
     /// After this method returns, no entries for the session remain in <c>_messageMaps</c>
-    /// or <c>_sessionIndex</c>.
+    /// or <c>_sessionIndex</c>. Individual settlements also clean the index: a settlement releases its tag
+    /// through <see cref="ReleaseSessionTag"/> once the SDK call returned.
     /// </remarks>
     /// <param name="consumerId">The consumer that owned the session.</param>
     /// <param name="sessionId">The session whose entries to evict.</param>
@@ -260,7 +316,7 @@ internal sealed class AzureServiceBusConsumerRegistry
 
         if (!_messageMaps.TryGetValue(
             consumerId,
-            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>? map))
+            out ConcurrentDictionary<ulong, (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)>? map))
         {
             return;
         }

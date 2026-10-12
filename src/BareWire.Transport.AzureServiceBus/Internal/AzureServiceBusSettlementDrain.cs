@@ -9,8 +9,8 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// consumer that is already gone and the message does not come back after its lock expires.
 /// </summary>
 /// <remarks>
-/// Shutdown path only; nothing here runs per message. Logs carry identifiers and counts only — never message
-/// content, ordering keys, lock tokens or exception messages.
+/// Runs on the shutdown path and when an idle session is released; nothing here runs per message. Logs carry
+/// identifiers and counts only — never message content, ordering keys, lock tokens or exception messages.
 /// </remarks>
 internal static partial class AzureServiceBusSettlementDrain
 {
@@ -20,9 +20,13 @@ internal static partial class AzureServiceBusSettlementDrain
     /// <summary>The interval at which the pending count is re-checked. Shutdown path only.</summary>
     internal static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
 
+    /// <summary>The coarser re-check interval used while an idle session waits, which can last minutes.</summary>
+    internal static readonly TimeSpan IdlePollInterval = TimeSpan.FromMilliseconds(50);
+
     /// <summary>
     /// Waits until <paramref name="pendingCount"/> reports no in-flight or in-progress settlement, the
-    /// <paramref name="budget"/> is spent, or <paramref name="abortToken"/> is cancelled.
+    /// <paramref name="budget"/> is spent, or <paramref name="abortToken"/> is cancelled. The pending count is
+    /// re-checked every <paramref name="pollInterval"/>.
     /// </summary>
     /// <returns>
     /// <see langword="true"/> when every settlement finished; <see langword="false"/> when the budget ran out
@@ -35,6 +39,7 @@ internal static partial class AzureServiceBusSettlementDrain
         ILogger logger,
         string consumerId,
         string endpointName,
+        TimeSpan pollInterval,
         CancellationToken abortToken)
     {
         ArgumentNullException.ThrowIfNull(pendingCount);
@@ -65,7 +70,7 @@ internal static partial class AzureServiceBusSettlementDrain
         {
             while (true)
             {
-                await Task.Delay(PollInterval, timeProvider, abortToken).ConfigureAwait(false);
+                await Task.Delay(pollInterval, timeProvider, abortToken).ConfigureAwait(false);
 
                 pending = pendingCount();
                 if (pending <= 0)

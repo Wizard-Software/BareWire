@@ -195,7 +195,8 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
         {
             await AzureServiceBusSettlementDrain.WaitForSettlementsAsync(
                 () => _registry.PendingSettlementCount(_consumerId),
-                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName, _adapterShutdownToken)
+                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName,
+                AzureServiceBusSettlementDrain.PollInterval, _adapterShutdownToken)
                 .ConfigureAwait(false);
         }
         finally
