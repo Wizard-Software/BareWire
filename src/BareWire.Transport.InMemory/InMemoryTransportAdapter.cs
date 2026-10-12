@@ -270,6 +270,13 @@ internal sealed class InMemoryTransportAdapter
     internal long DrainDroppedCount => _diagnostics.DrainDroppedCount;
 
     /// <summary>
+    /// Gets or sets how long a stopping consume call waits for the deliveries it handed out to be settled
+    /// before it requeues them. Read when <see cref="ConsumeAsync"/> is called. A test hook; the default is
+    /// <see cref="InMemorySettlementDrain.Budget"/>.
+    /// </summary>
+    internal TimeSpan SettlementBudget { get; set; } = InMemorySettlementDrain.Budget;
+
+    /// <summary>
     /// Gets the number of metric or logger calls from this adapter's queue latch-episode/health
     /// diagnostics collaborator (<see cref="InMemoryQueueDiagnostics"/>) that threw and were suppressed. A
     /// test hook.
@@ -443,7 +450,8 @@ internal sealed class InMemoryTransportAdapter
         }
 
         _singleActiveGates.TryGetValue(endpointName, out SemaphoreSlim? gate);
-        var runner = new InMemoryQueueRunner(queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token);
+        var runner = new InMemoryQueueRunner(
+            queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token, SettlementBudget, _timeProvider);
         return runner.RunAsync(cancellationToken);
     }
 

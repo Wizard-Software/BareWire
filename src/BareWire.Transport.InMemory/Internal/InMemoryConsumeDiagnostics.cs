@@ -145,6 +145,46 @@ internal sealed partial class InMemoryConsumeDiagnostics
         "{SuppressedCount} earlier occurrence(s) for this queue were suppressed since the last log entry.")]
     private static partial void LogDroppedOnShutdown(ILogger logger, int count, string queueName, int suppressedCount);
 
+    /// <summary>
+    /// Records that a stopping runner of <paramref name="queueName"/> waits for <paramref name="count"/>
+    /// unsettled delivery(ies) before releasing them. Metadata only.
+    /// </summary>
+    internal void SettlementDrainWaitStarted(string queueName, int count)
+    {
+        try
+        {
+            LogSettlementDrainWaitStarted(_logger, queueName, count);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
+    }
+
+    /// <summary>
+    /// Records that the settlement wait of a stopping runner of <paramref name="queueName"/> ran out of
+    /// budget with <paramref name="count"/> delivery(ies) still unsettled; they are requeued as before.
+    /// </summary>
+    internal void SettlementBudgetElapsed(string queueName, int count)
+    {
+        try
+        {
+            LogSettlementBudgetElapsed(_logger, queueName, count);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _logFailureCount);
+        }
+    }
+
+    [LoggerMessage(Level = LogLevel.Debug, Message =
+        "Stopping consumer of in-memory queue '{QueueName}' waits for {Count} unsettled delivery(ies) before releasing them.")]
+    private static partial void LogSettlementDrainWaitStarted(ILogger logger, string queueName, int count);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message =
+        "Stopping consumer of in-memory queue '{QueueName}' released {Count} delivery(ies) still unsettled after the settlement budget.")]
+    private static partial void LogSettlementBudgetElapsed(ILogger logger, string queueName, int count);
+
     /// <summary>Gets the total number of undelivered messages dropped on drain (queue close) so far.</summary>
     internal long DrainDroppedCount => Interlocked.Read(ref _drainDroppedCount);
 

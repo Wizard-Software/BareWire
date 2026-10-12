@@ -62,6 +62,9 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
 
     private ulong _deliveryTagCounter;
     private readonly AzureServiceBusShutdownBudget _shutdownBudget;
+    private readonly TimeSpan _settlementBudget;
+    private readonly TimeProvider _timeProvider;
+    private readonly CancellationToken _adapterShutdownToken;
 
     private CancellationTokenSource? _loopCts;
     private Task? _loopTask;
@@ -79,7 +82,10 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
         string consumerId,
         string endpointName,
         ILogger logger,
-        TimeSpan? shutdownBudget = null)
+        TimeSpan? shutdownBudget = null,
+        TimeSpan? settlementBudget = null,
+        TimeProvider? timeProvider = null,
+        CancellationToken adapterShutdownToken = default)
     {
         ArgumentNullException.ThrowIfNull(receiver);
         ArgumentNullException.ThrowIfNull(channel);
@@ -95,6 +101,9 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
         _endpointName = endpointName;
         _logger = logger;
         _shutdownBudget = new AzureServiceBusShutdownBudget(shutdownBudget ?? ShutdownDrainBudget);
+        _settlementBudget = settlementBudget ?? AzureServiceBusSettlementDrain.Budget;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _adapterShutdownToken = adapterShutdownToken;
     }
 
     /// <summary>Gets the unique id of this consumer instance.</summary>
@@ -132,7 +141,8 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
     /// <summary>
     /// Stops receiving, hands back what is buffered, unregisters this consumer and closes the receiver.
     /// Order: stop receive loop, complete the writer, drain (evict, abandon within the shared budget,
-    /// dispose), unregister, close. Single-flight and never throws.
+    /// dispose), wait (bounded) for messages the caller still settles, unregister, close. Single-flight and
+    /// never throws.
     /// </summary>
     internal Task StopAsync() => SingleFlight(ref _stopTask, StopCoreAsync);
 
@@ -177,16 +187,30 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
             _channel.Reader, _registry, _consumerId, _endpointName, abandon: true, _shutdownBudget, _logger)
             .ConfigureAwait(false);
 
-        _registry.Unregister(_consumerId);
-
+        // Messages already handed to the caller may still be settled (for example by a per-key lane that finishes
+        // after the stop). Keep the registry entries and the receiver alive for them, for a bounded time and not
+        // when the adapter itself is being disposed. Receiving has stopped and the buffer is drained, so nothing
+        // new arrives meanwhile.
         try
         {
-            await _receiver.CloseAsync().ConfigureAwait(false);
+            await AzureServiceBusSettlementDrain.WaitForSettlementsAsync(
+                () => _registry.PendingSettlementCount(_consumerId),
+                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName, _adapterShutdownToken)
+                .ConfigureAwait(false);
         }
-        catch (Exception ex)
+        finally
         {
-            AzureServiceBusErrorInfo error = AzureServiceBusErrorInfo.From(ex);
-            LogReceiverCloseError(error.ExceptionType, error.FailureReason);
+            _registry.Unregister(_consumerId);
+
+            try
+            {
+                await _receiver.CloseAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                AzureServiceBusErrorInfo error = AzureServiceBusErrorInfo.From(ex);
+                LogReceiverCloseError(error.ExceptionType, error.FailureReason);
+            }
         }
     }
 

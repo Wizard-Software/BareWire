@@ -51,6 +51,12 @@ internal sealed class AzureServiceBusConsumerRegistry
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>> _sessionIndex =
         new(StringComparer.Ordinal);
 
+    // Per-consumer count of settlements that are inside SettleAsync (entry already evicted, SDK call not yet
+    // returned). Together with the in-flight count it tells a stopping consumer whether anything is still
+    // being settled.
+    private readonly ConcurrentDictionary<string, SettlementCounter> _settling =
+        new(StringComparer.Ordinal);
+
     /// <summary>
     /// Registers an active <paramref name="consumer"/> under the given <paramref name="consumerId"/>
     /// and creates a fresh empty message map for this consumer.
@@ -62,6 +68,7 @@ internal sealed class AzureServiceBusConsumerRegistry
 
         _consumers[consumerId] = consumer;
         _receiveControls[consumerId] = consumer;
+        _settling[consumerId] = new SettlementCounter();
         _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
     }
@@ -85,6 +92,7 @@ internal sealed class AzureServiceBusConsumerRegistry
             _receiveControls[consumerId] = receiveControl;
         }
 
+        _settling[consumerId] = new SettlementCounter();
         _messageMaps[consumerId] = new ConcurrentDictionary<ulong, (ServiceBusReceivedMessage, ServiceBusReceiver)>();
         _sessionIndex[consumerId] = new ConcurrentDictionary<string, ConcurrentDictionary<ulong, bool>>(StringComparer.Ordinal);
     }
@@ -98,6 +106,43 @@ internal sealed class AzureServiceBusConsumerRegistry
         _receiveControls.TryRemove(consumerId, out _);
         _messageMaps.TryRemove(consumerId, out _);
         _sessionIndex.TryRemove(consumerId, out _);
+        _settling.TryRemove(consumerId, out _);
+    }
+
+    /// <summary>
+    /// Opens a settlement scope for <paramref name="consumerId"/>. It must be opened BEFORE the registry entry
+    /// is evicted and disposed after the SDK settlement call returned, so that a stopping consumer never sees
+    /// "nothing pending" while a settlement is still inside the SDK. Returns an inert scope when the consumer is
+    /// not registered.
+    /// </summary>
+    internal SettlementScope BeginSettlement(string consumerId)
+    {
+        if (!_settling.TryGetValue(consumerId, out SettlementCounter? counter))
+        {
+            return default;
+        }
+
+        Interlocked.Increment(ref counter.Value);
+        return new SettlementScope(counter);
+    }
+
+    /// <summary>
+    /// Gets the number of messages of <paramref name="consumerId"/> that are received but not yet fully settled:
+    /// registered in-flight entries plus settlements currently inside the SDK call.
+    /// </summary>
+    internal int PendingSettlementCount(string consumerId)
+    {
+        // Read order is load-bearing: in-flight FIRST, then settling. A settlement opens its scope (settling + 1)
+        // before it evicts the entry (in-flight - 1), and closes the scope only after the SDK call returned.
+        // Reading in-flight first means that a 0 observed there implies the eviction already happened, hence the
+        // scope was already open and the later settling read still sees it. Reversing the two reads could
+        // observe settling == 0 (before the scope opened) and then in-flight == 0 (after the eviction) and
+        // report "nothing pending" while a settlement is about to call the SDK.
+        int inFlight = InFlightCount(consumerId);
+        int settling = _settling.TryGetValue(consumerId, out SettlementCounter? counter)
+            ? Volatile.Read(ref counter.Value)
+            : 0;
+        return inFlight + settling;
     }
 
     /// <summary>
@@ -224,6 +269,31 @@ internal sealed class AzureServiceBusConsumerRegistry
         foreach (ulong deliveryTag in tagSet.Keys)
         {
             map.TryRemove(deliveryTag, out _);
+        }
+    }
+
+    /// <summary>Mutable count of settlements in progress for one consumer.</summary>
+    internal sealed class SettlementCounter
+    {
+        internal int Value;
+    }
+
+    /// <summary>
+    /// Marks one settlement as in progress until disposed. A struct, so opening a scope allocates nothing.
+    /// </summary>
+    internal readonly struct SettlementScope : IDisposable
+    {
+        private readonly SettlementCounter? _counter;
+
+        internal SettlementScope(SettlementCounter? counter) => _counter = counter;
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            if (_counter is not null)
+            {
+                Interlocked.Decrement(ref _counter.Value);
+            }
         }
     }
 }

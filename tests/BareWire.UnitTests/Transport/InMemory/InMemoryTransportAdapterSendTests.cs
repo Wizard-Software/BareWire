@@ -24,7 +24,11 @@ public sealed class InMemoryTransportAdapterSendTests
         var c = new InMemoryConfigurator();
         configure(c);
         InMemoryTransportOptions o = c.Build();
-        return new InMemoryTransportAdapter(o, new InMemoryBroker(o), logger: logger, meter: meter);
+        return new InMemoryTransportAdapter(o, new InMemoryBroker(o), logger: logger, meter: meter)
+        {
+            // Release unsettled deliveries at once; the bounded settlement wait is pinned in the ShutdownSettle tests.
+            SettlementBudget = TimeSpan.Zero,
+        };
     }
 
     // ILogger<T> whose Log always throws, IsEnabled always true — proves a logging provider's own

@@ -96,9 +96,17 @@ internal static class AzureServiceBusShutdownTestSupport
         return condition();
     }
 
+    /// <summary>One captured log call: the source-generated event name, the level and the rendered text.</summary>
+    internal sealed record LogEntry(string? EventName, LogLevel Level, string Text);
+
     internal sealed class CapturingLogger : ILogger<AzureServiceBusTransportAdapter>
     {
         private readonly List<(LogLevel Level, string Text)> _entries = [];
+        private readonly List<LogEntry> _logEntries = [];
+        private readonly List<string> _timeline = [];
+
+        /// <summary>Completes when the consumer logs that it waits for pending settlements.</summary>
+        public TaskCompletionSource WaitStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public List<string> Warnings
         {
@@ -122,6 +130,39 @@ internal static class AzureServiceBusShutdownTestSupport
             }
         }
 
+        /// <summary>Gets a snapshot of every captured entry with its event name.</summary>
+        public IReadOnlyList<LogEntry> Entries
+        {
+            get
+            {
+                lock (_entries)
+                {
+                    return [.. _logEntries];
+                }
+            }
+        }
+
+        /// <summary>Gets a snapshot of the ordered markers appended by <see cref="Mark"/> and by the logger itself.</summary>
+        public IReadOnlyList<string> Timeline
+        {
+            get
+            {
+                lock (_entries)
+                {
+                    return [.. _timeline];
+                }
+            }
+        }
+
+        /// <summary>Appends a marker to the shared timeline (used to order test-side events against log events).</summary>
+        public void Mark(string marker)
+        {
+            lock (_entries)
+            {
+                _timeline.Add(marker);
+            }
+        }
+
         public IDisposable? BeginScope<TState>(TState state)
             where TState : notnull => null;
 
@@ -134,9 +175,20 @@ internal static class AzureServiceBusShutdownTestSupport
             Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
+            string text = formatter(state, exception) + (exception?.ToString() ?? string.Empty);
             lock (_entries)
             {
-                _entries.Add((logLevel, formatter(state, exception) + (exception?.ToString() ?? string.Empty)));
+                _entries.Add((logLevel, text));
+                _logEntries.Add(new LogEntry(eventId.Name, logLevel, text));
+                if (eventId.Name == "LogAwaitingSettlements")
+                {
+                    _timeline.Add("wait-started");
+                }
+            }
+
+            if (eventId.Name == "LogAwaitingSettlements")
+            {
+                WaitStarted.TrySetResult();
             }
         }
     }

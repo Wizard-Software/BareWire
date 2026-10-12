@@ -129,7 +129,10 @@ internal sealed partial class KafkaTransportAdapter
             topic: endpointName,
             logger: _logger,
             isRetryOrDlqTopic: isRetryOrDlqTopic,
-            commitTracker: commitTracker);
+            commitTracker: commitTracker,
+            settlementBudget: SettlementBudget,
+            timeProvider: SettlementTimeProvider,
+            adapterShutdownToken: _disposeCts.Token);
         kafkaConsumerRef = kafkaConsumer;
 
         _consumerRegistry.Register(consumerId, kafkaConsumer);
@@ -223,6 +226,11 @@ internal sealed partial class KafkaTransportAdapter
                 transportName: TransportName,
                 endpointAddress: null);
         }
+
+        // Count this settlement as in progress BEFORE the offset entry is evicted and until the method returns
+        // (this covers a retry/DLQ republish and the commit-tracker update): a stopping consumer waits for
+        // in-flight offsets and in-progress settlements before it closes the native consumer.
+        using KafkaConsumerRegistry.SettlementScope settling = _consumerRegistry.BeginSettlement(consumerId);
 
         // Evict the DeliveryTag → TopicPartitionOffset entry ONCE, before routing, regardless of
         // action (PERF-1: single eviction point — all branches inherit it; no unbounded buffers).

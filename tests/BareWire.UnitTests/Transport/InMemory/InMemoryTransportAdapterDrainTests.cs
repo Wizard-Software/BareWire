@@ -37,7 +37,11 @@ public sealed class InMemoryTransportAdapterDrainTests
         InMemoryTransportOptions o = c.Build();
         return new InMemoryTransportAdapter(
             o, new InMemoryBroker(o), logger: logger, meter: meter, timeProvider: timeProvider,
-            bufferPoolObserver: observer);
+            bufferPoolObserver: observer)
+        {
+            // Release unsettled deliveries at once; the bounded settlement wait is pinned in the ShutdownSettle tests.
+            SettlementBudget = TimeSpan.Zero,
+        };
     }
 
     private static InMemoryQueue Queue(InMemoryTransportAdapter adapter, string name)

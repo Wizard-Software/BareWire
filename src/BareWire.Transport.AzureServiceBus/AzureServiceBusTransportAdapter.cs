@@ -70,6 +70,10 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
     private ServiceBusAdministrationClient? _adminClient;
     private bool _disposed;
 
+    // Cancelled first thing in DisposeAsync: ends any consumer's settlement wait at once, so disposing an
+    // adapter with several stopping consumers never adds up one wait budget per consumer.
+    private readonly CancellationTokenSource _disposeCts = new();
+
     // Sender cache: one sender per routing key (queue/topic name). Thread-safe.
     private readonly ConcurrentDictionary<string, ServiceBusSender> _senders =
         new(StringComparer.Ordinal);
@@ -101,6 +105,16 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
 
         _client = client;
     }
+
+    /// <summary>
+    /// Gets or sets how long a stopping consumer waits for messages it handed out to be settled before it
+    /// releases its receiver. Read when <c>ConsumeAsync</c> is called. A test hook; the default is
+    /// <see cref="AzureServiceBusSettlementDrain.Budget"/>.
+    /// </summary>
+    internal TimeSpan SettlementBudget { get; set; } = AzureServiceBusSettlementDrain.Budget;
+
+    /// <summary>Gets or sets the time source of the settlement wait. Read when <c>ConsumeAsync</c> is called.</summary>
+    internal TimeProvider SettlementTimeProvider { get; set; } = TimeProvider.System;
 
     /// <inheritdoc />
     public string TransportName => "AzureServiceBus";
@@ -270,6 +284,10 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
 
         _disposed = true;
 
+        // Abort every settlement wait first: consumers that are stopping release immediately, and the loops
+        // below do not sit out one wait budget per consumer.
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
+
         // Stop all active non-session consumers BEFORE disposing the client.
         foreach (AzureServiceBusConsumer consumer in _consumerRegistry.AllConsumers())
         {
@@ -310,6 +328,7 @@ internal sealed partial class AzureServiceBusTransportAdapter : ITransportAdapte
         }
 
         _connectionLock.Dispose();
+        _disposeCts.Dispose();
     }
 
     // ── Lazy connection helpers ───────────────────────────────────────────────

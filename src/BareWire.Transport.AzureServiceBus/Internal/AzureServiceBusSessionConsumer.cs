@@ -76,6 +76,9 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     private readonly SemaphoreSlim _acceptGate;
 
     private readonly AzureServiceBusShutdownBudget _shutdownBudget;
+    private readonly TimeSpan _settlementBudget;
+    private readonly TimeProvider _timeProvider;
+    private readonly CancellationToken _adapterShutdownToken;
 
     // Completion handles of the per-session receive loops and of the whole per-session tasks. They let
     // EnsureReceiveStoppedAsync wait for in-flight receive calls and StopAsync wait for session teardown.
@@ -103,7 +106,10 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         Channel<InboundMessage> outputChannel,
         FlowControlOptions flowControl,
         ILogger logger,
-        TimeSpan? shutdownBudget = null)
+        TimeSpan? shutdownBudget = null,
+        TimeSpan? settlementBudget = null,
+        TimeProvider? timeProvider = null,
+        CancellationToken adapterShutdownToken = default)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
@@ -125,6 +131,9 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
         _shutdownBudget = new AzureServiceBusShutdownBudget(
             shutdownBudget ?? AzureServiceBusConsumer.ShutdownDrainBudget);
+        _settlementBudget = settlementBudget ?? AzureServiceBusSettlementDrain.Budget;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _adapterShutdownToken = adapterShutdownToken;
         _acceptGate = new SemaphoreSlim(options.MaxConcurrentSessions, options.MaxConcurrentSessions);
     }
 
@@ -165,10 +174,10 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         SingleFlight(ref _receiveStopTask, StopReceivingAsync);
 
     /// <summary>
-    /// Stops receiving, waits for the per-session tasks to tear their receivers down, hands back whatever is
-    /// still buffered and unregisters this consumer. Closing a session receiver releases its locks, so
-    /// buffered messages are only evicted and disposed — never abandoned one by one. Single-flight and
-    /// never throws.
+    /// Stops receiving, hands back whatever is still buffered, waits (bounded) for the messages the caller
+    /// still settles, then waits for the per-session tasks to tear their receivers down and unregisters this
+    /// consumer. Closing a session receiver releases its locks, so buffered messages are only evicted and
+    /// disposed — never abandoned one by one. Single-flight and never throws.
     /// </summary>
     internal Task StopAsync() => SingleFlight(ref _stopTask, StopCoreAsync);
 
@@ -187,22 +196,40 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     {
         await EnsureReceiveStoppedAsync().ConfigureAwait(false);
 
-        // The runner has settled its in-flight messages by now (this runs from the enumerator's finally), so
-        // the session receivers may be torn down.
-        if (_teardownCts is not null)
-        {
-            await _teardownCts.CancelAsync().ConfigureAwait(false);
-        }
-
-        await WaitBoundedAsync([.. _sessionTasks.Values]).ConfigureAwait(false);
-
+        // Receiving has stopped. Close the shared buffer and hand back what nobody has taken yet; a message that
+        // a session task forwards after this point finds the channel closed and is only evicted and disposed.
         _outputChannel.Writer.TryComplete();
 
         await AzureServiceBusShutdownDrain.DrainAsync(
             _outputChannel.Reader, _registry, _consumerId, _endpointName, abandon: false, _shutdownBudget, _logger)
             .ConfigureAwait(false);
 
-        _registry.Unregister(_consumerId);
+        try
+        {
+            // The caller may still settle the messages it holds (for example a per-key lane that finishes after
+            // the stop), and the session receivers must stay open for that: wait, bounded and not when the
+            // adapter itself is being disposed, until nothing is in flight or being settled.
+            await AzureServiceBusSettlementDrain.WaitForSettlementsAsync(
+                () => _registry.PendingSettlementCount(_consumerId),
+                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName, _adapterShutdownToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            try
+            {
+                if (_teardownCts is not null)
+                {
+                    await _teardownCts.CancelAsync().ConfigureAwait(false);
+                }
+
+                await WaitBoundedAsync([.. _sessionTasks.Values]).ConfigureAwait(false);
+            }
+            finally
+            {
+                _registry.Unregister(_consumerId);
+            }
+        }
     }
 
     private async Task WaitBoundedAsync(IReadOnlyList<Task> tasks)
@@ -665,8 +692,11 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
                     if (!canWrite || !_outputChannel.Writer.TryWrite(message))
                     {
+                        // The shared buffer is closed (the consumer is stopping): nobody will consume this
+                        // message, so it is only evicted and disposed; its lock is released with the session.
                         _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
                         message.Dispose();
+                        LogSessionMessageAfterDrain(_consumerId);
                     }
                 }
                 catch (OperationCanceledException)
@@ -896,6 +926,10 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': message DeliveryTag={DeliveryTag} dropped by the per-session bounded channel (non-Wait FullMode); registry entry evicted. SessionId='{SessionId}'.")]
     private partial void LogMessageDropped(string consumerId, string queueName, ulong deliveryTag, string sessionId);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Azure Service Bus session consumer {ConsumerId}: a session message arrived after the shared buffer was closed; it was evicted and its lock is released with the session.")]
+    private partial void LogSessionMessageAfterDrain(string consumerId);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': session tasks did not stop in time; continuing shutdown.")]

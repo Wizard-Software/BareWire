@@ -3,6 +3,9 @@ using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.AzureServiceBus;
+using BareWire.Transport.AzureServiceBus.Internal;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Time.Testing;
 using NSubstitute;
 using Xunit;
 using static BareWire.UnitTests.Transport.AzureServiceBus.AzureServiceBusShutdownTestSupport;
@@ -21,7 +24,12 @@ public sealed class AzureServiceBusSessionConsumerShutdownTests
 
     private static FlowControlOptions Flow(int capacity = 100) => new() { InternalQueueCapacity = capacity };
 
-    private static (AzureServiceBusTransportAdapter Adapter, ServiceBusSessionReceiver Receiver) NewAdapter()
+    // The settlement wait is off (zero budget) unless a test opts in: tests that take a message and never settle
+    // it would otherwise sit out the full wait when the consumer stops.
+    private static (AzureServiceBusTransportAdapter Adapter, ServiceBusSessionReceiver Receiver) NewAdapter(
+        CapturingLogger? logger = null,
+        TimeSpan? settlementBudget = null,
+        TimeProvider? timeProvider = null)
     {
         ServiceBusSessionReceiver receiver = Substitute.For<ServiceBusSessionReceiver>();
         receiver.SessionId.Returns(SessionId);
@@ -43,7 +51,33 @@ public sealed class AzureServiceBusSessionConsumerShutdownTests
                 return null!;
             });
 
-        return (new AzureServiceBusTransportAdapter(Options(sessions: true), new CapturingLogger(), client), receiver);
+        var adapter = new AzureServiceBusTransportAdapter(
+            Options(sessions: true), logger ?? new CapturingLogger(), client)
+        {
+            SettlementBudget = settlementBudget ?? TimeSpan.Zero,
+        };
+        if (timeProvider is not null)
+        {
+            adapter.SettlementTimeProvider = timeProvider;
+        }
+
+        return (adapter, receiver);
+    }
+
+    // The observable end of a stopping enumerator: MoveNextAsync ends with OperationCanceledException once the
+    // generator's finally (the consumer stop) has run.
+    private static Task Observed(Task end) => end.ContinueWith(static _ => { }, TaskScheduler.Default);
+
+    private static void MarkOnDispose(ServiceBusSessionReceiver receiver, CapturingLogger logger)
+    {
+        // NSubstitute configures the call by "awaiting" the substitute's return value; the ValueTask is never consumed.
+#pragma warning disable CA2012
+        receiver.DisposeAsync().Returns(_ =>
+        {
+            logger.Mark("close");
+            return ValueTask.CompletedTask;
+        });
+#pragma warning restore CA2012
     }
 
     private static bool Disposed(ServiceBusSessionReceiver receiver) =>
@@ -184,6 +218,144 @@ public sealed class AzureServiceBusSessionConsumerShutdownTests
         cts.IsCancellationRequested.Should().BeFalse();
         Disposed(receiver).Should().BeTrue();
 
+        await adapter.DisposeAsync();
+    }
+
+    // ── Settlement wait before the session receivers are released ─────────────
+
+    [Fact]
+    public async Task StopAsync_InFlightMessageSettledDuringWait_CompletesBeforeSessionClose()
+    {
+        // Arrange
+        var logger = new CapturingLogger();
+        (AzureServiceBusTransportAdapter adapter, ServiceBusSessionReceiver receiver) =
+            NewAdapter(logger, AzureServiceBusSettlementDrain.Budget);
+        MarkOnDispose(receiver, logger);
+        receiver
+            .CompleteMessageAsync(Arg.Any<ServiceBusReceivedMessage>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                logger.Mark("complete");
+                return Task.CompletedTask;
+            });
+        ProgramReceive(receiver, [Batch("m", 1, SessionId)]);
+        using var cts = new CancellationTokenSource();
+        IAsyncEnumerator<InboundMessage> enumerator = adapter.ConsumeAsync(QueueName, Flow(), cts.Token)
+            .GetAsyncEnumerator(cts.Token);
+        (await enumerator.MoveNextAsync()).Should().BeTrue();
+        InboundMessage message = enumerator.Current;
+
+        // Act — the runner stops while a lane still holds the message, then settles it.
+        await cts.CancelAsync();
+        Task end = enumerator.MoveNextAsync().AsTask();
+        await Task.WhenAny(end, logger.WaitStarted.Task).WaitAsync(Guard, TestContext.Current.CancellationToken);
+        Func<Task> settle = () => adapter.SettleAsync(SettlementAction.Ack, message, CancellationToken.None);
+        await settle.Should().NotThrowAsync("the registry entry must still exist while the consumer waits");
+        await Observed(end).WaitAsync(Guard, TestContext.Current.CancellationToken);
+
+        // Assert
+        logger.Timeline.Should().ContainInOrder("complete", "close");
+
+        await enumerator.DisposeAsync();
+        await adapter.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StopAsync_SettlementInProgress_ClosesSessionOnlyAfterSdkCallReturns()
+    {
+        // Arrange — CompleteMessageAsync stays inside the SDK call until the test releases it.
+        var logger = new CapturingLogger();
+        (AzureServiceBusTransportAdapter adapter, ServiceBusSessionReceiver receiver) =
+            NewAdapter(logger, AzureServiceBusSettlementDrain.Budget);
+        var completeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var completeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        receiver
+            .CompleteMessageAsync(Arg.Any<ServiceBusReceivedMessage>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                completeEntered.TrySetResult();
+                return completeGate.Task;
+            });
+        ProgramReceive(receiver, [Batch("m", 1, SessionId)]);
+        using var cts = new CancellationTokenSource();
+        IAsyncEnumerator<InboundMessage> enumerator = adapter.ConsumeAsync(QueueName, Flow(), cts.Token)
+            .GetAsyncEnumerator(cts.Token);
+        (await enumerator.MoveNextAsync()).Should().BeTrue();
+
+        // Act — the entry is evicted (nothing in flight) while the settlement is still inside the SDK call.
+        Task settle = adapter.SettleAsync(SettlementAction.Ack, enumerator.Current, CancellationToken.None);
+        await completeEntered.Task.WaitAsync(Guard, TestContext.Current.CancellationToken);
+        await cts.CancelAsync();
+        Task end = enumerator.MoveNextAsync().AsTask();
+        await Task.WhenAny(end, logger.WaitStarted.Task).WaitAsync(Guard, TestContext.Current.CancellationToken);
+        await Task.Delay(100, TestContext.Current.CancellationToken); // give a premature teardown time to show
+
+        // Assert — the session receiver is released only after the SDK call returned.
+        Disposed(receiver).Should().BeFalse();
+        completeGate.SetResult();
+        await settle.WaitAsync(Guard, TestContext.Current.CancellationToken);
+        await Observed(end).WaitAsync(Guard, TestContext.Current.CancellationToken);
+        Disposed(receiver).Should().BeTrue();
+
+        await enumerator.DisposeAsync();
+        await adapter.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StopAsync_InFlightNeverSettled_ReleasesAfterBudget()
+    {
+        // Arrange
+        var fake = new FakeTimeProvider();
+        var logger = new CapturingLogger();
+        (AzureServiceBusTransportAdapter adapter, ServiceBusSessionReceiver receiver) =
+            NewAdapter(logger, AzureServiceBusSettlementDrain.Budget, fake);
+        ProgramReceive(receiver, [Batch("m", 1, SessionId)]);
+        using var cts = new CancellationTokenSource();
+        IAsyncEnumerator<InboundMessage> enumerator = adapter.ConsumeAsync(QueueName, Flow(), cts.Token)
+            .GetAsyncEnumerator(cts.Token);
+        (await enumerator.MoveNextAsync()).Should().BeTrue();
+
+        // Act — nobody settles the message.
+        await cts.CancelAsync();
+        Task end = enumerator.MoveNextAsync().AsTask();
+        Task endObserved = Observed(end);
+        await Task.WhenAny(endObserved, logger.WaitStarted.Task).WaitAsync(Guard, TestContext.Current.CancellationToken);
+        await FakeTimePump.AdvanceUntilCompletedAsync(fake, endObserved, AzureServiceBusSettlementDrain.Budget, Guard);
+
+        // Assert
+        logger.Entries.Should().ContainSingle(e => e.EventName == "LogSettlementBudgetElapsed")
+            .Which.Level.Should().Be(LogLevel.Warning);
+        Disposed(receiver).Should().BeTrue();
+
+        await enumerator.DisposeAsync();
+        await adapter.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task StopAsync_NoInFlight_ReleasesWithoutWaiting()
+    {
+        // Arrange — fake time that is never advanced: any wait would hang.
+        var fake = new FakeTimeProvider();
+        var logger = new CapturingLogger();
+        (AzureServiceBusTransportAdapter adapter, ServiceBusSessionReceiver receiver) =
+            NewAdapter(logger, AzureServiceBusSettlementDrain.Budget, fake);
+        ProgramReceive(receiver, [Batch("m", 1, SessionId)]);
+        using var cts = new CancellationTokenSource();
+        IAsyncEnumerator<InboundMessage> enumerator = adapter.ConsumeAsync(QueueName, Flow(), cts.Token)
+            .GetAsyncEnumerator(cts.Token);
+        (await enumerator.MoveNextAsync()).Should().BeTrue();
+        await adapter.SettleAsync(SettlementAction.Ack, enumerator.Current, CancellationToken.None);
+
+        // Act
+        await cts.CancelAsync();
+        Task end = enumerator.MoveNextAsync().AsTask();
+        await Observed(end).WaitAsync(Guard, TestContext.Current.CancellationToken);
+
+        // Assert
+        logger.Entries.Should().NotContain(e => e.EventName == "LogAwaitingSettlements");
+        Disposed(receiver).Should().BeTrue();
+
+        await enumerator.DisposeAsync();
         await adapter.DisposeAsync();
     }
 }
