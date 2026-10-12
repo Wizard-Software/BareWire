@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
@@ -34,6 +36,7 @@ internal sealed partial class ReceiveEndpointRunner
     private readonly FlowController _flowController;
     private readonly IBareWireInstrumentation _instrumentation;
     private readonly ILogger _logger;
+    private readonly TimeProvider _timeProvider;
     private readonly ConsumerInvokerFactory.InvokerDelegate[] _invokers;
     private readonly string[] _consumerMessageTypeNames;
     private readonly ConsumerInvokerFactory.RawInvokerDelegate[] _rawInvokers;
@@ -151,8 +154,10 @@ internal sealed partial class ReceiveEndpointRunner
         ILogger logger,
         IReadOnlyList<ISagaMessageDispatcher>? sagaDispatchers = null,
         ILoggerFactory? loggerFactory = null,
-        IMessageDeserializer? massTransitEnvelopeDeserializer = null)
+        IMessageDeserializer? massTransitEnvelopeDeserializer = null,
+        TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _binding = binding;
         _adapter = adapter;
         _channelManager = adapter as IConsumerChannelManager;
@@ -331,11 +336,20 @@ internal sealed partial class ReceiveEndpointRunner
         int consecutiveHandoffFaults = 0;
         string? lastFaultedMessageId = null;
 
+        // The primary fault of the read loop, kept so a failure while draining the lanes cannot replace it.
+        Exception? loopFault = null;
+
         try
         {
-            await foreach (InboundMessage message in _adapter
-                .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken)
-                .ConfigureAwait(false))
+            IAsyncEnumerable<InboundMessage> source = _adapter
+                .ConsumeAsync(_binding.EndpointName, flowControl, cancellationToken);
+            if (orderedStage is not null)
+            {
+                // Ordered path only: the sequential path keeps the raw adapter enumerable unchanged.
+                source = StopAwareAsync(source, cancellationToken);
+            }
+
+            await foreach (InboundMessage message in source.ConfigureAwait(false))
             {
                 long bodyLength = 0;
                 bool creditGranted = false;
@@ -506,6 +520,11 @@ internal sealed partial class ReceiveEndpointRunner
                 }
             }
 
+            if (orderedStage is not null && cancellationToken.IsCancellationRequested)
+            {
+                // StopAwareAsync ended the loop without an exception; log the exit like the other stop paths.
+                LogConsumeLoopCancelled(_binding.EndpointName);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -513,32 +532,68 @@ internal sealed partial class ReceiveEndpointRunner
         }
         catch (Exception ex)
         {
+            loopFault = ex;
             LogConsumeLoopFaulted(_binding.EndpointName, ex);
             throw;
         }
         finally
         {
+            ExceptionDispatchInfo? drainFault = null;
+
             // Drain in-flight lanes ALWAYS — on normal completion AND on cancellation/fault. CompleteAsync
             // completes the lane writers, so each lane's reader (which intentionally reads with
             // CancellationToken.None — see Lane.RunAsync) finishes draining its already-enqueued items
             // (settling + disposing them) and then exits; Task.WhenAll joins all lane workers. Skipping this
             // on cancellation would leak laneCount background tasks per endpoint and orphan in-flight
             // messages (never settled / disposed → pooled-buffer leak).
-            if (orderedStage is not null)
+            try
             {
-                await orderedStage.CompleteAsync().ConfigureAwait(false);
+                if (orderedStage is not null)
+                {
+                    await orderedStage.CompleteAsync().ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Defensive: lane faults are handled inside the lane and do not escape, so this only sees
+                // unexpected failures. It must neither skip the channel release below nor mask the primary
+                // fault of the read loop; a stop-induced cancellation is not a fault.
+                LogLaneDrainFaulted(_binding.EndpointName, ex.GetType().Name);
+                if (loopFault is null
+                    && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+                {
+                    drainFault = ExceptionDispatchInfo.Capture(ex);
+                }
+            }
+            finally
+            {
+                // Release the consumer channel so the broker can reclaim it.
+                // CancellationToken.None is intentional — by the time we get here the original
+                // cancellationToken is likely already cancelled (shutdown scenario), but the
+                // close handshake with the broker must still complete cleanly.
+                if (_channelManager is not null && consumerChannelId is not null)
+                {
+                    await _channelManager
+                        .ReleaseConsumerChannelAsync(consumerChannelId, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
             }
 
-            // Release the consumer channel so the broker can reclaim it.
-            // CancellationToken.None is intentional — by the time we get here the original
-            // cancellationToken is likely already cancelled (shutdown scenario), but the
-            // close handshake with the broker must still complete cleanly.
-            if (_channelManager is not null && consumerChannelId is not null)
-            {
-                await _channelManager
-                    .ReleaseConsumerChannelAsync(consumerChannelId, CancellationToken.None)
-                    .ConfigureAwait(false);
-            }
+            drainFault?.Throw();
+        }
+    }
+
+    // Never asks the adapter for another message once a stop is requested: the check runs when the runner
+    // requests the next item, before the inner MoveNextAsync. The runner does not call WithCancellation,
+    // so the token is the one passed in (no extra linked token source is created).
+    private static async IAsyncEnumerable<InboundMessage> StopAwareAsync(
+        IAsyncEnumerable<InboundMessage> source,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await using IAsyncEnumerator<InboundMessage> inner = source.GetAsyncEnumerator(cancellationToken);
+        while (!cancellationToken.IsCancellationRequested && await inner.MoveNextAsync().ConfigureAwait(false))
+        {
+            yield return inner.Current;
         }
     }
 
@@ -1432,7 +1487,7 @@ internal sealed partial class ReceiveEndpointRunner
     /// (<c>MaxInFlightBytes</c> does not gate intake — ADR-026 §7). Poison/anti-starvation per
     /// partition is R8.12.
     /// </remarks>
-    private sealed class OrderedDispatchStage
+    private sealed class OrderedDispatchStage : IDisposable
     {
         private readonly ReceiveEndpointRunner _runner;
         private readonly CreditManager _creditManager;
@@ -1440,6 +1495,14 @@ internal sealed partial class ReceiveEndpointRunner
         private readonly Lane[] _lanes;
         private readonly IConsumerOrderingConfiguration _ordering;
         private readonly MappingEpochTracker _epochTracker;
+
+        // A lane settles after the runner was told to stop, so the settlement must not use the runner's
+        // (already cancelled) token. This token is cancelled LaneSettlementBudget after the runner's token,
+        // which keeps bus shutdown bounded on transports without an adapter-side wait for settlements.
+        private readonly CancellationTokenSource _settlementCts;
+        private readonly CancellationTokenRegistration _armSettlementBudget;
+
+        internal static readonly TimeSpan LaneSettlementBudget = TimeSpan.FromSeconds(5);
 
         internal OrderedDispatchStage(
             ReceiveEndpointRunner runner,
@@ -1452,6 +1515,11 @@ internal sealed partial class ReceiveEndpointRunner
             _creditManager = creditManager;
             _cancellationToken = cancellationToken;
             _ordering = ordering;
+
+            _settlementCts = new CancellationTokenSource(Timeout.InfiniteTimeSpan, runner._timeProvider);
+            _armSettlementBudget = cancellationToken.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).CancelAfter(LaneSettlementBudget),
+                _settlementCts);
 
             int laneDepth = OrderedDispatchLaneDepth.Resolve(
                 laneCount,
@@ -1527,6 +1595,9 @@ internal sealed partial class ReceiveEndpointRunner
             => _lanes[laneIndex].Channel.Writer
                 .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken);
 
+        /// <summary>Token used by lanes for settlement calls; cancelled a fixed budget after the runner stops.</summary>
+        internal CancellationToken SettlementToken => _settlementCts.Token;
+
         /// <summary>Completes all lane channels and awaits in-flight lane drain.</summary>
         internal async Task CompleteAsync()
         {
@@ -1535,7 +1606,22 @@ internal sealed partial class ReceiveEndpointRunner
                 lane.Channel.Writer.Complete();
             }
 
-            await Task.WhenAll(Array.ConvertAll(_lanes, static l => l.Worker)).ConfigureAwait(false);
+            try
+            {
+                await Task.WhenAll(Array.ConvertAll(_lanes, static l => l.Worker)).ConfigureAwait(false);
+            }
+            finally
+            {
+                Dispose();
+            }
+        }
+
+        /// <summary>Releases the settlement budget timer; called once all lane workers have finished.</summary>
+        public void Dispose()
+        {
+            // The registration goes first so the budget callback can no longer touch a disposed source.
+            _armSettlementBudget.Dispose();
+            _settlementCts.Dispose();
         }
 
         private readonly record struct WorkItem(InboundMessage Message, long ArrivalSequence, long BodyLength);
@@ -1612,7 +1698,7 @@ internal sealed partial class ReceiveEndpointRunner
                             // allow the reader to fetch the next message and enqueue it, at which point the
                             // lane would advance to it — violating the C3 head-of-line ordering guarantee.
                             bool advance = await _poisonContract.HandleOutcomeAsync(
-                                    outcome.Action, item.Message, runner._adapter, ct)
+                                    outcome.Action, item.Message, runner._adapter, ct, _stage.SettlementToken)
                                 .ConfigureAwait(false);
 
                             // C3 loop: park failed — retry on the same head until confirmed or cancelled.
@@ -1622,7 +1708,7 @@ internal sealed partial class ReceiveEndpointRunner
                             {
                                 await Task.Delay(PoisonContract.C3RetryDelay, ct).ConfigureAwait(false);
                                 advance = await _poisonContract.HandleOutcomeAsync(
-                                        outcome.Action, item.Message, runner._adapter, ct)
+                                        outcome.Action, item.Message, runner._adapter, ct, _stage.SettlementToken)
                                     .ConfigureAwait(false);
                             }
                         }
@@ -1640,15 +1726,28 @@ internal sealed partial class ReceiveEndpointRunner
                         }
                     }
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // Shutdown (for example a cancelled C3 delay): not a fault, so no error entry.
+                }
                 catch (Exception ex)
                 {
-                    // A lane worker must never fault silently — log and let CompleteAsync observe completion.
-                    runner.LogConsumeLoopFaulted(runner._binding.EndpointName, ex);
-                    throw;
+                    // Explicit handling: the fault is logged once, by type only (the message may carry header
+                    // values), and the worker ends without rethrowing so CompleteAsync joins it cleanly and the
+                    // runner neither logs the same failure again nor skips the rest of the shutdown.
+                    runner.LogLaneWorkerFaulted(runner._binding.EndpointName, ex.GetType().Name);
                 }
             }
         }
     }
+
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Ordered lane worker faulted on endpoint '{EndpointName}' ({ExceptionType}). The lane has stopped.")]
+    private partial void LogLaneWorkerFaulted(string endpointName, string exceptionType);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Draining the ordered lanes of endpoint '{EndpointName}' failed ({ExceptionType}).")]
+    private partial void LogLaneDrainFaulted(string endpointName, string exceptionType);
 
     [LoggerMessage(Level = LogLevel.Information,
         Message = "Starting consume loop for endpoint '{EndpointName}' with {ConsumerCount} consumer(s).")]

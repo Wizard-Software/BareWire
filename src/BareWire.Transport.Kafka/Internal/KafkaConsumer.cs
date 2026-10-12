@@ -77,6 +77,12 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     /// </summary>
     private readonly HashSet<TopicPartition> _pausedByTracker = [];
 
+    private readonly TimeSpan _settlementBudget;
+    private readonly TimeProvider _timeProvider;
+    private readonly CancellationToken _adapterShutdownToken;
+    private readonly Lock _stopLock = new();
+    private Task? _stopTask;
+
     private long _deliveryTagCounter;
     private CancellationTokenSource? _loopCts;
     private Task? _loopTask;
@@ -90,7 +96,10 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         string topic,
         ILogger logger,
         bool isRetryOrDlqTopic = false,
-        KafkaPartitionCommitTracker? commitTracker = null)
+        KafkaPartitionCommitTracker? commitTracker = null,
+        TimeSpan? settlementBudget = null,
+        TimeProvider? timeProvider = null,
+        CancellationToken adapterShutdownToken = default)
     {
         ArgumentNullException.ThrowIfNull(consumer);
         ArgumentNullException.ThrowIfNull(channel);
@@ -108,6 +117,9 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         _logger = logger;
         _commitTracker = commitTracker
             ?? new KafkaPartitionCommitTracker(topic, DefaultMaxTrackedPerPartition, consumer.StoreOffset);
+        _settlementBudget = settlementBudget ?? KafkaSettlementDrain.Budget;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _adapterShutdownToken = adapterShutdownToken;
     }
 
     /// <summary>
@@ -158,11 +170,21 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Signals the polling loop to stop, then closes the consumer performing a clean
-    /// group leave + final offset commit. Completes the channel writer so that
-    /// <c>ReadAllAsync</c> on the reader side terminates.
+    /// Signals the polling loop to stop, hands back what is still buffered, waits (bounded) for messages the
+    /// caller already received and still settles, then unregisters this consumer and closes the native consumer
+    /// performing a clean group leave + final offset commit. Completes the channel writer so that
+    /// <c>ReadAllAsync</c> on the reader side terminates. Single-flight: concurrent callers (the consume
+    /// generator's <c>finally</c> and the adapter's <c>DisposeAsync</c>) share one stop.
     /// </summary>
-    internal async Task StopAsync()
+    internal Task StopAsync()
+    {
+        lock (_stopLock)
+        {
+            return _stopTask ??= StopCoreAsync();
+        }
+    }
+
+    private async Task StopCoreAsync()
     {
         if (_loopCts is not null)
         {
@@ -186,16 +208,48 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
         }
 
         _channel.Writer.TryComplete();
-        _registry.Unregister(_consumerId);
 
         try
         {
-            // Clean leave-group and final offset commit.
-            _consumer.Close();
+            EvictBufferedOffsets();
+
+            // Messages already handed to the caller may still be settled (for example by a per-key ordering lane
+            // that finishes after the stop). Keep the offset map and the native consumer alive for them, for a
+            // bounded time and not when the adapter itself is being disposed. Polling has stopped and the buffer
+            // is drained, so nothing new arrives meanwhile.
+            await KafkaSettlementDrain.WaitForSettlementsAsync(
+                () => _registry.PendingSettlementCount(_consumerId),
+                _settlementBudget, _timeProvider, _logger, _consumerId, _topic, _adapterShutdownToken)
+                .ConfigureAwait(false);
         }
-        catch (Exception ex)
+        finally
         {
-            LogConsumerCloseError(ex);
+            _registry.Unregister(_consumerId);
+
+            try
+            {
+                // Clean leave-group and final offset commit.
+                _consumer.Close();
+            }
+            catch (Exception ex)
+            {
+                LogConsumerCloseError(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops messages that were polled into the channel but never handed to the caller: their offsets stay
+    /// unsettled in the commit tracker, so the commit position stops in front of them and they come back after
+    /// a restart or rebalance, exactly as before. Dropping the map entries keeps the pending count honest, so
+    /// the stop does not wait for settlements that can never arrive.
+    /// </summary>
+    private void EvictBufferedOffsets()
+    {
+        while (_channel.Reader.TryRead(out InboundMessage? message))
+        {
+            _registry.TryEvictOffset(_consumerId, message.DeliveryTag);
+            message.Dispose();
         }
     }
 
@@ -209,9 +263,15 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
 
         _disposed = true;
 
-        await StopAsync().ConfigureAwait(false);
-        _consumer.Dispose();
-        _loopCts?.Dispose();
+        try
+        {
+            await StopAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _consumer.Dispose();
+            _loopCts?.Dispose();
+        }
     }
 
     // ── Polling loop ──────────────────────────────────────────────────────────

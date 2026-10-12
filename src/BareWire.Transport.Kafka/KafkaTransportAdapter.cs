@@ -45,6 +45,10 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
     private IAdminClient? _adminClient;
     private bool _disposed;
 
+    // Cancelled first thing in DisposeAsync: ends any consumer's settlement wait at once, so disposing an
+    // adapter with several stopping consumers never adds up one wait budget per consumer.
+    private readonly CancellationTokenSource _disposeCts = new();
+
     public KafkaTransportAdapter(
         KafkaTransportOptions options,
         ILogger<KafkaTransportAdapter> logger)
@@ -57,6 +61,16 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         _options = options;
         _logger = logger;
     }
+
+    /// <summary>
+    /// Gets or sets how long a stopping consumer waits for messages it handed out to be settled before it
+    /// closes the native consumer. Read when <c>ConsumeAsync</c> is called. A test hook; the default is
+    /// <see cref="KafkaSettlementDrain.Budget"/>.
+    /// </summary>
+    internal TimeSpan SettlementBudget { get; set; } = KafkaSettlementDrain.Budget;
+
+    /// <summary>Gets or sets the time source of the settlement wait. Read when <c>ConsumeAsync</c> is called.</summary>
+    internal TimeProvider SettlementTimeProvider { get; set; } = TimeProvider.System;
 
     /// <inheritdoc />
     public string TransportName => "Kafka";
@@ -296,6 +310,10 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
 
         _disposed = true;
 
+        // Abort every settlement wait first: consumers that are stopping release immediately, and the loop
+        // below does not sit out one wait budget per consumer.
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
+
         // GAP-3: Stop all active consumers BEFORE disposing the producer and connection lock.
         // This ensures a clean leave-group + final offset commit for each consumer.
         foreach (Internal.KafkaConsumer consumer in _consumerRegistry.AllConsumers())
@@ -324,6 +342,7 @@ internal sealed partial class KafkaTransportAdapter : ITransportAdapter, IAsyncD
         _adminClient = null;
 
         _connectionLock.Dispose();
+        _disposeCts.Dispose();
 
         await ValueTask.CompletedTask.ConfigureAwait(false);
     }

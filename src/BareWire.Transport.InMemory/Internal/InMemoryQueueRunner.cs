@@ -40,6 +40,9 @@ internal sealed class InMemoryQueueRunner
     private readonly CancellationToken _shutdownToken;
     private readonly InMemoryConsumeDiagnostics _diagnostics;
     private readonly InMemoryBufferPool _pool;
+    private readonly TimeSpan _settlementBudget;
+    private readonly TimeProvider _timeProvider;
+    private int _unsettledCount;
 
     /// <param name="queue">The queue to consume.</param>
     /// <param name="map">The adapter's delivery map.</param>
@@ -50,13 +53,20 @@ internal sealed class InMemoryQueueRunner
     /// <param name="diagnostics">Reports deliveries dropped on shutdown.</param>
     /// <param name="pool">The pool this runner's requeue-on-abandon copies are rented from and returned to.</param>
     /// <param name="shutdownToken">Cancelled when the adapter shuts down.</param>
+    /// <param name="settlementBudget">
+    /// How long a stopping runner waits for deliveries it handed out to be settled; defaults to
+    /// <see cref="InMemorySettlementDrain.Budget"/>.
+    /// </param>
+    /// <param name="timeProvider">The time source of the settlement wait; defaults to <see cref="TimeProvider.System"/>.</param>
     internal InMemoryQueueRunner(
         InMemoryQueue queue,
         InMemoryDeliveryMap map,
         SemaphoreSlim? singleActiveGate,
         InMemoryConsumeDiagnostics diagnostics,
         InMemoryBufferPool pool,
-        CancellationToken shutdownToken)
+        CancellationToken shutdownToken,
+        TimeSpan? settlementBudget = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(map);
@@ -69,7 +79,18 @@ internal sealed class InMemoryQueueRunner
         _shutdownToken = shutdownToken;
         _diagnostics = diagnostics;
         _pool = pool;
+        _settlementBudget = settlementBudget ?? InMemorySettlementDrain.Budget;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
+
+    /// <summary>Gets the number of deliveries this runner handed out that have not been settled or claimed yet.</summary>
+    internal int UnsettledCount => Volatile.Read(ref _unsettledCount);
+
+    /// <summary>Counts a delivery this runner handed out; called by the delivery map when the entry is added.</summary>
+    internal void OnDeliveryAdded() => Interlocked.Increment(ref _unsettledCount);
+
+    /// <summary>Uncounts a delivery of this runner; called by the delivery map on every successful removal.</summary>
+    internal void OnDeliveryRemoved() => Interlocked.Decrement(ref _unsettledCount);
 
     /// <summary>Gets the queue this runner consumes.</summary>
     internal InMemoryQueue Queue { get; }
@@ -118,18 +139,33 @@ internal sealed class InMemoryQueueRunner
         }
         finally
         {
+            // Give a consumer that is still processing a handed-out delivery (for example a per-key lane that
+            // finishes after the stop) a bounded window to settle it before the delivery is requeued: a late
+            // settlement of an already-released delivery is a no-op and the requeued copy would be processed
+            // twice. Ends at once when nothing is outstanding or the adapter is being disposed. The
+            // single-active gate is held for the wait, so the next standby consumer takes over at most one
+            // settlement budget later, and only when something was in flight.
             try
             {
-                ReleaseUnsettled();
+                await InMemorySettlementDrain.WaitForSettlementsAsync(
+                    () => UnsettledCount, _settlementBudget, _timeProvider, _diagnostics, Queue.Name, _shutdownToken)
+                    .ConfigureAwait(false);
             }
             finally
             {
-                if (gateAcquired)
+                try
                 {
-                    _singleActiveGate!.Release();
+                    ReleaseUnsettled();
                 }
+                finally
+                {
+                    if (gateAcquired)
+                    {
+                        _singleActiveGate!.Release();
+                    }
 
-                linked.Dispose();
+                    linked.Dispose();
+                }
             }
         }
     }

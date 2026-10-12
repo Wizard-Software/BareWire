@@ -28,7 +28,11 @@ public sealed class InMemoryTransportAdapterSettleTests
         var c = new InMemoryConfigurator();
         configure(c);
         InMemoryTransportOptions o = c.Build();
-        return new InMemoryTransportAdapter(o, new InMemoryBroker(o), bufferPoolObserver: observer);
+        return new InMemoryTransportAdapter(o, new InMemoryBroker(o), bufferPoolObserver: observer)
+        {
+            // Release unsettled deliveries at once; the bounded settlement wait is pinned in the ShutdownSettle tests.
+            SettlementBudget = TimeSpan.Zero,
+        };
     }
 
     private static InMemoryTransportAdapter OrdersOnlyAdapter(

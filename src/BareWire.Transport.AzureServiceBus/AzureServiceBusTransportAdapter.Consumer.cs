@@ -100,7 +100,10 @@ internal sealed partial class AzureServiceBusTransportAdapter
             registry: _consumerRegistry,
             consumerId: consumerId,
             endpointName: endpointName,
-            logger: _logger);
+            logger: _logger,
+            settlementBudget: SettlementBudget,
+            timeProvider: SettlementTimeProvider,
+            adapterShutdownToken: _disposeCts.Token);
 
         _consumerRegistry.Register(consumerId, consumer);
         consumer.StartLoop(cancellationToken);
@@ -153,7 +156,10 @@ internal sealed partial class AzureServiceBusTransportAdapter
             consumerId: consumerId,
             outputChannel: outputChannel,
             flowControl: flowControl,
-            logger: _logger);
+            logger: _logger,
+            settlementBudget: SettlementBudget,
+            timeProvider: SettlementTimeProvider,
+            adapterShutdownToken: _disposeCts.Token);
 
         // Session consumers are tracked in _sessionConsumers, not in _consumerRegistry._consumers.
         // RegisterSession creates the message map and session index without touching AllConsumers(); the
@@ -217,6 +223,10 @@ internal sealed partial class AzureServiceBusTransportAdapter
                 transportName: TransportName,
                 endpointAddress: null);
         }
+
+        // Count this settlement as in progress BEFORE the entry is evicted and until the SDK call returned: a
+        // stopping consumer waits for in-flight entries and in-progress settlements before it closes the receiver.
+        using AzureServiceBusConsumerRegistry.SettlementScope settling = _consumerRegistry.BeginSettlement(consumerId);
 
         // Evict the delivery-tag entry exactly once (no unbounded buffers).
         (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)? entry =

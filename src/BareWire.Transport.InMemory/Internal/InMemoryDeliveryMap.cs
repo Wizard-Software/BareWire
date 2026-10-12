@@ -19,6 +19,11 @@ namespace BareWire.Transport.InMemory.Internal;
 /// shutdown sweep) removes it with an atomic remove; exactly one of them wins, so the queue slot is
 /// released or reused exactly once.
 /// </para>
+/// <para>
+/// <b>Per-owner count.</b> Every successful add and removal also updates the owning runner's unsettled
+/// count (an interlocked counter, no allocation, no dictionary scan), which a stopping runner polls while it
+/// waits for its consumers to settle.
+/// </para>
 /// </remarks>
 internal sealed class InMemoryDeliveryMap
 {
@@ -46,13 +51,24 @@ internal sealed class InMemoryDeliveryMap
         {
             throw new InvalidOperationException($"Delivery tag {deliveryTag} is already in flight.");
         }
+
+        entry.Owner.OnDeliveryAdded();
     }
 
     /// <summary>
     /// Removes and returns the entry for <paramref name="deliveryTag"/>. Returns <see langword="false"/>
     /// when the tag is unknown or another path has already removed it.
     /// </summary>
-    internal bool TryTake(ulong deliveryTag, out InFlightDelivery entry) => _entries.TryRemove(deliveryTag, out entry);
+    internal bool TryTake(ulong deliveryTag, out InFlightDelivery entry)
+    {
+        if (!_entries.TryRemove(deliveryTag, out entry))
+        {
+            return false;
+        }
+
+        entry.Owner.OnDeliveryRemoved();
+        return true;
+    }
 
     /// <summary>
     /// Returns, without removing them, the entries handed out by <paramref name="owner"/>, ordered by
@@ -87,6 +103,7 @@ internal sealed class InMemoryDeliveryMap
         {
             if (_entries.TryRemove(tag, out InFlightDelivery entry))
             {
+                entry.Owner.OnDeliveryRemoved();
                 taken.Add(new KeyValuePair<ulong, InFlightDelivery>(tag, entry));
             }
         }
@@ -121,6 +138,7 @@ internal sealed class InMemoryDeliveryMap
 
             if (_entries.TryRemove(candidate.Key, out InFlightDelivery entry))
             {
+                entry.Owner.OnDeliveryRemoved();
                 (released ??= []).Add(entry);
             }
         }

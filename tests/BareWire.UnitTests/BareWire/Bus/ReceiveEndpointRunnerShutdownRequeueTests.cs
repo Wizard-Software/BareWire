@@ -129,6 +129,24 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
             $"every queued message must still be recoverable from the queue after shutdown ({diagnostics})");
         redeliveryCounts.Should().OnlyContain(count => count <= 1,
             $"a requeue-driven busy-spin would redeliver the same copy more than once before shutdown is observed ({diagnostics})");
+
+        if (path != RunnerPath.Sequential)
+        {
+            // K5 (ordered variants): the stopping consumer is never handed the same message twice, and the
+            // shutdown leaves at most one redelivery per message that was unsettled when the runner stopped.
+            // runTask has completed, so every handler invocation that could ever happen has been recorded.
+            Dictionary<string, int> invocations = signal.InvocationsSnapshot();
+            invocations.Should().NotBeEmpty("the stalled handler must have been invoked at least once");
+            invocations.Values.Should().OnlyContain(count => count <= 1,
+                $"a stopping ordered consumer must not receive the same MessageId twice ({diagnostics}, " +
+                $"invocations=[{string.Join(',', invocations.Select(kv => $"{kv.Key}:{kv.Value}"))}])");
+
+            int unsettledAtStop = QueuedMessageCount - adapter.TerminalSettlements;
+            queue.Occupancy.Should().BeLessThanOrEqualTo(unsettledAtStop,
+                $"the queue must hold at most the messages that were unsettled at stop ({diagnostics}, unsettledAtStop={unsettledAtStop})");
+            transport.InFlight.Count.Should().Be(0,
+                $"no delivery may stay claimed in the adapter after the runner stopped ({diagnostics})");
+        }
     }
 
     // ── Test harness ─────────────────────────────────────────────────────────────────────────────
@@ -236,6 +254,27 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
         /// own consume loop is cancelled during shutdown (<c>context.CancellationToken</c>).
         /// </summary>
         internal TaskCompletionSource Gate { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        private readonly Lock _lock = new();
+        private readonly Dictionary<string, int> _invocations = new(StringComparer.Ordinal);
+
+        /// <summary>Records one handler invocation for <paramref name="messageId"/>.</summary>
+        internal void RecordInvocation(string messageId)
+        {
+            lock (_lock)
+            {
+                _invocations[messageId] = _invocations.GetValueOrDefault(messageId) + 1;
+            }
+        }
+
+        /// <summary>Copy of the per-MessageId handler invocation counts recorded so far.</summary>
+        internal Dictionary<string, int> InvocationsSnapshot()
+        {
+            lock (_lock)
+            {
+                return new Dictionary<string, int>(_invocations, StringComparer.Ordinal);
+            }
+        }
     }
 
     private sealed class StalledRawConsumer(StallSignal signal) : IRawConsumer
@@ -246,6 +285,8 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
             // consumer for its next queued item, and a second SetResult on an already-completed
             // TaskCompletionSource throws InvalidOperationException — which would surface as a false
             // failure of this harness rather than a signal about the runner under test.
+            context.Headers.TryGetValue("message-id", out string? messageId);
+            signal.RecordInvocation(messageId ?? string.Empty);
             signal.Entered.TrySetResult();
             await signal.Gate.Task.WaitAsync(context.CancellationToken).ConfigureAwait(false);
         }
@@ -275,12 +316,16 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
         private int _totalReads;
         private int _readsAfterCancellation;
         private int _requeueSettlements;
+        private int _terminalSettlements;
 
         internal int TotalReads => Volatile.Read(ref _totalReads);
 
         internal int ReadsAfterCancellation => Volatile.Read(ref _readsAfterCancellation);
 
         internal int RequeueSettlements => Volatile.Read(ref _requeueSettlements);
+
+        /// <summary>Settlements that remove a message from the queue for good (anything but a requeue).</summary>
+        internal int TerminalSettlements => Volatile.Read(ref _terminalSettlements);
 
         /// <summary>Set by the test immediately before cancelling the runner's token.</summary>
         internal volatile bool CancellationObserved;
@@ -318,6 +363,10 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
             if (action == SettlementAction.Requeue)
             {
                 Interlocked.Increment(ref _requeueSettlements);
+            }
+            else
+            {
+                Interlocked.Increment(ref _terminalSettlements);
             }
 
             return inner.SettleAsync(action, message, cancellationToken);

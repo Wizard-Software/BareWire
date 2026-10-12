@@ -83,7 +83,12 @@ internal sealed partial class PoisonContract
     /// <param name="action">The settlement action determined by <c>ProcessMessageAsync</c>.</param>
     /// <param name="message">The inbound message that was dispatched.</param>
     /// <param name="adapter">The transport adapter for settling.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="cancellationToken">Cancellation token of the runner; drives the durable park and its retries.</param>
+    /// <param name="settlementToken">
+    /// Token used for the settlement calls (ack / nack / reject). It is deliberately distinct from
+    /// <paramref name="cancellationToken"/>: a lane settles after the runner was told to stop, so the
+    /// runner's own token is already cancelled by then and would make the broker SDK drop the settlement.
+    /// </param>
     /// <returns>
     /// <see langword="true"/> when the lane SHOULD advance to the next WorkItem (release);
     /// <see langword="false"/> when the lane MUST NOT advance (C3 — head not durably resolved).
@@ -92,12 +97,13 @@ internal sealed partial class PoisonContract
         SettlementAction action,
         InboundMessage message,
         ITransportAdapter adapter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken settlementToken)
     {
         // Contract DISABLED (default): behave exactly as R8.7 — settle and release unconditionally.
         if (_maxDeliveryAttempts == 0)
         {
-            await SettleAndForgetAsync(adapter, action, message, cancellationToken)
+            await SettleAndForgetAsync(adapter, action, message, settlementToken)
                 .ConfigureAwait(false);
             return true;
         }
@@ -106,7 +112,7 @@ internal sealed partial class PoisonContract
         if (action != SettlementAction.Nack)
         {
             ResetHeadTracking();
-            await SettleAndForgetAsync(adapter, action, message, cancellationToken)
+            await SettleAndForgetAsync(adapter, action, message, settlementToken)
                 .ConfigureAwait(false);
             return true;
         }
@@ -116,7 +122,7 @@ internal sealed partial class PoisonContract
         // OQ-4: empty/unparseable MessageId → head is untrackable → behave as MaxDeliveryAttempts==0.
         if (string.IsNullOrEmpty(message.MessageId))
         {
-            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, cancellationToken)
+            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, settlementToken)
                 .ConfigureAwait(false);
             return true;
         }
@@ -133,13 +139,13 @@ internal sealed partial class PoisonContract
         // Under threshold → redeliver (NACK, broker re-queues); keep head, preserve ordering.
         if (_currentHeadAttempts < _maxDeliveryAttempts)
         {
-            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, cancellationToken)
+            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, settlementToken)
                 .ConfigureAwait(false);
             return true; // lane advances; broker will re-deliver the same head next
         }
 
         // --- PARK threshold reached ---
-        return await ParkHeadAsync(message, adapter, cancellationToken).ConfigureAwait(false);
+        return await ParkHeadAsync(message, adapter, cancellationToken, settlementToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -150,7 +156,8 @@ internal sealed partial class PoisonContract
     private async ValueTask<bool> ParkHeadAsync(
         InboundMessage message,
         ITransportAdapter adapter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CancellationToken settlementToken)
     {
         string token = OrderingKeyDiagnostics.ToOpaqueToken(message.MessageId);
 
@@ -168,7 +175,7 @@ internal sealed partial class PoisonContract
         // Documented as option (b) from R8.3.
         if (!string.IsNullOrEmpty(_deadLetterExchange))
         {
-            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, cancellationToken)
+            await SettleAndForgetAsync(adapter, SettlementAction.Nack, message, settlementToken)
                 .ConfigureAwait(false);
             LogPoisonGapNarrowDlx(_endpointName, token);
             ResetHeadTracking();
@@ -177,7 +184,7 @@ internal sealed partial class PoisonContract
 
         // Branch 3: no DLX at all — message would be lost; log and reject per ADR-026 §7
         // ("no block-forever path" — we must release rather than stall permanently).
-        await SettleAndForgetAsync(adapter, SettlementAction.Reject, message, cancellationToken)
+        await SettleAndForgetAsync(adapter, SettlementAction.Reject, message, settlementToken)
             .ConfigureAwait(false);
         LogMessageLostNoDlx(_endpointName, message.MessageId);
         ResetHeadTracking();
@@ -227,34 +234,56 @@ internal sealed partial class PoisonContract
         return false;
     }
 
+    // Logs only the exception type: the message may carry broker-specific identifiers.
+    private void ReportDiscardedSettlement(SettlementAction action, Exception ex)
+    {
+        if (_logger.IsEnabled(LogLevel.Debug))
+        {
+#pragma warning disable CA1873 // Guarded by IsEnabled above; the analyzer cannot see through the wrapper.
+            LogSettlementDiscarded(_endpointName, action, ex.GetType().Name);
+#pragma warning restore CA1873
+        }
+    }
+
     private void ResetHeadTracking()
     {
         _currentHeadMessageId = null;
         _currentHeadAttempts = 0;
     }
 
-    private static async Task SettleAndForgetAsync(
+    private async Task SettleAndForgetAsync(
         ITransportAdapter adapter,
         SettlementAction action,
         InboundMessage message,
-        CancellationToken cancellationToken)
+        CancellationToken settlementToken)
     {
         try
         {
             CancellationToken settleCt = action == SettlementAction.Requeue
                 ? CancellationToken.None
-                : cancellationToken;
+                : settlementToken;
             await adapter.SettleAsync(action, message, settleCt).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (settlementToken.IsCancellationRequested)
+        {
+            // The settlement budget elapsed while the broker call was still pending: the broker redelivers
+            // the message. The lane keeps draining so its queued items are still released.
+            ReportDiscardedSettlement(action, ex);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Settlement errors on the ordered path are non-fatal: the lane continues. The caller
             // (Lane.RunAsync) already wraps the whole WorkItem in try/finally for credit release.
-            _ = ex;
+            // Only the exception type is logged: its message may carry broker-specific identifiers.
+            ReportDiscardedSettlement(action, ex);
         }
     }
 
     // ── LoggerMessage declarations ────────────────────────────────────────────────────────────
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Settlement {Action} on endpoint '{EndpointName}' failed ({ExceptionType}); the lane continues.")]
+    private partial void LogSettlementDiscarded(string endpointName, SettlementAction action, string exceptionType);
 
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Poison head parked durably on endpoint '{EndpointName}' — " +
