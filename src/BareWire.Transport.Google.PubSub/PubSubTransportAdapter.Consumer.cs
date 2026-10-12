@@ -21,7 +21,7 @@ internal sealed partial class PubSubTransportAdapter
     // Shared in-flight registry — one instance per adapter, shared by every concurrent ConsumeAsync call
     // (one per receive endpoint). Created eagerly in the constructor: lazy initialization would race when
     // several endpoint runners start in parallel and entries would land in an abandoned registry.
-    // Bounded by MaxInFlightMessages (PERF-3 mitigation).
+    // Bounded by MaxInFlightMessages.
     private readonly PubSubInFlightRegistry _inFlightRegistry;
 
     /// <summary>
@@ -46,17 +46,26 @@ internal sealed partial class PubSubTransportAdapter
     /// <para>
     /// Runs a long-polling loop via <c>SubscriberServiceApiClient.PullAsync</c> with
     /// <c>maxMessages = min(MaxOutstandingMessages, flowControl.InternalQueueCapacity)</c>.
-    /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (ADR-004).
+    /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (the pipeline is back-pressured).
     /// </para>
     /// <para>
     /// Before every pull the loop atomically reserves slots in the shared <see cref="PubSubInFlightRegistry"/>
     /// (at most the free room of the endpoint buffer, <c>flowControl.MaxInFlightMessages</c>) and requests only
     /// that many messages; each received message converts one reservation into a registry entry before it is
     /// buffered. Unused reservations are returned when the iteration ends, and messages that cannot be
-    /// registered are handed back to the broker in one batch call. On every drop path (<c>TryWrite</c>
-    /// failure under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
-    /// prevent unbounded growth (PERF-3).
+    /// registered are handed back to the broker in one batch call. On every release path (cancellation,
+    /// channel closed) the registry entry is evicted to prevent unbounded growth.
     /// </para>
+    /// <para>
+    /// The internal buffer holds at least <c>flowControl.MaxInFlightMessages</c> messages, even when
+    /// <c>flowControl.InternalQueueCapacity</c> is smaller, so a received and registered message always fits.
+    /// Only <see cref="BoundedChannelFullMode.Wait"/> is supported: a <c>Drop*</c> mode would discard
+    /// a received message without returning it to the broker.
+    /// </para>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <c>flowControl.MaxInFlightMessages</c> or <c>flowControl.InternalQueueCapacity</c> is not positive,
+    /// or <c>flowControl.FullMode</c> is not <see cref="BoundedChannelFullMode.Wait"/>.
+    /// </exception>
     /// </remarks>
     public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
         string endpointName,
@@ -65,16 +74,21 @@ internal sealed partial class PubSubTransportAdapter
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+        ValidateFlowControl(flowControl);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await EnsureClientsAsync(cancellationToken).ConfigureAwait(false);
 
         var subscriptionName = SubscriptionName.FromProjectSubscription(_options.ProjectId, endpointName);
 
+        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
+
+        // The endpoint buffer holds at most bufferCapacity messages (the buffered counter gates every pull),
+        // so a channel at least that large is never full when the pull loop writes: TryWrite cannot fail.
         var inboundChannel = Channel.CreateBounded<InboundMessage>(
-            new BoundedChannelOptions(flowControl.InternalQueueCapacity)
+            new BoundedChannelOptions(Math.Max(flowControl.InternalQueueCapacity, bufferCapacity))
             {
-                FullMode = flowControl.FullMode,
+                FullMode = flowControl.FullMode, // always Wait after validation
                 SingleWriter = true,
                 SingleReader = false,
             });
@@ -92,7 +106,8 @@ internal sealed partial class PubSubTransportAdapter
 
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            subscriptionName, flowControl, inboundChannel.Writer, buffered, shutdownBudget, pollingCts.Token);
+            subscriptionName, flowControl, bufferCapacity, inboundChannel.Writer, buffered, shutdownBudget,
+            pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
@@ -140,7 +155,7 @@ internal sealed partial class PubSubTransportAdapter
     /// <description>
     /// → no broker operation (DeadLetterViaPolicy); the message remains for redelivery until
     /// <c>max_delivery_attempts</c> is exhausted and <c>DeadLetterPolicy</c> routes it to the
-    /// dead-letter topic (full wiring R5.3 / ADR-017).
+    /// dead-letter topic.
     /// </description>
     /// </item>
     /// </list>
@@ -191,7 +206,7 @@ internal sealed partial class PubSubTransportAdapter
                     break;
 
                 case PubSubSettlementOperation.DeadLetterViaPolicy:
-                    // ADR-017 / R5.3: do NOT ack or modify deadline for Reject.
+                    // Do NOT ack or modify deadline for Reject.
                     // Leave the message for redelivery — DeadLetterPolicy routes it to the
                     // dead-letter topic once max_delivery_attempts is exhausted.
                     LogRejectViaDeadLetterPolicy(message.DeliveryTag);
@@ -216,11 +231,27 @@ internal sealed partial class PubSubTransportAdapter
         }
     }
 
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            // A Drop* mode would discard a received, registered message without returning it to the broker.
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "Google Cloud Pub/Sub consumers support only BoundedChannelFullMode.Wait.");
+        }
+    }
+
     // ── Polling loop ─────────────────────────────────────────────────────────
 
     private async Task RunPollingLoopAsync(
         SubscriptionName subscriptionName,
         FlowControlOptions flowControl,
+        int bufferCapacity,
         ChannelWriter<InboundMessage> writer,
         BufferedCounter buffered,
         PubSubShutdownBudget shutdownBudget,
@@ -233,8 +264,6 @@ internal sealed partial class PubSubTransportAdapter
 
         LogConsumerStarted(subscriptionNameStr);
 
-        // The endpoint buffer never holds more than the prefetch window (flowControl.MaxInFlightMessages).
-        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
         bool paused = false;
 
         _inFlightRegistry.EnterConsumer();
@@ -345,21 +374,40 @@ internal sealed partial class PubSubTransportAdapter
                                 throw;
                             }
 
-                            // Attempt to write to the bounded channel.
-                            bool written = writer.TryWrite(inbound);
-
-                            if (written)
+                            if (!writer.TryWrite(inbound))
                             {
-                                buffered.Increment();
-                            }
-                            else
-                            {
-                                // Channel is full under Drop* FullMode.
-                                // PERF-3: evict from registry on every drop path.
+                                // Defensive: unreachable while the channel is at least as large as the endpoint
+                                // buffer (or when it has been closed). Never drop silently: this message and the
+                                // rest of the batch go back to the broker now.
                                 _inFlightRegistry.TryEvict(deliveryTag);
                                 inbound.Dispose();
                                 LogMessageDropped(deliveryTag, subscriptionNameStr);
+
+                                // Read the token state once, before choosing the budget, so the decision cannot
+                                // flip between the check and the call.
+                                bool stopping = cancellationToken.IsCancellationRequested;
+
+                                if (stopping)
+                                {
+                                    // Stopping: share the one shutdown budget with the rest of the drain.
+                                    await PubSubShutdownDrain.ReleaseUnprocessedAsync(
+                                        _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
+                                        shutdownBudget, _logger).ConfigureAwait(false);
+                                }
+                                else
+                                {
+                                    // Normal operation: a fresh budget, so the shutdown clock does not start
+                                    // while the consumer is running.
+                                    using var releaseBudget = new PubSubShutdownBudget(ShutdownDrainBudget);
+                                    await PubSubShutdownDrain.ReleaseUnprocessedAsync(
+                                        _subscriber!, subscriptionNameStr, response.ReceivedMessages, messageIndex,
+                                        releaseBudget, _logger).ConfigureAwait(false);
+                                }
+
+                                break;
                             }
+
+                            buffered.Increment();
                         }
                     }
                 }
@@ -398,13 +446,13 @@ internal sealed partial class PubSubTransportAdapter
         Dictionary<string, string> headers = PubSubHeaderMapper.MapInbound(
             pubsubMessage.Attributes);
 
-        // Propagate ordering key into BareWire headers if present (R5.1 pass-through).
+        // Propagate ordering key into BareWire headers if present (pass-through).
         if (!string.IsNullOrEmpty(pubsubMessage.OrderingKey))
         {
             headers[PubSubHeaderMapper.OrderingKeyHeader] = pubsubMessage.OrderingKey;
         }
 
-        // Copy body bytes to a pooled buffer to give InboundMessage proper ownership (ADR-003).
+        // Copy body bytes to a pooled buffer to give InboundMessage proper ownership.
         ReadOnlyMemory<byte> bodyMemory = pubsubMessage.Data.Memory;
         byte[]? pooledBuffer = null;
         ReadOnlySequence<byte> bodySequence;
@@ -470,10 +518,10 @@ internal sealed partial class PubSubTransportAdapter
     private partial void LogReceivePaused(string subscriptionName);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Pub/Sub channel full (Drop mode) — dropping message DeliveryTag={DeliveryTag} for subscription '{SubscriptionName}'.")]
+        Message = "Pub/Sub message DeliveryTag={DeliveryTag} could not be buffered for subscription '{SubscriptionName}'; returning it to the broker.")]
     private partial void LogMessageDropped(ulong deliveryTag, string subscriptionName);
 
     [LoggerMessage(Level = LogLevel.Debug,
-        Message = "Pub/Sub Reject (DeliveryTag={DeliveryTag}): leaving message for DeadLetterPolicy DLQ (ADR-017).")]
+        Message = "Pub/Sub Reject (DeliveryTag={DeliveryTag}): leaving message for DeadLetterPolicy DLQ.")]
     private partial void LogRejectViaDeadLetterPolicy(ulong deliveryTag);
 }

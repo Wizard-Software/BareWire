@@ -21,7 +21,7 @@ internal sealed partial class SqsTransportAdapter
     // Shared in-flight registry — one instance per adapter, shared by every concurrent ConsumeAsync call
     // (one per receive endpoint). Created eagerly in the constructor: lazy initialization would race when
     // several endpoint runners start in parallel and entries would land in an abandoned registry.
-    // Bounded by MaxInFlightMessages (PERF-3 mitigation).
+    // Bounded by MaxInFlightMessages.
     private readonly SqsInFlightRegistry _inFlightRegistry;
 
     /// <summary>
@@ -47,17 +47,26 @@ internal sealed partial class SqsTransportAdapter
     /// Runs a long-polling loop via <c>IAmazonSQS.ReceiveMessageAsync</c> with
     /// <c>WaitTimeSeconds</c> from <see cref="SqsTransportOptions"/> and
     /// <c>MaxNumberOfMessages = min(10, flowControl.InternalQueueCapacity)</c>.
-    /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (ADR-004).
+    /// Received messages are pushed into a bounded <see cref="Channel{T}"/> (the pipeline is back-pressured).
     /// </para>
     /// <para>
     /// Before every receive the loop atomically reserves slots in the shared <see cref="SqsInFlightRegistry"/>
     /// (at most the free room of the endpoint buffer, <c>flowControl.MaxInFlightMessages</c>) and requests only
     /// that many messages; each received message converts one reservation into a registry entry before it is
     /// buffered. Unused reservations are returned when the iteration ends, and messages that cannot be
-    /// registered are handed back to the broker in one batch call. On every drop path (<c>TryWrite</c>
-    /// failure under Drop* FullMode, cancellation, channel closed) the registry entry is evicted to
-    /// prevent unbounded growth (PERF-3).
+    /// registered are handed back to the broker in one batch call. On every release path (cancellation,
+    /// channel closed) the registry entry is evicted to prevent unbounded growth.
     /// </para>
+    /// <para>
+    /// The internal buffer holds at least <c>flowControl.MaxInFlightMessages</c> messages, even when
+    /// <c>flowControl.InternalQueueCapacity</c> is smaller, so a received and registered message always fits.
+    /// Only <see cref="BoundedChannelFullMode.Wait"/> is supported: a <c>Drop*</c> mode would discard
+    /// a received message without returning it to the broker.
+    /// </para>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <c>flowControl.MaxInFlightMessages</c> or <c>flowControl.InternalQueueCapacity</c> is not positive,
+    /// or <c>flowControl.FullMode</c> is not <see cref="BoundedChannelFullMode.Wait"/>.
+    /// </exception>
     /// </remarks>
     public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
         string endpointName,
@@ -66,6 +75,7 @@ internal sealed partial class SqsTransportAdapter
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+        ValidateFlowControl(flowControl);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await EnsureClientAsync(cancellationToken).ConfigureAwait(false);
@@ -73,10 +83,14 @@ internal sealed partial class SqsTransportAdapter
         string queueUrl = await GetOrResolveQueueUrlAsync(endpointName, cancellationToken)
             .ConfigureAwait(false);
 
+        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
+
+        // The endpoint buffer holds at most bufferCapacity messages (the buffered counter gates every receive),
+        // so a channel at least that large is never full when the polling loop writes: TryWrite cannot fail.
         var inboundChannel = Channel.CreateBounded<InboundMessage>(
-            new BoundedChannelOptions(flowControl.InternalQueueCapacity)
+            new BoundedChannelOptions(Math.Max(flowControl.InternalQueueCapacity, bufferCapacity))
             {
-                FullMode = flowControl.FullMode,
+                FullMode = flowControl.FullMode, // always Wait after validation
                 SingleWriter = true,
                 SingleReader = false,
             });
@@ -92,7 +106,8 @@ internal sealed partial class SqsTransportAdapter
 
         // Start the polling loop as a background task.
         Task pollingTask = RunPollingLoopAsync(
-            queueUrl, endpointName, flowControl, inboundChannel.Writer, buffered, shutdownBudget, pollingCts.Token);
+            queueUrl, endpointName, flowControl, bufferCapacity, inboundChannel.Writer, buffered, shutdownBudget,
+            pollingCts.Token);
 
         // Yield messages as they arrive; complete when cancellation fires or the loop stops.
         try
@@ -139,7 +154,7 @@ internal sealed partial class SqsTransportAdapter
     /// <term>Reject</term>
     /// <description>
     /// → no destructive operation; the message remains in the queue and will be moved to the
-    /// DLQ after <c>maxReceiveCount</c> is exhausted via RedrivePolicy (ADR-014 / GAP-3).
+    /// DLQ after <c>maxReceiveCount</c> is exhausted via RedrivePolicy.
     /// </description>
     /// </item>
     /// </list>
@@ -189,7 +204,7 @@ internal sealed partial class SqsTransportAdapter
                     break;
 
                 case SqsSettlementOperation.DeadLetterViaRedrive:
-                    // GAP-3 / ADR-014: do NOT delete or change visibility for Reject.
+                    // Do NOT delete or change visibility for Reject.
                     // Leave the message in the queue — its receive count will be incremented
                     // on the next ReceiveMessage call, and the RedrivePolicy will move it to
                     // the DLQ once maxReceiveCount is exhausted. Deleting here would discard
@@ -216,12 +231,28 @@ internal sealed partial class SqsTransportAdapter
         }
     }
 
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            // A Drop* mode would discard a received, registered message without returning it to the broker.
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "Amazon SQS consumers support only BoundedChannelFullMode.Wait.");
+        }
+    }
+
     // ── Polling loop ─────────────────────────────────────────────────────────
 
     private async Task RunPollingLoopAsync(
         string queueUrl,
         string endpointName,
         FlowControlOptions flowControl,
+        int bufferCapacity,
         ChannelWriter<InboundMessage> writer,
         BufferedCounter buffered,
         SqsShutdownBudget shutdownBudget,
@@ -232,8 +263,6 @@ internal sealed partial class SqsTransportAdapter
 
         LogConsumerStarted(endpointName);
 
-        // The endpoint buffer never holds more than the prefetch window (flowControl.MaxInFlightMessages).
-        int bufferCapacity = Math.Max(1, flowControl.MaxInFlightMessages);
         bool paused = false;
 
         _inFlightRegistry.EnterConsumer();
@@ -349,21 +378,40 @@ internal sealed partial class SqsTransportAdapter
                             throw;
                         }
 
-                        // Attempt to write to the bounded channel.
-                        bool written = writer.TryWrite(inbound);
-
-                        if (written)
+                        if (!writer.TryWrite(inbound))
                         {
-                            buffered.Increment();
-                        }
-                        else
-                        {
-                            // Channel is full under Drop* FullMode (Wait mode would block, not return false).
-                            // PERF-3: evict from registry on every drop path.
+                            // Defensive: unreachable while the channel is at least as large as the endpoint
+                            // buffer (or when it has been closed). Never drop silently: this message and the
+                            // rest of the batch go back to the broker now.
                             _inFlightRegistry.TryEvict(deliveryTag);
                             inbound.Dispose();
                             LogMessageDropped(deliveryTag, endpointName);
+
+                            // Read the token state once, before choosing the budget, so the decision cannot
+                            // flip between the check and the call.
+                            bool stopping = cancellationToken.IsCancellationRequested;
+
+                            if (stopping)
+                            {
+                                // Stopping: share the one shutdown budget with the rest of the drain.
+                                await SqsShutdownDrain.ReleaseUnprocessedAsync(
+                                    _client!, queueUrl, endpointName, receivedMessages, messageIndex,
+                                    shutdownBudget, _logger).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                // Normal operation: a fresh budget, so the shutdown clock does not start
+                                // while the consumer is running.
+                                using var releaseBudget = new SqsShutdownBudget(ShutdownDrainBudget);
+                                await SqsShutdownDrain.ReleaseUnprocessedAsync(
+                                    _client!, queueUrl, endpointName, receivedMessages, messageIndex,
+                                    releaseBudget, _logger).ConfigureAwait(false);
+                            }
+
+                            break;
                         }
+
+                        buffered.Increment();
                     }
                 }
                 finally
@@ -395,7 +443,7 @@ internal sealed partial class SqsTransportAdapter
         Dictionary<string, string> headers = SqsHeaderMapper.MapInbound(
             sqsMessage.MessageAttributes);
 
-        // Stamp trusted FIFO system attributes AFTER MapInbound (SEC-3 anti-squatting).
+        // Stamp trusted FIFO system attributes AFTER MapInbound (anti-squatting).
         // System attributes are set by the SQS broker (not the sender) and cannot be
         // forged via MessageAttributes. Stamping after MapInbound ensures broker values
         // always win over any sender-supplied MessageAttribute with the same BW key.
@@ -489,10 +537,10 @@ internal sealed partial class SqsTransportAdapter
     private partial void LogReceivePaused(string endpointName);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "SQS channel full (Drop mode) — dropping message DeliveryTag={DeliveryTag} for queue '{QueueName}'.")]
+        Message = "SQS message DeliveryTag={DeliveryTag} could not be buffered for queue '{QueueName}'; returning it to the broker.")]
     private partial void LogMessageDropped(ulong deliveryTag, string queueName);
 
     [LoggerMessage(Level = LogLevel.Debug,
-        Message = "SQS Reject (DeliveryTag={DeliveryTag}): leaving message for RedrivePolicy DLQ (ADR-014).")]
+        Message = "SQS Reject (DeliveryTag={DeliveryTag}): leaving message for RedrivePolicy DLQ.")]
     private partial void LogRejectViaRedrive(ulong deliveryTag);
 }

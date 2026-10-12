@@ -28,7 +28,7 @@ internal sealed partial class AzureServiceBusTransportAdapter
     /// When <c>_options.EnableSessions</c> is <see langword="false"/> (default), builds a plain
     /// <see cref="ServiceBusReceiver"/> in PeekLock mode (R2.1 path), starts an
     /// <see cref="AzureServiceBusConsumer"/> polling loop, and exposes received messages as
-    /// an <see cref="IAsyncEnumerable{T}"/> via a bounded <see cref="Channel{T}"/> (ADR-004).
+    /// an <see cref="IAsyncEnumerable{T}"/> via a bounded <see cref="Channel{T}"/> (the pipeline is back-pressured).
     /// </para>
     /// <para>
     /// When <c>_options.EnableSessions</c> is <see langword="true"/> (R2.2 path), builds an
@@ -39,6 +39,15 @@ internal sealed partial class AzureServiceBusTransportAdapter
     /// <para>
     /// <b>Full PeekLock/settlement behaviour</b> is validated by integration tests (R2.5).
     /// </para>
+    /// <para>
+    /// Only <see cref="BoundedChannelFullMode.Wait"/> is supported: a <c>Drop*</c> mode would discard
+    /// a received message without settling it, leaving it locked until the lock expires. The options are
+    /// validated before any receiver or session is opened.
+    /// </para>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <c>flowControl.MaxInFlightMessages</c> or <c>flowControl.InternalQueueCapacity</c> is not positive,
+    /// or <c>flowControl.FullMode</c> is not <see cref="BoundedChannelFullMode.Wait"/>.
+    /// </exception>
     /// </remarks>
     public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
         string endpointName,
@@ -47,6 +56,7 @@ internal sealed partial class AzureServiceBusTransportAdapter
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+        ValidateFlowControl(flowControl); // before EnsureClientAsync: no receiver or session is opened
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         await EnsureClientAsync(cancellationToken).ConfigureAwait(false);
@@ -66,6 +76,21 @@ internal sealed partial class AzureServiceBusTransportAdapter
             {
                 yield return message;
             }
+        }
+    }
+
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            // A Drop* mode would discard a received message without settling it.
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "Azure Service Bus consumers support only BoundedChannelFullMode.Wait.");
         }
     }
 
@@ -134,13 +159,13 @@ internal sealed partial class AzureServiceBusTransportAdapter
     {
         // Shared output channel: per-session channels forward into this via the drain task.
         // SingleWriter = false because N drain tasks (one per active session) all write here.
-        // FullMode is pinned to Wait — Drop* modes void per-session FIFO (D-9/PERF-1): a mid-session
+        // FullMode is pinned to Wait — Drop* modes void per-session FIFO: a mid-session
         // message silently dropped here creates an ordering hole that the per-session channels above
         // already prevent, so both levels must agree on Wait to preserve the end-to-end guarantee.
         var outputChannel = Channel.CreateBounded<InboundMessage>(
             new BoundedChannelOptions(flowControl.InternalQueueCapacity)
             {
-                // Drop* modes void per-session FIFO (D-9/PERF-1), so the session path pins Wait.
+                // Drop* modes void per-session FIFO, so the session path pins Wait.
                 FullMode = BoundedChannelFullMode.Wait,
                 SingleWriter = false,
                 SingleReader = false,
