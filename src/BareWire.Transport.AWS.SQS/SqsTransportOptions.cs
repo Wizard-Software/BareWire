@@ -130,8 +130,9 @@ internal sealed class SqsTransportOptions
     /// tracked in <c>SqsInFlightRegistry</c>. Defaults to <c>100</c>.
     /// </summary>
     /// <remarks>
-    /// When the registry is full, further messages are dropped (subject to the channel
-    /// <c>FullMode</c>) to prevent unbounded memory growth (ADR-004 / PERF-3).
+    /// Shared by all receive endpoints of the adapter. A receive never asks the broker for more messages
+    /// than there are free slots, and receiving pauses while no slot is free; this limit therefore also
+    /// bounds how many received messages each endpoint can hold in its internal buffer.
     /// </remarks>
     public int MaxInFlightMessages { get; set; } = 100;
 

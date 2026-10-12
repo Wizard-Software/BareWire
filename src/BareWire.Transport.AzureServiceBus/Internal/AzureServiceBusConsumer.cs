@@ -323,21 +323,13 @@ internal sealed partial class AzureServiceBusConsumer : IAsyncDisposable, IAzure
                     ServiceBusReceivedMessage received = batch[i];
                     InboundMessage message = BuildMessage(received);
 
-                    // Back-pressure: block the loop until the bounded channel can accept a write.
-                    // Under FullMode.Wait this suspends the loop when capacity is exhausted, preventing
-                    // over-fetching. Under DropWrite/DropOldest/DropNewest, WaitToWriteAsync returns
-                    // true immediately and TryWrite may return false — that is the drop-detection path.
+                    // The adapter accepts only FullMode.Wait and this loop is the only writer, so WaitToWriteAsync
+                    // blocks while the channel is full and the branch below runs only after the channel was
+                    // completed (the consumer is stopping).
                     try
                     {
                         bool canWrite = await _channel.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false);
 
-                        // PERF-1: check the result of TryWrite. Under a non-Wait FullMode
-                        // (DropWrite/DropOldest/DropNewest — all publicly settable on
-                        // FlowControlOptions.FullMode), WaitToWriteAsync returns true immediately and
-                        // TryWrite silently drops/evicts the message. Without this guard the dropped
-                        // message would (a) never be settled → PeekLock expires → DLQ after
-                        // max-delivery-count, and (b) leave an orphaned registry entry that grows
-                        // without bound, violating the CONSTITUTION "no unbounded buffers" rule.
                         if (!canWrite || !_channel.Writer.TryWrite(message))
                         {
                             _registry.TryEvictMessage(_consumerId, message.DeliveryTag);

@@ -15,7 +15,7 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Per-session channel topology (D-9/PERF-1):</b> Each accepted
+/// <b>Per-session channel topology:</b> Each accepted
 /// <see cref="ServiceBusSessionReceiver"/> writes to its OWN bounded channel
 /// (<c>SingleWriter = true</c>, legal because exactly one session-reader task is the sole writer).
 /// This guarantees FIFO ordering within each <c>SessionId</c> and makes the <c>SingleWriter</c>
@@ -455,7 +455,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         string sessionId,
         CancellationToken receiveToken)
     {
-        // Per-session bounded channel (D-9/PERF-1):
+        // Per-session bounded channel:
         // SingleWriter = true is legal because this session task is the ONLY writer.
         // FIFO within the session is guaranteed by the sequential single-reader drain below.
         // FullMode is pinned to Wait via BuildSessionChannelOptions — Drop* modes void per-session FIFO.
@@ -649,8 +649,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
                 InboundMessage message = BuildMessage(batch[i], sessionReceiver, sessionId);
 
-                // Back-pressure: block until the per-session channel can accept a write.
-                // PERF-1 drop-detection: check TryWrite result.
+                // Back-pressure: the per-session channel is pinned to Wait and this loop is its only writer, so
+                // WaitToWriteAsync blocks while it is full; the branch below runs only after the channel was completed.
                 try
                 {
                     bool canWrite = await sessionChannel.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false);
@@ -685,19 +685,12 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             await foreach (InboundMessage message in sessionChannel.Reader
                 .ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                // Forward into the shared output channel.
+                // Forward into the shared output channel. Several session drain tasks write here; WriteAsync
+                // queues the writers and hands each freed slot to the longest-waiting one, so no writer loses a
+                // race for it (it completes synchronously, without allocating, when there is room).
                 try
                 {
-                    bool canWrite = await _outputChannel.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false);
-
-                    if (!canWrite || !_outputChannel.Writer.TryWrite(message))
-                    {
-                        // The shared buffer is closed (the consumer is stopping): nobody will consume this
-                        // message, so it is only evicted and disposed; its lock is released with the session.
-                        _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
-                        message.Dispose();
-                        LogSessionMessageAfterDrain(_consumerId);
-                    }
+                    await _outputChannel.Writer.WriteAsync(message, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -707,8 +700,11 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                 }
                 catch (ChannelClosedException)
                 {
+                    // The shared buffer is closed (the consumer is stopping): nobody will consume this
+                    // message, so it is only evicted and disposed; its lock is released with the session.
                     _registry.TryEvictMessage(_consumerId, message.DeliveryTag);
                     message.Dispose();
+                    LogSessionMessageAfterDrain(_consumerId);
                     return;
                 }
             }
@@ -800,14 +796,14 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     /// <returns>Options with <see cref="BoundedChannelFullMode.Wait"/> pinned unconditionally.</returns>
     /// <remarks>
     /// Drop* modes (DropWrite / DropOldest / DropNewest) void the per-session FIFO guarantee
-    /// (D-9/PERF-1): a mid-session message could be silently dropped while later messages
+    /// a mid-session message could be silently dropped while later messages
     /// still enqueue, creating a hole in the ordered sequence within a SessionId. The session
     /// path therefore always uses Wait, regardless of the caller's FlowControlOptions.FullMode.
     /// </remarks>
     internal static BoundedChannelOptions BuildSessionChannelOptions(int capacity) =>
         new(capacity)
         {
-            // Drop* modes void per-session FIFO (D-9/PERF-1), so the session path pins Wait.
+            // Drop* modes void per-session FIFO, so the session path pins Wait.
             FullMode = BoundedChannelFullMode.Wait,
             SingleWriter = true,
             SingleReader = true,
@@ -924,7 +920,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     private partial void LogOuterLoopStopError(AzureServiceBusErrorInfo error);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': message DeliveryTag={DeliveryTag} dropped by the per-session bounded channel (non-Wait FullMode); registry entry evicted. SessionId='{SessionId}'.")]
+        Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': message DeliveryTag={DeliveryTag} could not be buffered because the per-session channel was closed; registry entry evicted. SessionId='{SessionId}'.")]
     private partial void LogMessageDropped(string consumerId, string queueName, ulong deliveryTag, string sessionId);
 
     [LoggerMessage(Level = LogLevel.Debug,
