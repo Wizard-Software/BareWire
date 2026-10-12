@@ -44,11 +44,20 @@ namespace BareWire.Transport.AzureServiceBus.Internal;
 /// <b>Session-lock release and cleanup (D-11/VER-2):</b> When a session ends (idle drain or
 /// <c>SessionLockLost</c>), the cleanup sequence is:
 /// <list type="number">
-/// <item><description>Cancel the per-session <see cref="CancellationTokenSource"/> (stops both the receive loop and the renew task).</description></item>
-/// <item><description>Call <see cref="AzureServiceBusConsumerRegistry.EvictAllForSession"/> to bulk-remove all in-flight delivery-tag entries for the session.</description></item>
+/// <item><description>When the session went idle while forwarded messages are still unsettled, stop receiving, keep the receiver and its lock renewal alive, and wait for those messages to be settled (see below).</description></item>
+/// <item><description>Cancel the per-session <see cref="CancellationTokenSource"/> (stops both the renew task and the forwarding task).</description></item>
+/// <item><description>Call <see cref="AzureServiceBusConsumerRegistry.EvictAllForSession"/> to bulk-remove all remaining delivery-tag entries for the session.</description></item>
 /// <item><description>Release the <see cref="SemaphoreSlim"/> permit.</description></item>
 /// <item><description>Dispose the <see cref="ServiceBusSessionReceiver"/>.</description></item>
 /// </list>
+/// </para>
+/// <para>
+/// <b>Idle exit with messages in flight:</b> The settlement wait does not issue new receive calls, and the
+/// session stays locked, so no other consumer can take it while older messages of the session are still being
+/// handled. The wait ends as soon as every message of the session is settled, and no later than the end of the
+/// session lock: with auto-renewal enabled the lock is extended, so the session can hold its
+/// <c>MaxConcurrentSessions</c> permit for up to <c>MaxAutoLockRenewDuration</c> plus one lock period when the
+/// handler is slow or stuck. A lost session lock or a stopping consumer ends the wait earlier.
 /// </para>
 /// <para>
 /// <b>SDK thread-safety:</b> <see cref="ServiceBusReceiver"/> (and its subclass
@@ -211,7 +220,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             // adapter itself is being disposed, until nothing is in flight or being settled.
             await AzureServiceBusSettlementDrain.WaitForSettlementsAsync(
                 () => _registry.PendingSettlementCount(_consumerId),
-                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName, _adapterShutdownToken)
+                _settlementBudget, _timeProvider, _logger, _consumerId, _endpointName,
+                AzureServiceBusSettlementDrain.PollInterval, _adapterShutdownToken)
                 .ConfigureAwait(false);
         }
         finally
@@ -471,7 +481,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         CancellationToken sessionToken = sessionCts.Token;
 
         // Start background renew task BEFORE the receive loop (D-10/PERF-2).
-        Task renewTask = Task.CompletedTask;
+        Task<bool> renewTask = Task.FromResult(false);
         if (_options.MaxAutoLockRenewDuration > TimeSpan.Zero)
         {
             renewTask = Task.Factory.StartNew(
@@ -489,6 +499,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             TaskScheduler.Default).Unwrap();
 
         bool sessionLockLost = false;
+        bool idleExit = false;
 
         // Registered before the loop starts so EnsureReceiveStoppedAsync can never miss an in-flight receive.
         long loopId = Interlocked.Increment(ref _taskSequence);
@@ -499,7 +510,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         {
             try
             {
-                await RunSessionReceiveLoopAsync(sessionReceiver, sessionId, sessionChannel, receiveToken).ConfigureAwait(false);
+                idleExit = await RunSessionReceiveLoopAsync(sessionReceiver, sessionId, sessionChannel, receiveToken)
+                    .ConfigureAwait(false);
             }
             finally
             {
@@ -523,6 +535,16 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         }
         finally
         {
+            // The session went idle, but the caller may still hold messages forwarded from it. Stop writing, keep
+            // the receiver (and its lock renewal) alive, and wait for them to be settled, bounded by the session
+            // lock. The forwarding task keeps handing over what is already buffered.
+            if (idleExit && !sessionLockLost)
+            {
+                sessionChannel.Writer.TryComplete();
+                sessionLockLost |= await WaitForIdleSessionSettlementsAsync(
+                    sessionReceiver, sessionId, renewTask, receiveToken).ConfigureAwait(false);
+            }
+
             // Receiving stopped because the consumer is stopping: the caller may still settle the messages it
             // holds from this session, so the receiver (and its lock renewal) must stay alive until StopAsync
             // tears the consumer down. A session that ended on its own (idle, lock lost) is released at once.
@@ -577,6 +599,81 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
         }
     }
 
+    /// <summary>
+    /// Holds an idle session open until the messages forwarded from it are settled, the session lock ends, the
+    /// session lock is lost, or the consumer stops.
+    /// </summary>
+    /// <returns><see langword="true"/> when the wait was ended by a lost session lock.</returns>
+    private async Task<bool> WaitForIdleSessionSettlementsAsync(
+        ServiceBusSessionReceiver sessionReceiver,
+        string sessionId,
+        Task<bool> renewTask,
+        CancellationToken receiveToken)
+    {
+        if (_registry.SessionPendingSettlementCount(_consumerId, sessionId) <= 0)
+        {
+            return false;
+        }
+
+        using CancellationTokenSource waitCts =
+            CancellationTokenSource.CreateLinkedTokenSource(receiveToken, _adapterShutdownToken);
+
+        // The unbounded budget leaves the session-lock bound below as the only time limit.
+        Task<bool> settled = AzureServiceBusSettlementDrain.WaitForSettlementsAsync(
+            () => _registry.SessionPendingSettlementCount(_consumerId, sessionId),
+            TimeSpan.MaxValue, _timeProvider, _logger, _consumerId, _endpointName,
+            AzureServiceBusSettlementDrain.IdlePollInterval, waitCts.Token);
+
+        Task renewWatch = renewTask;
+        bool lockLost = false;
+
+        try
+        {
+            while (!settled.IsCompleted)
+            {
+                // Read live: auto-renewal extends the lock while the wait is in progress.
+                TimeSpan untilLockEnds = sessionReceiver.SessionLockedUntil - _timeProvider.GetUtcNow();
+                if (untilLockEnds <= TimeSpan.Zero)
+                {
+                    int unsettled = _registry.SessionPendingSettlementCount(_consumerId, sessionId);
+                    if (unsettled > 0)
+                    {
+                        LogIdleSessionLockBoundReached(_consumerId, _endpointName, sessionId, unsettled);
+                    }
+
+                    break;
+                }
+
+                using var delayCts = new CancellationTokenSource();
+                Task finished = await Task.WhenAny(
+                    settled, renewWatch, Task.Delay(untilLockEnds, _timeProvider, delayCts.Token)).ConfigureAwait(false);
+                await delayCts.CancelAsync().ConfigureAwait(false);
+
+                if (!ReferenceEquals(finished, renewWatch) || ReferenceEquals(renewWatch, settled))
+                {
+                    continue;
+                }
+
+                if (renewTask.IsCompletedSuccessfully && renewTask.Result)
+                {
+                    lockLost = true;
+                    break;
+                }
+
+                // The renew loop ended for another reason (renew limit, renewal disabled, error): the lock is
+                // not lost, so keep waiting until it ends.
+                renewWatch = settled;
+            }
+        }
+        finally
+        {
+            await waitCts.CancelAsync().ConfigureAwait(false);
+            await settled.ConfigureAwait(false);
+        }
+
+        return lockLost;
+    }
+
     private async Task WaitForTeardownAsync()
     {
         try
@@ -591,7 +688,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
     // ── Session receive loop ──────────────────────────────────────────────────
 
-    private async Task RunSessionReceiveLoopAsync(
+    /// <returns><see langword="true"/> when the loop ended because the session went idle (an empty batch).</returns>
+    private async Task<bool> RunSessionReceiveLoopAsync(
         ServiceBusSessionReceiver sessionReceiver,
         string sessionId,
         Channel<InboundMessage> sessionChannel,
@@ -610,7 +708,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             }
             catch (OperationCanceledException)
             {
-                break;
+                return false;
             }
             catch (ServiceBusException sbEx) when (sbEx.Reason == ServiceBusFailureReason.SessionLockLost)
             {
@@ -625,7 +723,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                 }
                 catch (OperationCanceledException)
                 {
-                    break;
+                    return false;
                 }
 
                 continue;
@@ -634,7 +732,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             if (batch.Count == 0)
             {
                 // No messages in the session — idle drain complete; release the session.
-                break;
+                return true;
             }
 
             for (int i = 0; i < batch.Count; i++)
@@ -644,7 +742,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                     // Received but never registered: hand the rest of the batch back right away.
                     await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
                         sessionReceiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
-                    return;
+                    return false;
                 }
 
                 InboundMessage message = BuildMessage(batch[i], sessionReceiver, sessionId);
@@ -668,10 +766,12 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                     message.Dispose();
                     await AzureServiceBusShutdownDrain.AbandonUnregisteredAsync(
                         sessionReceiver, batch, i, _endpointName, _shutdownBudget, _logger).ConfigureAwait(false);
-                    return;
+                    return false;
                 }
             }
         }
+
+        return false;
     }
 
     // ── Drain task (per-session channel → shared output channel) ─────────────
@@ -715,13 +815,14 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
     // ── Background renew loop (D-10 / PERF-2 / Opcja A) ─────────────────────
 
-    private async Task RunRenewLoopAsync(
+    /// <returns><see langword="true"/> when the loop stopped because the session lock was lost.</returns>
+    private async Task<bool> RunRenewLoopAsync(
         ServiceBusSessionReceiver sessionReceiver,
         string sessionId,
         CancellationTokenSource sessionCts,
         CancellationToken cancellationToken)
     {
-        DateTimeOffset renewStart = DateTimeOffset.UtcNow;
+        DateTimeOffset renewStart = _timeProvider.GetUtcNow();
         TimeSpan maxDuration = _options.MaxAutoLockRenewDuration;
 
         try
@@ -730,7 +831,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             {
                 // Check total elapsed renew time.
                 if (maxDuration > TimeSpan.Zero &&
-                    DateTimeOffset.UtcNow - renewStart >= maxDuration)
+                    _timeProvider.GetUtcNow() - renewStart >= maxDuration)
                 {
                     LogRenewDurationExceeded(_consumerId, _endpointName, sessionId);
                     break;
@@ -740,7 +841,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                 // MUST use SessionLockedUntil, NOT MaxAutoLockRenewDuration, as the sleep interval —
                 // confusing these would cause the lock to expire before the first renew.
                 DateTimeOffset lockedUntil = sessionReceiver.SessionLockedUntil;
-                TimeSpan remaining = lockedUntil - DateTimeOffset.UtcNow - RenewSafetyMargin;
+                TimeSpan remaining = lockedUntil - _timeProvider.GetUtcNow() - RenewSafetyMargin;
                 TimeSpan sleepInterval = remaining / 2;
 
                 if (sleepInterval < RenewMinFloor)
@@ -750,7 +851,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
 
                 try
                 {
-                    await Task.Delay(sleepInterval, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(sleepInterval, _timeProvider, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -771,7 +872,7 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
                 {
                     // Lock already expired — stop renewing; the receive loop will detect and handle.
                     LogSessionLockLostInRenew(_consumerId, _endpointName, sessionId);
-                    break;
+                    return true;
                 }
                 catch (OperationCanceledException)
                 {
@@ -785,6 +886,8 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
             }
         }
         catch (OperationCanceledException) { }
+
+        return false;
     }
 
     // ── Session channel factory ───────────────────────────────────────────────
@@ -878,6 +981,10 @@ internal sealed partial class AzureServiceBusSessionConsumer : IAsyncDisposable,
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Azure Service Bus session consumer {ConsumerId}: session lock lost during renew for session '{SessionId}' on queue '{QueueName}'. Stopping renew.")]
     private partial void LogSessionLockLostInRenew(string consumerId, string queueName, string sessionId);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Azure Service Bus session consumer {ConsumerId} on queue '{QueueName}': idle session '{SessionId}' released with {Count} unsettled message(s) because its session lock ended.")]
+    private partial void LogIdleSessionLockBoundReached(string consumerId, string queueName, string sessionId, int count);
 
     [LoggerMessage(Level = LogLevel.Debug,
         Message = "Azure Service Bus session consumer {ConsumerId}: session lock renewed for session '{SessionId}' on queue '{QueueName}'. LockedUntil={LockedUntil}.")]

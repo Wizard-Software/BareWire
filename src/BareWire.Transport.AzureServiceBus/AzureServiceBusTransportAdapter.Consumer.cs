@@ -253,9 +253,10 @@ internal sealed partial class AzureServiceBusTransportAdapter
         // stopping consumer waits for in-flight entries and in-progress settlements before it closes the receiver.
         using AzureServiceBusConsumerRegistry.SettlementScope settling = _consumerRegistry.BeginSettlement(consumerId);
 
-        // Evict the delivery-tag entry exactly once (no unbounded buffers).
-        (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver)? entry =
-            _consumerRegistry.TryEvictMessage(consumerId, message.DeliveryTag);
+        // Evict the delivery-tag entry exactly once (no unbounded buffers). The session tag stays counted until
+        // the SDK call below has returned, so an idle session waits for this settlement before it closes.
+        (ServiceBusReceivedMessage Message, ServiceBusReceiver Receiver, string? SessionId)? entry =
+            _consumerRegistry.TryEvictMessage(consumerId, message.DeliveryTag, releaseSessionTag: false);
 
         if (entry is null)
         {
@@ -268,56 +269,63 @@ internal sealed partial class AzureServiceBusTransportAdapter
 
         AzureServiceBusSettlementOperation operation = AzureServiceBusSettlementRouter.Map(action);
 
-        // A requeue while the consumer is stopping must not race the receive loop: if it were still running,
-        // the broker could hand the abandoned message straight back to this very consumer.
-        if (operation == AzureServiceBusSettlementOperation.Abandon &&
-            _consumerRegistry.TryGetReceiveControl(consumerId, out IAzureServiceBusReceiveControl? receiveControl) &&
-            receiveControl.IsStopRequested)
-        {
-            await receiveControl.EnsureReceiveStoppedAsync().ConfigureAwait(false);
-        }
-
         try
         {
-            switch (operation)
+            // A requeue while the consumer is stopping must not race the receive loop: if it were still running,
+            // the broker could hand the abandoned message straight back to this very consumer.
+            if (operation == AzureServiceBusSettlementOperation.Abandon &&
+                _consumerRegistry.TryGetReceiveControl(consumerId, out IAzureServiceBusReceiveControl? receiveControl) &&
+                receiveControl.IsStopRequested)
             {
-                case AzureServiceBusSettlementOperation.Complete:
-                    await entry.Value.Receiver
-                        .CompleteMessageAsync(entry.Value.Message, cancellationToken)
-                        .ConfigureAwait(false);
-                    break;
+                await receiveControl.EnsureReceiveStoppedAsync().ConfigureAwait(false);
+            }
 
-                case AzureServiceBusSettlementOperation.Abandon:
-                    await entry.Value.Receiver
-                        .AbandonMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
-                        .ConfigureAwait(false);
-                    break;
+            try
+            {
+                switch (operation)
+                {
+                    case AzureServiceBusSettlementOperation.Complete:
+                        await entry.Value.Receiver
+                            .CompleteMessageAsync(entry.Value.Message, cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
 
-                case AzureServiceBusSettlementOperation.DeadLetter:
-                    await entry.Value.Receiver
-                        .DeadLetterMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
-                        .ConfigureAwait(false);
-                    break;
+                    case AzureServiceBusSettlementOperation.Abandon:
+                        await entry.Value.Receiver
+                            .AbandonMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
 
-                case AzureServiceBusSettlementOperation.Defer:
-                    await entry.Value.Receiver
-                        .DeferMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
-                        .ConfigureAwait(false);
-                    break;
+                    case AzureServiceBusSettlementOperation.DeadLetter:
+                        await entry.Value.Receiver
+                            .DeadLetterMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
 
-                default:
-                    throw new InvalidOperationException(
-                        $"Unknown AzureServiceBusSettlementOperation value: {operation}.");
+                    case AzureServiceBusSettlementOperation.Defer:
+                        await entry.Value.Receiver
+                            .DeferMessageAsync(entry.Value.Message, cancellationToken: cancellationToken)
+                            .ConfigureAwait(false);
+                        break;
+
+                    default:
+                        throw new InvalidOperationException(
+                            $"Unknown AzureServiceBusSettlementOperation value: {operation}.");
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException and not BareWireTransportException and not InvalidOperationException)
+            {
+                throw new BareWireTransportException(
+                    message: $"Failed to settle message (action={action}, DeliveryTag={message.DeliveryTag}) " +
+                             $"on Azure Service Bus.",
+                    transportName: TransportName,
+                    endpointAddress: null,
+                    innerException: ex);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException and not BareWireTransportException and not InvalidOperationException)
+        finally
         {
-            throw new BareWireTransportException(
-                message: $"Failed to settle message (action={action}, DeliveryTag={message.DeliveryTag}) " +
-                         $"on Azure Service Bus.",
-                transportName: TransportName,
-                endpointAddress: null,
-                innerException: ex);
+            _consumerRegistry.ReleaseSessionTag(consumerId, entry.Value.SessionId, message.DeliveryTag);
         }
     }
 
