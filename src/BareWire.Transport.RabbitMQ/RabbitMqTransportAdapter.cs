@@ -31,8 +31,9 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     // Maps consumerChannelId → the consumer, so SettleAsync(Requeue) can cancel the AMQP consumer before
     // the nack when the caller is shutting down. Looked up only by the BW-ConsumerChannelId header; entries
-    // are removed together with the channel (ReleaseConsumerChannelAsync / DisposeAsync) or when
-    // basic.consume fails.
+    // are removed together with the channel: on release (ReleaseConsumerChannelAsync), on adapter DisposeAsync,
+    // when consumer setup fails (basic.qos or basic.consume), and when an iteration ends without having handed
+    // out any delivery.
     private readonly ConcurrentDictionary<string, RabbitMqConsumer> _activeConsumers =
         new(StringComparer.Ordinal);
 
@@ -41,7 +42,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     private long _deliveryTagCounter;
     private IConnection? _connection;
-    private bool _disposed;
+    private int _disposed;
 
     // Mapping-epoch memoization — keyed on topology reference (O(1) ReferenceEquals per batch).
     // Recomputed only when the configured topology reference is reassigned (re-map scenario).
@@ -114,7 +115,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(messages);
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         try
         {
@@ -267,7 +268,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         ArgumentNullException.ThrowIfNull(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
         ValidateFlowControl(flowControl);
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         try
         {
@@ -290,40 +291,53 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 cancellationToken)
             .ConfigureAwait(false);
 
-        // ValidateFlowControl guarantees MaxInFlightMessages > 0 at int level, so the narrowing cast is safe.
-        ushort prefetchCount = (ushort)Math.Min(flowControl.MaxInFlightMessages, ushort.MaxValue);
-
-        await consumerChannel.BasicQosAsync(
-            prefetchSize: 0,
-            prefetchCount: prefetchCount,
-            global: false,
-            cancellationToken: cancellationToken).ConfigureAwait(false);
-
-        // Invariant: the broker never has more than prefetchCount unacknowledged deliveries for this consumer
-        // (basic.qos with global: false applies per consumer, and there is one consumer per channel), so a
-        // buffer of at least that size cannot be full while the writer is open. The buffer stays bounded
-        // (at most ushort.MaxValue entries).
-        int bufferCapacity = Math.Max(flowControl.InternalQueueCapacity, prefetchCount);
-        Channel<InboundMessage> inboundChannel = Channel.CreateBounded<InboundMessage>(
-            new BoundedChannelOptions(bufferCapacity)
-            {
-                FullMode = flowControl.FullMode,
-                SingleWriter = true,
-                SingleReader = false,
-            });
-
         // Each ConsumeAsync invocation gets a unique key so multiple consumers on the same
         // endpoint (round-robin) do not overwrite each other's channel in the dictionary.
+        // Register the channel immediately so every failure below releases it through one path, and so adapter
+        // DisposeAsync closes it if the adapter is torn down mid-setup. It also lets SettleAsync resolve it by
+        // consumer channel ID.
         string consumerChannelId = Guid.NewGuid().ToString("N");
-        var consumer = new RabbitMqConsumer(consumerChannel, inboundChannel, _headerMapper, consumerChannelId);
-
-        // Register the channel so SettleAsync can resolve it by consumer channel ID.
         _activeConsumerChannels[consumerChannelId] = consumerChannel;
-        _activeConsumers[consumerChannelId] = consumer;
 
+        // Pairs with the CompareExchange in DisposeAsync: either its sweep sees the registration above, or the
+        // re-check below sees the disposed flag (store -> load ordering needs a full fence on both sides).
+        Interlocked.MemoryBarrier();
+
+        RabbitMqConsumer? consumer = null;
+        Channel<InboundMessage>? inboundChannel = null;
         string assignedTag;
         try
         {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            // ValidateFlowControl guarantees MaxInFlightMessages > 0 at int level, so the narrowing cast is safe.
+            ushort prefetchCount = (ushort)Math.Min(flowControl.MaxInFlightMessages, ushort.MaxValue);
+
+            await consumerChannel.BasicQosAsync(
+                prefetchSize: 0,
+                prefetchCount: prefetchCount,
+                global: false,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            // Invariant: the broker never has more than prefetchCount unacknowledged deliveries for this consumer
+            // (basic.qos with global: false applies per consumer, and there is one consumer per channel), so a
+            // buffer of at least that size cannot be full while the writer is open. The buffer stays bounded
+            // (at most ushort.MaxValue entries).
+            int bufferCapacity = Math.Max(flowControl.InternalQueueCapacity, prefetchCount);
+            inboundChannel = Channel.CreateBounded<InboundMessage>(
+                new BoundedChannelOptions(bufferCapacity)
+                {
+                    FullMode = flowControl.FullMode,
+                    SingleWriter = true,
+                    SingleReader = false,
+                });
+
+            consumer = new RabbitMqConsumer(consumerChannel, inboundChannel, _headerMapper, consumerChannelId)
+            {
+                EndpointName = endpointName,
+            };
+            _activeConsumers[consumerChannelId] = consumer;
+
             assignedTag = await consumerChannel.BasicConsumeAsync(
                 queue: endpointName,
                 autoAck: false,
@@ -336,12 +350,26 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         }
         catch
         {
-            // basic.consume failed: nothing was delivered, so drop the consumer registration and rethrow.
-            _activeConsumers.TryRemove(consumerChannelId, out _);
-            consumer.CompleteWriter();
+            // Setup failed and nothing was handed to the caller. Stop buffering, return the pooled buffers of any
+            // deliveries that arrived after consume-ok without a nack (closing the channel makes the broker
+            // return them), release the channel and rethrow the original failure.
+            consumer?.CompleteWriter();
+            if (inboundChannel is not null)
+            {
+                while (inboundChannel.Reader.TryRead(out InboundMessage? buffered))
+                {
+                    buffered.Dispose();
+                }
+            }
+
+            await ReleaseConsumerChannelSafeAsync(endpointName, consumerChannelId).ConfigureAwait(false);
             throw;
         }
 
+        // Must not throw: this region runs after the setup catch and before the iterator's try/finally, so an
+        // exception here would leak the channel. It is a property assignment and a token registration whose
+        // callback (RequestStop) only flips a flag; it stays outside the setup try because the `await using`
+        // registration must live for the whole loop.
         consumer.AssignedTag = assignedTag;
 
         // Flag the consumer as stopping the moment the caller's token fires, before the runner settles the
@@ -349,11 +377,13 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         await using CancellationTokenRegistration stopRegistration = cancellationToken.Register(
             static state => ((RabbitMqConsumer)state!).RequestStop(), consumer);
 
+        bool deliveredAny = false;
         try
         {
             await foreach (InboundMessage message in consumer.ReadUntilCancelledAsync(cancellationToken)
                 .ConfigureAwait(false))
             {
+                deliveredAny = true;
                 yield return message;
             }
         }
@@ -372,6 +402,9 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             //      in-flight deliveries owned by the runner).
             //   4. If the cancel did not complete (channel not open, failure or timeout) the consumer may still
             //      be fed by the broker; close the channel so the broker returns every unsettled delivery once.
+            //   4a. If no delivery was ever handed to the caller, nothing can be settled on this channel and the
+            //      caller never learns its id (it travels only on deliveries), so the adapter releases it here
+            //      instead of step 4.
             bool cancelled = await consumer.EnsureCancelledAsync().ConfigureAwait(false);
             if (!cancelled && consumer.CancelFailure is { } cancelFailure)
             {
@@ -392,7 +425,11 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 }
             }
 
-            if (!cancelled && consumerChannel.IsOpen)
+            if (!deliveredAny)
+            {
+                await ReleaseConsumerChannelSafeAsync(endpointName, consumerChannelId).ConfigureAwait(false);
+            }
+            else if (!cancelled && consumerChannel.IsOpen)
             {
                 try
                 {
@@ -432,7 +469,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(message);
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         IChannel? channel = ResolveChannelForMessage(message);
 
@@ -661,16 +698,36 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         channelId.Length <= MaxLoggedChannelIdLength ? channelId : channelId[..MaxLoggedChannelIdLength];
 
     /// <inheritdoc />
-    public async Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default)
-    {
-        _activeConsumers.TryRemove(channelId, out _);
+    public Task ReleaseConsumerChannelAsync(string channelId, CancellationToken cancellationToken = default) =>
+        ReleaseConsumerChannelCoreAsync(channelId, endpointName: null, cancellationToken);
 
+    // Never throws: close and dispose failures are logged, so a caller's finally never sees them and the
+    // original failure is not masked.
+    private async Task ReleaseConsumerChannelCoreAsync(
+        string channelId, string? endpointName, CancellationToken cancellationToken)
+    {
+        // Intentional order: the consumer entry goes first, so nothing can resolve a consumer whose channel is
+        // already on its way out; the channel entry decides who owns the close.
+        _activeConsumers.TryRemove(channelId, out RabbitMqConsumer? consumer);
+
+        // Whoever removes the entry (this method, a failed setup, the iterator's finally, or DisposeAsync) is the
+        // only one to release it. Already released or never registered: no-op (idempotent).
         if (!_activeConsumerChannels.TryRemove(channelId, out IChannel? channel))
         {
-            // Already released or never registered — no-op (idempotent).
             return;
         }
 
+        await CloseAndDisposeConsumerChannelAsync(
+                channel, endpointName ?? consumer?.EndpointName ?? string.Empty, channelId, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // Never throws: every caller has already removed the channel from the registry, so a failure here must not
+    // stop the caller from releasing anything else. The token bounds CloseAsync only; IChannel.DisposeAsync()
+    // takes no token and is bounded solely by the client's ContinuationTimeout (default 20 s, not set by BareWire).
+    private async Task CloseAndDisposeConsumerChannelAsync(
+        IChannel channel, string endpointName, string channelId, CancellationToken cancellationToken)
+    {
         try
         {
             if (channel.IsOpen)
@@ -680,10 +737,25 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         }
         catch (Exception ex)
         {
-            LogConsumeChannelCloseError(channelId, ex);
+            LogConsumerChannelReleaseError(endpointName, TruncateChannelId(channelId), ex);
         }
 
-        await channel.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            await channel.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogConsumerChannelReleaseError(endpointName, TruncateChannelId(channelId), ex);
+        }
+    }
+
+    // Used on setup failure and in the iterator's finally, where the original exception must surface.
+    private async Task ReleaseConsumerChannelSafeAsync(string endpointName, string consumerChannelId)
+    {
+        // Independent of the caller's token: setup may have failed precisely because it was cancelled.
+        using var timeout = new CancellationTokenSource(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds);
+        await ReleaseConsumerChannelCoreAsync(consumerChannelId, endpointName, timeout.Token).ConfigureAwait(false);
     }
 
     private static string ToRabbitMqExchangeType(BwExchangeType exchangeType) =>
@@ -699,31 +771,32 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
         {
             return;
         }
 
-        _disposed = true;
-
         await _disposeCts.CancelAsync().ConfigureAwait(false);
 
-        // Close consumer channels that were intentionally kept alive for post-iteration settlement.
-        foreach (KeyValuePair<string, IChannel> kvp in _activeConsumerChannels)
+        // Close consumer channels that were intentionally kept alive for post-iteration settlement. One TryRemove
+        // pass, enumerating the dictionary directly. An entry removed here is released only here; a setup that
+        // registers after this pass sees the disposed flag and releases its own channel, so no outer retry loop
+        // is needed. The helper never throws, so one failing channel cannot skip the remaining channels, the
+        // connection, the lock or the CTS.
+        foreach (KeyValuePair<string, IChannel> entry in _activeConsumerChannels)
         {
-            try
+            if (!_activeConsumerChannels.TryRemove(entry.Key, out IChannel? channel))
             {
-                await kvp.Value.CloseAsync().ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                LogConsumeChannelCloseError(kvp.Key, ex);
+                continue;
             }
 
-            await kvp.Value.DisposeAsync().ConfigureAwait(false);
+            _activeConsumers.TryRemove(entry.Key, out RabbitMqConsumer? consumer);
+            using var closeTimeout = new CancellationTokenSource(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds);
+            await CloseAndDisposeConsumerChannelAsync(
+                    channel, consumer?.EndpointName ?? string.Empty, entry.Key, closeTimeout.Token)
+                .ConfigureAwait(false);
         }
 
-        _activeConsumerChannels.Clear();
         _activeConsumers.Clear();
 
         if (_connection is not null)
@@ -846,6 +919,10 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     [LoggerMessage(Level = LogLevel.Warning,
         Message = "Exception while closing consumer channel for endpoint '{EndpointName}'.")]
     private partial void LogConsumeChannelCloseError(string endpointName, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Exception while releasing consumer channel '{ChannelId}' for endpoint '{EndpointName}'.")]
+    private partial void LogConsumerChannelReleaseError(string endpointName, string channelId, Exception ex);
 
     // Aggregated: reported once per shutdown for the FIRST failed requeue; the remaining buffered deliveries
     // were disposed without a nack and are returned by the broker when the channel closes. Logs identifiers

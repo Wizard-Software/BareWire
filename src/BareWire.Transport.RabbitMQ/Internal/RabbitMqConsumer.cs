@@ -48,6 +48,9 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         _consumerChannelId = consumerChannelId;
     }
 
+    /// <summary>The endpoint (queue) name this consumer reads from; used in channel release diagnostics.</summary>
+    internal string EndpointName { get; init; } = string.Empty;
+
     /// <summary>The broker-assigned consumer tag; set by the adapter once <c>basic.consume</c> returns.</summary>
     internal string AssignedTag { get; set; } = string.Empty;
 
