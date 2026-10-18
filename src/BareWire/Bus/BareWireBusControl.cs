@@ -434,17 +434,19 @@ internal sealed partial class BareWireBusControl : IBusControl
             : null;
 
         List<EndpointHealthStatus> endpointStatuses = new(endpointNames.Count + (transportHealth?.Endpoints.Count ?? 0));
-        BusStatus worstStatus = BusStatus.Healthy;
+        BusStatus flowControlWorstStatus = BusStatus.Healthy;
 
         foreach (string endpointName in endpointNames)
         {
             BusStatus status = _flowController.CheckHealth(endpointName);
 
-            if (status > worstStatus)
-                worstStatus = status;
+            if (status > flowControlWorstStatus)
+                flowControlWorstStatus = status;
 
             endpointStatuses.Add(new EndpointHealthStatus(endpointName, status, Description: null));
         }
+
+        BusStatus worstStatus = flowControlWorstStatus;
 
         // Worst status contributed by the transport itself (aggregate and per-queue), tracked separately
         // so that its description is only appended when the transport is the one reporting trouble.
@@ -466,11 +468,16 @@ internal sealed partial class BareWireBusControl : IBusControl
                 worstStatus = transportWorstStatus;
         }
 
-        string description = worstStatus switch
+        // The capacity wording is used only when flow control contributes the worst status; a status
+        // reported by the transport alone (for example a consumer waiting for connection recovery) gets
+        // a neutral summary and the transport's own description explains the cause.
+        string description = (worstStatus, flowControlWorstStatus == worstStatus) switch
         {
-            BusStatus.Healthy => "All endpoints are operating normally.",
-            BusStatus.Degraded => "One or more endpoints are approaching capacity.",
-            BusStatus.Unhealthy => "One or more endpoints are at capacity.",
+            (BusStatus.Healthy, _) => "All endpoints are operating normally.",
+            (BusStatus.Degraded, true) => "One or more endpoints are approaching capacity.",
+            (BusStatus.Degraded, false) => "One or more endpoints are degraded.",
+            (BusStatus.Unhealthy, true) => "One or more endpoints are at capacity.",
+            (BusStatus.Unhealthy, false) => "One or more endpoints are unhealthy.",
             _ => "Unknown status.",
         };
 

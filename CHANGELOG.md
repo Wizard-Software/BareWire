@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behavior change:** the bus health description (`IBusControl.CheckHealth` and the `barewire` health check) mentions capacity only when flow control causes the worst status. When the worst status comes from the transport alone — a RabbitMQ consumer waiting for automatic recovery or an in-memory queue at or above 90% of capacity — the summary is now `One or more endpoints are degraded.` (previously `One or more endpoints are approaching capacity.`) or `One or more endpoints are unhealthy.` (previously `One or more endpoints are at capacity.`), followed by the transport's description as before. Health statuses are unchanged; update alerts or dashboards that match on the description text
 - Bumped the transitive MessagePack pin to 2.5.307 to clear the NuGetAudit advisory GHSA-qhrr-8q5h-9q3h (NU1902), which failed `dotnet restore` under warnings-as-errors
 - **Behavior change:** registering a second, different transport in one service collection (for example `AddBareWireRabbitMq` followed by `AddBareWireKafka`) now throws `BareWireConfigurationException`. Previously the second transport's adapter and receive endpoints were silently ignored. Register exactly one transport per service collection; support for multiple transports is planned.
 - Kafka: declaring a receive endpoint without `ConsumerGroup` now fails at configuration time with `BareWireConfigurationException` instead of in the consume loop
