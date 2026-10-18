@@ -40,7 +40,7 @@ public sealed class RabbitMqConsumerSetupFailureTests
         internal required IConnection Connection { get; init; }
     }
 
-    private static Harness CreateHarness()
+    private static Harness CreateHarness(bool automaticRecoveryEnabled = true)
     {
         IChannel channel = Substitute.For<IChannel>();
         channel.IsOpen.Returns(true);
@@ -64,7 +64,11 @@ public sealed class RabbitMqConsumerSetupFailureTests
             .Returns(Task.FromResult(channel));
 
         var adapter = new RabbitMqTransportAdapter(
-            new RabbitMqTransportOptions { ConnectionString = "amqp://guest:guest@localhost:5672/" },
+            new RabbitMqTransportOptions
+            {
+                ConnectionString = "amqp://guest:guest@localhost:5672/",
+                AutomaticRecoveryEnabled = automaticRecoveryEnabled,
+            },
             NullLogger<RabbitMqTransportAdapter>.Instance);
 
         // EnsureConnectedAsync returns early when _connection is open, so no broker connection is attempted.
@@ -375,5 +379,59 @@ public sealed class RabbitMqConsumerSetupFailureTests
         // Assert — the sweep and the start-up cleanup must not both release the channel.
         (await act.Should().ThrowAsync<InvalidOperationException>()).Which.Should().BeSameAs(failure);
         await AssertReleasedAsync(harness.Channel);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ConsumeAsync_ConsumerCreated_PassesRecoverySettingsToConsumer(bool automaticRecoveryEnabled)
+    {
+        // Arrange — basic.consume parks on a gate so the consumer stays registered while it is inspected.
+        Harness harness = CreateHarness(automaticRecoveryEnabled);
+        var gate = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        StubBasicConsume(harness.Channel, _ => gate.Task);
+        using var cts = new CancellationTokenSource(TestTimeout);
+        await using IAsyncEnumerator<InboundMessage> enumerator = Consume(harness, cts.Token);
+
+        // Act
+        Task<bool> moveNext = enumerator.MoveNextAsync().AsTask();
+        while (GetConsumers(harness.Adapter).IsEmpty)
+        {
+            await Task.Delay(10, cts.Token);
+        }
+
+        RabbitMqConsumer consumer = GetConsumers(harness.Adapter).Values.Single();
+        bool probedWhileOpen = consumer.IsConnectionOpen!();
+        harness.Connection.IsOpen.Returns(false);
+        bool probedWhileClosed = consumer.IsConnectionOpen!();
+
+        // The probe is bound to the connection that created the channel, not to the adapter's current one.
+        IConnection replacement = Substitute.For<IConnection>();
+        replacement.IsOpen.Returns(true);
+        typeof(RabbitMqTransportAdapter)
+            .GetField("_connection", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(harness.Adapter, replacement);
+        bool probedAfterReplacement = consumer.IsConnectionOpen!();
+
+        // Assert
+        consumer.AutomaticRecoveryEnabled.Should().Be(automaticRecoveryEnabled);
+        probedWhileOpen.Should().BeTrue();
+        probedWhileClosed.Should().BeFalse();
+        probedAfterReplacement.Should().BeFalse();
+        await harness.Connection.Received(1).CreateChannelAsync(
+            Arg.Is<CreateChannelOptions?>(o => o != null && o.ConsumerDispatchConcurrency == 1),
+            Arg.Any<CancellationToken>());
+
+        // Cleanup
+        gate.SetResult(ConsumerTag);
+        await cts.CancelAsync();
+        try
+        {
+            await moveNext;
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: the token was cancelled while the consumer was waiting for deliveries.
+        }
     }
 }

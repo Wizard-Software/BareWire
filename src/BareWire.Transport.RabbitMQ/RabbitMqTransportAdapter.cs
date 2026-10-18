@@ -283,11 +283,18 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 innerException: ex);
         }
 
-        IChannel consumerChannel = await _connection!
+        // Capture the connection that owns this channel: the field is replaced when the adapter reconnects, and
+        // the consumer's recovery probe must describe this connection, not whichever is current later.
+        IConnection owner = _connection!;
+
+        // consumerDispatchConcurrency: 1 serialises deliveries and shutdown events of the channel, which the
+        // consumer relies on (single writer for its delivery-tag tracking).
+        IChannel consumerChannel = await owner
             .CreateChannelAsync(
                 new CreateChannelOptions(
                     publisherConfirmationsEnabled: false,
-                    publisherConfirmationTrackingEnabled: false),
+                    publisherConfirmationTrackingEnabled: false,
+                    consumerDispatchConcurrency: 1),
                 cancellationToken)
             .ConfigureAwait(false);
 
@@ -335,6 +342,8 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             consumer = new RabbitMqConsumer(consumerChannel, inboundChannel, _headerMapper, consumerChannelId)
             {
                 EndpointName = endpointName,
+                AutomaticRecoveryEnabled = _options.AutomaticRecoveryEnabled,
+                IsConnectionOpen = () => owner.IsOpen,
             };
             _activeConsumers[consumerChannelId] = consumer;
 

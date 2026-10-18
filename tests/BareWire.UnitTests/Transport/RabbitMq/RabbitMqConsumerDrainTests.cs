@@ -142,7 +142,7 @@ public sealed class RabbitMqConsumerDrainTests
         RabbitMqConsumer.DrainResult result = await consumer.DrainAndRequeueAsync(CancellationToken.None);
 
         // Assert
-        result.Should().Be(new RabbitMqConsumer.DrainResult(2, 2, 0, null, 0, null));
+        result.Should().Be(new RabbitMqConsumer.DrainResult(2, 2, 0, null, 0, null, 0));
         await channel.Received(1).BasicNackAsync(2UL, false, true, Arg.Any<CancellationToken>());
         await channel.Received(1).BasicNackAsync(3UL, false, true, Arg.Any<CancellationToken>());
         m2.PooledBuffer.Should().BeNull("the pooled buffer must be returned");

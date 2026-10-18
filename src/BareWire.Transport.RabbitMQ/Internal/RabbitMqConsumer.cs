@@ -31,6 +31,15 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     private Task<bool>? _cancelTask;
     private int _cancelFailureReported;
 
+    // Highest delivery tag seen so far. Written only by the delivery dispatcher (the adapter pins
+    // consumerDispatchConcurrency to 1), read from the shutdown handler through Volatile.
+    private ulong _maxSeenDeliveryTag;
+
+    // Every tag at or below this value was issued by a channel instance that has since shut down. Raised
+    // monotonically by HandleChannelShutdownAsync; never lowered.
+    private ulong _staleTagWatermark;
+    private int _discardedStale;
+
     internal RabbitMqConsumer(
         IChannel channel,
         Channel<InboundMessage> inboundChannel,
@@ -50,6 +59,27 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
 
     /// <summary>The endpoint (queue) name this consumer reads from; used in channel release diagnostics.</summary>
     internal string EndpointName { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Whether the connection factory recovers channels automatically (mirrors
+    /// <c>RabbitMqTransportOptions.AutomaticRecoveryEnabled</c>).
+    /// </summary>
+    internal bool AutomaticRecoveryEnabled { get; init; }
+
+    /// <summary>
+    /// Reports whether the connection that owns this consumer's channel is still open. <see langword="null"/>
+    /// means "unknown" and makes every channel shutdown terminal.
+    /// </summary>
+    internal Func<bool>? IsConnectionOpen { get; init; }
+
+    /// <summary>
+    /// <see langword="true"/> when <paramref name="deliveryTag"/> was issued by a channel instance that has since
+    /// shut down, so the broker already returned the delivery to the queue.
+    /// </summary>
+    internal bool IsStale(ulong deliveryTag) => deliveryTag <= Volatile.Read(ref _staleTagWatermark);
+
+    /// <summary>Number of buffered deliveries disposed without settlement because their channel shut down.</summary>
+    internal int DiscardedStaleDeliveries => Volatile.Read(ref _discardedStale);
 
     /// <summary>The broker-assigned consumer tag; set by the adapter once <c>basic.consume</c> returns.</summary>
     internal string AssignedTag { get; set; } = string.Empty;
@@ -133,6 +163,14 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         {
             while (!cancellationToken.IsCancellationRequested && reader.TryRead(out InboundMessage? message))
             {
+                if (IsStale(message.DeliveryTag))
+                {
+                    // Raced in after the purge: the broker already returned this delivery, so the runner must
+                    // never process (or settle) it.
+                    DiscardStale(message);
+                    continue;
+                }
+
                 yield return message;
             }
 
@@ -151,13 +189,15 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     /// <param name="FirstFailure">The first nack failure, if any.</param>
     /// <param name="FirstFailedTag">Delivery tag of the first failed nack.</param>
     /// <param name="FirstFailedMessageId">Message id of the first failed nack.</param>
+    /// <param name="DiscardedStale">Stale deliveries disposed without a nack.</param>
     internal readonly record struct DrainResult(
         int Drained,
         int Requeued,
         int SkippedNacks,
         Exception? FirstFailure,
         ulong FirstFailedTag,
-        string? FirstFailedMessageId);
+        string? FirstFailedMessageId,
+        int DiscardedStale);
 
     /// <summary>
     /// Hands every delivery still sitting in the buffer back to the broker (nack, <c>requeue: true</c>) and
@@ -171,6 +211,9 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     /// or slow broker call cannot leak its pooled buffer. After the first nack failure (or when the channel is
     /// closed) the drain switches to dispose-only: the broker returns unsettled deliveries itself when the
     /// channel closes. This method never throws.
+    /// A stale delivery (its tag was issued by a channel that has since shut down, see <see cref="IsStale"/>) is
+    /// only disposed, never nacked: the broker returned it when that channel closed, and the nack would target a
+    /// recovered channel. This filter is defensive; the client already drops such nacks.
     /// Requeue vs dispose-only (measured on rabbitmq:4.2 quorum): both raise <c>x-delivery-count</c> of a
     /// buffered delivery by exactly 1, so the explicit nack-requeue chosen by the maintainers is kept; it also
     /// returns the messages immediately instead of waiting for the channel to close.
@@ -183,6 +226,7 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         Exception? firstFailure = null;
         ulong firstFailedTag = 0;
         string? firstFailedMessageId = null;
+        int discardedStale = 0;
         bool nackMode = true;
 
         while (_inboundChannel.Reader.TryRead(out InboundMessage? message))
@@ -191,6 +235,15 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
             string messageId = message.MessageId;
             message.Dispose();
             drained++;
+
+            if (IsStale(tag))
+            {
+                // Defensive: RabbitMQ.Client already ignores a nack for a tag of a recovered-away channel, and
+                // the broker returned the delivery when that channel closed. Never nack it on the new channel.
+                discardedStale++;
+                Interlocked.Increment(ref _discardedStale);
+                continue;
+            }
 
             if (nackMode && !Channel.IsOpen)
             {
@@ -219,7 +272,8 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
             }
         }
 
-        return new DrainResult(drained, requeued, skipped, firstFailure, firstFailedTag, firstFailedMessageId);
+        return new DrainResult(
+            drained, requeued, skipped, firstFailure, firstFailedTag, firstFailedMessageId, discardedStale);
     }
 
     /// <inheritdoc />
@@ -269,6 +323,12 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
             deliveryTag: deliveryTag,
             pooledBuffer: pooledBuffer);
 
+        // Track the highest tag before buffering so a shutdown handler running right after sees it.
+        if (deliveryTag > Volatile.Read(ref _maxSeenDeliveryTag))
+        {
+            Volatile.Write(ref _maxSeenDeliveryTag, deliveryTag);
+        }
+
         // TryWrite returns false when the buffer is full or when the writer is completed.
         // The pooled buffer must be returned here since ReceiveEndpointRunner will never see this message.
         if (!_inboundChannel.Writer.TryWrite(message))
@@ -293,10 +353,91 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         }
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Reacts to the shutdown of this consumer's channel. Every delivery buffered so far carries a tag of the
+    /// dead channel and was already returned to the queue by the broker, so it is disposed without settlement
+    /// and never reaches the runner.
+    /// </summary>
+    /// <remarks>
+    /// When the client is going to recover the channel (see <see cref="IsRecoveryExpected"/>) the writer stays
+    /// open: the client re-registers this very consumer and its deliveries, numbered above every old tag, keep
+    /// flowing. Otherwise the shutdown is terminal and the writer is completed so the stream ends. If recovery
+    /// never succeeds, or succeeds without re-registering the consumer, the stream simply waits for deliveries;
+    /// stopping through the caller's token keeps working. This method never throws.
+    /// </remarks>
     public override Task HandleChannelShutdownAsync(object channel, ShutdownEventArgs reason)
     {
-        CompleteWriter();
+        ulong seen = Volatile.Read(ref _maxSeenDeliveryTag);
+        ulong current;
+        while ((current = Volatile.Read(ref _staleTagWatermark)) < seen
+            && Interlocked.CompareExchange(ref _staleTagWatermark, seen, current) != current)
+        {
+        }
+
+        if (!IsRecoveryExpected(reason))
+        {
+            CompleteWriter();
+        }
+
+        DiscardStaleBuffered();
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Decides whether RabbitMQ.Client will recover the channel after this shutdown. The connection rule is a copy
+    /// of the one in <c>AutorecoveringConnection</c> (RabbitMQ.Client 7.2.1): nothing is recovered after an
+    /// application-initiated close, nor after the peer closed the connection with <c>ACCESS_REFUSED</c> (403);
+    /// every other close of a connection that is no longer open is recovered. A channel closed on its own while
+    /// the connection stays open is never recovered. Revisit when the client is upgraded.
+    /// </summary>
+    private bool IsRecoveryExpected(ShutdownEventArgs reason)
+    {
+        if (!AutomaticRecoveryEnabled || _stopRequested || IsConnectionOpen is null)
+        {
+            return false;
+        }
+
+        if (reason.Initiator == ShutdownInitiator.Application
+            || (reason.Initiator == ShutdownInitiator.Peer && reason.ReplyCode == Constants.AccessRefused))
+        {
+            return false;
+        }
+
+        try
+        {
+            return !IsConnectionOpen();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The connection that owned the channel was disposed: it will not be recovered.
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Disposes the buffered deliveries issued by the dead channel. At most the current number of entries is
+    /// examined, so an entry that is kept (not stale) and written back to the tail cannot be examined twice.
+    /// A kept entry that cannot be written back (the writer is completed) is disposed without settlement; the
+    /// broker returns it when the channel closes.
+    /// </summary>
+    private void DiscardStaleBuffered()
+    {
+        ChannelReader<InboundMessage> reader = _inboundChannel.Reader;
+        int budget = reader.Count;
+        while (budget-- > 0 && reader.TryRead(out InboundMessage? message))
+        {
+            if (!IsStale(message.DeliveryTag) && _inboundChannel.Writer.TryWrite(message))
+            {
+                continue;
+            }
+
+            DiscardStale(message);
+        }
+    }
+
+    private void DiscardStale(InboundMessage message)
+    {
+        message.Dispose();
+        Interlocked.Increment(ref _discardedStale);
     }
 }
