@@ -56,6 +56,18 @@ Endpoints:
 - `/health/live` — liveness only (no dependency checks)
 - `/health/ready` — full readiness including broker connectivity and flow control
 
+A transport can report its own endpoints too: the in-memory transport reports queues at or above 90% of
+capacity, and RabbitMQ reports consumers that have been waiting for automatic connection recovery for too
+long (see [Connection recovery and health](transport-rabbitmq.md#connection-recovery-and-health)). Both
+appear as `Degraded`.
+
+The bus health description starts with a summary followed by the transport's own description, when the
+transport reports trouble. The summary mentions capacity only when flow control (in-flight limits) causes
+the worst status — `One or more endpoints are approaching capacity.` (`Degraded`) or
+`One or more endpoints are at capacity.` (`Unhealthy`). When only the transport reports the worst status,
+the summary is neutral — `One or more endpoints are degraded.` or `One or more endpoints are unhealthy.` —
+for example `One or more endpoints are degraded. 1 RabbitMQ consumer(s) waiting for automatic recovery for at least 30 s.`
+
 ## Aspire Dashboard
 
 When running via the Aspire AppHost, traces and metrics are automatically exported to the Aspire Dashboard. No additional configuration is needed — the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable is injected automatically.

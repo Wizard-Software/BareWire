@@ -87,6 +87,23 @@ transport.Host("amqp://broker.internal:5672/", h =>
 });
 ```
 
+### Connection recovery and health
+
+The client recovers a lost connection automatically, retrying every 5 seconds. After recovery it
+re-registers each consumer, and the receive endpoint keeps receiving without a restart. Messages that were
+buffered but not yet handled when the connection dropped are discarded: the broker redelivers them. A
+message that was already in a handler may be processed twice (at-least-once).
+
+While a consumer waits for recovery its endpoint receives nothing. If the connection does not come back,
+or the client cannot re-register the consumer (for example because its queue was deleted and the
+transport does not declare it), the bus health check reports that endpoint as `Degraded` after
+30 seconds. The endpoint description says how long the consumer has been waiting and whether the
+connection is still down or open without the consumer. A `Warning` is logged once when the limit is
+reached, and an `Information` entry when the consumer recovers after it. The status is `Degraded`, not
+`Unhealthy`, so a liveness probe does not restart the process during a broker outage. The endpoint is not
+restarted automatically: if it stays degraded, fix the broker side (recreate the queue) or restart the
+service.
+
 ## TLS and mutual TLS
 
 For an encrypted connection, use the `amqps://` scheme and configure TLS through the host

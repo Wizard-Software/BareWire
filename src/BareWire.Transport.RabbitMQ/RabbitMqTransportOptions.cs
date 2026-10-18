@@ -14,6 +14,22 @@ internal sealed class RabbitMqTransportOptions
 
     public TimeSpan NetworkRecoveryInterval { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How long a consumer may wait for automatic recovery (after its channel was shut down by a lost connection)
+    /// before its endpoint is reported as degraded by the bus health check and a warning is logged.
+    /// <see langword="null"/> uses <see cref="EffectiveRecoveryHealthTimeout"/>'s default.
+    /// </summary>
+    public TimeSpan? RecoveryHealthTimeout { get; set; }
+
+    /// <summary>
+    /// <see cref="RecoveryHealthTimeout"/> when set; otherwise three <see cref="NetworkRecoveryInterval"/>s, but at
+    /// least 30 seconds, so a recovery that only needs a few attempts never raises an alarm.
+    /// </summary>
+    public TimeSpan EffectiveRecoveryHealthTimeout =>
+        RecoveryHealthTimeout ?? TimeSpan.FromTicks(Math.Max(
+            NetworkRecoveryInterval.Ticks > long.MaxValue / 3 ? long.MaxValue : NetworkRecoveryInterval.Ticks * 3,
+            TimeSpan.FromSeconds(30).Ticks));
+
     public string DefaultExchange { get; set; } = string.Empty;
 
     /// <summary>
@@ -115,6 +131,14 @@ internal sealed class RabbitMqTransportOptions
                 optionName: nameof(ConnectionString),
                 optionValue: ConnectionString,
                 expectedValue: "A non-empty RabbitMQ connection string (e.g. amqp://guest:guest@localhost:5672/)");
+        }
+
+        if (RecoveryHealthTimeout is { } recoveryHealthTimeout && recoveryHealthTimeout <= TimeSpan.Zero)
+        {
+            throw new BareWireConfigurationException(
+                optionName: nameof(RecoveryHealthTimeout),
+                optionValue: recoveryHealthTimeout.ToString(),
+                expectedValue: "A positive TimeSpan");
         }
     }
 }

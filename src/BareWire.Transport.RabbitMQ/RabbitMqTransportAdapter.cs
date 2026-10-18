@@ -15,9 +15,13 @@ using BwExchangeType = BareWire.Abstractions.ExchangeType;
 
 namespace BareWire.Transport.RabbitMQ;
 
-internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, IConsumerChannelManager, IDurableParkSettlement, IAsyncDisposable
+internal sealed partial class RabbitMqTransportAdapter
+    : ITransportAdapter, IConsumerChannelManager, IDurableParkSettlement, ITransportHealthSource, IAsyncDisposable
 {
     private readonly RabbitMqTransportOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly Action<RabbitMqConsumer, TimeSpan> _onRecoveryOverdue;
+    private readonly Action<RabbitMqConsumer, TimeSpan> _onRecoveredAfterOverdue;
     private readonly ILogger<RabbitMqTransportAdapter> _logger;
     private readonly RabbitMqHeaderMapper _headerMapper;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
@@ -64,7 +68,8 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
     public RabbitMqTransportAdapter(
         RabbitMqTransportOptions options,
         ILogger<RabbitMqTransportAdapter> logger,
-        RabbitMqHeaderMapper? headerMapper = null)
+        RabbitMqHeaderMapper? headerMapper = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(logger);
@@ -74,6 +79,11 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         _options = options;
         _logger = logger;
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _onRecoveryOverdue = (consumer, waited) =>
+            LogConsumerRecoveryOverdue(consumer.EndpointName, (long)waited.TotalSeconds);
+        _onRecoveredAfterOverdue = (consumer, waited) =>
+            LogConsumerRecoveredAfterOverdue(consumer.EndpointName, (long)waited.TotalSeconds);
 
         LogPublishRoutingDivergences();
     }
@@ -344,6 +354,10 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
                 EndpointName = endpointName,
                 AutomaticRecoveryEnabled = _options.AutomaticRecoveryEnabled,
                 IsConnectionOpen = () => owner.IsOpen,
+                TimeProvider = _timeProvider,
+                RecoveryHealthTimeout = _options.EffectiveRecoveryHealthTimeout,
+                RecoveryOverdue = _onRecoveryOverdue,
+                RecoveredAfterOverdue = _onRecoveredAfterOverdue,
             };
             _activeConsumers[consumerChannelId] = consumer;
 
@@ -421,6 +435,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             }
 
             consumer.CompleteWriter();
+            consumer.StopRecoveryTracking();
 
             using (var drainTimeout = new CancellationTokenSource(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds))
             {
@@ -718,6 +733,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
         // Intentional order: the consumer entry goes first, so nothing can resolve a consumer whose channel is
         // already on its way out; the channel entry decides who owns the close.
         _activeConsumers.TryRemove(channelId, out RabbitMqConsumer? consumer);
+        consumer?.StopRecoveryTracking();
 
         // Whoever removes the entry (this method, a failed setup, the iterator's finally, or DisposeAsync) is the
         // only one to release it. Already released or never registered: no-op (idempotent).
@@ -800,6 +816,7 @@ internal sealed partial class RabbitMqTransportAdapter : ITransportAdapter, ICon
             }
 
             _activeConsumers.TryRemove(entry.Key, out RabbitMqConsumer? consumer);
+            consumer?.StopRecoveryTracking();
             using var closeTimeout = new CancellationTokenSource(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds);
             await CloseAndDisposeConsumerChannelAsync(
                     channel, consumer?.EndpointName ?? string.Empty, entry.Key, closeTimeout.Token)

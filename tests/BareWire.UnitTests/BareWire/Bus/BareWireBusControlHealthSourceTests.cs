@@ -95,8 +95,43 @@ public sealed class BareWireBusControlHealthSourceTests
         BusHealthStatus status = control.CheckHealth();
 
         status.Status.Should().Be(BusStatus.Degraded);
-        status.Description.Should().Contain("orders").And.Contain("92%");
+        status.Description.Should().Be($"One or more endpoints are degraded. {QueueDescription}");
         status.Endpoints.Should().ContainSingle(e => e.EndpointName == "orders" && e.Status == BusStatus.Degraded);
+    }
+
+    [Fact]
+    public void CheckHealth_WhenOnlyTransportReportsRecoveryWait_DoesNotMentionCapacity()
+    {
+        const string recoveryDescription = "1 RabbitMQ consumer(s) waiting for automatic recovery for at least 30 s.";
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter, ITransportHealthSource>();
+        ((ITransportHealthSource)adapter).GetHealth().Returns(new BusHealthStatus(
+            BusStatus.Degraded, recoveryDescription,
+            [new EndpointHealthStatus("orders", BusStatus.Degraded, "waiting 31 s for automatic recovery")]));
+        var (control, _) = CreateControl(adapter);
+
+        BusHealthStatus status = control.CheckHealth();
+
+        status.Status.Should().Be(BusStatus.Degraded);
+        status.Description.Should().Be($"One or more endpoints are degraded. {recoveryDescription}");
+        status.Description.Should().NotContain("approaching capacity");
+    }
+
+    [Fact]
+    public void CheckHealth_WhenFlowControlAndTransportBothDegraded_KeepsCapacityWordingAndAppendsTransportDescription()
+    {
+        ITransportAdapter adapter = Substitute.For<ITransportAdapter, ITransportHealthSource>();
+        ((ITransportHealthSource)adapter).GetHealth().Returns(new BusHealthStatus(
+            BusStatus.Degraded, QueueDescription,
+            [new EndpointHealthStatus("orders", BusStatus.Degraded, QueueDescription)]));
+        var (control, flowController) = CreateControl(adapter);
+        CreditManager manager = flowController.GetOrCreateManager(
+            "busy-endpoint", new FlowControlOptions { MaxInFlightMessages = 10 });
+        manager.TrackInflight(9, 0);
+
+        BusHealthStatus status = control.CheckHealth();
+
+        status.Status.Should().Be(BusStatus.Degraded);
+        status.Description.Should().Be($"One or more endpoints are approaching capacity. {QueueDescription}");
     }
 
     [Fact]
@@ -161,7 +196,7 @@ public sealed class BareWireBusControlHealthSourceTests
 
         status.Status.Should().Be(BusStatus.Unhealthy);
         status.Endpoints.Should().HaveCount(2);
-        status.Description.Should().Contain("orders");
+        status.Description.Should().Be($"One or more endpoints are unhealthy. {unhealthyDescription}");
     }
 
     [Fact]
@@ -176,6 +211,6 @@ public sealed class BareWireBusControlHealthSourceTests
         BusHealthStatus status = control.CheckHealth();
 
         status.Status.Should().Be(BusStatus.Degraded);
-        status.Description.Should().Contain("orders");
+        status.Description.Should().Be($"One or more endpoints are degraded. {QueueDescription}");
     }
 }
