@@ -32,7 +32,7 @@ public sealed class BareWireHealthCheckTransportSourceTests
         result.Status.Should().Be(HealthStatus.Degraded);
         // Exact match: the description carries only the bus summary plus the transport's queue metadata.
         result.Description.Should().Be(
-            "One or more endpoints are approaching capacity. Queue 'orders' is at 92% of capacity (920/1000).");
+            "One or more endpoints are degraded. Queue 'orders' is at 92% of capacity (920/1000).");
         result.Data.Should().ContainKey("endpoints");
         result.Data.Keys.Should().BeEquivalentTo(["bus_status", "description", "endpoints"]);
     }
