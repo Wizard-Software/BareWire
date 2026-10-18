@@ -26,6 +26,8 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     /// </summary>
     internal const int ShutdownStepTimeoutMilliseconds = 5000;
 
+    private static readonly TimeSpan MaxTimerDueTime = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
     private volatile bool _stopRequested;
     private volatile bool _writerCompleted;
     private Task<bool>? _cancelTask;
@@ -39,6 +41,14 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     // monotonically by HandleChannelShutdownAsync; never lowered.
     private ulong _staleTagWatermark;
     private int _discardedStale;
+
+    // TimeProvider timestamp of the first recoverable channel shutdown of the current series; 0 while the consumer
+    // is not waiting for recovery. Read lock-free (health checks, the delivery hot path); every transition happens
+    // under _recoveryLock, together with the timer that reports the wait once it exceeds RecoveryHealthTimeout.
+    private long _awaitingRecoverySince;
+    private readonly object _recoveryLock = new();
+    private ITimer? _recoveryOverdueTimer;
+    private bool _recoveryOverdueReported;
 
     internal RabbitMqConsumer(
         IChannel channel,
@@ -72,6 +82,61 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     /// </summary>
     internal Func<bool>? IsConnectionOpen { get; init; }
 
+    /// <summary>Clock used to measure how long the consumer waits for automatic recovery.</summary>
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
+
+    /// <summary>
+    /// How long the consumer may wait for automatic recovery before the wait is reported (see
+    /// <see cref="IsRecoveryOverdue"/>, <see cref="RecoveryOverdue"/>). <see cref="Timeout.InfiniteTimeSpan"/>
+    /// disables the report.
+    /// </summary>
+    internal TimeSpan RecoveryHealthTimeout { get; init; } = Timeout.InfiniteTimeSpan;
+
+    /// <summary>
+    /// Invoked once per shutdown series, from a timer, when the wait for recovery reaches
+    /// <see cref="RecoveryHealthTimeout"/>. Receives the time waited so far. Must not throw.
+    /// </summary>
+    internal Action<RabbitMqConsumer, TimeSpan>? RecoveryOverdue { get; init; }
+
+    /// <summary>
+    /// Invoked when the consumer is recovered after <see cref="RecoveryOverdue"/> was raised. Receives the total
+    /// time waited. Must not throw.
+    /// </summary>
+    internal Action<RabbitMqConsumer, TimeSpan>? RecoveredAfterOverdue { get; init; }
+
+    /// <summary>
+    /// <see langword="true"/> while the consumer waits for the client to recover its channel and re-register it
+    /// (a recoverable channel shutdown was seen and neither <c>consume-ok</c> nor a fresh delivery followed).
+    /// </summary>
+    /// <param name="waited">Time since the first shutdown of the current series.</param>
+    internal bool TryGetRecoveryWait(out TimeSpan waited)
+    {
+        long since = Volatile.Read(ref _awaitingRecoverySince);
+        if (since == 0)
+        {
+            waited = TimeSpan.Zero;
+            return false;
+        }
+
+        waited = TimeProvider.GetElapsedTime(since);
+        return true;
+    }
+
+    /// <summary>
+    /// <see langword="true"/> when the consumer has waited for recovery for at least
+    /// <see cref="RecoveryHealthTimeout"/>.
+    /// </summary>
+    /// <param name="waited">Time since the first shutdown of the current series.</param>
+    internal bool IsRecoveryOverdue(out TimeSpan waited) =>
+        TryGetRecoveryWait(out waited)
+        && RecoveryHealthTimeout != Timeout.InfiniteTimeSpan
+        && waited >= RecoveryHealthTimeout;
+
+    /// <summary>
+    /// Ends the wait for recovery without reporting a recovery; called when the consume loop ends.
+    /// </summary>
+    internal void StopRecoveryTracking() => EndRecoveryWait(recovered: false);
+
     /// <summary>
     /// <see langword="true"/> when <paramref name="deliveryTag"/> was issued by a channel instance that has since
     /// shut down, so the broker already returned the delivery to the queue.
@@ -91,7 +156,13 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     internal bool IsStopRequested => _stopRequested;
 
     /// <summary>Marks the consumer as stopping; called from the caller's token registration.</summary>
-    internal void RequestStop() => _stopRequested = true;
+    internal void RequestStop()
+    {
+        _stopRequested = true;
+
+        // A stopping endpoint is not stuck waiting for recovery.
+        EndRecoveryWait(recovered: false);
+    }
 
     /// <summary>
     /// Completes the inbound buffer for writing. Deliveries that arrive afterwards are not buffered.
@@ -329,6 +400,13 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
             Volatile.Write(ref _maxSeenDeliveryTag, deliveryTag);
         }
 
+        // A delivery of the recovered channel (its tags are offset above every tag of the dead one) proves the
+        // consumer is registered again. One volatile read on the hot path; the lock is taken only while waiting.
+        if (Volatile.Read(ref _awaitingRecoverySince) != 0 && !IsStale(deliveryTag))
+        {
+            EndRecoveryWait(recovered: true);
+        }
+
         // TryWrite returns false when the buffer is full or when the writer is completed.
         // The pooled buffer must be returned here since ReceiveEndpointRunner will never see this message.
         if (!_inboundChannel.Writer.TryWrite(message))
@@ -363,7 +441,8 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
     /// open: the client re-registers this very consumer and its deliveries, numbered above every old tag, keep
     /// flowing. Otherwise the shutdown is terminal and the writer is completed so the stream ends. If recovery
     /// never succeeds, or succeeds without re-registering the consumer, the stream simply waits for deliveries;
-    /// stopping through the caller's token keeps working. This method never throws.
+    /// stopping through the caller's token keeps working. The wait is timed (see <see cref="TryGetRecoveryWait"/>)
+    /// so the adapter can report the endpoint as degraded. This method never throws.
     /// </remarks>
     public override Task HandleChannelShutdownAsync(object channel, ShutdownEventArgs reason)
     {
@@ -374,13 +453,110 @@ internal sealed class RabbitMqConsumer : AsyncDefaultBasicConsumer
         {
         }
 
-        if (!IsRecoveryExpected(reason))
+        if (IsRecoveryExpected(reason))
+        {
+            BeginRecoveryWait();
+        }
+        else
         {
             CompleteWriter();
+            EndRecoveryWait(recovered: false);
         }
 
         DiscardStaleBuffered();
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Ends the wait for recovery: after recovery RabbitMQ.Client 7.2.1 re-registers this very consumer object
+    /// (<c>basic.consume</c> with the recorded consumer), so the broker's <c>consume-ok</c> arrives here. When the
+    /// consumer cannot be re-registered (for example its queue is gone) no <c>consume-ok</c> arrives and the wait
+    /// goes on until <see cref="RecoveryHealthTimeout"/> reports it.
+    /// </summary>
+    public override async Task HandleBasicConsumeOkAsync(string consumerTag, CancellationToken cancellationToken = default)
+    {
+        await base.HandleBasicConsumeOkAsync(consumerTag, cancellationToken).ConfigureAwait(false);
+        EndRecoveryWait(recovered: true);
+    }
+
+    /// <summary>
+    /// Starts the wait for recovery unless one is already running: the first shutdown of a series sets the
+    /// timestamp and arms the one-shot overdue timer.
+    /// </summary>
+    private void BeginRecoveryWait()
+    {
+        lock (_recoveryLock)
+        {
+            if (_awaitingRecoverySince != 0 || _stopRequested)
+            {
+                return;
+            }
+
+            long now = TimeProvider.GetTimestamp();
+            Volatile.Write(ref _awaitingRecoverySince, now == 0 ? 1 : now);
+            _recoveryOverdueReported = false;
+
+            if (RecoveryHealthTimeout != Timeout.InfiniteTimeSpan)
+            {
+                // Timers accept at most uint.MaxValue - 1 milliseconds; a longer timeout is clamped (the health
+                // check still compares against the full value).
+                TimeSpan dueTime = RecoveryHealthTimeout < MaxTimerDueTime ? RecoveryHealthTimeout : MaxTimerDueTime;
+                _recoveryOverdueTimer = TimeProvider.CreateTimer(
+                    static state => ((RabbitMqConsumer)state!).OnRecoveryOverdueTimer(),
+                    this,
+                    dueTime,
+                    Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    private void OnRecoveryOverdueTimer()
+    {
+        TimeSpan waited;
+        lock (_recoveryLock)
+        {
+            long since = _awaitingRecoverySince;
+            if (since == 0 || _recoveryOverdueReported)
+            {
+                return;
+            }
+
+            _recoveryOverdueReported = true;
+            waited = TimeProvider.GetElapsedTime(since);
+        }
+
+        RecoveryOverdue?.Invoke(this, waited);
+    }
+
+    /// <summary>
+    /// Ends the current wait (if any) and cancels the overdue timer. <paramref name="recovered"/> reports a
+    /// recovery through <see cref="RecoveredAfterOverdue"/> when the wait had already been reported overdue.
+    /// </summary>
+    private void EndRecoveryWait(bool recovered)
+    {
+        TimeSpan waited;
+        bool reportRecovered;
+        ITimer? timer;
+        lock (_recoveryLock)
+        {
+            long since = _awaitingRecoverySince;
+            if (since == 0)
+            {
+                return;
+            }
+
+            Volatile.Write(ref _awaitingRecoverySince, 0);
+            reportRecovered = recovered && _recoveryOverdueReported;
+            waited = TimeProvider.GetElapsedTime(since);
+            timer = _recoveryOverdueTimer;
+            _recoveryOverdueTimer = null;
+        }
+
+        timer?.Dispose();
+        if (reportRecovered)
+        {
+            RecoveredAfterOverdue?.Invoke(this, waited);
+        }
     }
 
     /// <summary>

@@ -85,4 +85,59 @@ public sealed class RabbitMqTransportOptionsTests
         // Assert
         act.Should().NotThrow();
     }
+
+    // ── Recovery health timeout ───────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void Validate_NonPositiveRecoveryHealthTimeout_ThrowsBareWireConfigurationException(int seconds)
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions
+        {
+            ConnectionString = "amqp://localhost",
+            RecoveryHealthTimeout = TimeSpan.FromSeconds(seconds),
+        };
+
+        // Act
+        Action act = () => options.Validate();
+
+        // Assert
+        act.Should().Throw<BareWireConfigurationException>()
+            .Which.OptionName.Should().Be(nameof(RabbitMqTransportOptions.RecoveryHealthTimeout));
+    }
+
+    [Theory]
+    [InlineData(5, 30)]
+    [InlineData(10, 30)]
+    [InlineData(20, 60)]
+    public void EffectiveRecoveryHealthTimeout_NotSet_IsThreeRecoveryIntervalsButAtLeast30Seconds(
+        int intervalSeconds, int expectedSeconds)
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions
+        {
+            NetworkRecoveryInterval = TimeSpan.FromSeconds(intervalSeconds),
+        };
+
+        // Act
+        TimeSpan effective = options.EffectiveRecoveryHealthTimeout;
+
+        // Assert
+        effective.Should().Be(TimeSpan.FromSeconds(expectedSeconds));
+    }
+
+    [Fact]
+    public void EffectiveRecoveryHealthTimeout_Set_UsesConfiguredValue()
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions { RecoveryHealthTimeout = TimeSpan.FromSeconds(7) };
+
+        // Act
+        TimeSpan effective = options.EffectiveRecoveryHealthTimeout;
+
+        // Assert
+        effective.Should().Be(TimeSpan.FromSeconds(7));
+    }
 }
