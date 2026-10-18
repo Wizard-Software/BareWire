@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bumped the transitive MessagePack pin to 2.5.307 to clear the NuGetAudit advisory GHSA-qhrr-8q5h-9q3h (NU1902), which failed `dotnet restore` under warnings-as-errors
 - **Behavior change:** registering a second, different transport in one service collection (for example `AddBareWireRabbitMq` followed by `AddBareWireKafka`) now throws `BareWireConfigurationException`. Previously the second transport's adapter and receive endpoints were silently ignored. Register exactly one transport per service collection; support for multiple transports is planned.
 - Kafka: declaring a receive endpoint without `ConsumerGroup` now fails at configuration time with `BareWireConfigurationException` instead of in the consume loop
 - **Behavior change:** retry settings now have upper bounds. A retry count above 100 or a single retry delay above 1 hour fails `StartAsync` with `BareWireConfigurationException` before the bus is marked started — for consumer policies (`Interval`, `Incremental`, `Exponential`, including the largest computed `Incremental` delay) and for endpoint `RetryCount`/`RetryInterval` (the interval is checked when `RetryCount` is greater than zero; negative values are rejected too). Previously such values were accepted and failed or overflowed only during delivery. Retry delays are computed without overflow and clamped before waiting, and the retry log reports the delay that is actually awaited
