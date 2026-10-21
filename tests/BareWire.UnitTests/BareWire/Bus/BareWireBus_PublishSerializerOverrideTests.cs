@@ -81,7 +81,6 @@ public sealed class BareWireBus_PublishSerializerOverrideTests
 
         // Act
         await bus.PublishAsync(new OrderCreated("ORD-1"), CancellationToken.None);
-        await Task.Delay(50); // allow background publish loop to flush
 
         // Assert — serializer for mapped type was called
         mappedSerializer.Received(1).Serialize(Arg.Any<OrderCreated>(), Arg.Any<IBufferWriter<byte>>());
@@ -108,7 +107,6 @@ public sealed class BareWireBus_PublishSerializerOverrideTests
 
         // Act
         await bus.PublishAsync(new PaymentRequested("PAY-1"), CancellationToken.None);
-        await Task.Delay(50);
 
         // Assert — default serializer used for unmapped type
         defaultSerializer.Received(1).Serialize(Arg.Any<PaymentRequested>(), Arg.Any<IBufferWriter<byte>>());
@@ -136,7 +134,6 @@ public sealed class BareWireBus_PublishSerializerOverrideTests
         // Act — publish both message types
         await bus.PublishAsync(new OrderCreated("ORD-1"), CancellationToken.None);
         await bus.PublishAsync(new PaymentRequested("PAY-1"), CancellationToken.None);
-        await Task.Delay(80);
 
         // Assert — each type uses its own serializer
         envelopeSerializer.Received(1).Serialize(Arg.Any<OrderCreated>(), Arg.Any<IBufferWriter<byte>>());
@@ -165,7 +162,6 @@ public sealed class BareWireBus_PublishSerializerOverrideTests
 
         // Act
         await endpoint.SendAsync(new OrderCreated("ORD-2"), CancellationToken.None);
-        await Task.Delay(50);
 
         // Assert
         envelopeSerializer.Received(1).Serialize(Arg.Any<OrderCreated>(), Arg.Any<IBufferWriter<byte>>());

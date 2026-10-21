@@ -24,6 +24,20 @@ public sealed class RetryMiddlewareTests
             cancellationToken: cancellationToken);
     }
 
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5_000)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     private static IntervalRetryPolicy CreateIntervalPolicy(
         int retryCount = 3,
         TimeSpan? interval = null,
@@ -334,12 +348,12 @@ public sealed class RetryMiddlewareTests
         // Act — start the retry, it will enter a 60s delay after first failure
         Task retryTask = sut.InvokeAsync(context, _ =>
         {
-            callCount++;
+            Interlocked.Increment(ref callCount);
             throw new InvalidOperationException("will retry");
         });
 
-        // Give it a moment to enter the delay
-        await Task.Delay(50);
+        // Wait until the first attempt has run; the retry then enters its 60s delay
+        await WaitUntilAsync(() => Volatile.Read(ref callCount) >= 1);
         callCount.Should().Be(1);
 
         // Cancel during delay

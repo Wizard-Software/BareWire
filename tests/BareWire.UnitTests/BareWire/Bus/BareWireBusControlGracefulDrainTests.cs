@@ -239,6 +239,8 @@ public sealed class BareWireBusControlGracefulDrainTests
 
                 _ = Task.Run(async () =>
                 {
+                    // Simulates processing time of the next message inside the SendBatchAsync mock;
+                    // it does not precede an assertion.
                     await Task.Delay(50).ConfigureAwait(false);
                     CancellationToken consumerToken = await h.ConsumerTokenReady.Task.ConfigureAwait(false);
                     consumerTokenCancelledWhenFollowUpConsumed = consumerToken.IsCancellationRequested;
