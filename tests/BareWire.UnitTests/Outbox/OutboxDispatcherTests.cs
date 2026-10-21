@@ -117,6 +117,66 @@ public sealed class OutboxDispatcherTests
         };
     }
 
+    // Waits until the dispatcher loop has polled the store at least `polls` times (2 => the first batch was
+    // fully processed, because the dispatcher loop is sequential), or the timeout elapses. Never throws:
+    // the exact assertion that follows reports the real state.
+    private static async Task WaitForCompletedBatchesAsync(IOutboxStore store, int polls = 2, int timeoutMs = 5_000)
+    {
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            int calls = store.ReceivedCalls()
+                .Count(c => c.GetMethodInfo().Name == nameof(IOutboxStore.GetPendingAsync));
+            if (calls >= polls)
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
+    [Fact]
+    public async Task DispatchBatch_WhenFirstPollIsSlow_WaitObservesCompletedBatchBeforeStop()
+    {
+        // Arrange — the first poll answers only after 200 ms (honouring cancellation), then the store is empty.
+        int getPendingCalls = 0;
+
+        async ValueTask<IReadOnlyList<OutboxEntry>> PollAsync(CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref getPendingCalls) == 1)
+            {
+                await Task.Delay(200, ct);
+                return [CreateEntry(1)];
+            }
+
+            return Array.Empty<OutboxEntry>();
+        }
+
+        _store
+            .GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(ci => PollAsync(ci.ArgAt<CancellationToken>(1)));
+
+        _adapter
+            .SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(ci => Task.FromResult<IReadOnlyList<SendResult>>(
+                ci.Arg<IReadOnlyList<OutboundMessage>>()
+                    .Select(static (_, i) => new SendResult(IsConfirmed: true, DeliveryTag: (ulong)i))
+                    .ToArray()));
+
+        await using var sut = CreateSut();
+
+        // Act
+        await sut.StartAsync(CancellationToken.None);
+        await WaitForCompletedBatchesAsync(_store);
+        await sut.StopAsync(CancellationToken.None);
+
+        // Assert
+        await _adapter.Received(1).SendBatchAsync(
+            Arg.Any<IReadOnlyList<OutboundMessage>>(),
+            Arg.Any<CancellationToken>());
+    }
+
     [Fact]
     public async Task StartAsync_PollsAndDispatchesPendingMessages()
     {
@@ -163,7 +223,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50); // Allow at least one poll tick to complete.
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert
@@ -196,7 +256,8 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50); // Allow several poll ticks to run with empty store.
+        // Negative assertion below: wait for at least two polls of the empty store before checking nothing was sent.
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — adapter must never be called when there are no pending messages.
@@ -218,7 +279,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50); // Allow at least one poll tick.
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — store must have been queried with the exact configured batch size.
@@ -271,7 +332,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — only the one pending entry was sent and marked.
@@ -325,7 +386,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — only entries[0] (id=1) and entries[2] (id=3) were confirmed; entries[1] (id=2) was nacked.
@@ -391,7 +452,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — MarkDeliveredAsync must never be called when all messages are nacked.
@@ -443,7 +504,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — MarkDeliveredAsync must never be called when send throws.
@@ -522,7 +583,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — only K2 (Id=3) and keyless (Id=4) are delivered; K1 (Id=1 nacked + Id=2 blocked) are released.
@@ -590,7 +651,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — exactly one combined release, nacks and barrier siblings kept apart.
@@ -660,7 +721,7 @@ public sealed class OutboxDispatcherTests
 
         // Act
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(_store);
         await sut.StopAsync(CancellationToken.None);
 
         // Assert — exactly one MarkDeliveredAsync call with confirmed ids [1, 3].

@@ -78,6 +78,8 @@ public sealed class PartitionerMiddlewareTests
         Task second = Task.Run(() => middleware.InvokeAsync(ctx2, SlowNext2));
 
         // Give the second task a moment to attempt semaphore acquisition (it should block).
+        // Intentional window: under load the test may pass without exercising the block,
+        // but it cannot fail falsely.
         await Task.Delay(50);
 
         // Let the first handler finish.
@@ -314,6 +316,8 @@ public sealed class PartitionerMiddlewareTests
         Task first = Task.Run(() => middleware.InvokeAsync(ctx1, SlowNext1));
         await firstEntered.WaitAsync();
         Task second = Task.Run(() => middleware.InvokeAsync(ctx2, SlowNext2));
+        // Intentional window in which the second call tries to enter the semaphore; under load the
+        // test may pass without exercising the block, but it cannot fail falsely.
         await Task.Delay(50);
         firstCanExit.Release();
         await Task.WhenAll(first, second);

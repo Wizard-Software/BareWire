@@ -31,7 +31,20 @@ public sealed class OutboxDispatcherRetryObservabilityTests
     // [LoggerMessage] calls).
     private sealed class CapturingLogger<T> : ILogger<T>
     {
-        public List<(LogLevel Level, string Message, IReadOnlyList<KeyValuePair<string, object?>> State)> Events { get; } = [];
+        private readonly Lock _gate = new();
+        private readonly List<(LogLevel Level, string Message, IReadOnlyList<KeyValuePair<string, object?>> State)> _events = [];
+
+        // Snapshot copy taken under the lock (defensive hardening: the loop thread writes while tests may read).
+        public IReadOnlyList<(LogLevel Level, string Message, IReadOnlyList<KeyValuePair<string, object?>> State)> Events
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _events];
+                }
+            }
+        }
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
@@ -46,7 +59,12 @@ public sealed class OutboxDispatcherRetryObservabilityTests
         {
             IReadOnlyList<KeyValuePair<string, object?>> kvps =
                 state as IReadOnlyList<KeyValuePair<string, object?>> ?? [];
-            Events.Add((logLevel, formatter(state, exception), kvps));
+            (LogLevel, string, IReadOnlyList<KeyValuePair<string, object?>>) entry =
+                (logLevel, formatter(state, exception), kvps);
+            lock (_gate)
+            {
+                _events.Add(entry);
+            }
         }
     }
 
@@ -91,27 +109,56 @@ public sealed class OutboxDispatcherRetryObservabilityTests
         return lifetime;
     }
 
-    private static IOutboxStore CreateStoreReturningOnceThenEmpty(IReadOnlyList<OutboxEntry> entries)
+    // firstPollDelay simulates a slow first poll; the delay honours the cancellation token, as a real store would.
+    private static IOutboxStore CreateStoreReturningOnceThenEmpty(
+        IReadOnlyList<OutboxEntry> entries,
+        TimeSpan? firstPollDelay = null)
     {
         var store = Substitute.For<IOutboxStore>();
-        bool first = true;
-        store.GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
-            .Returns(_ =>
+        int calls = 0;
+
+        async ValueTask<IReadOnlyList<OutboxEntry>> PollAsync(CancellationToken ct)
+        {
+            if (Interlocked.Increment(ref calls) == 1)
             {
-                if (first)
+                if (firstPollDelay is { } delay)
                 {
-                    first = false;
-                    return ValueTask.FromResult(entries);
+                    await Task.Delay(delay, ct);
                 }
 
-                return ValueTask.FromResult<IReadOnlyList<OutboxEntry>>(Array.Empty<OutboxEntry>());
-            });
+                return entries;
+            }
+
+            return Array.Empty<OutboxEntry>();
+        }
+
+        store.GetPendingAsync(Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(ci => PollAsync(ci.ArgAt<CancellationToken>(1)));
         store.ReleaseLockAsync(
                 Arg.Any<IReadOnlyList<long>>(), Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
             .Returns(_ => ValueTask.FromResult<IReadOnlySet<long>>(FrozenSet<long>.Empty));
         store.MarkDeliveredAsync(Arg.Any<IReadOnlyList<long>>(), Arg.Any<CancellationToken>())
             .Returns(_ => ValueTask.CompletedTask);
         return store;
+    }
+
+    // Waits until the dispatcher loop has polled the store at least `polls` times (2 => the first batch was
+    // fully processed, because the dispatcher loop is sequential), or the timeout elapses. Never throws:
+    // the exact assertion that follows reports the real state.
+    private static async Task WaitForCompletedBatchesAsync(IOutboxStore store, int polls = 2, int timeoutMs = 5_000)
+    {
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            int calls = store.ReceivedCalls()
+                .Count(c => c.GetMethodInfo().Name == nameof(IOutboxStore.GetPendingAsync));
+            if (calls >= polls)
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
     }
 
     private static ITransportAdapter CreateAdapterReturning(Func<int, bool> isConfirmed)
@@ -161,6 +208,25 @@ public sealed class OutboxDispatcherRetryObservabilityTests
     // ── Retry Warning + counter ──────────────────────────────────────────────
 
     [Fact]
+    public async Task DispatchBatch_WhenFirstPollIsSlow_WaitObservesRetryWarningBeforeStop()
+    {
+        IOutboxStore store = CreateStoreReturningOnceThenEmpty(
+            [CreateEntry(7, nackCount: 2)], firstPollDelay: TimeSpan.FromMilliseconds(200));
+        ITransportAdapter adapter = CreateAdapterReturning(_ => false);
+        var logger = new CapturingLogger<OutboxDispatcher>();
+        var options = new OutboxOptions { PollingInterval = TimeSpan.FromMilliseconds(10), DispatchBatchSize = 100 };
+
+        await using var sut = new OutboxDispatcher(
+            CreateScopeFactory(store), adapter, options, logger, StartedLifetime());
+
+        await sut.StartAsync(CancellationToken.None);
+        await WaitForCompletedBatchesAsync(store);
+        await sut.StopAsync(CancellationToken.None);
+
+        logger.Events.Where(e => e.Level == LogLevel.Warning).Should().ContainSingle();
+    }
+
+    [Fact]
     public async Task DispatchBatch_WhenRowNacked_LogsRetryWarningWithRowIdAndRetryCount()
     {
         IOutboxStore store = CreateStoreReturningOnceThenEmpty([CreateEntry(7, nackCount: 2)]);
@@ -172,7 +238,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             CreateScopeFactory(store), adapter, options, logger, StartedLifetime());
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         var warnings = logger.Events.Where(e => e.Level == LogLevel.Warning).ToList();
@@ -201,7 +267,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             (_, _, _) => { });
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         longMeasurements
@@ -231,7 +297,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             CreateScopeFactory(store), adapter, options, logger, StartedLifetime());
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         sut.RetryDiagnostics.RetriedRowCount.Should().Be(1);
@@ -257,7 +323,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             CreateScopeFactory(store), adapter, options, logger, StartedLifetime());
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         var warning = logger.Events.Single(e => e.Level == LogLevel.Warning);
@@ -278,7 +344,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             CreateScopeFactory(store), adapter, options, logger, StartedLifetime());
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         logger.Events.Count(e => e.Level == LogLevel.Warning).Should().Be(
@@ -318,7 +384,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
         listener.RecordObservableInstruments(); // requests a sample before any batch runs
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         await probe.Received(1).GetOldestDueRetryAsync(Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>());
@@ -350,7 +416,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
             CreateScopeFactory(store), adapter, options, logger, StartedLifetime(), meterFactory: factory);
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         await probe.DidNotReceive().GetOldestDueRetryAsync(Arg.Any<DateTimeOffset>(), Arg.Any<CancellationToken>());
@@ -395,7 +461,7 @@ public sealed class OutboxDispatcherRetryObservabilityTests
         listener.RecordObservableInstruments(); // requests a sample so the probe is actually invoked
 
         await sut.StartAsync(CancellationToken.None);
-        await Task.Delay(50);
+        await WaitForCompletedBatchesAsync(store);
         await sut.StopAsync(CancellationToken.None);
 
         await adapter.Received().SendBatchAsync(
