@@ -277,6 +277,13 @@ internal sealed class InMemoryTransportAdapter
     internal TimeSpan SettlementBudget { get; set; } = InMemorySettlementDrain.Budget;
 
     /// <summary>
+    /// Gets or sets the observer a consume call's cleanup notifies after it claimed an unsettled delivery
+    /// for requeueing. Read when <see cref="ConsumeAsync"/> is called. A test hook; <see langword="null"/>
+    /// in production.
+    /// </summary>
+    internal IInMemoryRequeueClaimObserver? RequeueClaimObserver { get; set; }
+
+    /// <summary>
     /// Gets the number of metric or logger calls from this adapter's queue latch-episode/health
     /// diagnostics collaborator (<see cref="InMemoryQueueDiagnostics"/>) that threw and were suppressed. A
     /// test hook.
@@ -451,7 +458,8 @@ internal sealed class InMemoryTransportAdapter
 
         _singleActiveGates.TryGetValue(endpointName, out SemaphoreSlim? gate);
         var runner = new InMemoryQueueRunner(
-            queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token, SettlementBudget, _timeProvider);
+            queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token, SettlementBudget, _timeProvider,
+            RequeueClaimObserver);
         return runner.RunAsync(cancellationToken);
     }
 

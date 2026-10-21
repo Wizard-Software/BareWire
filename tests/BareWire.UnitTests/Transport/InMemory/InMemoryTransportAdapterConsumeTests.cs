@@ -303,6 +303,70 @@ public sealed class InMemoryTransportAdapterConsumeTests
         next.Current.Dispose();
     }
 
+    [Fact]
+    public async Task ConsumeAsync_ConsumerSettlesAndDisposesWhileCleanupHasClaimedEntry_RequeuesMessage()
+    {
+        InMemoryTransportAdapter adapter = OrdersAdapter();
+        // Inside the window between the cleanup claiming the entry and copying its body, the consumer's
+        // lane does what it does on a late settlement: a no-op Requeue (the entry is gone), then Dispose.
+        adapter.RequeueClaimObserver = new DelegateRequeueClaimObserver(message =>
+        {
+            adapter.SettleAsync(SettlementAction.Requeue, message, CancellationToken.None).GetAwaiter().GetResult();
+            message.Dispose();
+        });
+        InMemoryQueue queue = Queue(adapter, "orders");
+        Enqueue(queue, "m-1");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+
+        IAsyncEnumerator<InboundMessage> consumer = Consume(adapter, cts.Token);
+        (await NextAsync(consumer)).Should().BeTrue();
+        await AbandonAsync(consumer, cts);
+
+        queue.Occupancy.Should().Be(1);
+        adapter.DisposedUnsettledCount.Should().Be(0);
+        await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
+        (await NextAsync(next)).Should().BeTrue();
+        BodyOf(next.Current).Should().Be("m-1");
+        next.Current.Dispose();
+    }
+
+    [Fact]
+    public async Task SettleAsync_RequeueWhilePinHeldLongerThanSpinBudget_RequeuesInsteadOfReleasingSlot()
+    {
+        InMemoryTransportAdapter adapter = OrdersAdapter();
+        InMemoryQueue queue = Queue(adapter, "orders");
+        Enqueue(queue, "m-1");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+
+        await using IAsyncEnumerator<InboundMessage> consumer = Consume(adapter, cts.Token);
+        (await NextAsync(consumer)).Should().BeTrue();
+        InboundMessage message = consumer.Current;
+
+        // Another holder (the runner's cleanup) pins the body; a settlement that wins the map entry meanwhile
+        // must wait for the pin to be released, however long that takes, rather than treat it as "disposed".
+        message.TryPinPooledBuffer().Should().BeTrue();
+        Task settle = Task.Run(
+            () => adapter.SettleAsync(SettlementAction.Requeue, message, CancellationToken.None),
+            TestContext.Current.CancellationToken);
+        await Task.Delay(TimeSpan.FromMilliseconds(250), TestContext.Current.CancellationToken);
+        settle.IsCompleted.Should().BeFalse("the settlement has to wait for the pin holder");
+        message.UnpinPooledBuffer();
+        await settle.WaitAsync(Timeout, TestContext.Current.CancellationToken);
+        message.Dispose();
+
+        queue.Occupancy.Should().Be(1);
+        adapter.DisposedUnsettledCount.Should().Be(0);
+        await using IAsyncEnumerator<InboundMessage> next = Consume(adapter, TestContext.Current.CancellationToken);
+        (await NextAsync(next)).Should().BeTrue();
+        BodyOf(next.Current).Should().Be("m-1");
+        next.Current.Dispose();
+    }
+
+    private sealed class DelegateRequeueClaimObserver(Action<InboundMessage> onClaimed) : IInMemoryRequeueClaimObserver
+    {
+        public void OnRequeueClaimed(InboundMessage message) => onClaimed(message);
+    }
+
     // ── DisposeAsync: sweep the delivery map ──────────────────────────────────────────────────────
 
     [Fact]

@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Diagnostics;
 using AwesomeAssertions;
 using BareWire;
 using BareWire.Abstractions;
@@ -14,6 +15,7 @@ using BareWire.Transport.InMemory;
 using BareWire.Transport.InMemory.Configuration;
 using BareWire.Transport.InMemory.Internal;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
 using Xunit;
@@ -46,11 +48,34 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
     [InlineData(RunnerPath.Sequential)]
     [InlineData(RunnerPath.OrderedSingleLane)]
     [InlineData(RunnerPath.OrderedMultiLane)]
-    public async Task RunAsync_CancelledWhileConsumerStalled_RequeuesAndReadsAtMostQueuedMessages(RunnerPath path)
+    public Task RunAsync_CancelledWhileConsumerStalled_RequeuesAndReadsAtMostQueuedMessages(RunnerPath path)
+        => RunScenarioAsync(path, settlementBudget: null);
+
+    [Theory]
+    [InlineData(RunnerPath.OrderedSingleLane)]
+    [InlineData(RunnerPath.OrderedMultiLane)]
+    public async Task RunAsync_CancelledWithZeroSettlementBudget_KeepsEveryQueuedMessage(RunnerPath path)
+    {
+        // A zero settlement budget makes the transport's cleanup claim deliveries while lanes are still
+        // settling them — the window in which a delivery could be dropped instead of requeued.
+        const int iterations = 50;
+        for (int i = 0; i < iterations; i++)
+        {
+            await RunScenarioAsync(path, settlementBudget: TimeSpan.Zero);
+        }
+    }
+
+    private static async Task RunScenarioAsync(RunnerPath path, TimeSpan? settlementBudget)
     {
         // Arrange — a queue filled to capacity with distinct ordering keys, so the multi-lane path
         // spreads deliveries across lanes instead of collapsing them onto one key.
-        InMemoryTransportAdapter transport = CreateTransport(queueCapacity: QueuedMessageCount);
+        var transportLog = new BudgetLogCapture();
+        InMemoryTransportAdapter transport = CreateTransport(queueCapacity: QueuedMessageCount, transportLog);
+        if (settlementBudget is { } budget)
+        {
+            transport.SettlementBudget = budget;
+        }
+
         InMemoryQueue queue = GetQueue(transport);
         for (int i = 0; i < QueuedMessageCount; i++)
         {
@@ -88,8 +113,10 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
         await signal.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         adapter.CancellationObserved = true;
+        long cancelTimestamp = Stopwatch.GetTimestamp();
         await cts.CancelAsync();
         await runTask.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        TimeSpan runTaskElapsed = Stopwatch.GetElapsedTime(cancelTimestamp);
 
         // Assert — validity check: the counting decorator must have actually observed traffic, otherwise
         // the counters below prove nothing.
@@ -101,7 +128,13 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
             $"path={path}, TotalReads={adapter.TotalReads}, " +
             $"ReadsAfterCancellation={adapter.ReadsAfterCancellation}, " +
             $"RequeueSettlements={adapter.RequeueSettlements}, Occupancy={queue.Occupancy}, " +
-            $"redeliveryCounts=[{string.Join(',', redeliveryCounts)}]";
+            $"redeliveryCounts=[{string.Join(',', redeliveryCounts)}], " +
+            $"TerminalSettlements={adapter.TerminalSettlements}, " +
+            $"DisposedUnsettled={transport.DisposedUnsettledCount}, " +
+            $"DisposedUnsettledDuringSettle={adapter.DisposedUnsettledDuringSettle}, " +
+            $"DroppedOnShutdown={transport.DroppedOnShutdownCount}, " +
+            $"runTaskElapsedMs={runTaskElapsed.TotalMilliseconds:F0} (measured from cancel), " +
+            $"SettlementBudgetElapsed={transportLog.BudgetElapsedCount > 0}";
 
         queue.Occupancy.Should().Be(QueuedMessageCount,
             $"a requeue on shutdown must not lose messages ({diagnostics})");
@@ -141,9 +174,15 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
                 $"a stopping ordered consumer must not receive the same MessageId twice ({diagnostics}, " +
                 $"invocations=[{string.Join(',', invocations.Select(kv => $"{kv.Key}:{kv.Value}"))}])");
 
-            int unsettledAtStop = QueuedMessageCount - adapter.TerminalSettlements;
-            queue.Occupancy.Should().BeLessThanOrEqualTo(unsettledAtStop,
-                $"the queue must hold at most the messages that were unsettled at stop ({diagnostics}, unsettledAtStop={unsettledAtStop})");
+            // Only with the default budget: the drain then waits for the lanes, so every terminal settlement
+            // the decorator counted reached the transport. With a zero budget the cleanup may claim and requeue
+            // a delivery before its lane settles it, and that late settlement is a no-op (at-least-once).
+            if (settlementBudget is null)
+            {
+                int unsettledAtStop = QueuedMessageCount - adapter.TerminalSettlements;
+                queue.Occupancy.Should().BeLessThanOrEqualTo(unsettledAtStop,
+                    $"the queue must hold at most the messages that were unsettled at stop ({diagnostics}, unsettledAtStop={unsettledAtStop})");
+            }
             transport.InFlight.Count.Should().Be(0,
                 $"no delivery may stay claimed in the adapter after the runner stopped ({diagnostics})");
         }
@@ -180,13 +219,13 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
         _ => throw new ArgumentOutOfRangeException(nameof(path), path, message: null),
     };
 
-    private static InMemoryTransportAdapter CreateTransport(int queueCapacity)
+    private static InMemoryTransportAdapter CreateTransport(int queueCapacity, ILogger<InMemoryTransportAdapter> logger)
     {
         var configurator = new InMemoryConfigurator();
         configurator.QueueCapacity(queueCapacity);
         configurator.ConfigureTopology(t => t.DeclareQueue(QueueName));
         InMemoryTransportOptions options = configurator.Build();
-        return new InMemoryTransportAdapter(options, new InMemoryBroker(options));
+        return new InMemoryTransportAdapter(options, new InMemoryBroker(options), logger);
     }
 
     private static InMemoryQueue GetQueue(InMemoryTransportAdapter transport)
@@ -242,6 +281,29 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
         }
 
         return counts;
+    }
+
+    /// <summary>Counts the transport's "released after the settlement budget" warnings (drain budget elapsed).</summary>
+    private sealed class BudgetLogCapture : ILogger<InMemoryTransportAdapter>
+    {
+        private int _budgetElapsedCount;
+
+        internal int BudgetElapsedCount => Volatile.Read(ref _budgetElapsedCount);
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (formatter(state, exception).Contains("after the settlement budget", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref _budgetElapsedCount);
+            }
+        }
     }
 
     private sealed class StallSignal
@@ -311,8 +373,9 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
     /// (in total and after the test sets <see cref="CancellationObserved"/>) and the number of
     /// <see cref="SettleAsync"/> calls that carry <see cref="SettlementAction.Requeue"/>.
     /// </summary>
-    private sealed class CountingTransportAdapter(ITransportAdapter inner) : ITransportAdapter
+    private sealed class CountingTransportAdapter(InMemoryTransportAdapter inner) : ITransportAdapter
     {
+        private long _disposedUnsettledDuringSettle;
         private int _totalReads;
         private int _readsAfterCancellation;
         private int _requeueSettlements;
@@ -329,6 +392,12 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
 
         /// <summary>Set by the test immediately before cancelling the runner's token.</summary>
         internal volatile bool CancellationObserved;
+
+        /// <summary>
+        /// Deliveries the transport dropped as disposed-unsettled while a <see cref="SettleAsync"/> call was
+        /// in flight (global counter delta; indicative only when several settlements overlap).
+        /// </summary>
+        internal long DisposedUnsettledDuringSettle => Interlocked.Read(ref _disposedUnsettledDuringSettle);
 
         public string TransportName => inner.TransportName;
 
@@ -357,7 +426,7 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
             }
         }
 
-        public Task SettleAsync(
+        public async Task SettleAsync(
             SettlementAction action, InboundMessage message, CancellationToken cancellationToken = default)
         {
             if (action == SettlementAction.Requeue)
@@ -369,7 +438,13 @@ public sealed class ReceiveEndpointRunnerShutdownRequeueTests
                 Interlocked.Increment(ref _terminalSettlements);
             }
 
-            return inner.SettleAsync(action, message, cancellationToken);
+            long before = inner.DisposedUnsettledCount;
+            await inner.SettleAsync(action, message, cancellationToken).ConfigureAwait(false);
+            long delta = inner.DisposedUnsettledCount - before;
+            if (delta > 0)
+            {
+                Interlocked.Add(ref _disposedUnsettledDuringSettle, delta);
+            }
         }
 
         public Task DeployTopologyAsync(

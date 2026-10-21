@@ -16,21 +16,23 @@ namespace BareWire.Transport.InMemory.Internal;
 /// <para>
 /// <b>Buffer ownership.</b> The buffer of a handed-out delivery belongs to the <see cref="InboundMessage"/>
 /// it was handed out in (its <c>Dispose</c> returns it to the pool); this runner and the delivery map never
-/// return it. A requeued delivery therefore carries a copy of the body in a newly rented buffer, taken
-/// before the map entry is claimed: if the claim wins, the original buffer was valid for the whole copy; if
-/// it loses (the delivery was settled concurrently), the copy is returned to the pool. When the consume
-/// loop never disposes a message (for example a consumer cancelled while waiting for credit), the original
-/// buffer is left to the garbage collector — a missed return, never a double return.
+/// return it. A requeued delivery therefore carries a copy of the body in a newly rented buffer. The body
+/// is pinned before the map entry is claimed and the copy is taken only after the claim won, so a
+/// concurrent <c>Dispose</c> of the message cannot take the buffer away between the claim and the copy
+/// (the unpin returns it); when the claim loses (the delivery was settled concurrently) nothing is copied.
+/// When the consume loop never disposes a message (for example a consumer cancelled while waiting for
+/// credit), the original buffer is left to the garbage collector — a missed return, never a double return.
 /// </para>
 /// <para>
 /// <b>At-least-once.</b> The consume loop may dispose this enumerator while messages it handed out are
 /// still being processed (for example by per-key ordering lanes during a stop, or across a single-active
 /// consumer handover). Those messages are requeued and may be processed twice; a late settlement of the
 /// original finds no map entry and must be a no-op. A message the consume loop disposed without settling it
-/// (its buffer already back in the pool) is detected and dropped with a warning instead of being copied.
-/// Pinning the body (<see cref="InMemoryBodyCopier"/>) closes the race between the two: a dispose that
-/// arrives while the copy is in progress waits for the unpin to return the buffer, so the copy never reads
-/// memory already back in the pool.
+/// (its buffer already back in the pool, so it cannot be pinned) is detected and dropped with a warning
+/// instead of being copied. Pinning the body (<see cref="InMemoryBodyCopier"/>) closes the race between the
+/// two: a dispose that arrives while the body is pinned defers returning the buffer to the unpin, so the
+/// copy never reads memory already back in the pool and never loses a message the consumer merely
+/// finished with.
 /// </para>
 /// </remarks>
 internal sealed class InMemoryQueueRunner
@@ -42,6 +44,7 @@ internal sealed class InMemoryQueueRunner
     private readonly InMemoryBufferPool _pool;
     private readonly TimeSpan _settlementBudget;
     private readonly TimeProvider _timeProvider;
+    private readonly IInMemoryRequeueClaimObserver? _requeueClaimObserver;
     private int _unsettledCount;
 
     /// <param name="queue">The queue to consume.</param>
@@ -58,6 +61,7 @@ internal sealed class InMemoryQueueRunner
     /// <see cref="InMemorySettlementDrain.Budget"/>.
     /// </param>
     /// <param name="timeProvider">The time source of the settlement wait; defaults to <see cref="TimeProvider.System"/>.</param>
+    /// <param name="requeueClaimObserver">A test hook notified after a claimed delivery is about to be copied for requeueing; <see langword="null"/> in production.</param>
     internal InMemoryQueueRunner(
         InMemoryQueue queue,
         InMemoryDeliveryMap map,
@@ -66,7 +70,8 @@ internal sealed class InMemoryQueueRunner
         InMemoryBufferPool pool,
         CancellationToken shutdownToken,
         TimeSpan? settlementBudget = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IInMemoryRequeueClaimObserver? requeueClaimObserver = null)
     {
         ArgumentNullException.ThrowIfNull(queue);
         ArgumentNullException.ThrowIfNull(map);
@@ -81,6 +86,7 @@ internal sealed class InMemoryQueueRunner
         _pool = pool;
         _settlementBudget = settlementBudget ?? InMemorySettlementDrain.Budget;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _requeueClaimObserver = requeueClaimObserver;
     }
 
     /// <summary>Gets the number of deliveries this runner handed out that have not been settled or claimed yet.</summary>
@@ -202,26 +208,46 @@ internal sealed class InMemoryQueueRunner
         int disposedUnsettled = 0;
         foreach (KeyValuePair<ulong, InFlightDelivery> pair in owned)
         {
-            // Taking the entry first makes a concurrent settlement a no-op; losing the race means the delivery
-            // was settled and its message owns the buffer as usual.
-            if (!_map.TryTake(pair.Key, out InFlightDelivery entry))
-            {
-                continue;
-            }
-
             // Consumers may still be processing (and disposing) messages on other threads, e.g. ordered lanes
-            // that drain after this enumerator ends. InMemoryBodyCopier pins the body atomically with the
-            // message's Dispose: if the consumer disposed first, the buffer is already back in the pool and
-            // the body can no longer be read, so the delivery is dropped and its slot freed instead of copied.
-            if (!InMemoryBodyCopier.TryCopy(entry, _pool, out byte[] copy))
+            // that drain after this enumerator ends. The body is therefore pinned BEFORE the map entry is
+            // claimed: a pinned message that is disposed concurrently keeps its buffer until the unpin below,
+            // so once this runner wins the claim the copy can always be made — a lane's late Requeue
+            // settlement finds no entry (a no-op) and its Dispose cannot take the buffer away.
+            InboundMessage message = pair.Value.Message;
+            if (!message.TryPinPooledBuffer())
             {
-                Queue.ReleaseSlot();
-                disposedUnsettled++;
+                // Disposed, or pinned by a settlement. A settlement pins only AFTER winning _map.TryTake, so an
+                // entry that is still in the map here belongs to a message its consumer disposed without
+                // settling: claim it and free its slot instead of copying a body that is no longer readable.
+                // Losing the claim means a settlement owns the delivery and its slot.
+                if (_map.TryTake(pair.Key, out _))
+                {
+                    Queue.ReleaseSlot();
+                    disposedUnsettled++;
+                }
+
                 continue;
             }
 
-            InMemoryDelivery delivery = entry.Delivery;
-            requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
+            try
+            {
+                // Taking the entry makes a concurrent settlement a no-op; losing the race means the delivery
+                // was settled and its message owns the buffer as usual.
+                if (!_map.TryTake(pair.Key, out InFlightDelivery entry))
+                {
+                    continue;
+                }
+
+                _requeueClaimObserver?.OnRequeueClaimed(message);
+
+                byte[] copy = InMemoryBodyCopier.CopyPinned(entry, _pool);
+                InMemoryDelivery delivery = entry.Delivery;
+                requeue.Add(delivery.CreateRedelivery(copy, delivery.Length));
+            }
+            finally
+            {
+                message.UnpinPooledBuffer();
+            }
         }
 
         _diagnostics.DeliveriesDisposedUnsettled(Queue.Name, disposedUnsettled);
