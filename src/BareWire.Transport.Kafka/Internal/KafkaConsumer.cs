@@ -370,14 +370,12 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
                             waitTask.GetAwaiter().GetResult();
                         }
 
-                        // PERF-1: the TryWrite result MUST be checked. WaitToWriteAsync returns true
-                        // immediately under a non-Wait FullMode (DropWrite/DropOldest/DropNewest — all
-                        // settable on the public FlowControlOptions.FullMode), in which case TryWrite
-                        // silently drops/evicts the message. The DeliveryTag → TopicPartitionOffset entry
-                        // was already stored in BuildMessage, so a dropped message would (a) never be
-                        // settled (silent at-least-once violation) and (b) leak its offset-map entry.
-                        // On a failed write we therefore evict the offset entry and dispose the message,
-                        // mirroring RabbitMqConsumer.cs:87-93 (which nack-requeues on a failed write).
+                        // PERF-1: the TryWrite result MUST be checked. FullMode is always Wait here
+                        // (validated in ConsumeAsync), so this branch is a defensive guard that should not
+                        // run in normal operation. If the write still fails, the DeliveryTag →
+                        // TopicPartitionOffset entry stored in BuildMessage is evicted, the partition commit
+                        // is held at this offset and the message is disposed, so nothing leaks and the
+                        // message is re-consumed after a restart.
                         if (!_channel.Writer.TryWrite(message))
                         {
                             _registry.TryEvictOffset(_consumerId, message.DeliveryTag);
@@ -641,7 +639,7 @@ internal sealed partial class KafkaConsumer : IAsyncDisposable
     private partial void LogChannelFull(string consumerId);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Kafka consumer {ConsumerId}: message DeliveryTag={DeliveryTag} dropped by the bounded channel (non-Wait FullMode); offset entry evicted, message will be re-consumed from the last committed offset.")]
+        Message = "Kafka consumer {ConsumerId}: message DeliveryTag={DeliveryTag} was not written to the inbound channel (writer closed); offset entry evicted and partition commit held, message will be re-consumed after a restart.")]
     private partial void LogMessageDropped(string consumerId, ulong deliveryTag);
 
     [LoggerMessage(Level = LogLevel.Information,

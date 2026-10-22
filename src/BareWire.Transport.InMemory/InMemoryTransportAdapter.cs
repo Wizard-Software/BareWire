@@ -1,6 +1,7 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
 using System.Diagnostics.Metrics;
+using System.Threading.Channels;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
@@ -433,6 +434,10 @@ internal sealed class InMemoryTransportAdapter
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="flowControl"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <c>flowControl.InternalQueueCapacity</c> is not positive, or <c>flowControl.FullMode</c> is not
+    /// <see cref="BoundedChannelFullMode.Wait"/>. Checked before the queue lookup.
+    /// </exception>
     /// <exception cref="ObjectDisposedException">The adapter has been disposed.</exception>
     /// <exception cref="BareWireConfigurationException">
     /// Thrown when <paramref name="endpointName"/> names a queue that is neither declared nor
@@ -446,6 +451,7 @@ internal sealed class InMemoryTransportAdapter
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+        ValidateFlowControl(flowControl);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         if (!Registry.ContainsQueue(endpointName) || !Broker.TryGetQueue(endpointName, out InMemoryQueue? queue))
@@ -461,6 +467,28 @@ internal sealed class InMemoryTransportAdapter
             queue, InFlight, gate, _diagnostics, BufferPool, _shutdown.Token, SettlementBudget, _timeProvider,
             RequeueClaimObserver);
         return runner.RunAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Rejects flow-control options the other transports reject, so the contract is the same everywhere.
+    /// </summary>
+    /// <remarks>
+    /// The in-memory transport buffers in the broker's queue and uses neither
+    /// <see cref="FlowControlOptions.FullMode"/> nor <see cref="FlowControlOptions.InternalQueueCapacity"/>.
+    /// The check keeps the behavior consistent: a <c>Drop*</c> mode would let a full buffer discard a
+    /// delivered message instead of applying back-pressure.
+    /// </remarks>
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "In-memory consumers support only BoundedChannelFullMode.Wait.");
+        }
     }
 
     /// <summary>

@@ -31,8 +31,9 @@ public sealed class FlowControlOptions
     /// <para>
     /// Receive endpoints configured through the bus set only <see cref="MaxInFlightMessages"/> (from the
     /// endpoint <c>PrefetchCount</c>); this value and <see cref="FullMode"/> take effect only when
-    /// <c>ITransportAdapter.ConsumeAsync</c> is called directly. It must be greater than zero for RabbitMQ,
-    /// Amazon SQS, Google Cloud Pub/Sub and Azure Service Bus.
+    /// <c>ITransportAdapter.ConsumeAsync</c> is called directly. It must be greater than zero for every
+    /// transport, including Kafka and in-memory (which does not otherwise use it); a non-positive value makes
+    /// <c>ConsumeAsync</c> throw <see cref="System.ArgumentOutOfRangeException"/>.
     /// </para>
     /// <para>
     /// The RabbitMQ transport raises its internal buffer to at least the prefetch count
@@ -57,11 +58,10 @@ public sealed class FlowControlOptions
     /// by blocking the transport reader until space becomes available.
     /// </summary>
     /// <remarks>
-    /// The RabbitMQ, Amazon SQS, Google Cloud Pub/Sub and Azure Service Bus transports accept only
-    /// <see cref="BoundedChannelFullMode.Wait"/>; any other value makes <c>ITransportAdapter.ConsumeAsync</c>
-    /// throw <see cref="System.ArgumentOutOfRangeException"/>, because a <c>Drop*</c> mode would discard a
-    /// received message without returning it to the broker. The Kafka and in-memory transports do not apply
-    /// this rule.
+    /// Every transport (RabbitMQ, Kafka, Amazon SQS, Google Cloud Pub/Sub, Azure Service Bus and in-memory)
+    /// accepts only <see cref="BoundedChannelFullMode.Wait"/>; any other value makes
+    /// <c>ITransportAdapter.ConsumeAsync</c> throw <see cref="System.ArgumentOutOfRangeException"/>, because a
+    /// <c>Drop*</c> mode would discard a received message without returning it to the broker.
     /// </remarks>
     public BoundedChannelFullMode FullMode { get; set; } = BoundedChannelFullMode.Wait;
 }
