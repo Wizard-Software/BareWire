@@ -44,6 +44,14 @@ internal sealed partial class RabbitMqTransportAdapter
     private const string ChannelIdHeaderName = "BW-ConsumerChannelId";
     private const int MaxLoggedChannelIdLength = 64;
 
+    // Budget of one shutdown step (closing a consumer channel, closing the connection, disposing either).
+    private static readonly TimeSpan ShutdownStepTimeout =
+        TimeSpan.FromMilliseconds(RabbitMqConsumer.ShutdownStepTimeoutMilliseconds);
+
+    // The connection-close token outlives the limit handed to the client by one second, so the client's own
+    // limit is the one that normally ends the close and the token is only the backstop.
+    private static readonly TimeSpan ConnectionCloseTokenTimeout = ShutdownStepTimeout + TimeSpan.FromSeconds(1);
+
     private long _deliveryTagCounter;
     private IConnection? _connection;
     private int _disposed;
@@ -726,7 +734,9 @@ internal sealed partial class RabbitMqTransportAdapter
         ReleaseConsumerChannelCoreAsync(channelId, endpointName: null, cancellationToken);
 
     // Never throws: close and dispose failures are logged, so a caller's finally never sees them and the
-    // original failure is not masked.
+    // original failure is not masked. The close is bounded by ShutdownStepTimeout on the adapter's clock whatever
+    // token the caller passes (the receive endpoint runner passes CancellationToken.None while it is stopping),
+    // and a caller's own cancellation still ends it at once.
     private async Task ReleaseConsumerChannelCoreAsync(
         string channelId, string? endpointName, CancellationToken cancellationToken)
     {
@@ -742,14 +752,18 @@ internal sealed partial class RabbitMqTransportAdapter
             return;
         }
 
+        using var budget = new CancellationTokenSource(ShutdownStepTimeout, _timeProvider);
+        using var closeToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, budget.Token);
         await CloseAndDisposeConsumerChannelAsync(
-                channel, endpointName ?? consumer?.EndpointName ?? string.Empty, channelId, cancellationToken)
+                channel, endpointName ?? consumer?.EndpointName ?? string.Empty, channelId, closeToken.Token)
             .ConfigureAwait(false);
     }
 
     // Never throws: every caller has already removed the channel from the registry, so a failure here must not
-    // stop the caller from releasing anything else. The token bounds CloseAsync only; IChannel.DisposeAsync()
-    // takes no token and is bounded solely by the client's ContinuationTimeout (default 20 s, not set by BareWire).
+    // stop the caller from releasing anything else. RabbitMQ.Client does not honour the token of CloseAsync while
+    // the channel is still open (it waits for the broker up to its ContinuationTimeout), so the token also bounds
+    // the wait itself; IChannel.DisposeAsync() takes no token and is bounded by ShutdownStepTimeout the same way.
+    // A close or dispose abandoned this way keeps running in the client; its outcome is observed and dropped.
     private async Task CloseAndDisposeConsumerChannelAsync(
         IChannel channel, string endpointName, string channelId, CancellationToken cancellationToken)
     {
@@ -757,7 +771,8 @@ internal sealed partial class RabbitMqTransportAdapter
         {
             if (channel.IsOpen)
             {
-                await channel.CloseAsync(cancellationToken).ConfigureAwait(false);
+                await WaitBoundedAsync(channel.CloseAsync(cancellationToken), cancellationToken)
+                    .ConfigureAwait(false);
             }
         }
         catch (Exception ex)
@@ -767,13 +782,50 @@ internal sealed partial class RabbitMqTransportAdapter
 
         try
         {
-            await channel.DisposeAsync().ConfigureAwait(false);
+            await DisposeBoundedAsync(channel.DisposeAsync()).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             LogConsumerChannelReleaseError(endpointName, TruncateChannelId(channelId), ex);
         }
     }
+
+    // Stops waiting for work that ignores its token when the token is cancelled. The abandoned task is observed
+    // so a later fault does not surface as an unobserved task exception.
+    private static async Task WaitBoundedAsync(Task work, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await work.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!work.IsCompleted)
+        {
+            ObserveAbandoned(work);
+            throw;
+        }
+    }
+
+    // Bounds a dispose, which takes no token, by ShutdownStepTimeout on the adapter's clock.
+    private async Task DisposeBoundedAsync(ValueTask dispose)
+    {
+        Task work = dispose.AsTask();
+        try
+        {
+            await work.WaitAsync(ShutdownStepTimeout, _timeProvider).ConfigureAwait(false);
+        }
+        catch (TimeoutException) when (!work.IsCompleted)
+        {
+            ObserveAbandoned(work);
+            throw;
+        }
+    }
+
+    private static void ObserveAbandoned(Task work) =>
+        _ = work.ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     // Used on setup failure and in the iterator's finally, where the original exception must surface.
     private async Task ReleaseConsumerChannelSafeAsync(string endpointName, string consumerChannelId)
@@ -827,16 +879,33 @@ internal sealed partial class RabbitMqTransportAdapter
 
         if (_connection is not null)
         {
+            // The client gets ShutdownStepTimeout. abort: true because a graceful close (abort: false) raises any
+            // timeout below 30 s to 30 s in RabbitMQ.Client; an abort still sends connection.close and waits for
+            // the broker, but within the limit and without throwing on a connection that is already gone. The
+            // client also swaps the token for None while the connection is open, so the token bounds the wait too.
             try
             {
-                await _connection.CloseAsync().ConfigureAwait(false);
+                using var closeToken = new CancellationTokenSource(ConnectionCloseTokenTimeout, _timeProvider);
+                await WaitBoundedAsync(
+                        _connection.CloseAsync(
+                            Constants.ReplySuccess, "Goodbye", ShutdownStepTimeout, abort: true, closeToken.Token),
+                        closeToken.Token)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 LogConnectionCloseError(ex);
             }
 
-            await _connection.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                await DisposeBoundedAsync(_connection.DisposeAsync()).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                LogConnectionCloseError(ex);
+            }
+
             _connection = null;
         }
 

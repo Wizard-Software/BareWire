@@ -587,7 +587,9 @@ internal sealed partial class ReceiveEndpointRunner
                 // Release the consumer channel so the broker can reclaim it.
                 // CancellationToken.None is intentional — by the time we get here the original
                 // cancellationToken is likely already cancelled (shutdown scenario), but the
-                // close handshake with the broker must still complete cleanly.
+                // close handshake with the broker must still complete cleanly. The time limit of that
+                // handshake is applied by the transport regardless of this token, so a broker that never
+                // answers cannot hold the endpoint shutdown.
                 if (_channelManager is not null && consumerChannelId is not null)
                 {
                     await _channelManager

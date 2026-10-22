@@ -82,7 +82,7 @@ public sealed class RabbitMqTransportAdapterChannelCleanupTests
         await adapter.ReleaseConsumerChannelAsync(channelId, CancellationToken.None);
 
         // Assert — CloseAsync and DisposeAsync must each be called exactly once
-        await mockChannel.Received(1).CloseAsync(CancellationToken.None);
+        await mockChannel.Received(1).CloseAsync(Arg.Is<CancellationToken>(t => t.CanBeCanceled));
         await mockChannel.Received(1).DisposeAsync();
     }
 
@@ -125,7 +125,7 @@ public sealed class RabbitMqTransportAdapterChannelCleanupTests
         await adapter.ReleaseConsumerChannelAsync(channelId, CancellationToken.None);
 
         // Assert — CloseAsync and DisposeAsync each called exactly once despite two Release calls
-        await mockChannel.Received(1).CloseAsync(CancellationToken.None);
+        await mockChannel.Received(1).CloseAsync(Arg.Is<CancellationToken>(t => t.CanBeCanceled));
         await mockChannel.Received(1).DisposeAsync();
     }
 
