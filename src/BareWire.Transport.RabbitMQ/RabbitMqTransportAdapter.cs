@@ -27,6 +27,9 @@ internal sealed partial class RabbitMqTransportAdapter
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
     private readonly CancellationTokenSource _disposeCts = new();
 
+    // Captured once: the source is cancelled before it is disposed, and Token throws on a disposed source.
+    private readonly CancellationToken _disposeToken;
+
     // Maps consumerChannelId (the BW-ConsumerChannelId header stamped on every delivery) → the IChannel that
     // delivered it, so SettleAsync can ACK/NACK messages on the correct channel without threading channel
     // references through InboundMessage.
@@ -55,6 +58,10 @@ internal sealed partial class RabbitMqTransportAdapter
     private long _deliveryTagCounter;
     private IConnection? _connection;
     private int _disposed;
+
+    // Creates the broker connection. A seam for tests, which replace it to block or fail connection setup.
+    internal Func<ConnectionFactory, CancellationToken, Task<IConnection>> CreateConnection { get; set; } =
+        static (factory, cancellationToken) => factory.CreateConnectionAsync(cancellationToken);
 
     // Mapping-epoch memoization — keyed on topology reference (O(1) ReferenceEquals per batch).
     // Recomputed only when the configured topology reference is reassigned (re-map scenario).
@@ -87,6 +94,7 @@ internal sealed partial class RabbitMqTransportAdapter
         _options = options;
         _logger = logger;
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
+        _disposeToken = _disposeCts.Token;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _onRecoveryOverdue = (consumer, waited) =>
             LogConsumerRecoveryOverdue(consumer.EndpointName, (long)waited.TotalSeconds);
@@ -859,7 +867,7 @@ internal sealed partial class RabbitMqTransportAdapter
         // pass, enumerating the dictionary directly. An entry removed here is released only here; a setup that
         // registers after this pass sees the disposed flag and releases its own channel, so no outer retry loop
         // is needed. The helper never throws, so one failing channel cannot skip the remaining channels, the
-        // connection, the lock or the CTS.
+        // connection or the CTS.
         foreach (KeyValuePair<string, IChannel> entry in _activeConsumerChannels)
         {
             if (!_activeConsumerChannels.TryRemove(entry.Key, out IChannel? channel))
@@ -877,54 +885,82 @@ internal sealed partial class RabbitMqTransportAdapter
 
         _activeConsumers.Clear();
 
-        if (_connection is not null)
+        // Exactly one side closes a connection: this exchange, or the caller that created it after the disposed flag
+        // was set (see EnsureConnectedAsync). A connection that is still being created when this runs is therefore
+        // closed by that caller, possibly after DisposeAsync has returned; that close is bounded by the same
+        // limits as the one below.
+        IConnection? connection = Interlocked.Exchange(ref _connection, null);
+        if (connection is not null)
         {
-            // The client gets ShutdownStepTimeout. abort: true because a graceful close (abort: false) raises any
-            // timeout below 30 s to 30 s in RabbitMQ.Client; an abort still sends connection.close and waits for
-            // the broker, but within the limit and without throwing on a connection that is already gone. The
-            // client also swaps the token for None while the connection is open, so the token bounds the wait too.
-            try
-            {
-                using var closeToken = new CancellationTokenSource(ConnectionCloseTokenTimeout, _timeProvider);
-                await WaitBoundedAsync(
-                        _connection.CloseAsync(
-                            Constants.ReplySuccess, "Goodbye", ShutdownStepTimeout, abort: true, closeToken.Token),
-                        closeToken.Token)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                LogConnectionCloseError(ex);
-            }
-
-            try
-            {
-                await DisposeBoundedAsync(_connection.DisposeAsync()).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                LogConnectionCloseError(ex);
-            }
-
-            _connection = null;
+            await CloseAndDisposeConnectionAsync(connection).ConfigureAwait(false);
         }
 
-        _connectionLock.Dispose();
+        // _connectionLock is intentionally not disposed: a SemaphoreSlim whose AvailableWaitHandle was never read
+        // holds no unmanaged resource, and disposing it under a holder or a waiter turns their Release or WaitAsync
+        // into an ObjectDisposedException. Waiters are woken by _disposeToken instead.
         _disposeCts.Dispose();
+    }
+
+    // Never throws: callers have already taken ownership of the connection, so a failure here must not stop them
+    // from releasing anything else.
+    private async Task CloseAndDisposeConnectionAsync(IConnection connection)
+    {
+        // The client gets ShutdownStepTimeout. abort: true because a graceful close (abort: false) raises any
+        // timeout below 30 s to 30 s in RabbitMQ.Client; an abort still sends connection.close and waits for
+        // the broker, but within the limit and without throwing on a connection that is already gone. The
+        // client also swaps the token for None while the connection is open, so the token bounds the wait too.
+        try
+        {
+            using var closeToken = new CancellationTokenSource(ConnectionCloseTokenTimeout, _timeProvider);
+            await WaitBoundedAsync(
+                    connection.CloseAsync(
+                        Constants.ReplySuccess, "Goodbye", ShutdownStepTimeout, abort: true, closeToken.Token),
+                    closeToken.Token)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogConnectionCloseError(ex);
+        }
+
+        try
+        {
+            await DisposeBoundedAsync(connection.DisposeAsync()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogConnectionCloseError(ex);
+        }
     }
 
     private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
     {
-        if (_connection is not null && _connection.IsOpen)
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        if (_connection is { IsOpen: true })
         {
             return;
         }
 
-        await _connectionLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        // Dispose wakes a caller that waits for the lock or is creating the connection. The caller's own token
+        // is never replaced: a cancellation it requested still surfaces as OperationCanceledException.
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeToken);
         try
         {
-            // Re-check after acquiring the lock — another caller may have connected.
-            if (_connection is not null && _connection.IsOpen)
+            await _connectionLock.WaitAsync(linked.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+
+        try
+        {
+            // Re-check after acquiring the lock — the adapter may have been disposed or another caller may have
+            // connected while this one waited.
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            if (_connection is { IsOpen: true })
             {
                 return;
             }
@@ -954,14 +990,36 @@ internal sealed partial class RabbitMqTransportAdapter
                 LogAmqpsWithoutTlsConfig();
             }
 
-            _connection = await factory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
+            IConnection connection;
+            try
+            {
+                connection = await CreateConnection(factory, linked.Token).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _disposed) != 0)
+            {
+                // The client may wrap the cancellation raised by the dispose token (for example in
+                // BrokerUnreachableException); the caller sees one exception type whatever the client threw.
+                throw new ObjectDisposedException(GetType().FullName);
+            }
 
-            _connection.ConnectionShutdownAsync += OnConnectionShutdownAsync;
-            _connection.RecoverySucceededAsync += OnRecoverySucceededAsync;
+            connection.ConnectionShutdownAsync += OnConnectionShutdownAsync;
+            connection.RecoverySucceededAsync += OnRecoverySucceededAsync;
 
-            string host = _connection.Endpoint.HostName;
-            int port = _connection.Endpoint.Port;
-            LogConnectionEstablished(host, port);
+            // Publish, then re-check. Pairs with the CompareExchange on _disposed and the Interlocked.Exchange on
+            // _connection in DisposeAsync: whichever side runs second takes the connection out of the field and
+            // closes it, so there is exactly one owner and none is leaked.
+            Interlocked.Exchange(ref _connection, connection);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                if (Interlocked.CompareExchange(ref _connection, null, connection) == connection)
+                {
+                    await CloseAndDisposeConnectionAsync(connection).ConfigureAwait(false);
+                }
+
+                throw new ObjectDisposedException(GetType().FullName);
+            }
+
+            LogConnectionEstablished(connection.Endpoint.HostName, connection.Endpoint.Port);
         }
         finally
         {
