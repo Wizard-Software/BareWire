@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Transport.InMemory;
 using BareWire.Transport.InMemory.Configuration;
 using BareWire.Transport.InMemory.Internal;
@@ -232,15 +233,16 @@ public sealed class InMemoryStartupDiagnosticsTests
     }
 
     [Fact]
-    public void AddBareWireInMemory_CalledTwice_RegistersSingleStartupDiagnosticsHostedService()
+    public void AddBareWireInMemory_CalledTwice_ThrowsAndKeepsSingleStartupDiagnosticsHostedService()
     {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddBareWireInMemory(_ => { });
-        services.AddBareWireInMemory(_ => { });
 
+        Action act = () => services.AddBareWireInMemory(_ => { });
+
+        act.Should().Throw<BareWireConfigurationException>();
         using ServiceProvider sp = services.BuildServiceProvider();
-
         sp.GetServices<IHostedService>().OfType<InMemoryStartupDiagnostics>().Should().ContainSingle();
     }
 

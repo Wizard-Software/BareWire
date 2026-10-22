@@ -134,6 +134,7 @@ Things to know:
   is dead-lettered.
 - `IBus.ConnectReceiveEndpoint` (adding an endpoint at runtime) is not supported yet; declare every endpoint in the transport delegate.
 - Only one transport can be registered per service collection: registering a second, different transport throws `BareWireConfigurationException`, and support for hosting several transports in one service collection is planned.
+- Calling `AddBareWireAzureServiceBus` a second time on one service collection also throws `BareWireConfigurationException`; declare every receive endpoint in a single call.
 
 ## Sessions
 

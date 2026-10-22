@@ -1,6 +1,7 @@
 using AwesomeAssertions;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
+using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.RabbitMQ;
 using Microsoft.Extensions.DependencyInjection;
@@ -30,20 +31,19 @@ public sealed class RabbitMqServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public async Task AddBareWireRabbitMq_CalledTwice_UsesFirstRegistration()
+    public void AddBareWireRabbitMq_CalledTwice_ThrowsConfigurationException()
     {
         // Arrange
         var services = new ServiceCollection();
         services.AddLogging();
-
-        // Act — TryAddSingleton should keep the first registration
         services.AddBareWireRabbitMq(rmq => rmq.Host("amqp://first@localhost:5672/"));
-        services.AddBareWireRabbitMq(rmq => rmq.Host("amqp://second@localhost:5672/"));
+
+        // Act
+        Action act = () => services.AddBareWireRabbitMq(rmq => rmq.Host("amqp://second@localhost:5672/"));
 
         // Assert
-        await using var provider = services.BuildServiceProvider();
-        var adapter = provider.GetService<ITransportAdapter>();
-        adapter.Should().NotBeNull();
+        act.Should().Throw<BareWireConfigurationException>().Which.Message.Should().Contain("already called");
+        services.Where(d => d.ServiceType == typeof(RabbitMqTransportOptions)).Should().ContainSingle();
     }
 
     [Fact]

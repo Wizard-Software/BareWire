@@ -30,12 +30,29 @@ public static class ServiceCollectionExtensions
     /// Thrown when <paramref name="services"/> or <paramref name="configure"/> is
     /// <see langword="null"/>.
     /// </exception>
+    /// <exception cref="BareWireConfigurationException">
+    /// Thrown when this method was already called on <paramref name="services"/>, or when another
+    /// transport is already registered in <paramref name="services"/>.
+    /// </exception>
     public static IServiceCollection AddBareWirePubSub(
         this IServiceCollection services,
         Action<IPubSubConfigurator> configure)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configure);
+
+        // Fail fast on a repeated call for this transport: every registration below uses TryAdd, so a second
+        // call's receive endpoints, topology and options would be silently ignored. Runs before configure(...)
+        // and before any TryAdd/Replace, so a rejected call leaves the first registration untouched.
+        if (services.Any(d => d.ServiceType == typeof(PubSubTransportOptions) && !d.IsKeyedService))
+        {
+            throw new BareWireConfigurationException(
+                optionName: "AddBareWirePubSub",
+                optionValue: "already called for this service collection",
+                expectedValue: "a single AddBareWirePubSub(...) call per service collection. A second call's " +
+                               "receive endpoints, topology and mappings would be ignored. Declare every receive " +
+                               "endpoint, topology and mapping in one AddBareWirePubSub(...) delegate");
+        }
 
         // Fail fast when another transport's adapter is already registered: the core bus resolves exactly one
         // non-keyed ITransportAdapter and one endpoint list, so this transport would be silently ignored.

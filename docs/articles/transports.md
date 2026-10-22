@@ -32,7 +32,7 @@ Every transport offers the same two registration shapes described in [Configurat
 - **Two calls** — register the transport adapter and the core separately with `AddBareWire{Transport}(…)`
   followed by `AddBareWire(…)`. Use this form when you want to reference the core and transport packages separately.
 
-A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Support for hosting several transports in one service collection is planned.
+A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Calling the same transport's registration method (for example `AddBareWireRabbitMq`) a second time on one service collection also throws `BareWireConfigurationException`, so declare every receive endpoint, topology and mapping in a single call. Support for hosting several transports in one service collection is planned.
 
 ```csharp
 // Bundle — the common single-transport case
