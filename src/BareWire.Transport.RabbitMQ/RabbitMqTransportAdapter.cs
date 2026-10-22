@@ -714,8 +714,53 @@ internal sealed partial class RabbitMqTransportAdapter
         }
         finally
         {
-            await channel.CloseAsync(cancellationToken).ConfigureAwait(false);
-            await channel.DisposeAsync().ConfigureAwait(false);
+            await CloseAndDisposeTopologyChannelAsync(channel).ConfigureAwait(false);
+        }
+    }
+
+    // Never throws: it runs in the finally of DeployTopologyAsync, so a close or dispose failure must neither
+    // replace the topology exception (or the caller's cancellation) nor turn a successful deployment into a
+    // failure. The close gets its own ShutdownStepTimeout budget on the adapter's clock, independent of the
+    // caller's token, so a cancelled deployment still closes the channel gracefully; it is linked only to the
+    // captured _disposeToken, so disposing the adapter ends it at once (and skips it when already disposed).
+    // The channel is closed only while it is open: the broker may already have closed it after a failed
+    // declaration. The dispose is bounded the same way as the close.
+    private async Task CloseAndDisposeTopologyChannelAsync(IChannel channel)
+    {
+        try
+        {
+            if (channel.IsOpen && !_disposeToken.IsCancellationRequested)
+            {
+                using var budget = new CancellationTokenSource(ShutdownStepTimeout, _timeProvider);
+                using var closeToken = CancellationTokenSource.CreateLinkedTokenSource(budget.Token, _disposeToken);
+                try
+                {
+                    await WaitBoundedAsync(channel.CloseAsync(closeToken.Token), closeToken.Token)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException ex)
+                    when (_disposeToken.IsCancellationRequested && !budget.IsCancellationRequested)
+                {
+                    LogTopologyChannelCloseAbandoned(ex);
+                }
+                catch (Exception ex)
+                {
+                    LogTopologyChannelCloseError(ex);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogTopologyChannelCloseError(ex);
+        }
+
+        try
+        {
+            await DisposeBoundedAsync(channel.DisposeAsync()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            LogTopologyChannelCloseError(ex);
         }
     }
 
@@ -1059,6 +1104,13 @@ internal sealed partial class RabbitMqTransportAdapter
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Exception while closing publish channel.")]
     private partial void LogPublishChannelCloseError(Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "Exception while closing the topology channel.")]
+    private partial void LogTopologyChannelCloseError(Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Closing the topology channel was abandoned because the adapter is being disposed.")]
+    private partial void LogTopologyChannelCloseAbandoned(Exception ex);
 
     // Guaranteed-routing return diagnostic. Logs only the exchange and routing key — both are topology
     // structure (the routing key on the send path is derived from the message type / an explicit mapping,
