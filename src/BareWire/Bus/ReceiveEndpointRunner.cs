@@ -320,8 +320,16 @@ internal sealed partial class ReceiveEndpointRunner
         // fan-out (C2); each lane carries its own TerminatorState (the [ThreadStatic] invariant no longer
         // holds across parallel lanes).
         bool orderingEnabled = _binding.Ordering is not null;
+
+        // One settlement budget per pass, shared by the sequential path and the ordered lanes. Declared before
+        // the stage and disposed with the method scope, i.e. after orderedStage.CompleteAsync() has joined
+        // every lane worker, so no lane can observe a disposed source.
+        using var settlementBudget = new SettlementBudget(_timeProvider, cancellationToken);
+        CancellationToken settlementToken = settlementBudget.Token;
+
         OrderedDispatchStage? orderedStage = orderingEnabled
-            ? new OrderedDispatchStage(this, creditManager, ResolveLaneCount(), _binding.Ordering!, cancellationToken)
+            ? new OrderedDispatchStage(
+                this, creditManager, ResolveLaneCount(), _binding.Ordering!, cancellationToken, settlementToken)
             : null;
 
         // Monotonic arrival sequence — assigned in this single reader, in channel-read order, BEFORE any
@@ -486,25 +494,34 @@ internal sealed partial class ReceiveEndpointRunner
 
                     try
                     {
+                        // A settlement racing the stop must still reach the broker, so Ack/Nack/Reject use the
+                        // settlement budget token (cancelled SettlementBudget.Budget after the runner token),
+                        // never the already cancelled runner token. A requeue is never cancelled.
                         CancellationToken settleCt = outcome.Action == SettlementAction.Requeue
                             ? CancellationToken.None
-                            : cancellationToken;
+                            : settlementToken;
                         await _adapter.SettleAsync(outcome.Action, message, settleCt).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException ex) when (settlementToken.IsCancellationRequested)
+                    {
+                        // The budget elapsed while the broker call was pending: the broker redelivers the message.
+                        string discardedType = ex.GetType().Name;
+                        LogSequentialSettlementDiscarded(
+                            _binding.EndpointName, message.MessageId, outcome.Action, discardedType);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
-                        LogSettlementError(_binding.EndpointName, message.MessageId, outcome.Action, ex);
+                        // Only the exception type is logged — its message may carry broker or payload detail.
+                        LogSequentialSettlementFailed(
+                            _binding.EndpointName, message.MessageId, outcome.Action, ex.GetType().Name);
                     }
 
-                    // A cancellation-induced requeue puts the delivery back at the head of the queue —
-                    // the loop must stop instead of reading it again, rather than fetching the same
-                    // delivery over and over while shutting down. The catch (OperationCanceledException)
-                    // filter below logs the exit; the finally block still runs to release credit, dispose
-                    // the message, and check health.
-                    if (outcome.Action == SettlementAction.Requeue)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                    }
+                    // A stop that was requested while this message was in progress ends the loop after its
+                    // settlement (any action), instead of asking the adapter for the next delivery. For a
+                    // cancellation-induced requeue this also avoids reading the same delivery over and over
+                    // while shutting down. The catch (OperationCanceledException) filter below logs the exit;
+                    // the finally block still runs to release credit, dispose the message, and check health.
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
                 finally
                 {
@@ -570,7 +587,9 @@ internal sealed partial class ReceiveEndpointRunner
                 // Release the consumer channel so the broker can reclaim it.
                 // CancellationToken.None is intentional — by the time we get here the original
                 // cancellationToken is likely already cancelled (shutdown scenario), but the
-                // close handshake with the broker must still complete cleanly.
+                // close handshake with the broker must still complete cleanly. The time limit of that
+                // handshake is applied by the transport regardless of this token, so a broker that never
+                // answers cannot hold the endpoint shutdown.
                 if (_channelManager is not null && consumerChannelId is not null)
                 {
                     await _channelManager
@@ -1487,7 +1506,7 @@ internal sealed partial class ReceiveEndpointRunner
     /// (<c>MaxInFlightBytes</c> does not gate intake — ADR-026 §7). Poison/anti-starvation per
     /// partition is R8.12.
     /// </remarks>
-    private sealed class OrderedDispatchStage : IDisposable
+    private sealed class OrderedDispatchStage
     {
         private readonly ReceiveEndpointRunner _runner;
         private readonly CreditManager _creditManager;
@@ -1497,29 +1516,24 @@ internal sealed partial class ReceiveEndpointRunner
         private readonly MappingEpochTracker _epochTracker;
 
         // A lane settles after the runner was told to stop, so the settlement must not use the runner's
-        // (already cancelled) token. This token is cancelled LaneSettlementBudget after the runner's token,
-        // which keeps bus shutdown bounded on transports without an adapter-side wait for settlements.
-        private readonly CancellationTokenSource _settlementCts;
-        private readonly CancellationTokenRegistration _armSettlementBudget;
-
-        internal static readonly TimeSpan LaneSettlementBudget = TimeSpan.FromSeconds(5);
+        // (already cancelled) token. This is the budget token owned by RunAsync (SettlementBudget): cancelled
+        // SettlementBudget.Budget after the runner's token, which keeps bus shutdown bounded on transports
+        // without an adapter-side wait for settlements.
+        private readonly CancellationToken _settlementToken;
 
         internal OrderedDispatchStage(
             ReceiveEndpointRunner runner,
             CreditManager creditManager,
             int laneCount,
             IConsumerOrderingConfiguration ordering,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            CancellationToken settlementToken)
         {
             _runner = runner;
             _creditManager = creditManager;
             _cancellationToken = cancellationToken;
             _ordering = ordering;
-
-            _settlementCts = new CancellationTokenSource(Timeout.InfiniteTimeSpan, runner._timeProvider);
-            _armSettlementBudget = cancellationToken.UnsafeRegister(
-                static state => ((CancellationTokenSource)state!).CancelAfter(LaneSettlementBudget),
-                _settlementCts);
+            _settlementToken = settlementToken;
 
             int laneDepth = OrderedDispatchLaneDepth.Resolve(
                 laneCount,
@@ -1596,7 +1610,7 @@ internal sealed partial class ReceiveEndpointRunner
                 .WriteAsync(new WorkItem(message, arrivalSequence, bodyLength), _cancellationToken);
 
         /// <summary>Token used by lanes for settlement calls; cancelled a fixed budget after the runner stops.</summary>
-        internal CancellationToken SettlementToken => _settlementCts.Token;
+        internal CancellationToken SettlementToken => _settlementToken;
 
         /// <summary>Completes all lane channels and awaits in-flight lane drain.</summary>
         internal async Task CompleteAsync()
@@ -1606,23 +1620,14 @@ internal sealed partial class ReceiveEndpointRunner
                 lane.Channel.Writer.Complete();
             }
 
-            try
-            {
-                await Task.WhenAll(Array.ConvertAll(_lanes, static l => l.Worker)).ConfigureAwait(false);
-            }
-            finally
-            {
-                Dispose();
-            }
+            await Task.WhenAll(Array.ConvertAll(_lanes, static l => l.Worker)).ConfigureAwait(false);
         }
 
-        /// <summary>Releases the settlement budget timer; called once all lane workers have finished.</summary>
-        public void Dispose()
-        {
-            // The registration goes first so the budget callback can no longer touch a disposed source.
-            _armSettlementBudget.Dispose();
-            _settlementCts.Dispose();
-        }
+        // Pause before each requeue of an abandoned lane while the endpoint keeps running.
+        private static readonly TimeSpan DrainThrottle = TimeSpan.FromMilliseconds(100);
+
+        // An abandoned lane that keeps draining reports its progress at Warning level every this many items.
+        private const int DrainReportInterval = 100;
 
         private readonly record struct WorkItem(InboundMessage Message, long ArrivalSequence, long BodyLength);
 
@@ -1669,6 +1674,9 @@ internal sealed partial class ReceiveEndpointRunner
                 ReceiveEndpointRunner runner = _stage._runner;
                 CreditManager creditManager = _stage._creditManager;
                 CancellationToken ct = _stage._cancellationToken;
+
+                // Set when the lane stops before its writer completed: whatever is still queued is then drained.
+                bool abandoned = false;
 
                 try
                 {
@@ -1729,6 +1737,7 @@ internal sealed partial class ReceiveEndpointRunner
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     // Shutdown (for example a cancelled C3 delay): not a fault, so no error entry.
+                    abandoned = true;
                 }
                 catch (Exception ex)
                 {
@@ -1736,10 +1745,157 @@ internal sealed partial class ReceiveEndpointRunner
                     // values), and the worker ends without rethrowing so CompleteAsync joins it cleanly and the
                     // runner neither logs the same failure again nor skips the rest of the shutdown.
                     runner.LogLaneWorkerFaulted(runner._binding.EndpointName, ex.GetType().Name);
+                    abandoned = true;
+                }
+
+                if (abandoned)
+                {
+                    await DrainAbandonedAsync().ConfigureAwait(false);
+                }
+            }
+
+            // Reads until the writer completes (CompleteAsync), so the single reader never blocks on a dead lane.
+            // Every queued item is requeued to the broker, its credit released and its pooled buffer returned.
+            // While the endpoint keeps running each requeue is throttled on the runner clock (the broker would
+            // otherwise hand the messages straight back in a hot loop); once the runner is stopping there is no
+            // delay, and the requeue is bounded by the settlement budget so shutdown cannot hang on the broker.
+            private async Task DrainAbandonedAsync()
+            {
+                ReceiveEndpointRunner runner = _stage._runner;
+                CreditManager creditManager = _stage._creditManager;
+                CancellationToken ct = _stage._cancellationToken;
+                CancellationToken settlementToken = _stage.SettlementToken;
+                string endpointName = runner._binding.EndpointName;
+                int drained = 0;
+
+                await foreach (WorkItem item in Channel.Reader.ReadAllAsync(CancellationToken.None)
+                    .ConfigureAwait(false))
+                {
+                    try
+                    {
+                        if (!ct.IsCancellationRequested)
+                        {
+                            try
+                            {
+                                await Task.Delay(DrainThrottle, runner._timeProvider, ct).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                            {
+                                // The runner is stopping: requeue without waiting.
+                            }
+                        }
+
+                        try
+                        {
+                            await runner._adapter.SettleAsync(SettlementAction.Requeue, item.Message, settlementToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException ex) when (settlementToken.IsCancellationRequested)
+                        {
+                            // The budget elapsed while the broker call was pending: the broker redelivers it.
+                            string discardedType = ex.GetType().Name;
+                            runner.LogAbandonedLaneSettlementDiscarded(
+                                endpointName, item.Message.MessageId, discardedType);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Explicit handling: one failed requeue must not stop releasing the rest (the broker
+                            // redelivers anyway). Only the exception type is logged, never its message.
+                            runner.LogAbandonedLaneRequeueFailed(endpointName, ex.GetType().Name);
+                        }
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            creditManager.ReleaseInflight(1, item.BodyLength);
+                        }
+                        finally
+                        {
+                            item.Message.Dispose();
+                        }
+                    }
+
+                    drained++;
+                    if (drained % DrainReportInterval == 0)
+                    {
+                        runner.LogAbandonedLaneDraining(endpointName, drained);
+                    }
+
+                    BusStatus healthStatus = runner._flowController.CheckHealth(endpointName);
+                    if (healthStatus == BusStatus.Degraded)
+                    {
+                        runner.LogFlowControlDegraded(endpointName);
+                    }
+                }
+
+                if (drained > 0)
+                {
+                    runner.LogAbandonedLaneDrained(endpointName, drained);
                 }
             }
         }
     }
+
+    /// <summary>
+    /// Settlement token for one <c>RunAsync</c> pass: cancelled <see cref="Budget"/> after the runner token, so
+    /// settlements that race the stop still reach the broker while bus shutdown stays bounded.
+    /// </summary>
+    private sealed class SettlementBudget : IDisposable
+    {
+        internal static readonly TimeSpan Budget = TimeSpan.FromSeconds(5);
+
+        private readonly CancellationTokenSource _cts;
+        private readonly CancellationTokenRegistration _arm;
+
+        internal SettlementBudget(TimeProvider timeProvider, CancellationToken runnerToken)
+        {
+            _cts = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
+            _arm = runnerToken.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).CancelAfter(Budget),
+                _cts);
+        }
+
+        internal CancellationToken Token => _cts.Token;
+
+        public void Dispose()
+        {
+            // The registration goes first so the budget callback can no longer touch a disposed source.
+            _arm.Dispose();
+            _cts.Dispose();
+        }
+    }
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Settlement {Action} of message {MessageId} on endpoint '{EndpointName}' did not complete " +
+                  "within the shutdown budget ({ExceptionType}); the broker redelivers it.")]
+    private partial void LogSequentialSettlementDiscarded(
+        string endpointName, string messageId, SettlementAction action, string exceptionType);
+
+    [LoggerMessage(Level = LogLevel.Error,
+        Message = "Settlement {Action} of message {MessageId} on endpoint '{EndpointName}' failed ({ExceptionType}).")]
+    private partial void LogSequentialSettlementFailed(
+        string endpointName, string messageId, SettlementAction action, string exceptionType);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Requeue of a message queued on an abandoned ordered lane of endpoint '{EndpointName}' failed " +
+                  "({ExceptionType}); the broker redelivers it.")]
+    private partial void LogAbandonedLaneRequeueFailed(string endpointName, string exceptionType);
+
+    [LoggerMessage(Level = LogLevel.Debug,
+        Message = "Requeue of message {MessageId} queued on an abandoned ordered lane of endpoint '{EndpointName}' " +
+                  "did not complete within the shutdown budget ({ExceptionType}); the broker redelivers it.")]
+    private partial void LogAbandonedLaneSettlementDiscarded(string endpointName, string messageId, string exceptionType);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Abandoned ordered lane of endpoint '{EndpointName}' is still draining: {Count} queued " +
+                  "message(s) released back to the broker so far.")]
+    private partial void LogAbandonedLaneDraining(string endpointName, int count);
+
+    [LoggerMessage(Level = LogLevel.Warning,
+        Message = "Abandoned ordered lane of endpoint '{EndpointName}' released {Count} queued message(s) " +
+                  "back to the broker.")]
+    private partial void LogAbandonedLaneDrained(string endpointName, int count);
 
     [LoggerMessage(Level = LogLevel.Error,
         Message = "Ordered lane worker faulted on endpoint '{EndpointName}' ({ExceptionType}). The lane has stopped.")]

@@ -51,6 +51,10 @@ internal sealed partial class KafkaTransportAdapter
     /// <b>Full consume/commit/rebalance behaviour</b> is validated by integration tests (R1.5).
     /// </para>
     /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <c>flowControl.InternalQueueCapacity</c> is not positive, or <c>flowControl.FullMode</c> is not
+    /// <see cref="BoundedChannelFullMode.Wait"/>. Thrown before any broker call.
+    /// </exception>
     public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
         string endpointName,
         FlowControlOptions flowControl,
@@ -58,6 +62,10 @@ internal sealed partial class KafkaTransportAdapter
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
         ArgumentNullException.ThrowIfNull(flowControl);
+
+        // Reject unsupported flow-control options before any state check or consumer setup.
+        ValidateFlowControl(flowControl);
+
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         // Validate consumer-specific options (GroupId required; producer Validate() already ran in ctor).
@@ -91,22 +99,9 @@ internal sealed partial class KafkaTransportAdapter
         var inboundChannel = Channel.CreateBounded<InboundMessage>(
             new BoundedChannelOptions(flowControl.InternalQueueCapacity)
             {
-                FullMode = flowControl.FullMode,
+                FullMode = flowControl.FullMode, // always Wait after ValidateFlowControl
                 SingleWriter = true,
                 SingleReader = false,
-            },
-            itemDropped: dropped =>
-            {
-                // Drop* full modes silently evict a delivered message: it will never be settled, so
-                // pin the commit position at its offset (redelivered after restart) and free the entry.
-                TopicPartitionOffset? droppedTpo = _consumerRegistry.TryEvictOffset(consumerId, dropped.DeliveryTag);
-                if (droppedTpo is not null &&
-                    commitTracker.Hold(droppedTpo.Partition.Value, droppedTpo.Offset.Value))
-                {
-                    LogPartitionCommitHeld(consumerId, droppedTpo.Topic, droppedTpo.Partition.Value, droppedTpo.Offset.Value);
-                }
-
-                dropped.Dispose();
             });
 
         KafkaConsumer? kafkaConsumerRef = null;
@@ -346,6 +341,24 @@ internal sealed partial class KafkaTransportAdapter
     }
 
     /// <summary>
+    /// Rejects flow-control options this transport cannot honour, before any consumer is built.
+    /// </summary>
+    private static void ValidateFlowControl(FlowControlOptions flowControl)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
+
+        if (flowControl.FullMode != BoundedChannelFullMode.Wait)
+        {
+            // A Drop* mode would discard a polled message: it never reaches the handler and the
+            // partition commit stays held at its offset until a restart or rebalance.
+            throw new ArgumentOutOfRangeException(
+                nameof(flowControl),
+                flowControl.FullMode,
+                "Kafka consumers support only BoundedChannelFullMode.Wait.");
+        }
+    }
+
+    /// <summary>
     /// Reads the wire <c>BW-RetryCount</c> header (untrusted). A missing or non-numeric value is
     /// treated as 0; the value is clamped by the caller (SEC-1) so a spoofed value is harmless here.
     /// </summary>
@@ -479,7 +492,7 @@ internal sealed partial class KafkaTransportAdapter
     private partial void LogRejectCommittedWithoutDlq(string consumerId, string topic, int partition, long offset);
 
     [LoggerMessage(Level = LogLevel.Warning,
-        Message = "Kafka consumer {ConsumerId}: commit position of {Topic}[{Partition}] is held at offset {Offset} (a message was returned, nacked or dropped); the message and later messages of the partition are redelivered after a consumer restart.")]
+        Message = "Kafka consumer {ConsumerId}: commit position of {Topic}[{Partition}] is held at offset {Offset} (a message was returned or nacked); the message and later messages of the partition are redelivered after a consumer restart.")]
     private partial void LogPartitionCommitHeld(string consumerId, string topic, int partition, long offset);
 
     [LoggerMessage(Level = LogLevel.Warning,
