@@ -28,12 +28,32 @@ public static class ServiceCollectionExtensions
     /// A delegate that configures the RabbitMQ transport via <see cref="IRabbitMqConfigurator"/>.
     /// </param>
     /// <returns>The same <see cref="IServiceCollection"/> to allow chaining.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// Thrown when <paramref name="services"/> or <paramref name="configure"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="BareWireConfigurationException">
+    /// Thrown when this method was already called on <paramref name="services"/>, or when another
+    /// transport is already registered in <paramref name="services"/>.
+    /// </exception>
     public static IServiceCollection AddBareWireRabbitMq(
         this IServiceCollection services,
         Action<IRabbitMqConfigurator> configure)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configure);
+
+        // Fail fast on a repeated call for this transport: every registration below uses TryAdd, so a second
+        // call's receive endpoints, topology and options would be silently ignored. Runs before configure(...)
+        // and before any TryAdd/Replace, so a rejected call leaves the first registration untouched.
+        if (services.Any(d => d.ServiceType == typeof(RabbitMqTransportOptions) && !d.IsKeyedService))
+        {
+            throw new BareWireConfigurationException(
+                optionName: "AddBareWireRabbitMq",
+                optionValue: "already called for this service collection",
+                expectedValue: "a single AddBareWireRabbitMq(...) call per service collection. A second call's " +
+                               "receive endpoints, topology and mappings would be ignored. Declare every receive " +
+                               "endpoint, topology and mapping in one AddBareWireRabbitMq(...) delegate");
+        }
 
         // Fail fast when another transport's adapter is already registered: the core bus resolves exactly one
         // non-keyed ITransportAdapter and one endpoint list, so this transport would be silently ignored.

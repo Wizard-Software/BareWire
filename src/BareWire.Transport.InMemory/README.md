@@ -38,9 +38,9 @@ services.AddBareWire();
 ```
 
 Call `AddBareWireInMemory` once per dependency-injection container, alongside `AddBareWire()`. A
-second call on the same container still validates its options but is otherwise ignored as a whole — it
-does not create a second in-memory broker, replace the per-type routing mappings, or merge the two
-configurations.
+second call on the same container throws `BareWireConfigurationException`
+before its configuration delegate runs and leaves the first registration untouched; declare every
+queue, binding and routing mapping in a single call.
 
 ## Delivery guarantee
 

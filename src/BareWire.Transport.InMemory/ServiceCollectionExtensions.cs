@@ -39,8 +39,9 @@ public static class ServiceCollectionExtensions
     /// </para>
     /// <para>
     /// Call this method once per <see cref="IServiceCollection"/>. A second call on the same collection
-    /// still validates its options but is otherwise ignored as a whole — it does not create a second
-    /// in-memory broker, replace the per-type routing mappings, or merge the two configurations.
+    /// throws <see cref="BareWire.Abstractions.Exceptions.BareWireConfigurationException"/>
+    /// before its configuration delegate runs and leaves the first registration untouched, so declare every
+    /// queue, binding and routing mapping in a single call.
     /// </para>
     /// <para>
     /// Also registers a hosted service that logs, once at startup, the transport's at-most-once delivery
@@ -74,7 +75,8 @@ public static class ServiceCollectionExtensions
     /// </exception>
     /// <exception cref="BareWire.Abstractions.Exceptions.BareWireConfigurationException">
     /// Thrown when the configured options fail validation (see <see cref="IInMemoryConfigurator"/> for
-    /// the per-option rules).
+    /// the per-option rules), when this method was already called on <paramref name="services"/>, or when
+    /// another transport is already registered in <paramref name="services"/>.
     /// </exception>
     public static IServiceCollection AddBareWireInMemory(
         this IServiceCollection services,
@@ -82,6 +84,19 @@ public static class ServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configure);
+
+        // Fail fast on a repeated call for this transport: every registration below uses TryAdd, so a second
+        // call's receive endpoints, topology and options would be silently ignored. Runs before configure(...)
+        // and before any TryAdd/Replace, so a rejected call leaves the first registration untouched.
+        if (services.Any(d => d.ServiceType == typeof(InMemoryTransportOptions) && !d.IsKeyedService))
+        {
+            throw new BareWireConfigurationException(
+                optionName: "AddBareWireInMemory",
+                optionValue: "already called for this service collection",
+                expectedValue: "a single AddBareWireInMemory(...) call per service collection. A second call's " +
+                               "receive endpoints, topology and mappings would be ignored. Declare every receive " +
+                               "endpoint, topology and mapping in one AddBareWireInMemory(...) delegate");
+        }
 
         // Fail fast when another transport's adapter is already registered: the core bus resolves exactly one
         // non-keyed ITransportAdapter and one endpoint list, so this transport would be silently ignored.
@@ -101,13 +116,6 @@ public static class ServiceCollectionExtensions
         var configurator = new InMemoryConfigurator();
         configure(configurator);
         InMemoryTransportOptions options = configurator.Build();
-
-        // A second call on the same collection is ignored as a whole (after its options were validated),
-        // so its per-type resolvers cannot be mixed with the first call's topology and endpoint bindings.
-        if (services.Any(d => d.ServiceType == typeof(InMemoryTransportOptions)))
-        {
-            return services;
-        }
 
         services.TryAddSingleton(options);
 

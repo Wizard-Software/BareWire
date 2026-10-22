@@ -143,27 +143,29 @@ public sealed class InMemoryServiceCollectionExtensionsTests
     }
 
     [Fact]
-    public void AddBareWireInMemory_CalledTwice_KeepsFirstRoutingMappings()
+    public void AddBareWireInMemory_CalledTwice_ThrowsAndKeepsFirstRoutingMappings()
     {
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddBareWireInMemory(t => t.MapExchange<OrderCreated>("first"));
-        services.AddBareWireInMemory(t => t.MapExchange<OrderCreated>("second"));
 
+        Action act = () => services.AddBareWireInMemory(t => t.MapExchange<OrderCreated>("second"));
+
+        act.Should().Throw<BareWireConfigurationException>().Which.Message.Should().Contain("already called");
         using ServiceProvider sp = services.BuildServiceProvider();
-
         sp.GetRequiredService<IExchangeResolver>().Resolve<OrderCreated>().Should().Be("first");
         sp.GetServices<InMemoryTransportOptions>().Should().ContainSingle();
     }
 
     [Fact]
-    public void AddBareWireInMemory_SecondCallWithInvalidOption_StillThrowsConfigurationException()
+    public void AddBareWireInMemory_SecondCallWithInvalidOption_ThrowsRepeatedCallException()
     {
         var services = new ServiceCollection();
         services.AddBareWireInMemory(_ => { });
 
         services.Invoking(s => s.AddBareWireInMemory(t => t.QueueCapacity(0)))
-            .Should().Throw<BareWireConfigurationException>();
+            .Should().Throw<BareWireConfigurationException>()
+            .Which.Message.Should().Contain("AddBareWireInMemory").And.Contain("already called");
     }
 
     [Fact]

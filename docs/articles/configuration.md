@@ -64,7 +64,7 @@ equivalent. The two-call form is fully supported and is the path to use when you
 and transport packages separately or need full control over registration (a bundle call registers
 the core internally).
 
-A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Support for hosting several transports in one service collection is planned.
+A service collection hosts exactly one transport; registering a second, different transport throws `BareWireConfigurationException`. Calling the same transport's registration method (for example `AddBareWireRabbitMq`) a second time on one service collection also throws `BareWireConfigurationException`, so declare every receive endpoint, topology and mapping in a single call. Support for hosting several transports in one service collection is planned.
 
 > **Deprecated:** earlier versions configured the transport with `cfg.UseRabbitMQ(...)` *inside*
 > the `AddBareWire` delegate. That marker is now an obsolete no-op — any host/credentials passed
