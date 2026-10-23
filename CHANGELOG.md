@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-23
+
 ### Added
 
+- `ConsumerDefinition<TConsumer>`: a per-consumer configuration class discovered through DI at startup — retry (`IRetryConfigurator` is now public in Abstractions), prefetch, concurrency, routing keys and opt-in RabbitMQ consumer topology; the new `Consumer<TConsumer>()` overload infers the message type for consumers implementing a single `IConsumer<T>`, and untyped definitions log a secure-by-default warning. See the `ConsumerDefinitionShowcase` sample
+- In-memory transport: new `BareWire.Transport.InMemory` package and `BareWire.InMemory` bundle (`AddBareWireWithInMemory`) with bounded queues and send timeout, topic routing, settlement mirroring RabbitMQ, graceful drain, native saga timeout scheduling, metrics and startup diagnostics; `BareWireTestHarness` now runs on it. See the `InMemoryModularMonolith` sample, which switches between in-memory and RabbitMQ by registration only
+- Outbox: rows released after a transport nack are deferred with per-row jitter instead of being retried at once (per-key barrier rows are released immediately); new rows and due retries are claimed as two fair classes; rate-limited retry logging and retry backlog metrics
+- Retry-attempt observability on the public retry surface, an inbox duplicates metric with an endpoint-derived tag, and transport queue health in `IBusControl.CheckHealth`
 - RabbitMQ: a receive endpoint whose consumer waits for automatic connection recovery for 30 seconds or more is now reported as `Degraded` by the bus health check, with a description of how long it has waited and whether the connection is still down or open without the consumer; a `Warning` is logged once when the limit is reached and an `Information` entry when the consumer recovers after it. This covers a connection that never comes back and a consumer that the client cannot re-register (for example because its queue was deleted). The endpoint is not restarted automatically
 - RabbitMQ: the transport adapter now writes an `Information` entry after a topology deployment succeeds, with the number of exchanges, queues, exchange-to-queue bindings and exchange-to-exchange bindings declared (counts only, never element names; written for an empty topology too, with zeros). This is an operational `ILogger` entry, not an audit sink: a failed or cancelled deployment surfaces as an exception to the caller and is not logged by this entry, and the per-element result (created or already existing) is not available. Starting the bus already logs a general topology summary under the `BareWireBusControl` category, so starting a RabbitMQ bus with a configured topology now writes two entries: the bus summary and the adapter entry, which also includes the binding counts. The adapter entry also covers an explicit `IBusControl.DeployTopologyAsync` call and saga delay-requeue scheduling, which deploys its delay queue for every event that schedules a timeout and therefore writes one entry per scheduled timeout. Raising the minimum level of the `RabbitMqTransportAdapter` category hides this entry but also the connection-established and connection-recovered entries; the bus entry has a different category and is not affected
 
@@ -266,6 +272,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Enhanced unit tests for service collection extensions and pipeline components
 
+[Unreleased]: https://github.com/Wizard-Software/BareWire/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/Wizard-Software/BareWire/compare/v2.0.4...v3.0.0
+[2.0.4]: https://github.com/Wizard-Software/BareWire/compare/v2.0.3...v2.0.4
+[2.0.3]: https://github.com/Wizard-Software/BareWire/compare/v2.0.2...v2.0.3
+[2.0.2]: https://github.com/Wizard-Software/BareWire/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/Wizard-Software/BareWire/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/Wizard-Software/BareWire/compare/v1.5.1...v2.0.0
 [1.5.1]: https://github.com/Wizard-Software/BareWire/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/Wizard-Software/BareWire/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/Wizard-Software/BareWire/compare/v1.3.1...v1.4.0
