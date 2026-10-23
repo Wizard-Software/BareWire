@@ -255,6 +255,63 @@ public sealed class DelayRequeueScheduleProviderTests
     }
 
     [Fact]
+    public async Task ScheduleAsync_AfterFailedTopologyDeployment_RedeploysTopologyForSameQueue()
+    {
+        var (provider, transport, _) = CreateProvider();
+        var message = new PaymentTimeout(Guid.NewGuid());
+        transport.DeployTopologyAsync(Arg.Any<TopologyDeclaration>(), Arg.Any<CancellationToken>())
+            .Returns(
+                _ => Task.FromException(new InvalidOperationException("broker unavailable")),
+                _ => Task.CompletedTask);
+        transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(new List<SendResult> { new(true, 1UL) });
+
+        Func<Task> first = () => provider.ScheduleAsync(
+            message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
+        await first.Should().ThrowAsync<InvalidOperationException>();
+
+        await provider.ScheduleAsync(
+            message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
+
+        await transport.Received(2).DeployTopologyAsync(
+            Arg.Is<TopologyDeclaration>(t =>
+                t.Queues.Count == 1 &&
+                t.Queues[0].Name == "barewire.delay.30000.order-saga" &&
+                t.Queues[0].Arguments != null &&
+                t.Queues[0].Arguments!["x-message-ttl"].Equals(30000L) &&
+                (string)t.Queues[0].Arguments!["x-dead-letter-exchange"] == "" &&
+                (string)t.Queues[0].Arguments!["x-dead-letter-routing-key"] == "order-saga"),
+            Arg.Any<CancellationToken>());
+        await transport.Received(1).SendBatchAsync(
+            Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task ScheduleAsync_AfterCancelledTopologyDeployment_RedeploysTopologyForSameQueue()
+    {
+        var (provider, transport, _) = CreateProvider();
+        var message = new PaymentTimeout(Guid.NewGuid());
+        transport.DeployTopologyAsync(Arg.Any<TopologyDeclaration>(), Arg.Any<CancellationToken>())
+            .Returns(
+                _ => Task.FromCanceled(new CancellationToken(canceled: true)),
+                _ => Task.CompletedTask);
+        transport.SendBatchAsync(Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>())
+            .Returns(new List<SendResult> { new(true, 1UL) });
+
+        Func<Task> first = () => provider.ScheduleAsync(
+            message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
+        await first.Should().ThrowAsync<OperationCanceledException>();
+
+        await provider.ScheduleAsync(
+            message, TimeSpan.FromSeconds(30), "order-saga", Guid.NewGuid(), CancellationToken.None);
+
+        await transport.Received(2).DeployTopologyAsync(
+            Arg.Any<TopologyDeclaration>(), Arg.Any<CancellationToken>());
+        await transport.Received(1).SendBatchAsync(
+            Arg.Any<IReadOnlyList<OutboundMessage>>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task ScheduleAsync_BrokerNack_ThrowsInvalidOperationException()
     {
         var (provider, transport, serializer) = CreateProvider();
