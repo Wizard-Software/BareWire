@@ -52,8 +52,8 @@ internal sealed partial class KafkaTransportAdapter
     /// </para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">
-    /// <c>flowControl.InternalQueueCapacity</c> is not positive, or <c>flowControl.FullMode</c> is not
-    /// <see cref="BoundedChannelFullMode.Wait"/>. Thrown before any broker call.
+    /// <c>flowControl.MaxInFlightMessages</c> or <c>flowControl.InternalQueueCapacity</c> is not positive, or
+    /// <c>flowControl.FullMode</c> is not <see cref="BoundedChannelFullMode.Wait"/>. Thrown before any broker call.
     /// </exception>
     public async IAsyncEnumerable<InboundMessage> ConsumeAsync(
         string endpointName,
@@ -345,6 +345,9 @@ internal sealed partial class KafkaTransportAdapter
     /// </summary>
     private static void ValidateFlowControl(FlowControlOptions flowControl)
     {
+        // Checked first: a non-positive value lowers the per-partition tracking limit
+        // (InternalQueueCapacity + MaxInFlightMessages + 2) and can hold the partition commit.
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
 
         if (flowControl.FullMode != BoundedChannelFullMode.Wait)

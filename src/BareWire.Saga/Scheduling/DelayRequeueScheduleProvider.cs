@@ -47,10 +47,12 @@ internal sealed partial class DelayRequeueScheduleProvider : IScheduleProvider
         // guarantees correct expiration semantics. See plan section 9 (TTL gotcha decision).
         LogScheduling(_logger, typeof(T).Name, ttlMs, delayQueueName, destinationQueue);
 
-        // Deploy delay queue only if not yet declared in this process lifetime.
-        // ConcurrentDictionary.TryAdd returns true only for the first caller — subsequent
-        // callers skip the DeployTopologyAsync call, avoiding redundant broker round-trips.
-        if (_declaredQueues.TryAdd(delayQueueName, true))
+        // Deploy the delay queue only until one deployment has succeeded for this provider instance.
+        // The queue is recorded as declared only AFTER DeployTopologyAsync completes, so a failed or
+        // cancelled deployment is retried by the next schedule with the same TTL and destination.
+        // Should callers ever race on the first schedule, each may deploy: queue.declare with
+        // identical arguments is idempotent, so concurrent first calls would still be safe.
+        if (!_declaredQueues.ContainsKey(delayQueueName))
         {
             var topology = new TopologyDeclaration
             {
@@ -70,6 +72,8 @@ internal sealed partial class DelayRequeueScheduleProvider : IScheduleProvider
             };
 
             await _transport.DeployTopologyAsync(topology, cancellationToken).ConfigureAwait(false);
+
+            _declaredQueues.TryAdd(delayQueueName, true);
         }
 
         // Serialize message. This is not a hot path — ArrayBufferWriter<byte> allocation is acceptable.

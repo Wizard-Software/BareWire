@@ -2,6 +2,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Transport.RabbitMQ.Configuration;
+using BareWire.Transport.RabbitMQ.Internal;
 using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 
@@ -69,7 +70,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         ILogger clientLogger = _loggerFactory.CreateLogger<RabbitMqRequestClient<T>>();
 
         // Parse connection URI and vhost once per client creation.
-        // The URI is already parsed in CreateConnectionAsync; we re-parse here to extract host/vhost
+        // The URI is already parsed in BuildConnectionFactory; we re-parse here to extract host/vhost
         // for building rabbitmq:// endpoint addresses without passing the full Uri through the factory.
         (Uri connectionUri, string? vhost) = ParseConnectionInfo();
 
@@ -232,7 +233,11 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         return (uri, vhost);
     }
 
-    private async Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken)
+    private async Task<IConnection> CreateConnectionAsync(CancellationToken cancellationToken) =>
+        await BuildConnectionFactory().CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+    /// <summary>Builds the connection factory from the transport options, including credentials and TLS.</summary>
+    internal ConnectionFactory BuildConnectionFactory()
     {
         var uri = new Uri(_options.ConnectionString);
 
@@ -242,6 +247,9 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             AutomaticRecoveryEnabled = _options.AutomaticRecoveryEnabled,
             NetworkRecoveryInterval = _options.NetworkRecoveryInterval,
         };
+
+        // Must follow the initializer: the Uri setter copies the URI user info into UserName/Password.
+        RabbitMqConnectionCredentials.ApplyOverrides(factory, _options);
 
         if (_options.ConfigureTls is not null)
         {
@@ -255,7 +263,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             factory.Ssl = _options.SslOptions;
         }
 
-        return await factory.CreateConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return factory;
     }
 
     // ── Logger messages ───────────────────────────────────────────────────────

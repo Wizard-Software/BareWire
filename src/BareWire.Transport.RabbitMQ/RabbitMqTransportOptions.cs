@@ -34,11 +34,13 @@ internal sealed class RabbitMqTransportOptions
 
     /// <summary>
     /// Optional username override. When set, overrides any username embedded in <see cref="ConnectionString"/>.
+    /// Applies to the transport connection and to the connection of the request client factory.
     /// </summary>
     public string? UsernameOverride { get; set; }
 
     /// <summary>
     /// Optional password override. When set, overrides any password embedded in <see cref="ConnectionString"/>.
+    /// Applies to the transport connection and to the connection of the request client factory.
     /// Never logged or included in diagnostic output.
     /// </summary>
     public string? PasswordOverride { get; set; }

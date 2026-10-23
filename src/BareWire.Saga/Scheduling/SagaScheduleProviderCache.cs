@@ -13,8 +13,9 @@ namespace BareWire.Saga.Scheduling;
 /// Sharing only applies to the native-scheduler path (<see cref="TransportNativeScheduleProvider"/>):
 /// its token map is an instance field, so all events of a saga must see the same instance for
 /// cross-event cancellation to find the token. <see cref="DelayRequeueScheduleProvider"/> is
-/// deliberately <b>not</b> cached — it declares its delay queue lazily per call, and a shared
-/// instance would leave later calls without a declared queue after one failed declaration.
+/// deliberately <b>not</b> cached — it is created for every event. It declares its delay queue
+/// lazily and records it as declared only after the declaration succeeded, so every event that
+/// schedules a timeout deploys the delay queue topology.
 /// </remarks>
 internal sealed class SagaScheduleProviderCache
 {

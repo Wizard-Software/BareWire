@@ -68,4 +68,50 @@ public sealed class KafkaTransportAdapterFlowControlValidationTests
         // Assert
         await act.Should().ThrowAsync<ArgumentOutOfRangeException>();
     }
+
+    // Reproduces the defect: a non-positive MaxInFlightMessages passes validation, a native consumer is built
+    // and the iterator waits until the test token is cancelled.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(-998)]
+    public async Task ConsumeAsync_NonPositiveMaxInFlightMessages_ThrowsArgumentOutOfRangeException(
+        int maxInFlightMessages)
+    {
+        // Arrange
+        var adapter = new KafkaTransportAdapter(ValidOptionsWithGroup(), NullLogger<KafkaTransportAdapter>.Instance);
+        await using var _ = adapter;
+        var flowControl = new FlowControlOptions
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            InternalQueueCapacity = 1000,
+            MaxInFlightMessages = maxInFlightMessages,
+        };
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+        // Act
+        Func<Task> act = () => DrainAsync(adapter, flowControl, cts.Token);
+
+        // Assert
+        (await act.Should().ThrowAsync<ArgumentOutOfRangeException>())
+            .Which.ParamName.Should().Be("flowControl.MaxInFlightMessages");
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_ZeroMaxInFlightMessagesWithoutGroupId_ThrowsArgumentOutOfRangeExceptionFirst()
+    {
+        // Arrange — a missing GroupId would otherwise surface as BareWireConfigurationException.
+        var adapter = new KafkaTransportAdapter(
+            new KafkaTransportOptions { BootstrapServers = "localhost:9092" },
+            NullLogger<KafkaTransportAdapter>.Instance);
+        await using var _ = adapter;
+        var flowControl = new FlowControlOptions { MaxInFlightMessages = 0 };
+
+        // Act
+        Func<Task> act = () => DrainAsync(adapter, flowControl, TestContext.Current.CancellationToken);
+
+        // Assert
+        await act.Should().ThrowAsync<ArgumentOutOfRangeException>();
+    }
 }

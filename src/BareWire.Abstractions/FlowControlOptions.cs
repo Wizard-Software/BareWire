@@ -13,6 +13,11 @@ public sealed class FlowControlOptions
     /// concurrently across all consumers on a receive endpoint.
     /// Defaults to <c>100</c>.
     /// </summary>
+    /// <remarks>
+    /// Must be greater than zero for every transport. Receive endpoints configured through the bus derive it
+    /// from the endpoint <c>PrefetchCount</c>, which the bus already validates; a non-positive value passed to
+    /// <c>ITransportAdapter.ConsumeAsync</c> directly makes it throw <see cref="System.ArgumentOutOfRangeException"/>.
+    /// </remarks>
     public int MaxInFlightMessages { get; set; } = 100;
 
     /// <summary>
