@@ -5,6 +5,7 @@ using BareWire.Transport.RabbitMQ;
 using BareWire.Transport.RabbitMQ.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using NSubstitute;
+using RabbitMQ.Client;
 
 namespace BareWire.UnitTests.Transport.RabbitMq;
 
@@ -347,5 +348,35 @@ public sealed class RabbitMqRequestClientFactoryTests
 
         // Assert — no deadlock; all tasks complete within the guard timeout.
         await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    // ── BuildConnectionFactory — credential overrides ──────────────────────────
+
+    [Fact]
+    public async Task BuildConnectionFactory_WhenCredentialOverridesSet_UsesOverridesInsteadOfUriCredentials()
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions
+        {
+            ConnectionString = "amqp://uriuser:uripass@localhost:59999",
+            UsernameOverride = "override-user",
+            PasswordOverride = "override-pass",
+        };
+
+        await using var factory = new RabbitMqRequestClientFactory(
+            options,
+            Substitute.For<ISerializerResolver>(),
+            Substitute.For<IDeserializerResolver>(),
+            Substitute.For<IExchangeResolver>(),
+            Substitute.For<IRoutingKeyResolver>(),
+            new RabbitMqHeaderMapper(),
+            NullLoggerFactory.Instance);
+
+        // Act
+        ConnectionFactory built = factory.BuildConnectionFactory();
+
+        // Assert — only the credential members are inspected; the Uri getter would rebuild the password.
+        built.UserName.Should().Be("override-user");
+        built.Password.Should().Be("override-pass");
     }
 }

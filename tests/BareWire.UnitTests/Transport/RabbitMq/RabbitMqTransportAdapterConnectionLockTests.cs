@@ -176,4 +176,56 @@ public sealed class RabbitMqTransportAdapterConnectionLockTests
         await adapter.DisposeAsync();
         await AssertClosedAndDisposedOnceAsync(connection);
     }
+
+    [Fact]
+    public async Task EnsureConnectedAsync_WhenCredentialOverridesSet_FactoryUsesOverridesInsteadOfUriCredentials()
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions
+        {
+            ConnectionString = "amqp://uriuser:uripass@localhost:5672/",
+            UsernameOverride = "override-user",
+            PasswordOverride = "override-pass",
+        };
+        await using var adapter = new RabbitMqTransportAdapter(options, NullLogger<RabbitMqTransportAdapter>.Instance);
+        ConnectionFactory? captured = null;
+        adapter.CreateConnection = (factory, _) =>
+        {
+            captured = factory;
+            return Task.FromResult(CreateOpenConnection());
+        };
+
+        // Act
+        await EnsureConnectedAsync(adapter, CancellationToken.None).WaitAsync(Guard);
+
+        // Assert — only the credential members are inspected; the factory Uri getter would rebuild the password.
+        captured.Should().NotBeNull();
+        captured!.UserName.Should().Be("override-user");
+        captured.Password.Should().Be("override-pass");
+    }
+
+    [Fact]
+    public async Task EnsureConnectedAsync_WhenNoCredentialOverrides_FactoryUsesUriCredentials()
+    {
+        // Arrange
+        var options = new RabbitMqTransportOptions
+        {
+            ConnectionString = "amqp://uriuser:uripass@localhost:5672/",
+        };
+        await using var adapter = new RabbitMqTransportAdapter(options, NullLogger<RabbitMqTransportAdapter>.Instance);
+        ConnectionFactory? captured = null;
+        adapter.CreateConnection = (factory, _) =>
+        {
+            captured = factory;
+            return Task.FromResult(CreateOpenConnection());
+        };
+
+        // Act
+        await EnsureConnectedAsync(adapter, CancellationToken.None).WaitAsync(Guard);
+
+        // Assert
+        captured.Should().NotBeNull();
+        captured!.UserName.Should().Be("uriuser");
+        captured.Password.Should().Be("uripass");
+    }
 }

@@ -1019,6 +1019,9 @@ internal sealed partial class RabbitMqTransportAdapter
                 NetworkRecoveryInterval = _options.NetworkRecoveryInterval,
             };
 
+            // Must follow the initializer: the Uri setter copies the URI user info into UserName/Password.
+            RabbitMqConnectionCredentials.ApplyOverrides(factory, _options);
+
             if (_options.ConfigureTls is not null)
             {
                 string serverName = uri.Host;
