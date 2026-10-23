@@ -716,6 +716,14 @@ internal sealed partial class RabbitMqTransportAdapter
         {
             await CloseAndDisposeTopologyChannelAsync(channel).ConfigureAwait(false);
         }
+
+        // Reached only when every declaration succeeded: a failure or a cancellation propagates out of the try
+        // block above and skips this entry. Counts only - element names are never logged.
+        LogTopologyDeployed(
+            topology.Exchanges.Count,
+            topology.Queues.Count,
+            topology.ExchangeQueueBindings.Count,
+            topology.ExchangeExchangeBindings.Count);
     }
 
     // Never throws: it runs in the finally of DeployTopologyAsync, so a close or dispose failure must neither
@@ -1089,6 +1097,13 @@ internal sealed partial class RabbitMqTransportAdapter
 
     [LoggerMessage(Level = LogLevel.Information, Message = "RabbitMQ connection established to {Host}:{Port}.")]
     private partial void LogConnectionEstablished(string host, int port);
+
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "RabbitMQ topology deployed: {ExchangeCount} exchange(s), {QueueCount} queue(s), "
+            + "{QueueBindingCount} exchange-to-queue binding(s), "
+            + "{ExchangeBindingCount} exchange-to-exchange binding(s).")]
+    private partial void LogTopologyDeployed(
+        int exchangeCount, int queueCount, int queueBindingCount, int exchangeBindingCount);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "RabbitMQ connection shut down. Cause: {Cause}. ReplyText: {ReplyText}.")]
     private partial void LogConnectionShutdown(string cause, string replyText);
