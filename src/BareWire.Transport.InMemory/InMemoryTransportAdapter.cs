@@ -435,8 +435,8 @@ internal sealed class InMemoryTransportAdapter
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="flowControl"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException">
-    /// <c>flowControl.InternalQueueCapacity</c> is not positive, or <c>flowControl.FullMode</c> is not
-    /// <see cref="BoundedChannelFullMode.Wait"/>. Checked before the queue lookup.
+    /// <c>flowControl.MaxInFlightMessages</c> or <c>flowControl.InternalQueueCapacity</c> is not positive, or
+    /// <c>flowControl.FullMode</c> is not <see cref="BoundedChannelFullMode.Wait"/>. Checked before the queue lookup.
     /// </exception>
     /// <exception cref="ObjectDisposedException">The adapter has been disposed.</exception>
     /// <exception cref="BareWireConfigurationException">
@@ -473,13 +473,15 @@ internal sealed class InMemoryTransportAdapter
     /// Rejects flow-control options the other transports reject, so the contract is the same everywhere.
     /// </summary>
     /// <remarks>
-    /// The in-memory transport buffers in the broker's queue and uses neither
-    /// <see cref="FlowControlOptions.FullMode"/> nor <see cref="FlowControlOptions.InternalQueueCapacity"/>.
+    /// The in-memory transport buffers in the broker's queue and uses none of
+    /// <see cref="FlowControlOptions.FullMode"/>, <see cref="FlowControlOptions.InternalQueueCapacity"/> or
+    /// <see cref="FlowControlOptions.MaxInFlightMessages"/>.
     /// The check keeps the behavior consistent: a <c>Drop*</c> mode would let a full buffer discard a
     /// delivered message instead of applying back-pressure.
     /// </remarks>
     private static void ValidateFlowControl(FlowControlOptions flowControl)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.MaxInFlightMessages);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(flowControl.InternalQueueCapacity);
 
         if (flowControl.FullMode != BoundedChannelFullMode.Wait)

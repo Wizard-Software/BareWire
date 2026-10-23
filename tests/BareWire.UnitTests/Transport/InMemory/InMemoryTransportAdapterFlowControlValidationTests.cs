@@ -76,4 +76,52 @@ public sealed class InMemoryTransportAdapterFlowControlValidationTests
         act.Should().NotThrow();
         stream.Should().NotBeNull();
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(-998)]
+    public void ConsumeAsync_NonPositiveMaxInFlightMessages_ThrowsArgumentOutOfRangeException(int maxInFlightMessages)
+    {
+        // Arrange
+        InMemoryTransportAdapter adapter = CreateAdapter();
+        var flowControl = new FlowControlOptions { MaxInFlightMessages = maxInFlightMessages };
+
+        // Act — ConsumeAsync is not an iterator, so the guards throw synchronously.
+        Action act = () => adapter.ConsumeAsync("orders", flowControl, TestContext.Current.CancellationToken);
+
+        // Assert
+        act.Should().Throw<ArgumentOutOfRangeException>()
+            .Which.ParamName.Should().Be("flowControl.MaxInFlightMessages");
+    }
+
+    [Fact]
+    public void ConsumeAsync_ZeroMaxInFlightMessagesOnUndeclaredQueue_ThrowsArgumentOutOfRangeExceptionFirst()
+    {
+        // Arrange — validation runs before the registry check, which would otherwise reject the unknown queue.
+        InMemoryTransportAdapter adapter = CreateAdapter();
+        var flowControl = new FlowControlOptions { MaxInFlightMessages = 0 };
+
+        // Act
+        Action act = () => adapter.ConsumeAsync("no-such-queue", flowControl, TestContext.Current.CancellationToken);
+
+        // Assert
+        act.Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
+    public void ConsumeAsync_MaxInFlightMessagesOne_ReturnsStream()
+    {
+        // Arrange — the smallest valid value must still pass validation.
+        InMemoryTransportAdapter adapter = CreateAdapter();
+        var flowControl = new FlowControlOptions { MaxInFlightMessages = 1 };
+        IAsyncEnumerable<InboundMessage>? stream = null;
+
+        // Act
+        Action act = () => stream = adapter.ConsumeAsync("orders", flowControl, TestContext.Current.CancellationToken);
+
+        // Assert
+        act.Should().NotThrow();
+        stream.Should().NotBeNull();
+    }
 }
