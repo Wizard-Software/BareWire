@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- In-memory transport: request/response — `IBus.CreateRequestClientAsync<T>()` now works with `AddBareWireInMemory` (send-style requests only; replies are correlated in process, do not use queue capacity and are not subject to `SendTimeout`; 30-second default timeout, at most 1000 pending requests per client; dispose or reuse the client) (#84). **Behavior change:** queue names starting with `bw.reply.` are now reserved for reply addresses, so a topology that declares such a queue fails validation at startup
+
 ## [3.0.0] - 2026-10-23
 
 ### Added

@@ -452,4 +452,28 @@ public sealed class InMemoryTopologyInterpreterTests
     }
 
     private sealed record OrderCreated;
+
+    [Fact]
+    public void BuildRegistry_WhenQueueNameUsesReservedReplyPrefix_ThrowsConfigurationException()
+    {
+        InMemoryTransportOptions options = Options(c => c.ConfigureTopology(t => t.DeclareQueue("bw.reply.mine")));
+
+        Action act = () => InMemoryTopologyInterpreter.BuildRegistry(options);
+
+        act.Should().Throw<BareWireConfigurationException>().WithMessage("*bw.reply.*");
+    }
+
+    [Fact]
+    public void BuildRegistry_WhenReceiveEndpointUsesReservedReplyPrefix_ThrowsConfigurationException()
+    {
+        InMemoryTransportOptions options = Options(c =>
+        {
+            c.AutoDeclareEndpointQueues();
+            c.ReceiveEndpoint("bw.reply.endpoint", _ => { });
+        });
+
+        Action act = () => InMemoryTopologyInterpreter.BuildRegistry(options);
+
+        act.Should().Throw<BareWireConfigurationException>().WithMessage("*bw.reply.*");
+    }
 }

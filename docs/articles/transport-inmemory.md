@@ -353,6 +353,41 @@ consequence is also the same as on the broker — an outbox retry re-delivers th
 that already accepted it, and an inbox deduplicates those copies. The only difference is the default:
 RabbitMQ has no length limit unless you set `x-max-length`, while in-memory queues are always bounded.
 
+## Request/response
+
+`IBus.CreateRequestClientAsync<T>()` works with `AddBareWireInMemory`. The request is sent to the
+exchange given by `MapExchange<T>` (or `DefaultExchange`) with the routing key from `MapRoutingKey<T>`,
+and the consumer answers with `RespondAsync`, exactly as on RabbitMQ:
+
+```csharp
+IRequestClient<CheckOrderStatus> client = await bus.CreateRequestClientAsync<CheckOrderStatus>();
+Response<OrderStatus> response = await client.GetResponseAsync<OrderStatus>(new CheckOrderStatus(orderId));
+```
+
+- **Send-style only.** The request is routed like any other send; there is no publish-style request
+  (`PublishRequest<T>`) and no competing-responder fan-out. The reply travels as a plain BareWire
+  message, not in a request/response envelope.
+- **Replies bypass the queues.** Each request client owns a reply address, and the transport hands the
+  response straight to that client in process. A response never occupies queue capacity, does not appear
+  in the queue metrics, and is not subject to `SendTimeout`.
+- **Limits.** The default timeout is 30 seconds (`RequestTimeoutException` when it elapses; cancelling
+  the call's token throws `OperationCanceledException`). At most 1000 requests may be pending per
+  client; the next one throws `BareWireTransportException` at once.
+- **Request not accepted.** If the transport does not confirm the request — the adapter is closed, the
+  target queue stays full for `SendTimeout`, or no queue is bound and `GuaranteedRouting` is on — the
+  call throws `BareWireTransportException` immediately instead of waiting for the timeout. An exchange
+  that is not declared is a configuration error reported when the bus starts. A request that is
+  confirmed but routed to no queue (no binding, `GuaranteedRouting` off) is accepted, and the call ends
+  with `RequestTimeoutException` after the timeout.
+- **Late and orphaned replies.** A reply whose correlation id is unknown or already timed out, or that
+  arrives after its client was disposed, is acknowledged and dropped; the drop is logged at `Debug`
+  without the correlation value.
+- **Reserved queue names.** Queue names starting with `bw.reply.` are reserved for reply addresses;
+  declaring such a queue in the topology fails validation at startup.
+- **Dispose or reuse the client.** A request client registers its reply address until it is disposed.
+  Create one client per request type and reuse it, or dispose it (`await using`) when you are done;
+  an undisposed client is never released.
+
 ## Outbox and Inbox
 
 The recommended production shape on this transport is the transactional [outbox](outbox.md) in

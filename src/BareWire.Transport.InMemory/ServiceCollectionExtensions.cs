@@ -3,6 +3,7 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Routing;
+using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.InMemory.Configuration;
@@ -130,15 +131,38 @@ public static class ServiceCollectionExtensions
         services.Replace(ServiceDescriptor.Singleton<IExchangeResolver>(exchangeResolver));
 
         services.TryAddSingleton(sp => new InMemoryBroker(sp.GetRequiredService<InMemoryTransportOptions>()));
+
+        // One reply registry per container, shared by the adapter's send path (which intercepts replies) and the
+        // request client factory (whose clients register their reply addresses). The factory resolves the adapter
+        // through the container — possibly a decorator — so the registry cannot be reached through the adapter.
+        services.TryAddSingleton(sp => new InMemoryReplyRegistry(
+            sp.GetService<ILogger<InMemoryReplyRegistry>>() ?? NullLogger<InMemoryReplyRegistry>.Instance));
+
         services.TryAddSingleton<ITransportAdapter>(sp => new InMemoryTransportAdapter(
             sp.GetRequiredService<InMemoryTransportOptions>(),
             sp.GetRequiredService<InMemoryBroker>(),
             logger: sp.GetService<ILogger<InMemoryTransportAdapter>>(),
-            meter: sp.GetService<IMeterFactory>()?.Create(InMemoryTransportMetrics.MeterName)));
+            meter: sp.GetService<IMeterFactory>()?.Create(InMemoryTransportMetrics.MeterName),
+            replies: sp.GetRequiredService<InMemoryReplyRegistry>()));
             // TimeProvider is intentionally NOT resolved here — see the remarks above: it drives the
             // adapter's defer timers and drain polling/timeouts, and a FakeTimeProvider registered for
             // tests elsewhere in the same container would freeze both. The adapter keeps its own
             // default (TimeProvider.System).
+
+        // Request/response. Replace (not TryAdd): a factory left over from another transport must never survive
+        // here, or requests would be sent to a different broker than the one this container's bus uses.
+        // The deserializer resolver is optional — a container that registers only a default deserializer
+        // (for example the test harness) still builds its bus, because the bus resolves this factory eagerly.
+        services.Replace(ServiceDescriptor.Singleton<IRequestClientFactory>(sp => new InMemoryRequestClientFactory(
+            () => sp.GetRequiredService<ITransportAdapter>(),
+            sp.GetRequiredService<InMemoryReplyRegistry>(),
+            sp.GetRequiredService<InMemoryTransportOptions>(),
+            sp.GetRequiredService<ISerializerResolver>(),
+            sp.GetService<IDeserializerResolver>()
+                ?? new SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
+            sp.GetRequiredService<IExchangeResolver>(),
+            sp.GetRequiredService<IRoutingKeyResolver>(),
+            sp.GetService<ILoggerFactory>() ?? NullLoggerFactory.Instance)));
 
         // Register topology so the core bus can deploy it on startup.
         if (options.Topology is not null)

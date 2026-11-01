@@ -89,6 +89,10 @@ internal sealed class InMemoryTransportAdapter
     /// at once. Defaults to <see cref="InMemoryMessageScheduler.DefaultMaxPending"/>; a test hook — there
     /// is no public option for it (see the package README's "Scheduled delivery" section).
     /// </param>
+    /// <param name="replies">
+    /// The reply registry shared with the request client factory. Defaults to a private instance, which is
+    /// what a directly constructed adapter (without the dependency injection container) uses.
+    /// </param>
     /// <remarks>
     /// An explicit constructor, not a primary one: <see cref="Registry"/> and the send-path collaborators
     /// built from it (<see cref="Router"/>, the sender) must be assigned in the constructor BODY, after
@@ -102,7 +106,8 @@ internal sealed class InMemoryTransportAdapter
         Meter? meter = null,
         TimeProvider? timeProvider = null,
         IInMemoryBufferPoolObserver? bufferPoolObserver = null,
-        int maxPendingScheduled = InMemoryMessageScheduler.DefaultMaxPending)
+        int maxPendingScheduled = InMemoryMessageScheduler.DefaultMaxPending,
+        InMemoryReplyRegistry? replies = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(broker);
@@ -113,6 +118,7 @@ internal sealed class InMemoryTransportAdapter
         // Built first, so an unsupported affinity fails before the topology registry is built.
         _singleActiveGates = BuildSingleActiveGates(options);
         BufferPool = new InMemoryBufferPool(bufferPoolObserver);
+        Replies = replies ?? new InMemoryReplyRegistry(NullLogger<InMemoryReplyRegistry>.Instance);
 
         Options = options;
         Broker = broker;
@@ -136,7 +142,7 @@ internal sealed class InMemoryTransportAdapter
         _diagnostics = new InMemoryConsumeDiagnostics(effectiveLogger, _metrics, _timeProvider);
         Router = new InMemoryRouter(Registry, options, new DelegatingLogger<InMemoryRouter>(effectiveLogger), _metrics);
         _sendDiagnostics = new InMemorySendDiagnostics(effectiveLogger, Registry, _metrics);
-        _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed, BufferPool);
+        _sender = new InMemorySender(broker, Router, options, _sendDiagnostics, IsClosed, BufferPool, Replies);
         _deferScheduler = options.DeferEnabled
             ? new InMemoryDeferScheduler(_timeProvider, BufferPool, _diagnostics)
             : null;
@@ -229,6 +235,12 @@ internal sealed class InMemoryTransportAdapter
     /// <see cref="InboundMessage.Dispose"/> without going through this pool.
     /// </summary>
     internal InMemoryBufferPool BufferPool { get; }
+
+    /// <summary>
+    /// Gets the reply registry the send path consults before routing. Shared with the request client factory
+    /// when the adapter is built by the dependency injection container; a private instance otherwise.
+    /// </summary>
+    internal InMemoryReplyRegistry Replies { get; }
 
     /// <summary>Gets the number of unsettled deliveries dropped because the adapter shut down.</summary>
     internal long DroppedOnShutdownCount => _diagnostics.DroppedOnShutdownCount;

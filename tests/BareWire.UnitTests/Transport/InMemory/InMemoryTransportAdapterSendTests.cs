@@ -664,4 +664,112 @@ public sealed class InMemoryTransportAdapterSendTests
         r.Single().IsConfirmed.Should().BeFalse();
         rejected.Should().ContainSingle(x => x.Reason == "oversized" && x.Exchange == null);
     }
+
+    // ── Reply interception (in-memory request/response) ─────────────────────────────────────────────
+
+    private sealed class ReplySink : IInMemoryReplySink
+    {
+        internal InboundMessage? Received { get; private set; }
+
+        public bool CanAccept(IReadOnlyDictionary<string, string> headers) => true;
+
+        public bool TryAccept(InboundMessage response)
+        {
+            Received = response;
+            return true;
+        }
+    }
+
+    private static OutboundMessage ReplyTo(string address, string correlationId) =>
+        new(
+            address,
+            new Dictionary<string, string> { ["BW-Exchange"] = "", ["correlation-id"] = correlationId },
+            "pong"u8.ToArray(),
+            "application/json");
+
+    private static InMemoryTransportAdapter PingAdapter(ILogger<InMemoryTransportAdapter>? logger = null) =>
+        Adapter(c =>
+        {
+            c.DefaultExchange(string.Empty);
+            c.ConfigureTopology(t => t.DeclareQueue("ping"));
+        }, logger: logger);
+
+    [Fact]
+    public async Task SendBatchAsync_WhenDefaultExchangeTargetsRegisteredReplyAddress_DeliversToSinkNotQueue()
+    {
+        InMemoryTransportAdapter a = PingAdapter();
+        var sink = new ReplySink();
+        string address = a.Replies.Register(sink);
+
+        IReadOnlyList<SendResult> results = await a.SendBatchAsync(
+            [ReplyTo(address, "c1")], TestContext.Current.CancellationToken);
+
+        results[0].IsConfirmed.Should().BeTrue();
+        sink.Received!.Headers["correlation-id"].Should().Be("c1");
+        sink.Received.Headers.Should().NotContainKey("BW-Exchange");
+        Queue(a, "ping").Occupancy.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_WhenReplyAddressNotRegistered_ConfirmsAndRoutesToNoQueue()
+    {
+        var logger = new CapturingLogger<InMemoryTransportAdapter>();
+        InMemoryTransportAdapter a = PingAdapter(logger);
+
+        IReadOnlyList<SendResult> results = await a.SendBatchAsync(
+            [ReplyTo(InMemoryReplyRegistry.ReservedPrefix + new string('0', 32), "c1")],
+            TestContext.Current.CancellationToken);
+
+        results[0].IsConfirmed.Should().BeTrue();
+        Queue(a, "ping").Occupancy.Should().Be(0);
+        logger.Entries.Should().NotContain(e => e.Level >= LogLevel.Warning);
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_WhenReplyBodyExceedsMaxMessageSize_RejectsBeforeInterception()
+    {
+        InMemoryTransportAdapter a = Adapter(c =>
+        {
+            c.DefaultExchange(string.Empty);
+            c.ConfigureTopology(t => t.DeclareQueue("ping"));
+            c.MaxMessageSize(16);
+        });
+        var sink = new ReplySink();
+        string address = a.Replies.Register(sink);
+        var message = new OutboundMessage(
+            address, new Dictionary<string, string> { ["BW-Exchange"] = "" }, new byte[17], "application/json");
+
+        IReadOnlyList<SendResult> results = await a.SendBatchAsync([message], TestContext.Current.CancellationToken);
+
+        results[0].IsConfirmed.Should().BeFalse();
+        sink.Received.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_WhenDefaultExchangeTargetsOrdinaryQueue_RoutesAsBefore()
+    {
+        InMemoryTransportAdapter a = PingAdapter();
+        var sink = new ReplySink();
+        a.Replies.Register(sink);
+
+        IReadOnlyList<SendResult> results = await a.SendBatchAsync(
+            [ToQueue("ping", "1")], TestContext.Current.CancellationToken);
+
+        results[0].IsConfirmed.Should().BeTrue();
+        Queue(a, "ping").Occupancy.Should().Be(1);
+        sink.Received.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task SendBatchAsync_WhenReservedPrefixButNotStrictFormat_RoutesAsOrdinaryKey()
+    {
+        InMemoryTransportAdapter a = PingAdapter();
+
+        IReadOnlyList<SendResult> results = await a.SendBatchAsync(
+            [ToQueue("bw.reply.not-an-address", "1")], TestContext.Current.CancellationToken);
+
+        // Not intercepted: it goes through the router, which finds no such queue (unroutable, confirmed by default).
+        results[0].IsConfirmed.Should().BeTrue();
+        Queue(a, "ping").Occupancy.Should().Be(0);
+    }
 }
