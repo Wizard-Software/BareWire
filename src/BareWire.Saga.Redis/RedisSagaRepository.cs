@@ -40,7 +40,11 @@ internal sealed class RedisSagaRepository<TSaga> : ISagaRepository<TSaga>
     /// <param name="serializer">
     /// The serializer for converting SAGA state to and from Redis values. Must not be <see langword="null"/>.
     /// </param>
-    internal RedisSagaRepository(
+    /// <remarks>
+    /// Public because <c>AddBareWireSagaRedis</c> registers this type by type and the DI container
+    /// only activates public constructors. The class itself stays <see langword="internal"/>.
+    /// </remarks>
+    public RedisSagaRepository(
         IConnectionMultiplexer multiplexer,
         RedisSagaRepositoryOptions options,
         SagaStateSerializer<TSaga> serializer)
