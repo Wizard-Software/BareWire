@@ -54,6 +54,10 @@ internal sealed class CountingBufferPoolObserver : IInMemoryBufferPoolObserver
     /// <summary>Gets the number of hook-rented buffers currently outstanding (rented, not yet returned by any means).</summary>
     internal int Outstanding => _state.Count(static kvp => kvp.Value == RentState.Outstanding);
 
+    /// <summary>Gets the hook-rented buffers currently outstanding.</summary>
+    internal IReadOnlyList<byte[]> OutstandingBuffers() =>
+        [.. _state.Where(static kvp => kvp.Value == RentState.Outstanding).Select(static kvp => kvp.Key)];
+
     /// <summary>Gets every violation recorded so far.</summary>
     internal IReadOnlyList<string> Violations => [.. _violations];
 

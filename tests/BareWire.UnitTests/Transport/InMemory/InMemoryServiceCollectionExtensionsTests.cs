@@ -4,8 +4,11 @@ using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
 using BareWire.Abstractions.Routing;
+using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
 using BareWire.Abstractions.Transport;
+using BareWire.InMemory;
+using BareWire.Serialization.Json;
 using BareWire.Transport.InMemory;
 using BareWire.Transport.InMemory.Internal;
 using Microsoft.Extensions.DependencyInjection;
@@ -23,6 +26,56 @@ public sealed class InMemoryServiceCollectionExtensionsTests
         services.AddLogging();
         services.AddBareWireInMemory(configure ?? (_ => { }));
         return services.BuildServiceProvider();
+    }
+
+    [Fact]
+    public void AddBareWireInMemory_WhenCalled_SharesReplyRegistryBetweenContainerAndAdapter()
+    {
+        using ServiceProvider sp = Build();
+
+        ((InMemoryTransportAdapter)sp.GetRequiredService<ITransportAdapter>()).Replies
+            .Should().BeSameAs(sp.GetRequiredService<InMemoryReplyRegistry>());
+    }
+
+    [Fact]
+    public void AddBareWireInMemory_WithBus_RegistersInMemoryRequestClientFactory()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBareWireJsonSerializer();
+        services.AddBareWireWithInMemory(t => t.ConfigureTopology(x => x.DeclareQueue("q")));
+        using ServiceProvider sp = services.BuildServiceProvider();
+
+        sp.GetService<IRequestClientFactory>().Should().BeOfType<InMemoryRequestClientFactory>();
+    }
+
+    [Fact]
+    public void AddBareWireInMemory_WhenAnotherRequestClientFactoryRegistered_ReplacesIt()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBareWireJsonSerializer();
+        services.AddSingleton(Substitute.For<IRequestClientFactory>());
+        services.AddBareWireWithInMemory(t => t.ConfigureTopology(x => x.DeclareQueue("q")));
+        using ServiceProvider sp = services.BuildServiceProvider();
+
+        services.Count(d => d.ServiceType == typeof(IRequestClientFactory)).Should().Be(1);
+        sp.GetService<IRequestClientFactory>().Should().BeOfType<InMemoryRequestClientFactory>();
+    }
+
+    [Fact]
+    public void AddBareWireInMemory_WhenNoDeserializerResolverRegistered_FactoryFallsBackToSingleDeserializer()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddBareWireJsonSerializer();
+        services.RemoveAll<IDeserializerResolver>();
+        services.AddBareWireWithInMemory(t => t.ConfigureTopology(x => x.DeclareQueue("q")));
+        using ServiceProvider sp = services.BuildServiceProvider();
+
+        sp.GetService<IDeserializerResolver>().Should().BeNull();
+        sp.GetService<IRequestClientFactory>().Should().BeOfType<InMemoryRequestClientFactory>();
+        sp.GetRequiredService<IBusControl>().Should().NotBeNull();
     }
 
     [Fact]

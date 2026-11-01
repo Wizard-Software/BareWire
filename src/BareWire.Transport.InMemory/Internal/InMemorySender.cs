@@ -69,6 +69,7 @@ internal sealed class InMemorySender
     private readonly InMemorySendDiagnostics _diagnostics;
     private readonly Func<bool> _isClosed;
     private readonly InMemoryBufferPool _pool;
+    private readonly InMemoryReplyRegistry _replies;
     private long _lastTag;
 
     /// <param name="broker">Resolves target queue instances by name. Must not be <see langword="null"/>.</param>
@@ -84,13 +85,18 @@ internal sealed class InMemorySender
     /// through it (rather than <see cref="System.Buffers.ArrayPool{T}.Shared"/> directly), so a test-time
     /// observer attached to that pool sees every one of them. Must not be <see langword="null"/>.
     /// </param>
+    /// <param name="replies">
+    /// The reply registry consulted before routing: a send to the default exchange whose routing key is a
+    /// reply address is handed to the owning request client instead of the router. Must not be <see langword="null"/>.
+    /// </param>
     internal InMemorySender(
         InMemoryBroker broker,
         InMemoryRouter router,
         InMemoryTransportOptions options,
         InMemorySendDiagnostics diagnostics,
         Func<bool> isClosed,
-        InMemoryBufferPool pool)
+        InMemoryBufferPool pool,
+        InMemoryReplyRegistry replies)
     {
         ArgumentNullException.ThrowIfNull(broker);
         ArgumentNullException.ThrowIfNull(router);
@@ -98,6 +104,7 @@ internal sealed class InMemorySender
         ArgumentNullException.ThrowIfNull(diagnostics);
         ArgumentNullException.ThrowIfNull(isClosed);
         ArgumentNullException.ThrowIfNull(pool);
+        ArgumentNullException.ThrowIfNull(replies);
 
         _broker = broker;
         _router = router;
@@ -105,6 +112,7 @@ internal sealed class InMemorySender
         _diagnostics = diagnostics;
         _isClosed = isClosed;
         _pool = pool;
+        _replies = replies;
     }
 
     /// <summary>
@@ -210,6 +218,17 @@ internal sealed class InMemorySender
                 _diagnostics.MessageRejected(
                     SendRejectionReason.Oversized, declared, exchange, message.RoutingKey, message.Body.Length);
                 return new MessageOutcome(false, null);
+            }
+
+            // A reply to an in-memory request client never touches the topology: it is handed to the registry
+            // (after the size check above, so MaxMessageSize still bounds it). Every reply outcome is confirmed
+            // — an unknown address or correlation is dropped by the registry (parity with a non-mandatory
+            // RabbitMQ publish to the default exchange) and is not an unroutable message.
+            if (InMemoryReplyRegistry.IsReplyAddress(exchange, message.RoutingKey))
+            {
+                _ = _replies.TryDeliver(
+                    message.RoutingKey, message.Headers, message.Body.Span, message.ContentType, _pool);
+                return new MessageOutcome(true, null);
             }
 
             InMemoryRouteResult route = _router.Route(exchange, message.RoutingKey);

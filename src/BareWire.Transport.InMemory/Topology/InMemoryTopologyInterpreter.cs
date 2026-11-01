@@ -21,6 +21,18 @@ internal static class InMemoryTopologyInterpreter
     /// <summary>The logical transport name used on every <see cref="BareWireTransportException"/> raised here.</summary>
     internal const string TransportName = "InMemory";
 
+    private static void ThrowIfReservedQueueName(string queueName, string optionName)
+    {
+        if (InMemoryReplyRegistry.IsReservedName(queueName))
+        {
+            throw new BareWireConfigurationException(
+                optionName: optionName,
+                optionValue: queueName,
+                expectedValue: $"a queue name that does not start with '{InMemoryReplyRegistry.ReservedPrefix}' " +
+                               "— that prefix is reserved for in-memory request/response reply addresses");
+        }
+    }
+
     /// <summary>
     /// Builds the sealed <see cref="ExchangeRegistry"/> for <paramref name="options"/>: validates
     /// exchange types and queue arguments, normalizes the topology, resolves receive-endpoint
@@ -35,7 +47,7 @@ internal static class InMemoryTopologyInterpreter
     /// Thrown when the topology contains a conflicting duplicate, an empty exchange or queue name, a
     /// binding to an undeclared exchange or queue, an undeclared <see cref="InMemoryTransportOptions.DefaultExchange"/>,
     /// an undeclared exchange mapping, or a receive endpoint whose queue is neither declared nor
-    /// eligible for auto-declaration.
+    /// eligible for auto-declaration, or a queue name using the reserved <c>bw.reply.</c> prefix.
     /// </exception>
     internal static ExchangeRegistry BuildRegistry(InMemoryTransportOptions options)
     {
@@ -48,11 +60,19 @@ internal static class InMemoryTopologyInterpreter
 
         NormalizedTopology declared = Normalize(topology);
 
+        // The reply-address prefix is reserved for in-memory request clients: a queue sharing it could
+        // never be reached, because the send path hands such addresses to the reply registry.
+        foreach (string declaredQueueName in declared.Queues.Keys)
+        {
+            ThrowIfReservedQueueName(declaredQueueName, "ConfigureTopology.DeclareQueue");
+        }
+
         // (d) Receive-endpoint queues — iterate UNIQUE queue names before touching declarations, so a
         // queue name repeated across two ReceiveEndpoint calls is resolved once, not twice.
         HashSet<string> uniqueEndpointQueueNames = new(StringComparer.Ordinal);
         foreach (var endpoint in options.EndpointConfigurations)
         {
+            ThrowIfReservedQueueName(endpoint.QueueName, "ReceiveEndpoint");
             uniqueEndpointQueueNames.Add(endpoint.QueueName);
         }
 
