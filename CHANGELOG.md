@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - In-memory transport: request/response — `IBus.CreateRequestClientAsync<T>()` now works with `AddBareWireInMemory` (send-style requests only; replies are correlated in process, do not use queue capacity and are not subject to `SendTimeout`; 30-second default timeout, at most 1000 pending requests per client; dispose or reuse the client) (#84). **Behavior change:** queue names starting with `bw.reply.` are now reserved for reply addresses, so a topology that declares such a queue fails validation at startup
+- Saga: `AddBareWireSagaInMemory<TSaga>()` in `BareWire.Saga` registers the in-memory saga repository (singleton; state lives only in the current process) for tests, samples and local development. Previously the in-memory repository could not be registered from application code, and the documentation of `AddBareWireSagaStateMachine` pointed to `AddBareWireSaga<TSaga>()`, which exists only in `BareWire.Saga.EntityFramework`; it now lists the in-memory, Entity Framework and Redis registrations (#85)
 
 ### Fixed
 

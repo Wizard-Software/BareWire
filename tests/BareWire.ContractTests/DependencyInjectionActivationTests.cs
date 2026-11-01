@@ -96,6 +96,7 @@ public sealed class DependencyInjectionActivationTests
             ["BareWire.Outbox.EntityFramework:AddBareWireOutbox"] = s => s.AddBareWireOutbox(_ => { }),
             ["BareWire.Saga:AddBareWireSagaStateMachine"] =
                 s => s.AddBareWireSagaStateMachine<ActivationStateMachine, ActivationSagaState>(),
+            ["BareWire.Saga:AddBareWireSagaInMemory"] = s => s.AddBareWireSagaInMemory<ActivationSagaState>(),
             ["BareWire.Saga.EntityFramework:AddBareWireSaga"] = s => s.AddBareWireSaga<ActivationSagaState>(_ => { }),
             ["BareWire.Saga.Redis:AddBareWireSagaRedis"] = s => s.AddBareWireSagaRedis<ActivationSagaState>(_ => { }),
             ["BareWire.Saga.Redis:AddBareWireRedisConnection"] = s => s.AddBareWireRedisConnection(o =>
