@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - In-memory transport: request/response — `IBus.CreateRequestClientAsync<T>()` now works with `AddBareWireInMemory` (send-style requests only; replies are correlated in process, do not use queue capacity and are not subject to `SendTimeout`; 30-second default timeout, at most 1000 pending requests per client; dispose or reuse the client) (#84). **Behavior change:** queue names starting with `bw.reply.` are now reserved for reply addresses, so a topology that declares such a queue fails validation at startup
 
+### Fixed
+
+- Redis saga persistence: `AddBareWireSagaRedis<TSaga>()` registered `RedisSagaRepository<TSaga>` with an internal constructor, so the DI container could not resolve `ISagaRepository<TSaga>` — the host failed at `ValidateOnBuild` (on by default in Development) or on the first saga message. The repository is now resolvable (#85)
+
 ## [3.0.0] - 2026-10-23
 
 ### Added
