@@ -27,13 +27,22 @@ namespace BareWire.Interop.MassTransit;
 /// context), output is byte-identical to the previous behavior — routing fields are not emitted.
 /// </para>
 /// <para>
+/// This class also implements <see cref="IOutboundHeaderContributor"/>: when the outbound headers contain a
+/// <c>traceparent</c> value, it is copied unchanged to <c>MT-Activity-Id</c>, the header MassTransit 8 reads to
+/// continue a distributed trace. Without a <c>traceparent</c> no header is written or removed.
+/// </para>
+/// <para>
 /// This class is stateless and thread-safe. Use <c>services.AddMassTransitEnvelopeSerializer()</c>
 /// to register it in the DI container as a Singleton (recommended) before calling
 /// <c>MapSerializer&lt;TMessage, MassTransitEnvelopeSerializer&gt;()</c>.
 /// </para>
 /// </remarks>
-public sealed class MassTransitEnvelopeSerializer : IMessageSerializer, IRequestEnvelopeSerializer, IResponseEnvelopeWriter
+public sealed class MassTransitEnvelopeSerializer
+    : IMessageSerializer, IRequestEnvelopeSerializer, IResponseEnvelopeWriter, IOutboundHeaderContributor
 {
+    private const string TraceParentHeader = "traceparent";
+    private const string MassTransitActivityIdHeader = "MT-Activity-Id";
+
     // Pre-encoded property name bytes used with typed WriteString overloads (zero .ToString() allocations).
     private static readonly byte[] s_requestIdName = "requestId"u8.ToArray();
     private static readonly byte[] s_responseAddressName = "responseAddress"u8.ToArray();
@@ -52,6 +61,18 @@ public sealed class MassTransitEnvelopeSerializer : IMessageSerializer, IRequest
     private static class UrnCache<T>
     {
         internal static readonly string Value = $"urn:message:{typeof(T).Namespace}:{typeof(T).Name}";
+    }
+
+    /// <inheritdoc/>
+    public void ContributeHeaders(IDictionary<string, string> headers)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+
+        // Same W3C format as traceparent, only the header name differs — no parsing, same string instance.
+        if (headers.TryGetValue(TraceParentHeader, out string? traceParent))
+        {
+            headers[MassTransitActivityIdHeader] = traceParent;
+        }
     }
 
     /// <inheritdoc/>

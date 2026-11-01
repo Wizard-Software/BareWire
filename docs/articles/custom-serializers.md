@@ -79,6 +79,32 @@ When multiple deserializers are registered globally (e.g. via `AddMassTransitEnv
 
 Per-endpoint `UseDeserializer<T>()` bypasses the router entirely and uses the specified deserializer for all messages on that endpoint, regardless of content type.
 
+## Adding Outbound Headers (`IOutboundHeaderContributor`)
+
+A serializer that needs to put extra **transport headers** on the outgoing message (not just bytes in the body) can also implement `IOutboundHeaderContributor`:
+
+```csharp
+public sealed class MySerializer : IMessageSerializer, IOutboundHeaderContributor
+{
+    // ... Serialize / ContentType ...
+
+    public void ContributeHeaders(IDictionary<string, string> headers)
+    {
+        // Called after user headers, framework headers and the trace context are written.
+        if (headers.TryGetValue("traceparent", out var traceparent))
+        {
+            headers["X-My-Trace"] = traceparent;
+        }
+    }
+}
+```
+
+The bus calls `ContributeHeaders` as the last header step for `PublishAsync`, `ISendEndpoint.SendAsync` and the RabbitMQ request client, on the serializer resolved for the message type. Rules:
+
+- **Only add** your own headers. Do not modify or remove existing ones (`BW-*`, `message-id`, `traceparent`); this is a documented contract, not enforced at runtime.
+- The implementation must be thread-safe and must not throw.
+- The default raw serializers do not implement it (raw-first). The built-in `MassTransitEnvelopeSerializer` uses it to write `MT-Activity-Id` — see [MassTransit Interop](masstransit-interop.md#distributed-tracing).
+
 ## When to Use What
 
 | Scenario | Approach |

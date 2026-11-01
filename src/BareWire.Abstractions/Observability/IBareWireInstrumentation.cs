@@ -37,6 +37,8 @@ public interface IBareWireInstrumentation
     /// <param name="messageId">The unique identifier of the message being consumed.</param>
     /// <param name="headers">
     /// The inbound message headers from which trace context (<c>traceparent</c>, <c>tracestate</c>) is extracted.
+    /// When <c>traceparent</c> is absent, the MassTransit <c>MT-Activity-Id</c> header (same W3C format) is used
+    /// as the parent instead. A present but invalid <c>traceparent</c> starts a new root span and does not fall back.
     /// </param>
     /// <returns>A started <see cref="Activity"/> with kind <c>Consumer</c>, or <see langword="null"/>.</returns>
     Activity? StartConsumeActivity(
@@ -151,8 +153,8 @@ public interface IBareWireInstrumentation
     void RecordPublishIntercepted(string endpoint, string messageType) { }
 
     /// <summary>
-    /// Injects the W3C trace context (<c>traceparent</c>, <c>tracestate</c>) from the given
-    /// <see cref="Activity"/> into the provided outbound message headers dictionary.
+    /// Injects the W3C trace context (<c>traceparent</c>, <c>tracestate</c>) and any <c>baggage</c> items
+    /// from the given <see cref="Activity"/> into the provided outbound message headers dictionary.
     /// Safe to call with a <see langword="null"/> activity — writes nothing in that case.
     /// </summary>
     /// <param name="activity">
@@ -168,7 +170,8 @@ public interface IBareWireInstrumentation
     /// Extracts the W3C trace context from inbound message headers and starts a new
     /// <see cref="Activity"/> as a child of the propagated trace.
     /// Returns <see langword="null"/> when no listener is attached to the activity source.
-    /// If no <c>traceparent</c> header is present, starts a new root span.
+    /// If no <c>traceparent</c> header is present, the MassTransit <c>MT-Activity-Id</c> header is used as the
+    /// parent; if neither is present (or <c>traceparent</c> is present but invalid), starts a new root span.
     /// </summary>
     /// <param name="headers">The inbound message headers to extract trace context from.</param>
     /// <param name="operationName">The span name for the extracted activity.</param>

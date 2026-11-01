@@ -648,6 +648,10 @@ namespace BareWire.Abstractions.Serialization
         void Serialize<T>(T message, System.Buffers.IBufferWriter<byte> output)
             where T :  class;
     }
+    public interface IOutboundHeaderContributor
+    {
+        void ContributeHeaders(System.Collections.Generic.IDictionary<string, string> headers);
+    }
     public interface IRequestEnvelopeRouteReader
     {
         bool TryReadRequestEnvelope(System.Buffers.ReadOnlySequence<byte> body, out BareWire.Abstractions.Serialization.RequestEnvelopeContext routing);

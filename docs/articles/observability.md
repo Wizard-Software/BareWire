@@ -26,6 +26,10 @@ POST /demo/run
 
 Each hop is visible as a child span in your tracing backend (Aspire Dashboard, Jaeger, Zipkin, etc.).
 
+Publish spans are created for `PublishAsync`, `ISendEndpoint.SendAsync`, `SendRawAsync`, `PublishRawAsync` and the RabbitMQ request client, and the W3C trace context (`traceparent`, `tracestate`, `baggage`) is injected into the outgoing message headers. The span's destination tag contains only the scheme, host and path of the address — never credentials or query strings — and the request client span does not carry the request correlation id.
+
+On the consume side, BareWire reads `traceparent` and falls back to `MT-Activity-Id`, the header MassTransit uses, when `traceparent` is absent; `traceparent` wins when both are present. Messages serialized with the MassTransit envelope also carry `MT-Activity-Id`, so a trace continues across BareWire and MassTransit services. See [MassTransit Interop](masstransit-interop.md#distributed-tracing) for details and limits.
+
 ## Metrics
 
 BareWire emits the following metrics via OpenTelemetry:

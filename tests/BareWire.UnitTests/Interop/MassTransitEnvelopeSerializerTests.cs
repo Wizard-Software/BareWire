@@ -197,4 +197,40 @@ public sealed class MassTransitEnvelopeSerializerTests
         root.TryGetProperty("faultAddress", out _).Should().BeFalse("plain Serialize must not emit faultAddress");
         root.TryGetProperty("expirationTime", out _).Should().BeFalse("plain Serialize must not emit expirationTime");
     }
+
+    [Fact]
+    public void ContributeHeaders_WithTraceparent_SetsMtActivityIdToSameValue()
+    {
+        // Arrange — built at runtime so the value is a distinct string instance, not an interned literal
+        string traceParent = string.Concat("00-0af7651916cd43dd8448eb211c80319c-", "b7ad6b7169203331-01");
+        var headers = new Dictionary<string, string> { ["traceparent"] = traceParent };
+
+        // Act
+        _sut.ContributeHeaders(headers);
+
+        // Assert
+        headers["MT-Activity-Id"].Should().BeSameAs(traceParent);
+        headers["traceparent"].Should().BeSameAs(traceParent);
+    }
+
+    [Fact]
+    public void ContributeHeaders_WithoutTraceparent_LeavesHeadersUnchanged()
+    {
+        // Arrange — a user-supplied MT-Activity-Id must survive when there is no framework trace context
+        var headers = new Dictionary<string, string> { ["MT-Activity-Id"] = "user-value", ["x"] = "y" };
+
+        // Act
+        _sut.ContributeHeaders(headers);
+
+        // Assert
+        headers.Should().BeEquivalentTo(new Dictionary<string, string> { ["MT-Activity-Id"] = "user-value", ["x"] = "y" });
+    }
+
+    [Fact]
+    public void ContributeHeaders_WithNullHeaders_ThrowsArgumentNullException()
+    {
+        Action act = () => _sut.ContributeHeaders(null!);
+
+        act.Should().Throw<ArgumentNullException>();
+    }
 }

@@ -94,6 +94,74 @@ public sealed class RabbitMqHeaderMapperTests
     }
 
     [Fact]
+    public void MapInbound_WithMtActivityIdAndIgnoreUnmapped_MapsMtActivityId()
+    {
+        // Arrange
+        const string traceValue = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        var amqpHeaders = new Dictionary<string, object?>
+        {
+            ["MT-Activity-Id"] = traceValue,
+            ["x-other"] = "dropped",
+        };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateMapperWith(cfg => cfg.IgnoreUnmappedHeaders(true));
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result["MT-Activity-Id"].Should().Be(traceValue);
+        result.Should().NotContainKey("x-other");
+    }
+
+    [Fact]
+    public void MapInbound_WithDifferentlyCasedMtActivityId_WritesNormalizedKey()
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["mt-activity-id"] = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+
+        // Act
+        Dictionary<string, string> result = CreateDefaultMapper().MapInbound(properties);
+
+        // Assert
+        result.Should().ContainKey("MT-Activity-Id");
+        result.Should().NotContainKey("mt-activity-id");
+    }
+
+    [Fact]
+    public void MapInbound_WithExplicitCustomMappingOfMtActivityId_CustomMappingWins()
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?> { ["MT-Activity-Id"] = "custom-value" };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateMapperWith(cfg => cfg.MapHeader("X-Trace", "MT-Activity-Id"));
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result["X-Trace"].Should().Be("custom-value");
+        result.Should().NotContainKey("MT-Activity-Id");
+    }
+
+    [Fact]
+    public void MapOutbound_WithMtActivityId_PassesThroughUnprefixed()
+    {
+        // Arrange
+        var headers = new Dictionary<string, string> { ["MT-Activity-Id"] = "00-aa-bb-01" };
+
+        // Act
+        (BasicProperties _, Dictionary<string, object?> amqpHeaders) = CreateDefaultMapper().MapOutbound(headers);
+
+        // Assert
+        amqpHeaders["MT-Activity-Id"].Should().Be("00-aa-bb-01");
+    }
+
+    [Fact]
     public void MapInbound_WithoutIgnoreUnmapped_PassesAllHeaders()
     {
         // Arrange

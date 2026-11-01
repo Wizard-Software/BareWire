@@ -8,6 +8,7 @@ namespace BareWire.UnitTests.Observability;
 /// Unit tests for <see cref="BareWireActivitySource"/> — verifies that spans are created
 /// with the correct names, kinds, and OpenTelemetry semantic-convention tags.
 /// </summary>
+[Collection(ActivityListenerFixtureGroup.Name)]
 public sealed class BareWireActivitySourceTests : IDisposable
 {
     private readonly ActivityListener _listener;

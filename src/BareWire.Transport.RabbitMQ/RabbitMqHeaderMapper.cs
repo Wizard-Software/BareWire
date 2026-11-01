@@ -33,6 +33,11 @@ namespace BareWire.Transport.RabbitMQ;
 /// this filter in both directions, and is the supported way to carry a custom <c>BW-</c>-prefixed header
 /// through the broker.
 /// </para>
+/// <para>
+/// The trace headers <c>traceparent</c> and <c>MT-Activity-Id</c> are always mapped 1:1 on inbound, even when
+/// unmapped headers are ignored. An explicit custom mapping of <c>MT-Activity-Id</c> takes precedence over
+/// that default (<c>traceparent</c> is always mapped 1:1).
+/// </para>
 /// </remarks>
 internal sealed class RabbitMqHeaderMapper
 {
@@ -45,6 +50,10 @@ internal sealed class RabbitMqHeaderMapper
     private const string BwContentType = "content-type";
     private const string BwMessageType = "BW-MessageType";
     private const string BwTraceparent = "traceparent";
+
+    // MassTransit's trace header (same W3C traceparent format). Mapped 1:1 on inbound so the consume
+    // path can use it as the parent context; the normalized key is written regardless of wire casing.
+    private const string MtActivityId = "MT-Activity-Id";
 
     private readonly RabbitMqHeaderMappingConfigurator? _config;
 
@@ -153,6 +162,12 @@ internal sealed class RabbitMqHeaderMapper
                 if (bareWireKey is not null)
                 {
                     result[bareWireKey] = ConvertHeaderValue(entry.Value);
+                }
+                else if (rawKey.Equals(MtActivityId, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Placed after the custom-mapping lookup so an explicit user mapping of this header wins.
+                    // Like traceparent, it is kept even when unmapped headers are ignored.
+                    result[MtActivityId] = ConvertHeaderValue(entry.Value);
                 }
                 else if (IsReservedHeader(rawKey) && !IsAcceptedReservedWireHeader(rawKey, result))
                 {

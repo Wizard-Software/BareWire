@@ -217,8 +217,23 @@ public abstract class ConsumeContext : IPublishEndpoint, ISendEndpointProvider
 
                 ISendEndpoint endpoint = await GetSendEndpoint(replyUri, cancellationToken)
                     .ConfigureAwait(false);
-                await endpoint.SendRawAsync(payload, "application/vnd.masstransit+json", cancellationToken)
-                    .ConfigureAwait(false);
+
+                // The response envelope writer doubles as the header contributor (e.g. MT-Activity-Id), so the
+                // MassTransit requester continues the trace. Endpoints that don't support it send the raw payload.
+                if (endpoint is IContributingSendEndpoint contributing)
+                {
+                    await contributing.SendRawAsync(
+                            payload,
+                            "application/vnd.masstransit+json",
+                            ResponseEnvelopeWriter as IOutboundHeaderContributor,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    await endpoint.SendRawAsync(payload, "application/vnd.masstransit+json", cancellationToken)
+                        .ConfigureAwait(false);
+                }
 
                 return;
             }

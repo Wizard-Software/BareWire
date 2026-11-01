@@ -36,6 +36,14 @@ public interface IHeaderMappingConfigurator
     /// Controls whether headers that have no explicit mapping are silently dropped on send
     /// and ignored on receive.
     /// </summary>
+    /// <remarks>
+    /// Distributed-trace headers are the exception on receive: <c>traceparent</c> and the MassTransit
+    /// <c>MT-Activity-Id</c> header are always read, so an incoming trace is continued even when unmapped headers
+    /// are ignored. On send there is no exception — with unmapped headers ignored, outbound <c>traceparent</c>,
+    /// <c>tracestate</c>, <c>baggage</c> and <c>MT-Activity-Id</c> are dropped unless explicitly mapped with
+    /// <see cref="MapHeader"/>. An explicit mapping of <c>MT-Activity-Id</c> takes precedence over the default
+    /// receive behaviour.
+    /// </remarks>
     /// <param name="ignore">
     /// <see langword="true"/> to drop unmapped headers (default); <see langword="false"/> to pass
     /// them through verbatim.

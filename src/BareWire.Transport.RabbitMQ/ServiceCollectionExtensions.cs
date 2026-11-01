@@ -1,3 +1,4 @@
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
@@ -105,7 +106,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IExchangeResolver>(),
             sp.GetRequiredService<IRoutingKeyResolver>(),
             sp.GetRequiredService<RabbitMqHeaderMapper>(),
-            sp.GetRequiredService<ILoggerFactory>()));
+            sp.GetRequiredService<ILoggerFactory>(),
+            sp.GetService<IBareWireInstrumentation>()));
 
         // Register topology so the core bus can deploy it on startup.
         if (options.Topology is not null)
