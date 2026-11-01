@@ -178,7 +178,13 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
         // could delete rows from an instance the operator considers "never started". The loop is therefore
         // gated on IHostApplicationLifetime.ApplicationStarted, which fires only after every hosted service's
         // StartAsync completes and never fires if startup aborts.
-        _outboxStore.CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>()).Returns(_ => ValueTask.CompletedTask);
+        // Signalled by the first cleanup call, so the positive assertion awaits the loop instead of a fixed delay.
+        var outboxCleaned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _outboxStore.CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>()).Returns(_ =>
+        {
+            outboxCleaned.TrySetResult();
+            return ValueTask.CompletedTask;
+        });
         _inboxStore.CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>()).Returns(_ => ValueTask.CompletedTask);
 
         var appStarted = new CancellationTokenSource();
@@ -186,17 +192,20 @@ public sealed class OutboxCleanupServiceTests : IAsyncDisposable
         lifetime.ApplicationStarted.Returns(appStarted.Token);
         await using var sut = CreateSut(lifetime);
 
-        // Act 1 — started, but the host has NOT signalled ApplicationStarted yet.
+        // Act 1 — started, but the host has NOT signalled ApplicationStarted yet. The window spans several
+        // cleanup intervals so an ungated loop would have ticked; it can only mask a bug, never fail spuriously.
         await sut.StartAsync(CancellationToken.None);
         await Task.Delay(TimeSpan.FromMilliseconds(80));
 
         // Assert 1 — no destructive cleanup before the host is fully started.
+        outboxCleaned.Task.IsCompleted.Should().BeFalse();
         await _outboxStore.DidNotReceive().CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
         await _inboxStore.DidNotReceive().CleanupAsync(Arg.Any<TimeSpan>(), Arg.Any<CancellationToken>());
 
-        // Act 2 — fire ApplicationStarted; the cleanup loop must now run.
+        // Act 2 — fire ApplicationStarted; the cleanup loop must now run. Wait for the first cleanup call
+        // (bounded, so a regression fails instead of hanging) rather than guessing how long scheduling takes.
         await appStarted.CancelAsync();
-        await Task.Delay(TimeSpan.FromMilliseconds(80));
+        await outboxCleaned.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         // Assert 2 — cleanup happens only after full host startup completes.
         await _outboxStore.Received().CleanupAsync(_options.OutboxRetention, Arg.Any<CancellationToken>());
