@@ -299,7 +299,7 @@ MassTransit carries the trace in the `MT-Activity-Id` header (W3C `traceparent` 
 
 ### Reading
 
-A BareWire consumer always reads `traceparent` first and falls back to `MT-Activity-Id` when `traceparent` is absent, so traces started by a MassTransit publisher continue in BareWire consumers. If both headers are present, `traceparent` wins. If `traceparent` is present but invalid, a new trace is started — there is no fallback to `MT-Activity-Id`. With the RabbitMQ transport, an inbound `MT-Activity-Id` is always mapped 1:1 (like `traceparent`), even when `IgnoreUnmappedHeaders` is enabled; an explicit `MapHeader(..., "MT-Activity-Id")` mapping takes precedence.
+A BareWire consumer always reads `traceparent` first and falls back to `MT-Activity-Id` when `traceparent` is absent, so traces started by a MassTransit publisher continue in BareWire consumers. If both headers are present, `traceparent` wins. If `traceparent` is present but invalid, a new trace is started — there is no fallback to `MT-Activity-Id`. With the RabbitMQ transport, the trace headers (`traceparent`, `tracestate`, `baggage` and `MT-Activity-Id`) are always mapped 1:1 in both directions, even when `IgnoreUnmappedHeaders` is enabled; an explicit `MapHeader` mapping of `tracestate`, `baggage` or `MT-Activity-Id` takes precedence.
 
 ### Writing
 
@@ -308,15 +308,13 @@ A BareWire consumer always reads `traceparent` first and falls back to `MT-Activ
 - `PublishAsync` and `ISendEndpoint.SendAsync`,
 - `SendRawAsync` and `PublishRawAsync`,
 - `ConsumeContext.RespondAsync` to a MassTransit requester (through the built-in send endpoint; a custom `ISendEndpoint` implementation does not receive the header),
-- the RabbitMQ request client.
+- the RabbitMQ and in-memory request clients.
 
 The serializer adds the header through the optional `IOutboundHeaderContributor` interface (see [Custom Serializers](custom-serializers.md)).
 
 ### Limits
 
-- With `IgnoreUnmappedHeaders` enabled on the RabbitMQ transport, outbound `traceparent` and `MT-Activity-Id` are dropped by the header mapper unless you map them explicitly. In that configuration the BareWire → MassTransit direction is not propagated.
 - One or two extra headers count against transport header limits: Amazon SQS allows 10 message attributes per message, and Google Cloud Pub/Sub limits the number of attributes as well.
-- The in-memory request client does not propagate trace context.
 
 ## Simulating a MassTransit Producer
 

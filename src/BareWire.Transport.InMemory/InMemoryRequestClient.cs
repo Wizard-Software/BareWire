@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.InMemory.Internal;
@@ -41,6 +43,7 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
     private readonly string _routingKey;
     private readonly TimeSpan _timeout;
     private readonly int _maxPending;
+    private readonly IBareWireInstrumentation? _instrumentation;
 
     // ADR-004: bounded — limits concurrent in-flight requests. Never disposed (see DisposeAsync).
     private readonly SemaphoreSlim _pendingGate;
@@ -57,7 +60,8 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
         string targetExchange,
         string routingKey,
         TimeSpan timeout,
-        int maxPendingRequests = DefaultMaxPendingRequests)
+        int maxPendingRequests = DefaultMaxPendingRequests,
+        IBareWireInstrumentation? instrumentation = null)
     {
         ArgumentNullException.ThrowIfNull(adapter);
         ArgumentNullException.ThrowIfNull(replies);
@@ -78,6 +82,7 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
         _routingKey = routingKey;
         _timeout = timeout;
         _maxPending = maxPendingRequests;
+        _instrumentation = instrumentation;
         _pendingGate = new SemaphoreSlim(maxPendingRequests, maxPendingRequests);
 
         ReplyAddress = replies.Register(this);
@@ -119,10 +124,7 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
             // re-check the request would wait out the full timeout for a reply that can never arrive.
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-            OutboundMessage outbound = BuildRequest(request, requestId);
-
-            IReadOnlyList<SendResult> results = await _adapter
-                .SendBatchAsync([outbound], cancellationToken)
+            IReadOnlyList<SendResult> results = await SendRequestAsync(request, requestId, cancellationToken)
                 .ConfigureAwait(false);
 
             if (results.Count != 1 || !results[0].IsConfirmed)
@@ -223,11 +225,35 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
             && _pending.TryGetValue(requestId, out tcs);
     }
 
+    // The producer span covers building and sending the request only, not the wait for the reply — the same
+    // shape as the RabbitMQ request client.
+    private async Task<IReadOnlyList<SendResult>> SendRequestAsync(
+        TRequest request,
+        Guid requestId,
+        CancellationToken cancellationToken)
+    {
+        Activity? activity = null;
+        try
+        {
+            // The message id tag is Guid.Empty on purpose: requestId is the correlation value and must not leak
+            // into telemetry.
+            activity = _instrumentation?.StartPublishActivity(typeof(TRequest).Name, _targetExchange, Guid.Empty);
+
+            OutboundMessage outbound = BuildRequest(request, requestId, activity);
+
+            return await _adapter.SendBatchAsync([outbound], cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            activity?.Dispose();
+        }
+    }
+
     // The serialized request is copied out of the pooled writer (ToArray) and the writer is returned to the
     // pool right away, so the message owns its bytes: a decorating adapter (the test harness) may keep
     // OutboundMessage.Body after SendBatchAsync returns, and no pooled buffer is held while waiting for the
     // reply. This is the one per-request allocation, on the cold request/response path.
-    private OutboundMessage BuildRequest(TRequest request, Guid requestId)
+    private OutboundMessage BuildRequest(TRequest request, Guid requestId, Activity? activity)
     {
         byte[] body;
         using (var writer = new InMemoryPooledWriter())
@@ -245,6 +271,16 @@ internal sealed partial class InMemoryRequestClient<TRequest> : IRequestClient<T
             // A separate Guid: the correlation value must not travel into the consumer's message-id (and logs).
             [InMemoryHeaderNames.MessageId] = Guid.NewGuid().ToString("D", CultureInfo.InvariantCulture),
         };
+
+        // Trace headers exist only for a traced request.
+        if (activity is not null)
+        {
+            _instrumentation!.InjectTraceContext(activity, headers);
+            if (_serializer is IOutboundHeaderContributor contributor)
+            {
+                contributor.ContributeHeaders(headers);
+            }
+        }
 
         return new OutboundMessage(_routingKey, headers, body, _serializer.ContentType);
     }

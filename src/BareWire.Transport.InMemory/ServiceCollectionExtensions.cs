@@ -2,6 +2,7 @@ using System.Diagnostics.Metrics;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Configuration;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Topology;
@@ -162,7 +163,8 @@ public static class ServiceCollectionExtensions
                 ?? new SingleDeserializerResolver(sp.GetRequiredService<IMessageDeserializer>()),
             sp.GetRequiredService<IExchangeResolver>(),
             sp.GetRequiredService<IRoutingKeyResolver>(),
-            sp.GetService<ILoggerFactory>() ?? NullLoggerFactory.Instance)));
+            sp.GetService<ILoggerFactory>() ?? NullLoggerFactory.Instance,
+            instrumentation: sp.GetService<IBareWireInstrumentation>())));
 
         // Register topology so the core bus can deploy it on startup.
         if (options.Topology is not null)

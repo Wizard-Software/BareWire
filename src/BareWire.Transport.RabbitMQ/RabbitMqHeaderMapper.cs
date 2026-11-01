@@ -34,9 +34,10 @@ namespace BareWire.Transport.RabbitMQ;
 /// through the broker.
 /// </para>
 /// <para>
-/// The trace headers <c>traceparent</c> and <c>MT-Activity-Id</c> are always mapped 1:1 on inbound, even when
-/// unmapped headers are ignored. An explicit custom mapping of <c>MT-Activity-Id</c> takes precedence over
-/// that default (<c>traceparent</c> is always mapped 1:1).
+/// The trace headers <c>traceparent</c>, <c>tracestate</c>, <c>baggage</c> and <c>MT-Activity-Id</c> are always
+/// mapped 1:1 in both directions, even when unmapped headers are ignored, so a trace is neither cut on send nor
+/// on receive. An explicit custom mapping of <c>tracestate</c>, <c>baggage</c> or <c>MT-Activity-Id</c> takes
+/// precedence over that default (<c>traceparent</c> is always mapped 1:1 on inbound).
 /// </para>
 /// </remarks>
 internal sealed class RabbitMqHeaderMapper
@@ -54,6 +55,10 @@ internal sealed class RabbitMqHeaderMapper
     // MassTransit's trace header (same W3C traceparent format). Mapped 1:1 on inbound so the consume
     // path can use it as the parent context; the normalized key is written regardless of wire casing.
     private const string MtActivityId = "MT-Activity-Id";
+
+    // The rest of the W3C trace context written by the propagator next to traceparent.
+    private const string Tracestate = "tracestate";
+    private const string Baggage = "baggage";
 
     private readonly RabbitMqHeaderMappingConfigurator? _config;
 
@@ -163,11 +168,12 @@ internal sealed class RabbitMqHeaderMapper
                 {
                     result[bareWireKey] = ConvertHeaderValue(entry.Value);
                 }
-                else if (rawKey.Equals(MtActivityId, StringComparison.OrdinalIgnoreCase))
+                else if (TryGetTraceHeaderKey(rawKey, out string? traceKey))
                 {
                     // Placed after the custom-mapping lookup so an explicit user mapping of this header wins.
-                    // Like traceparent, it is kept even when unmapped headers are ignored.
-                    result[MtActivityId] = ConvertHeaderValue(entry.Value);
+                    // Like traceparent, it is kept even when unmapped headers are ignored; the normalized key is
+                    // written regardless of wire casing.
+                    result[traceKey] = ConvertHeaderValue(entry.Value);
                 }
                 else if (IsReservedHeader(rawKey) && !IsAcceptedReservedWireHeader(rawKey, result))
                 {
@@ -275,6 +281,14 @@ internal sealed class RabbitMqHeaderMapper
                 continue;
             }
 
+            // Trace headers are always sent, even when unmapped headers are ignored — dropping them would cut
+            // the trace at this hop.
+            if (bwKey.Equals(BwTraceparent, StringComparison.OrdinalIgnoreCase) || TryGetTraceHeaderKey(bwKey, out _))
+            {
+                amqpHeaders[bwKey] = value;
+                continue;
+            }
+
             // Skip remaining reserved BareWire headers (case-insensitive) — only the transport stamps
             // them on the wire.
             if (IsReservedHeader(bwKey))
@@ -292,6 +306,19 @@ internal sealed class RabbitMqHeaderMapper
         }
 
         return (props, amqpHeaders);
+    }
+
+    // Returns the normalized name of a trace header that is passed through 1:1 whatever the IgnoreUnmapped setting
+    // (traceparent has its own, earlier inbound branch). Compared case-insensitively.
+    private static bool TryGetTraceHeaderKey(
+        string key,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? normalizedKey)
+    {
+        normalizedKey = key.Equals(MtActivityId, StringComparison.OrdinalIgnoreCase) ? MtActivityId
+            : key.Equals(Tracestate, StringComparison.OrdinalIgnoreCase) ? Tracestate
+            : key.Equals(Baggage, StringComparison.OrdinalIgnoreCase) ? Baggage
+            : null;
+        return normalizedKey is not null;
     }
 
     // Returns whether the key carries the reserved BareWire prefix, compared case-insensitively.

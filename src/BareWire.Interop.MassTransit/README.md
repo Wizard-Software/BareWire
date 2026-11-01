@@ -156,14 +156,12 @@ Both typed (`IConsumer<T>`) and raw (`IRawConsumer`) consumers are supported. A 
 
 MassTransit propagates the trace in the `MT-Activity-Id` header (W3C `traceparent` format), BareWire in `traceparent`. The two are bridged so a trace continues across a BareWire ↔ MassTransit hop:
 
-- **Reading (always on):** a BareWire consumer uses `traceparent` when present and falls back to `MT-Activity-Id` when it is absent. When both are present `traceparent` wins. An invalid `traceparent` starts a new trace; it does not fall back to `MT-Activity-Id`. The RabbitMQ transport always maps an inbound `MT-Activity-Id` 1:1, even with `IgnoreUnmappedHeaders`; an explicit custom mapping for it takes precedence.
-- **Writing (only with the MassTransit envelope):** messages serialized with `MassTransitEnvelopeSerializer` also carry `MT-Activity-Id`, set to the same value as `traceparent`. The default JSON serializer stays raw-first and adds no `MT-Activity-Id`. This covers `PublishAsync`, `ISendEndpoint.SendAsync`, `SendRawAsync` / `PublishRawAsync`, replies to a MassTransit requester (through the built-in send endpoint; a custom `ISendEndpoint` implementation does not get the header) and the RabbitMQ request client. The header is written through `IOutboundHeaderContributor`.
+- **Reading (always on):** a BareWire consumer uses `traceparent` when present and falls back to `MT-Activity-Id` when it is absent. When both are present `traceparent` wins. An invalid `traceparent` starts a new trace; it does not fall back to `MT-Activity-Id`. The RabbitMQ transport always maps the trace headers (`traceparent`, `tracestate`, `baggage`, `MT-Activity-Id`) 1:1 in both directions, even with `IgnoreUnmappedHeaders`; an explicit custom mapping of `tracestate`, `baggage` or `MT-Activity-Id` takes precedence.
+- **Writing (only with the MassTransit envelope):** messages serialized with `MassTransitEnvelopeSerializer` also carry `MT-Activity-Id`, set to the same value as `traceparent`. The default JSON serializer stays raw-first and adds no `MT-Activity-Id`. This covers `PublishAsync`, `ISendEndpoint.SendAsync`, `SendRawAsync` / `PublishRawAsync`, replies to a MassTransit requester (through the built-in send endpoint; a custom `ISendEndpoint` implementation does not get the header) and the RabbitMQ and in-memory request clients. The header is written through `IOutboundHeaderContributor`.
 
 Limits to know about:
 
-- With `IgnoreUnmappedHeaders` on the RabbitMQ transport, outbound `traceparent` and `MT-Activity-Id` are dropped unless you map them explicitly, so the BareWire → MassTransit direction is not propagated.
 - The extra headers count against transport limits on the number of headers or attributes (for example 10 message attributes on Amazon SQS, and the attribute limits of Google Cloud Pub/Sub).
-- The in-memory request client does not propagate trace context.
 
 ## Dependencies
 

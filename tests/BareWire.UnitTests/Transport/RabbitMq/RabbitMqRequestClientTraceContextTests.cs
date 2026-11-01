@@ -145,7 +145,7 @@ public sealed class RabbitMqRequestClientTraceContextTests : IDisposable
     }
 
     [Fact]
-    public async Task GetResponseAsync_WithIgnoreUnmappedHeaders_DoesNotPublishTraceHeaders()
+    public async Task GetResponseAsync_WithIgnoreUnmappedHeaders_StillPublishesTraceHeaders()
     {
         // Arrange
         StartListening();
@@ -159,8 +159,11 @@ public sealed class RabbitMqRequestClientTraceContextTests : IDisposable
         // Act
         _ = await client.GetResponseAsync<TestResponse>(new TestRequest("a"), TestContext.Current.CancellationToken);
 
-        // Assert — same whitelist rule as the publish path
-        captured.Should().ContainSingle().Which.Headers.Should().BeNull();
+        // Assert — trace headers are exempt from the whitelist, exactly as on the publish path
+        IDictionary<string, object?>? headers = captured.Should().ContainSingle().Which.Headers;
+        headers.Should().NotBeNull();
+        headers!.Should().ContainKey("traceparent");
+        headers["MT-Activity-Id"].Should().Be(headers["traceparent"]);
 
         await client.DisposeAsync();
     }

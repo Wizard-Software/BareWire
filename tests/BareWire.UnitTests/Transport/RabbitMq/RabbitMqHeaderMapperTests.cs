@@ -115,6 +115,69 @@ public sealed class RabbitMqHeaderMapperTests
     }
 
     [Fact]
+    public void MapOutbound_WithTraceHeadersAndIgnoreUnmapped_SendsTraceHeaders()
+    {
+        // Arrange
+        const string traceValue = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        var headers = new Dictionary<string, string>
+        {
+            ["traceparent"] = traceValue,
+            ["tracestate"] = "vendor=1",
+            ["baggage"] = "k=v",
+            ["MT-Activity-Id"] = traceValue,
+            ["x-other"] = "dropped",
+        };
+        var sut = CreateMapperWith(cfg => cfg.IgnoreUnmappedHeaders(true));
+
+        // Act
+        (_, Dictionary<string, object?> amqpHeaders) = sut.MapOutbound(headers);
+
+        // Assert
+        amqpHeaders["traceparent"].Should().Be(traceValue);
+        amqpHeaders["tracestate"].Should().Be("vendor=1");
+        amqpHeaders["baggage"].Should().Be("k=v");
+        amqpHeaders["MT-Activity-Id"].Should().Be(traceValue);
+        amqpHeaders.Should().NotContainKey("x-other");
+    }
+
+    [Fact]
+    public void MapInbound_WithTracestateAndBaggageAndIgnoreUnmapped_MapsThem()
+    {
+        // Arrange
+        var amqpHeaders = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["TraceState"] = "vendor=1",
+            ["baggage"] = "k=v",
+            ["x-other"] = "dropped",
+        };
+        IReadOnlyBasicProperties properties = CreateProperties(headers: amqpHeaders);
+        var sut = CreateMapperWith(cfg => cfg.IgnoreUnmappedHeaders(true));
+
+        // Act
+        Dictionary<string, string> result = sut.MapInbound(properties);
+
+        // Assert
+        result["tracestate"].Should().Be("vendor=1");
+        result["baggage"].Should().Be("k=v");
+        result.Should().NotContainKey("x-other");
+    }
+
+    [Fact]
+    public void MapOutbound_WithExplicitTracestateMapping_UsesMappedName()
+    {
+        // Arrange
+        var headers = new Dictionary<string, string> { ["tracestate"] = "vendor=1" };
+        var sut = CreateMapperWith(cfg => cfg.MapHeader("tracestate", "x-tracestate"));
+
+        // Act
+        (_, Dictionary<string, object?> amqpHeaders) = sut.MapOutbound(headers);
+
+        // Assert
+        amqpHeaders["x-tracestate"].Should().Be("vendor=1");
+        amqpHeaders.Should().NotContainKey("tracestate");
+    }
+
+    [Fact]
     public void MapInbound_WithDifferentlyCasedMtActivityId_WritesNormalizedKey()
     {
         // Arrange

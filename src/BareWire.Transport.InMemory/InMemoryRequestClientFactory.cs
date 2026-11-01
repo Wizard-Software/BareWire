@@ -1,5 +1,6 @@
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
@@ -34,6 +35,7 @@ internal sealed partial class InMemoryRequestClientFactory : IRequestClientFacto
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<InMemoryRequestClientFactory> _logger;
     private readonly TimeSpan _requestTimeout;
+    private readonly IBareWireInstrumentation? _instrumentation;
 
     internal InMemoryRequestClientFactory(
         Func<ITransportAdapter> adapterAccessor,
@@ -44,7 +46,8 @@ internal sealed partial class InMemoryRequestClientFactory : IRequestClientFacto
         IExchangeResolver exchangeResolver,
         IRoutingKeyResolver routingKeyResolver,
         ILoggerFactory loggerFactory,
-        TimeSpan? requestTimeout = null)
+        TimeSpan? requestTimeout = null,
+        IBareWireInstrumentation? instrumentation = null)
     {
         ArgumentNullException.ThrowIfNull(adapterAccessor);
         ArgumentNullException.ThrowIfNull(replies);
@@ -65,6 +68,7 @@ internal sealed partial class InMemoryRequestClientFactory : IRequestClientFacto
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<InMemoryRequestClientFactory>();
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
+        _instrumentation = instrumentation;
     }
 
     /// <inheritdoc />
@@ -83,7 +87,8 @@ internal sealed partial class InMemoryRequestClientFactory : IRequestClientFacto
             _loggerFactory.CreateLogger<InMemoryRequestClient<T>>(),
             targetExchange,
             routingKey,
-            _requestTimeout);
+            _requestTimeout,
+            instrumentation: _instrumentation);
 
         LogRequestClientCreated(typeof(T).Name, targetExchange, routingKey);
         return ValueTask.FromResult<IRequestClient<T>>(client);
