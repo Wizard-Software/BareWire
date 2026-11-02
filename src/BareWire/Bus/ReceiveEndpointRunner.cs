@@ -731,12 +731,16 @@ internal sealed partial class ReceiveEndpointRunner
         long startTimestamp = Stopwatch.GetTimestamp();
         Guid msgId = Guid.TryParse(message.MessageId, out Guid parsed) ? parsed : Guid.Empty;
 
-        // Activity is started AFTER messageType is resolved to avoid "unknown" leaking
-        // to streaming exporters before dispatch completes.
+        // The consume span is started BEFORE dispatch so it is Activity.Current inside the middleware and the
+        // consumer: work the consumer does (publishes, sends, outgoing calls) becomes its child. The message type
+        // is not known yet, so the span is named after the endpoint and renamed in the finally below.
         Activity? activity = null;
 
         try
         {
+            activity = _instrumentation.StartConsumeActivity(
+                _binding.EndpointName, _binding.EndpointName, msgId, message.Headers);
+
             terminatorState.Reset(this, cancellationToken);
             NextMiddleware terminator = terminatorState.InvokeAsync;
 
@@ -800,10 +804,6 @@ internal sealed partial class ReceiveEndpointRunner
                 : SettlementAction.Reject;
             messageType = terminatorState.MessageType;
 
-            // Start the activity now that messageType is fully resolved.
-            activity = _instrumentation.StartConsumeActivity(
-                messageType, _binding.EndpointName, msgId, message.Headers);
-
             // Record successful consume metrics.
             if (terminatorState.Dispatched)
             {
@@ -818,10 +818,6 @@ internal sealed partial class ReceiveEndpointRunner
         }
         catch (Exception ex)
         {
-            // Start an error activity if one hasn't been created yet — messageType may
-            // still be "unknown" here if the exception occurred before dispatch completed.
-            activity ??= _instrumentation.StartConsumeActivity(
-                messageType, _binding.EndpointName, msgId, message.Headers);
             LogConsumerError(_binding.EndpointName, message.MessageId, ex);
             _instrumentation.RecordFailure(
                 _binding.EndpointName, messageType, ex.GetType().Name);
@@ -830,7 +826,13 @@ internal sealed partial class ReceiveEndpointRunner
         }
         finally
         {
-            activity?.Dispose();
+            if (activity is not null)
+            {
+                // Same "{messageType} process" name the span had when it was started after dispatch; messageType
+                // is still "unknown" when dispatch failed before the type was resolved.
+                activity.DisplayName = $"{messageType} process";
+                activity.Dispose();
+            }
         }
 
         return new SettlementOutcome(action, messageType);

@@ -196,6 +196,10 @@ internal sealed partial class BareWireBus : IBus
                 ? new Dictionary<string, string>(headers)
                 : [];
 
+            // Resolved before the header build so an opt-in outbound header contributor (e.g. the MassTransit
+            // envelope serializer) can add its own headers after the framework headers and trace context.
+            IMessageSerializer serializer = _serializerResolver.Resolve<T>();
+
             // Framework headers — always override caller-supplied values.
             mergedHeaders["BW-MessageType"] = messageType;
             mergedHeaders["message-id"] = messageId.ToString();
@@ -210,7 +214,8 @@ internal sealed partial class BareWireBus : IBus
                     mergedHeaders["BW-Exchange"] = mappedExchange;
             }
 
-            IMessageSerializer serializer = _serializerResolver.Resolve<T>();
+            ContributeOutboundHeaders(serializer, mergedHeaders);
+
             OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
                 message,
                 serializer,
@@ -249,23 +254,47 @@ internal sealed partial class BareWireBus : IBus
         const string rawMessageType = "raw";
         const string rawEndpoint = "";
 
-        OutboundMessage outbound = new(
-            routingKey: rawEndpoint,
-            headers: s_emptyHeaders,
-            body: payload,
-            contentType: contentType);
+        Activity? activity = _instrumentation.StartPublishActivity(rawMessageType, rawEndpoint, Guid.Empty);
+        try
+        {
+            // A header dictionary is allocated only when a trace is active; otherwise the shared empty one is used.
+            IReadOnlyDictionary<string, string> headers = s_emptyHeaders;
+            if (activity is not null)
+            {
+                Dictionary<string, string> traceHeaders = [];
+                _instrumentation.InjectTraceContext(activity, traceHeaders);
+                headers = traceHeaders;
+            }
 
-        // The raw path hands the caller's buffer to the transport zero-copy. An interceptor may retain the
-        // message beyond this call, so it receives an owned copy; the copy exists only when one is registered.
-        if (_outboundInterceptor is { IsCapturing: true } && TryInterceptRaw(outbound, rawMessageType))
-            return;
+            OutboundMessage outbound = new(
+                routingKey: rawEndpoint,
+                headers: headers,
+                body: payload,
+                contentType: contentType);
 
-        await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
-        Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
+            // The raw path hands the caller's buffer to the transport zero-copy. An interceptor may retain the
+            // message beyond this call, so it receives an owned copy; the copy exists only when one is registered.
+            if (_outboundInterceptor is { IsCapturing: true } && TryInterceptRaw(outbound, rawMessageType))
+                return;
 
-        _instrumentation.RecordPublishPending(rawEndpoint, +1);
-        await _outgoingChannel.Writer.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
-        _instrumentation.RecordPublish(rawEndpoint, rawMessageType, outbound.Body.Length);
+            await WaitForByteBudgetAsync(outbound.Body.Length, cancellationToken).ConfigureAwait(false);
+            Interlocked.Add(ref _pendingBytes, outbound.Body.Length);
+
+            _instrumentation.RecordPublishPending(rawEndpoint, +1);
+            await _outgoingChannel.Writer.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+            _instrumentation.RecordPublish(rawEndpoint, rawMessageType, outbound.Body.Length);
+        }
+        finally
+        {
+            activity?.Dispose();
+        }
+    }
+
+    // Lets an opt-in serializer add its own headers (e.g. MT-Activity-Id) after framework headers and trace context.
+    private static void ContributeOutboundHeaders(object? source, Dictionary<string, string> headers)
+    {
+        if (source is IOutboundHeaderContributor contributor)
+            contributor.ContributeHeaders(headers);
     }
 
     // ── ISendEndpointProvider ────────────────────────────────────────────────
@@ -637,11 +666,15 @@ internal sealed partial class BareWireBus : IBus
 
     // ── Inner send-endpoint ───────────────────────────────────────────────────
 
-    private sealed class BareWireSendEndpoint : ISendEndpoint
+    private sealed class BareWireSendEndpoint : ISendEndpoint, IContributingSendEndpoint
     {
         private readonly ISerializerResolver _serializerResolver;
         private readonly ChannelWriter<OutboundMessage> _channelWriter;
         private readonly BareWireBus _bus;
+
+        // Span tag value for messaging.destination: scheme, host and path only — never user info or query string
+        // (which can carry credentials or the correlation id). Computed once per cached endpoint.
+        private readonly string _destination;
 
         internal BareWireSendEndpoint(
             Uri address,
@@ -653,6 +686,9 @@ internal sealed partial class BareWireBus : IBus
             Address = address ?? throw new ArgumentNullException(nameof(address));
             _serializerResolver = serializerResolver ?? throw new ArgumentNullException(nameof(serializerResolver));
             _channelWriter = channelWriter ?? throw new ArgumentNullException(nameof(channelWriter));
+            _destination = address.GetComponents(
+                UriComponents.Scheme | UriComponents.Host | UriComponents.Path,
+                UriFormat.UriEscaped);
         }
 
         public Uri Address { get; }
@@ -700,22 +736,47 @@ internal sealed partial class BareWireBus : IBus
             }
 
             IMessageSerializer serializer = _serializerResolver.Resolve<T>();
-            OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
-                message,
-                serializer,
-                routingKey,
-                headers: headers,
-                cancellationToken);
 
-            if (_bus._outboundInterceptor is not null && _bus.TryIntercept(outbound, typeof(T).Name))
-                return;
+            Activity? activity = _bus._instrumentation.StartPublishActivity(typeof(T).Name, _destination, Guid.Empty);
+            try
+            {
+                // Trace headers (and anything a contributor derives from them) exist only when a trace is active,
+                // so an untraced send allocates nothing extra.
+                if (activity is not null)
+                {
+                    headers ??= [];
+                    _bus._instrumentation.InjectTraceContext(activity, headers);
+                    ContributeOutboundHeaders(serializer, headers);
+                }
 
-            await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+                OutboundMessage outbound = MessagePipeline.ProcessOutboundAsync(
+                    message,
+                    serializer,
+                    routingKey,
+                    headers: headers,
+                    cancellationToken);
+
+                if (_bus._outboundInterceptor is not null && _bus.TryIntercept(outbound, typeof(T).Name))
+                    return;
+
+                await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                activity?.Dispose();
+            }
         }
+
+        public Task SendRawAsync(
+            ReadOnlyMemory<byte> payload,
+            string contentType,
+            CancellationToken cancellationToken = default)
+            => SendRawAsync(payload, contentType, headerContributor: null, cancellationToken);
 
         public async Task SendRawAsync(
             ReadOnlyMemory<byte> payload,
             string contentType,
+            IOutboundHeaderContributor? headerContributor,
             CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(contentType);
@@ -737,16 +798,37 @@ internal sealed partial class BareWireBus : IBus
                 routingKey = string.Empty;
             }
 
-            OutboundMessage outbound = new(
-                routingKey: routingKey,
-                headers: headers,
-                body: payload,
-                contentType: contentType);
+            Activity? activity = _bus._instrumentation.StartPublishActivity("raw", _destination, Guid.Empty);
+            try
+            {
+                // Only a traced raw send needs a mutable dictionary; the shared empty one is used otherwise.
+                if (activity is not null)
+                {
+                    // s_emptyHeaders is a shared instance and must never be mutated.
+                    Dictionary<string, string> traceHeaders =
+                        !ReferenceEquals(headers, s_emptyHeaders) && headers is Dictionary<string, string> existing
+                            ? existing
+                            : new Dictionary<string, string>(headers);
+                    _bus._instrumentation.InjectTraceContext(activity, traceHeaders);
+                    ContributeOutboundHeaders(headerContributor, traceHeaders);
+                    headers = traceHeaders;
+                }
 
-            if (_bus._outboundInterceptor is { IsCapturing: true } && _bus.TryInterceptRaw(outbound, "raw"))
-                return;
+                OutboundMessage outbound = new(
+                    routingKey: routingKey,
+                    headers: headers,
+                    body: payload,
+                    contentType: contentType);
 
-            await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+                if (_bus._outboundInterceptor is { IsCapturing: true } && _bus.TryInterceptRaw(outbound, "raw"))
+                    return;
+
+                await _channelWriter.WriteAsync(outbound, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                activity?.Dispose();
+            }
         }
     }
 }

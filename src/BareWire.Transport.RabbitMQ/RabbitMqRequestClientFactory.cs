@@ -1,4 +1,5 @@
 using BareWire.Abstractions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Routing;
 using BareWire.Abstractions.Serialization;
 using BareWire.Transport.RabbitMQ.Configuration;
@@ -25,6 +26,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
     private readonly IRoutingKeyResolver _routingKeyResolver;
     private readonly RabbitMqHeaderMapper _headerMapper;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly IBareWireInstrumentation? _instrumentation;
     private readonly ILogger<RabbitMqRequestClientFactory> _logger;
     private readonly SemaphoreSlim _connectionLock = new(1, 1);
 
@@ -38,7 +40,8 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         IExchangeResolver exchangeResolver,
         IRoutingKeyResolver routingKeyResolver,
         RabbitMqHeaderMapper headerMapper,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        IBareWireInstrumentation? instrumentation = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(serializerResolver);
@@ -55,6 +58,7 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
         _routingKeyResolver = routingKeyResolver;
         _headerMapper = headerMapper;
         _loggerFactory = loggerFactory;
+        _instrumentation = instrumentation;
         _logger = loggerFactory.CreateLogger<RabbitMqRequestClientFactory>();
     }
 
@@ -85,7 +89,8 @@ internal sealed partial class RabbitMqRequestClientFactory : IRequestClientFacto
             connectionUri: connectionUri,
             vhost: vhost,
             strict: strict,
-            headerMapper: _headerMapper);
+            headerMapper: _headerMapper,
+            instrumentation: _instrumentation);
 
         await client.InitializeAsync(cancellationToken).ConfigureAwait(false);
 

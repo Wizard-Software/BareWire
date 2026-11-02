@@ -7,7 +7,9 @@ internal sealed class BareWireInstrumentation(BareWireMetrics metrics)
     : IBareWireInstrumentation, IDisposable
 {
     public Activity? StartPublishActivity(string messageType, string destination, Guid messageId)
-        => BareWireActivitySource.StartPublish(messageType, destination, messageId);
+        => BareWireActivitySource.Source.HasListeners()
+            ? BareWireActivitySource.StartPublish(messageType, destination, messageId)
+            : null; // avoids building the span name string when nobody listens
 
     public Activity? StartConsumeActivity(
         string messageType,
@@ -15,26 +17,7 @@ internal sealed class BareWireInstrumentation(BareWireMetrics metrics)
         Guid messageId,
         IReadOnlyDictionary<string, string> headers)
     {
-        DistributedContextPropagator.Current.ExtractTraceIdAndState(
-            headers,
-            static (carrier, key, out value, out values) =>
-            {
-                var dict = (IReadOnlyDictionary<string, string>)carrier!;
-                if (dict.TryGetValue(key, out var single))
-                {
-                    value = single;
-                    values = null;
-                }
-                else
-                {
-                    value = null;
-                    values = null;
-                }
-            },
-            out var traceParent,
-            out var traceState);
-
-        ActivityContext.TryParse(traceParent, traceState, isRemote: true, out var parentContext);
+        ActivityContext parentContext = TraceContextPropagator.ExtractParentContext(headers);
 
         return BareWireActivitySource.StartConsume(messageType, endpoint, messageId, parentContext);
     }

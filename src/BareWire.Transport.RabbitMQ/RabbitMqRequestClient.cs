@@ -1,9 +1,11 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Globalization;
 using BareWire.Abstractions;
 using BareWire.Abstractions.Exceptions;
+using BareWire.Abstractions.Observability;
 using BareWire.Abstractions.Serialization;
 using BareWire.Abstractions.Transport;
 using BareWire.Transport.RabbitMQ.Internal;
@@ -38,6 +40,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
     private readonly string _targetExchange;
     private readonly string _routingKey;
     private readonly RabbitMqHeaderMapper _headerMapper;
+    private readonly IBareWireInstrumentation? _instrumentation;
     private readonly Uri _connectionUri;
     private readonly string? _vhost;
     private readonly bool _strict;
@@ -81,7 +84,8 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         bool strict = false,
         int maxPendingRequests = DefaultMaxPendingRequests,
         RabbitMqHeaderMapper? headerMapper = null,
-        Meter? meter = null)
+        Meter? meter = null,
+        IBareWireInstrumentation? instrumentation = null)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(serializer);
@@ -104,6 +108,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         _strict = strict;
         _pendingGate = new SemaphoreSlim(maxPendingRequests, maxPendingRequests);
         _headerMapper = headerMapper ?? new RabbitMqHeaderMapper();
+        _instrumentation = instrumentation;
 
         // 14.13 / D-3 / D-4: opt-in counter — only when an external Meter (named "BareWire" by the
         // composition root) is supplied. The Meter is owned by the caller (Observability layer), so
@@ -559,8 +564,14 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
             (rentedBuffer, length) = writer.DetachBuffer();
         }
 
+        // Started inside the try so the finally below disposes it even when building headers or publishing throws.
+        Activity? activity = null;
         try
         {
+            // The message id tag is Guid.Empty on purpose: requestId is the AMQP CorrelationId and must not
+            // leak into telemetry.
+            activity = _instrumentation?.StartPublishActivity(typeof(TRequest).Name, _targetExchange, Guid.Empty);
+
             var props = new BasicProperties
             {
                 // AMQP CorrelationId set to requestId.ToString() so BareWire↔BareWire
@@ -571,6 +582,21 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
                 // D4/PERF-1: _expirationMillis computed once in InitializeAsync — no alloc per request.
                 Expiration = _expirationMillis,
             };
+
+            // Trace headers exist only for a traced request; an untraced request leaves props.Headers null.
+            // They go through the header mapper so IgnoreUnmappedHeaders and the reserved-prefix rules apply
+            // exactly as on the publish path.
+            if (activity is not null)
+            {
+                Dictionary<string, string> traceHeaders = [];
+                _instrumentation!.InjectTraceContext(activity, traceHeaders);
+                if (_serializer is IOutboundHeaderContributor contributor)
+                    contributor.ContributeHeaders(traceHeaders);
+
+                Dictionary<string, object?> mapped = _headerMapper.MapOutbound(traceHeaders).Headers;
+                if (mapped.Count > 0)
+                    props.Headers = mapped;
+            }
 
             await publishChannel.BasicPublishAsync<BasicProperties>(
                 exchange: _targetExchange,
@@ -593,6 +619,7 @@ internal sealed partial class RabbitMqRequestClient<TRequest> : IRequestClient<T
         }
         finally
         {
+            activity?.Dispose();
             ArrayPool<byte>.Shared.Return(rentedBuffer);
         }
     }
