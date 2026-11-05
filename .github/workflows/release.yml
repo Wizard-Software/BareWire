@@ -3,17 +3,39 @@ name: Release NuGet Packages
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)publish, e.g. v3.1.0'
+        required: true
+        type: string
 
-permissions:
-  contents: write
-  packages: write
+# No permissions by default; each job requests only what it needs.
+permissions: {}
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  release:
-    name: Pack & Publish
+  build:
+    name: Build & Pack
+    # Manual re-publishing is only allowed with the workflow definition from main.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
+      - name: Validate release tag
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag: '$RELEASE_TAG'"
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - uses: actions/setup-dotnet@v5
         with:
@@ -27,7 +49,7 @@ jobs:
 
       - name: Extract version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "VERSION=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Restore
         run: dotnet restore BareWire.slnx
@@ -49,6 +71,35 @@ jobs:
           /p:Version=${{ steps.version.outputs.VERSION }}
           -o ./nupkgs
 
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs
+          path: ./nupkgs/*.nupkg
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    # Publishing credentials (OIDC token, package and release write access) live only in this job,
+    # which runs no repository code: it only pushes the packages built by the build job.
+    permissions:
+      contents: write
+      packages: write
+      id-token: write # NuGet.org Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nupkgs
+          path: ./nupkgs
+
       - name: Push to GitHub Packages
         run: >-
           dotnet nuget push ./nupkgs/*.nupkg
@@ -56,23 +107,32 @@ jobs:
           --api-key ${{ secrets.GITHUB_TOKEN }}
           --skip-duplicate
 
+      - name: NuGet.org login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: asawicki
+
       - name: Push to NuGet.org
         run: >-
           dotnet nuget push ./nupkgs/*.nupkg
           --source https://api.nuget.org/v3/index.json
-          --api-key ${{ secrets.NUGET_API_KEY }}
+          --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
           --skip-duplicate
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view "${{ github.ref_name }}" &>/dev/null; then
-            echo "Release ${{ github.ref_name }} already exists, skipping."
+          if gh release view "$RELEASE_TAG" &>/dev/null; then
+            echo "Release $RELEASE_TAG already exists, skipping."
           else
-            gh release create "${{ github.ref_name }}" \
-              --title "${{ github.ref_name }}" \
+            prerelease=""
+            [[ "$RELEASE_TAG" == *-* ]] && prerelease="--prerelease"
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
               --generate-notes \
               --verify-tag \
-              ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
+              $prerelease
           fi
